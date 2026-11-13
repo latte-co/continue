@@ -1230,6 +1230,8 @@ pub enum Response {
         side_chat: bool,
         #[serde(default)]
         side_chat_controls: bool,
+        #[serde(default)]
+        claude_side_chat: bool,
     },
     Projects {
         projects: Vec<Project>,

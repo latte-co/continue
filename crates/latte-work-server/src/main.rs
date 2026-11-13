@@ -334,6 +334,7 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
                             change_preview: true,
                             side_chat: true,
                             side_chat_controls: true,
+                            claude_side_chat: true,
                         }
                     } else {
                         Response::Error {
