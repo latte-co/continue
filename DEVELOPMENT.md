@@ -1791,3 +1791,28 @@ host and loopback Anthropic Messages, Chat Completions and Responses fixtures.
 It exercises prompt-free metadata, native resume, Provider switching,
 permissions, questions, steering, Shell exits and native commands. Native
 desktop, real SSH and live model acceptance are separate checks.
+
+### Side conversations
+
+A host advertising `hello.side_chat_controls` supports opening multiple side chats for a
+started Codex or Traex session. Opening a panel creates or reopens a child record and
+does not start a process. Clients can supply a UUID for retry-safe creation. The first
+explicit send starts a separate app-server actor that forks the current persisted
+context at the parent native ID, verifies the new thread identity and requested sandbox,
+and saves the child native ID before starting its turn. Later launches resume that ID.
+The side chat shares the working directory, with an independent request ledger and
+transcript. Side chats do not take undo snapshots because main and side file activity can
+overlap. The host rejects main-turn undo when a write-capable side turn overlaps it.
+The desktop routes the same protocol through local and SSH transports.
+
+A null side-chat permission selection defaults to a read-only sandbox and blocks
+external tools and permission requests. Explicit workspace approval or full access uses
+the corresponding native policy and restores normal tool configuration. The app routes
+permission decisions to the child that requested them.
+
+Codex's TUI uses an ephemeral native fork with an instruction boundary
+([source](https://github.com/openai/codex/blob/10b4080/codex-rs/tui/src/app/side.rs)).
+TRAE documents a parent-linked side window with separate input and history
+([interaction](https://docs.trae.cn/ide_chat)). Both installed app-server schemas expose
+`thread/fork`; Traex also exposes the single-question `turn/btw` RPC. Latte uses a
+persistent fork for multi-turn follow-ups and reopening.
