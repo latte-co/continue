@@ -1123,6 +1123,7 @@ impl Process {
         path: &str,
         config: LaunchConfig,
         session_open: Arc<AtomicBool>,
+        request_id: Option<&str>,
     ) -> Result<Self> {
         let mut adapter = agents::create(&session.agent)?;
         adapter.set_session_title(
@@ -1151,6 +1152,12 @@ impl Process {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .process_group(0);
+        // A launch may fail after starting the native process. Record the
+        // possible write before calling spawn, after all launch validation.
+        let side_writes_since = match request_id {
+            Some(id) => db(database, |s| s.start_side_write(id))?,
+            None => None,
+        };
         let child = command.spawn().with_context(|| {
             format!(
                 "无法启动 Agent {}，请检查此 Host 的 CLI 安装和登录状态",
@@ -1196,7 +1203,7 @@ impl Process {
             turn_active: false,
             settled_turn: None,
             background_at_start: false,
-            side_writes_since: None,
+            side_writes_since,
             stopping: false,
             interrupt_sent: false,
             interrupt_ack_pending: false,
@@ -1600,7 +1607,7 @@ async fn accept_turn(
         current.close().await;
         *process = None;
     }
-    let side_write_start = db(database, |s| {
+    db(database, |s| {
         s.begin(
             &session.id,
             &turn.request_id,
@@ -1609,8 +1616,7 @@ async fn accept_turn(
             config.effort,
             turn.fingerprint.as_deref(),
             config.permission_mode.as_deref(),
-        )?;
-        s.side_write_start(&turn.request_id)
+        )
     })?;
     // Admission is complete once the request and User/Running events are durable.
     // Filesystem snapshots and Agent startup can take longer than the sender's
@@ -1642,7 +1648,10 @@ async fn accept_turn(
                 db(database, |s| s.save_baseline(&session.id, &task_baseline))?;
             }
         }
-        if process.is_none() {
+        if let Some(p) = process.as_mut() {
+            let start = db(database, |s| s.start_side_write(&turn.request_id))?;
+            p.side_writes_since = p.side_writes_since.or(start);
+        } else {
             let current = db(database, |s| s.session(&session.id))?;
             *process = Some(Process::spawn(
                 database,
@@ -1651,10 +1660,10 @@ async fn accept_turn(
                 path,
                 turn.config,
                 session_open.clone(),
+                Some(&turn.request_id),
             )?);
         }
         let p = process.as_mut().context("Agent process missing")?;
-        p.side_writes_since = p.side_writes_since.or(side_write_start);
         p.turn_active = true;
         p.settled_turn = None;
         p.background_at_start = p.adapter.has_background_work();
@@ -1838,7 +1847,7 @@ async fn actor(
                     let result = async {
                         if process.is_none() {
                             let current = db(&database, |s| s.session(&session.id))?;
-                            let mut p = Process::spawn(&database, &binary, &current, &path, config, session_open.clone())?;
+                            let mut p = Process::spawn(&database, &binary, &current, &path, config, session_open.clone(), None)?;
                             let actions = p.adapter.advance(Input::Open)?;
                             p.apply(actions, &database, &session.id).await?;
                             process = Some(p);
@@ -2233,6 +2242,7 @@ async fn actor(
                         &path,
                         config,
                         session_open.clone(),
+                        None,
                     )?;
                     let actions = p.adapter.advance(Input::Open)?;
                     p.apply(actions, &database, &session.id).await?;
