@@ -794,6 +794,116 @@ async fn concurrent_side_confirmation_preserves_a_new_resource_claim() {
     }
 }
 
+#[tokio::test]
+async fn claim_before_confirmation_retains_ownership_when_open_or_send_follows() {
+    use latte_work_protocol::lifecycle::Resource;
+    for send_turn in [false, true] {
+        let host = Host::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = host.client().await;
+        let mut reopened = host.client().await;
+        let project = terminal_project(&mut writer, root.path()).await;
+        let parent = create_session(&mut writer, project, "codex").await;
+        send(&mut writer, &parent.id, "main-init", "hello").await;
+        wait(&mut writer, &parent.id, Status::Completed).await;
+        let side = open_side(&mut writer, &parent).await;
+        let resource = Resource::AgentSession(side.id.clone());
+        let server_id = writer.server_id().to_owned();
+        writer
+            .claim_resources("writer".into(), vec![resource.clone()])
+            .await
+            .unwrap();
+        start_writable_side(&mut writer, &side, "hello").await;
+
+        reopened
+            .claim_resources("reopened".into(), vec![resource.clone()])
+            .await
+            .unwrap();
+        // Model the desktop's Session lookup and Provider work between Claim and
+        // Open/Send. A different connection completes the old actor's close here.
+        assert!(
+            matches!(ask(&mut reopened, Request::Session { session_id: side.id.clone() }).await,
+            Response::Session { session } if session.agent_session_open == Some(true))
+        );
+        assert!(matches!(ask(&mut writer, Request::ConfirmSideWritesEnded {
+            session_id: side.id.clone(), request_id: "side-write".into(),
+        }).await, Response::Session { session } if session.agent_closed_by_confirmation == Some(true)));
+        if send_turn {
+            assert!(matches!(
+                send(&mut reopened, &side.id, "after-close", "hello").await,
+                Response::Accepted { duplicate: false }
+            ));
+            wait(&mut reopened, &side.id, Status::Completed).await;
+        } else {
+            assert!(matches!(
+                ask(
+                    &mut reopened,
+                    Request::OpenAgentSession {
+                        session_id: side.id.clone(),
+                        provider: Some(TurnProvider::Cli),
+                    }
+                )
+                .await,
+                Response::Ok
+            ));
+        }
+        assert!(
+            matches!(ask(&mut reopened, Request::Session { session_id: side.id.clone() }).await,
+            Response::Session { session } if session.agent_session_open == Some(true))
+        );
+        reopened
+            .close_owned_resources(server_id, "reopened".into(), vec![resource])
+            .await
+            .unwrap();
+        assert!(
+            matches!(ask(&mut reopened, Request::Session { session_id: side.id }).await,
+            Response::Session { session } if session.agent_session_open == Some(false))
+        );
+    }
+}
+
+#[tokio::test]
+async fn superseded_connection_claim_cannot_admit_a_turn_or_steal_ownership() {
+    use latte_work_protocol::lifecycle::Resource;
+    let host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut old = host.client().await;
+    let mut current = host.client().await;
+    let project = terminal_project(&mut old, root.path()).await;
+    let main = create_session(&mut old, project, "codex").await;
+    let resource = Resource::AgentSession(main.id.clone());
+    old.claim_resources("old".into(), vec![resource.clone()])
+        .await
+        .unwrap();
+    current
+        .claim_resources("current".into(), vec![resource.clone()])
+        .await
+        .unwrap();
+    assert!(matches!(send(&mut old, &main.id, "stale", "hello").await,
+        Response::Error { message, .. } if message.contains("资源认领已变化")));
+    assert!(
+        matches!(ask(&mut old, Request::Poll { session_id: main.id.clone(), after: 0.0 }).await,
+        Response::Events { session, events, .. } if session.agent_session_open == Some(false) && events.is_empty())
+    );
+    assert!(matches!(
+        send(&mut current, &main.id, "current", "hello").await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut current, &main.id, Status::Completed).await;
+    current
+        .close_owned_resources(
+            current.server_id().to_owned(),
+            "current".into(),
+            vec![resource],
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(ask(&mut current, Request::Session { session_id: main.id }).await,
+        Response::Session { session } if session.agent_session_open == Some(false))
+    );
+}
+
 async fn check_detached_side_writes(completed: bool) {
     let host = Host::start().await;
     let root = tempfile::tempdir().unwrap();

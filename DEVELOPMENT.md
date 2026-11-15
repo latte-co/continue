@@ -1830,6 +1830,15 @@ on exit. Only verified ends count, including after running an older Server.
 Native resource cleanup captures a claim version before waiting for close.
 Every claim or adoption gets a new version, including by the same App; an older
 close acknowledgement cannot remove that newer ownership.
+Claims reserve ownership for the claiming connection's next Open/Send (or terminal
+creation). A close of the previous actor preserves this pending reservation.
+Actual execution admission validates the connection's claim and retains its
+reservation across asynchronous Open/Send, refreshing the runtime version both
+before execution and when dispatch settles. Ordinary close can still interrupt
+pending message delivery; it cannot erase another connection's in-flight reservation.
+A connection's own explicit close or archive retires its reservation.
+A superseded claim fails before execution and never implicitly reclaims or replays
+the request. Adopted resources are already active and do not reserve a future open.
 Earlier overlapping turns remain protected. Side chats accept direct messages
 without native steering or a message queue.
 If native close itself was unconfirmed, users can verify the process and its

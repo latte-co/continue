@@ -292,10 +292,11 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(MAX_FRAME));
     let mut ready = false;
+    let mut claims = upgrade::ConnectionClaims::default();
     while let Some(line) = lines.next().await {
         let line = line?;
         if let Ok(request) = serde_json::from_str::<upgrade::Request>(&line) {
-            let response = upgrade::handle(&service, request).await;
+            let response = upgrade::handle(&service, request, &mut claims).await;
             let mut bytes = serde_json::to_vec(&response)?;
             bytes.push(b'\n');
             let written =
@@ -342,7 +343,7 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
                         }
                     }
                 }
-                Ok(request) if ready => match dispatch(&service, request).await {
+                Ok(request) if ready => match dispatch(&service, request, &mut claims).await {
                     Ok(response) => response,
                     Err(error) => Response::Error {
                         code: if error.is::<files::NotGitRepository>() {
@@ -376,7 +377,11 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
     }
     Ok(())
 }
-async fn dispatch(s: &Service, request: Request) -> Result<Response> {
+async fn dispatch(
+    s: &Service,
+    request: Request,
+    claims: &mut upgrade::ConnectionClaims,
+) -> Result<Response> {
     let allow_queue = matches!(&request, Request::SendQueued { .. });
     let request = match request {
         Request::SendQueued {
@@ -426,6 +431,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         Request::UndoTurnChanges { .. }
             | Request::ConfirmSideWritesEnded { .. }
             | Request::ConfirmAgentClosed { .. }
+            | Request::CloseTerminal { .. }
             | Request::ArchiveSession { archived: true, .. }
             | Request::RenameSession { .. }
     );
@@ -450,7 +456,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
     } else {
         None
     };
-    let mut closed_resource = match &request {
+    let closed_resource = match &request {
         Request::CloseAgentSession { session_id, .. }
         | Request::ConfirmAgentClosed { session_id, .. }
         | Request::ArchiveSession {
@@ -462,6 +468,46 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         }
         _ => None,
     };
+    let admitted_resource = match &request {
+        Request::OpenAgentSession { session_id, .. }
+        | Request::Send { session_id, .. }
+        | Request::DispatchQueuedMessage { session_id, .. }
+        | Request::ResumeMessageQueue { session_id, .. } => {
+            Some(upgrade::Resource::AgentSession(session_id.clone()))
+        }
+        Request::CreateTerminal { terminal_id, .. } => {
+            Some(upgrade::Resource::Terminal(terminal_id.clone()))
+        }
+        _ => None,
+    };
+    let admitted_claim = admitted_resource
+        .as_ref()
+        .map(|resource| s.lifecycle.admit_claim(resource, claims))
+        .transpose()?
+        .flatten();
+    let result = dispatch_admitted(
+        s,
+        request,
+        claims,
+        allow_queue,
+        closed_resource,
+        closing_claim,
+    )
+    .await;
+    if let Some(resource) = admitted_resource {
+        s.lifecycle.finish_admission(&resource, admitted_claim)?;
+    }
+    result
+}
+
+async fn dispatch_admitted(
+    s: &Service,
+    request: Request,
+    claims: &mut upgrade::ConnectionClaims,
+    allow_queue: bool,
+    mut closed_resource: Option<upgrade::Resource>,
+    closing_claim: Option<uuid::Uuid>,
+) -> Result<Response> {
     let mut response = match request {
         Request::Hello { .. } => unreachable!(),
         Request::Providers => s
@@ -1932,7 +1978,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         }
     };
     if let Some(resource) = closed_resource {
-        s.lifecycle.forget_claim(&resource, closing_claim)?;
+        s.lifecycle.forget_claim(&resource, closing_claim, claims)?;
     }
     runtime::refresh_titles(&s.database, &s.runs, &s.title_refresh, &mut response).await?;
     db(&s.database, |d| {
@@ -2008,15 +2054,19 @@ mod skill_admission_tests {
         });
         start.await.unwrap();
         assert!(
-            dispatch(&service, Request::Skills { project_id: None })
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("仍在进行")
+            dispatch(
+                &service,
+                Request::Skills { project_id: None },
+                &mut upgrade::ConnectionClaims::default()
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("仍在进行")
         );
         let _other_probe = service.command_probes.try_acquire().unwrap();
         assert!(
-            matches!(dispatch(&service,Request::AgentPermissions{agent:"claude".into()}).await.unwrap(),Response::AgentPermissions{modes}if !modes.is_empty())
+            matches!(dispatch(&service,Request::AgentPermissions{agent:"claude".into()}, &mut upgrade::ConnectionClaims::default()).await.unwrap(),Response::AgentPermissions{modes}if !modes.is_empty())
         );
         release.send(()).unwrap();
         job.await.unwrap().unwrap();

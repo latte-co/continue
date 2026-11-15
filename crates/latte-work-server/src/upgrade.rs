@@ -21,17 +21,78 @@ pub struct Lifecycle {
 }
 struct Ownership {
     owner_id: String,
+    claim_id: uuid::Uuid,
     version: uuid::Uuid,
+    pending_admission: bool,
 }
 impl Ownership {
-    fn new(owner_id: String) -> Self {
+    fn new(owner_id: String, pending_admission: bool) -> Self {
         Self {
             owner_id,
+            claim_id: uuid::Uuid::new_v4(),
             version: uuid::Uuid::new_v4(),
+            pending_admission,
         }
     }
 }
+/// Native claims are scoped to the connection which will submit Open/Send.
+/// No tokens or owner identity are accepted from the WebView request schema.
+#[derive(Default)]
+pub struct ConnectionClaims(std::collections::HashMap<Resource, uuid::Uuid>);
+impl ConnectionClaims {
+    fn check_capacity(&self, resources: &[Resource]) -> Result<()> {
+        if self.0.len()
+            + resources
+                .iter()
+                .filter(|r| !self.0.contains_key(*r))
+                .count()
+            > 4096
+        {
+            bail!("此连接的资源认领已达上限，请重新连接");
+        }
+        Ok(())
+    }
+}
 impl Lifecycle {
+    /// Called under execution admission, before any operation can start work.
+    /// Closing the old actor cannot revoke a still-pending claim. A superseded
+    /// connection must explicitly reclaim rather than silently steal ownership.
+    pub fn admit_claim(
+        &self,
+        resource: &Resource,
+        claims: &ConnectionClaims,
+    ) -> Result<Option<uuid::Uuid>> {
+        let Some(claim_id) = claims.0.get(resource) else {
+            return Ok(None);
+        };
+        let mut owners = self
+            .owners
+            .lock()
+            .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?;
+        let ownership = owners
+            .get_mut(resource)
+            .filter(|owner| &owner.claim_id == claim_id)
+            .context("资源认领已变化，请重新打开会话后重试；请求未执行")?;
+        ownership.pending_admission = true;
+        ownership.version = uuid::Uuid::new_v4();
+        Ok(Some(*claim_id))
+    }
+    /// Keep the reservation through asynchronous Open/Send and its receipt.
+    /// A close which saw the reservation cannot later retire this activation.
+    pub fn finish_admission(&self, resource: &Resource, claim: Option<uuid::Uuid>) -> Result<()> {
+        let mut owners = self
+            .owners
+            .lock()
+            .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?;
+        if let Some(owner) = owners
+            .get_mut(resource)
+            .filter(|owner| Some(owner.claim_id) == claim)
+        {
+            owner.pending_admission = false;
+            owner.version = uuid::Uuid::new_v4();
+        }
+        Ok(())
+    }
     pub fn new() -> Result<Self> {
         Ok(Self {
             build_id: executable_id()?,
@@ -52,17 +113,26 @@ impl Lifecycle {
     }
     /// A close can await the old actor while another connection reclaims its ID.
     /// Even a reclaim by the same App is a new version, not the closed resource.
-    pub fn forget_claim(&self, resource: &Resource, version: Option<uuid::Uuid>) -> Result<()> {
+    pub fn forget_claim(
+        &self,
+        resource: &Resource,
+        version: Option<uuid::Uuid>,
+        claims: &mut ConnectionClaims,
+    ) -> Result<()> {
         let mut owners = self
             .owners
             .lock()
             .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?;
-        if owners
-            .get(resource)
-            .is_some_and(|ownership| Some(ownership.version) == version)
-        {
+        if owners.get(resource).is_some_and(|ownership| {
+            Some(ownership.version) == version
+                && (!ownership.pending_admission
+                    || claims.0.get(resource) == Some(&ownership.claim_id))
+        }) {
             owners.remove(resource);
         }
+        // This connection explicitly closed/archived the resource. Its old claim
+        // no longer represents a future open, unlike another client's reservation.
+        claims.0.remove(resource);
         Ok(())
     }
 }
@@ -79,8 +149,12 @@ fn executable_id() -> Result<String> {
     }
     Ok(format!("{:x}", hash.finalize()))
 }
-pub async fn handle(service: &Service, request: Request) -> Response {
-    match handle_inner(service, request).await {
+pub async fn handle(
+    service: &Service,
+    request: Request,
+    claims: &mut ConnectionClaims,
+) -> Response {
+    match handle_inner(service, request, claims).await {
         Ok(response) => response,
         Err(error) => Response::Error {
             code: "upgrade_blocked".into(),
@@ -88,13 +162,18 @@ pub async fn handle(service: &Service, request: Request) -> Response {
         },
     }
 }
-async fn handle_inner(service: &Service, request: Request) -> Result<Response> {
+async fn handle_inner(
+    service: &Service,
+    request: Request,
+    claims: &mut ConnectionClaims,
+) -> Result<Response> {
     match request {
         Request::ClaimResources {
             owner_id,
             resources,
         } => {
             validate_resources(&owner_id, &resources)?;
+            claims.check_capacity(&resources)?;
             let draining = service.lifecycle.draining.read().await;
             if *draining {
                 bail!("后台正在停止，请重新连接");
@@ -112,7 +191,9 @@ async fn handle_inner(service: &Service, request: Request) -> Result<Response> {
                 bail!("会话资源归属数量已达上限");
             }
             for resource in resources {
-                owners.insert(resource, Ownership::new(owner_id.clone()));
+                let ownership = Ownership::new(owner_id.clone(), true);
+                claims.0.insert(resource.clone(), ownership.claim_id);
+                owners.insert(resource, ownership);
             }
             Ok(Response::ResourcesClaimed)
         }
@@ -123,6 +204,7 @@ async fn handle_inner(service: &Service, request: Request) -> Result<Response> {
             resources,
         } => {
             validate_resources(&owner_id, &resources)?;
+            claims.check_capacity(&resources)?;
             if previous_owner_id.is_empty() || previous_owner_id.len() > 128 {
                 bail!("无效的资源归属");
             }
@@ -158,7 +240,9 @@ async fn handle_inner(service: &Service, request: Request) -> Result<Response> {
                         ownership.owner_id == previous_owner_id || ownership.owner_id == owner_id
                     })
                 {
-                    owners.insert(resource.clone(), Ownership::new(owner_id.clone()));
+                    let ownership = Ownership::new(owner_id.clone(), false);
+                    claims.0.insert(resource.clone(), ownership.claim_id);
+                    owners.insert(resource.clone(), ownership);
                     adopted.push(resource);
                 }
             }
@@ -402,21 +486,86 @@ mod tests {
             .owners
             .lock()
             .unwrap()
-            .insert(resource.clone(), Ownership::new("app".into()));
-        lifecycle.forget_claim(&resource, absent).unwrap();
+            .insert(resource.clone(), Ownership::new("app".into(), false));
+        lifecycle
+            .forget_claim(&resource, absent, &mut ConnectionClaims::default())
+            .unwrap();
         let first = lifecycle.claim_version(&resource).unwrap();
         assert!(first.is_some());
         lifecycle
             .owners
             .lock()
             .unwrap()
-            .insert(resource.clone(), Ownership::new("app".into()));
+            .insert(resource.clone(), Ownership::new("app".into(), false));
         let newer = lifecycle.claim_version(&resource).unwrap();
         assert_ne!(first, newer);
-        lifecycle.forget_claim(&resource, first).unwrap();
+        lifecycle
+            .forget_claim(&resource, first, &mut ConnectionClaims::default())
+            .unwrap();
         assert_eq!(lifecycle.claim_version(&resource).unwrap(), newer);
-        lifecycle.forget_claim(&resource, newer).unwrap();
+        lifecycle
+            .forget_claim(&resource, newer, &mut ConnectionClaims::default())
+            .unwrap();
         assert!(lifecycle.claim_version(&resource).unwrap().is_none());
+    }
+    #[test]
+    fn pending_claim_survives_close_and_admission_refreshes_the_runtime_version() {
+        let lifecycle = Lifecycle::new().unwrap();
+        let resource = Resource::AgentSession("session".into());
+        let ownership = Ownership::new("app".into(), true);
+        let mut claims = ConnectionClaims::default();
+        claims.0.insert(resource.clone(), ownership.claim_id);
+        lifecycle
+            .owners
+            .lock()
+            .unwrap()
+            .insert(resource.clone(), ownership);
+        let closing = lifecycle.claim_version(&resource).unwrap();
+        lifecycle
+            .forget_claim(&resource, closing, &mut ConnectionClaims::default())
+            .unwrap();
+        assert_eq!(lifecycle.claim_version(&resource).unwrap(), closing);
+        let claim = lifecycle.admit_claim(&resource, &claims).unwrap();
+        let admitted = lifecycle.claim_version(&resource).unwrap();
+        assert_ne!(closing, admitted);
+        lifecycle
+            .forget_claim(&resource, closing, &mut ConnectionClaims::default())
+            .unwrap();
+        assert_eq!(lifecycle.claim_version(&resource).unwrap(), admitted);
+        lifecycle
+            .forget_claim(&resource, admitted, &mut ConnectionClaims::default())
+            .unwrap();
+        assert_eq!(lifecycle.claim_version(&resource).unwrap(), admitted);
+        lifecycle.finish_admission(&resource, claim).unwrap();
+        let active = lifecycle.claim_version(&resource).unwrap();
+        lifecycle
+            .forget_claim(&resource, admitted, &mut ConnectionClaims::default())
+            .unwrap();
+        assert_eq!(lifecycle.claim_version(&resource).unwrap(), active);
+        lifecycle
+            .forget_claim(&resource, active, &mut ConnectionClaims::default())
+            .unwrap();
+        assert!(lifecycle.claim_version(&resource).unwrap().is_none());
+        assert!(lifecycle.admit_claim(&resource, &claims).is_err());
+    }
+    #[test]
+    fn explicit_close_on_claiming_connection_retires_its_own_reservation() {
+        let lifecycle = Lifecycle::new().unwrap();
+        let resource = Resource::AgentSession("session".into());
+        let ownership = Ownership::new("app".into(), true);
+        let mut claims = ConnectionClaims::default();
+        claims.0.insert(resource.clone(), ownership.claim_id);
+        lifecycle
+            .owners
+            .lock()
+            .unwrap()
+            .insert(resource.clone(), ownership);
+        let version = lifecycle.claim_version(&resource).unwrap();
+        lifecycle
+            .forget_claim(&resource, version, &mut claims)
+            .unwrap();
+        assert!(lifecycle.claim_version(&resource).unwrap().is_none());
+        assert!(claims.0.is_empty());
     }
     #[tokio::test]
     async fn status_retries_a_closed_connection_without_requesting_upgrade() {
