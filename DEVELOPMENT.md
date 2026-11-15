@@ -1745,7 +1745,11 @@ Native usage reports turn totals separately from context occupancy. Occupancy
 matches OpenCode ACP's total tokens in the latest step (input, output, reasoning
 and cache); window capacity comes from that step's actual model in the native
 catalog. Missing capacity stays unknown. Catalog lookup is cached until a
-native model update and has a one-second timeout.
+native model update. A lookup waits at most one second across all steps, so a
+stalled catalog cannot accumulate delays before a cancellation event. A late
+successful lookup restores capacity for subsequent steps. `make test-unit`
+and CI also test the plugin's cache, failure and timeout behavior over a real
+Unix socket without an OpenCode process.
 Only a slash name in the execution session's catalog is treated as a command.
 Other slash-prefixed text is sent as an ordinary prompt.
 Compaction uses its ACP completion. OpenCode 2.0 implements `/compact` even

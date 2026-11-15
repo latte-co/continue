@@ -33,6 +33,7 @@ jobs:
       - run: npm ci
       - run: make fmt-check
       - run: make types-check
+      - run: node --test scripts/test-opencode-plugin.mjs
       - run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --exclude latte-work-desktop --no-deps --locked
       - name: ShellCheck
         run: docker run --rm -v "${PWD}:/repo" -w /repo koalaman/shellcheck:v0.11.0 scripts/*.sh

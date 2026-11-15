@@ -27,6 +27,7 @@ lint: prepare ## Check all Rust crates, denying warnings
 	cargo clippy --workspace --all-targets --locked -- -D warnings
 test-unit: ## Rust crate-local unit tests and frontend reducers
 	cargo test --workspace --exclude latte-work-desktop --lib --bins --locked
+	node --test scripts/test-opencode-plugin.mjs
 	npm test
 test-e2e: ## Final server binary, socket bridge, and deterministic Claude fixture
 	cargo test -p latte-work-server --test e2e --locked -- --test-threads=1

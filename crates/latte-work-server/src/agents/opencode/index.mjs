@@ -28,24 +28,40 @@ export default {
     const promptSubmissions = new Map();
     let models;
     async function contextWindow(ref) {
-      let timer;
       try {
-        models ??= (ctx.model ?? ctx.catalog.model).list({ location: ctx.location });
-        // Plugin domain methods ignore client RequestOptions. Bound the wait
-        // ourselves, retaining one pending lookup rather than spawning retries.
-        const result = await Promise.race([
-          models,
-          new Promise((resolve) => { timer = setTimeout(resolve, 1000); }),
-        ]);
-        return result?.data.find(
+        if (!models) {
+          const cached = {};
+          let timer;
+          const read = (ctx.model ?? ctx.catalog.model)
+            .list({ location: ctx.location })
+            .then(
+              (result) => {
+                cached.data = result.data;
+              },
+              () => {
+                if (models === cached) models = undefined;
+              },
+            );
+          // Plugin domain methods ignore client RequestOptions. Spend at most
+          // one second per lookup, not per step; a stalled catalog must not
+          // accumulate waits ahead of an execution's interruption event.
+          cached.ready = Promise.race([
+            read,
+            new Promise((resolve) => {
+              timer = setTimeout(resolve, 1000);
+            }),
+          ]).finally(() => clearTimeout(timer));
+          models = cached;
+        }
+        const cached = models;
+        await cached.ready;
+        return cached.data?.find(
           (model) => model.providerID === ref.providerID && model.id === ref.id,
         )?.limit.context;
       } catch {
         // Missing metadata stays unknown and is retried on the next step.
         models = undefined;
         return undefined;
-      } finally {
-        clearTimeout(timer);
       }
     }
     const cleanup = () => {
@@ -96,7 +112,11 @@ export default {
             const { sessionID, model } = data;
             send({
               type,
-              data: { sessionID, model, contextWindow: await contextWindow(model) },
+              data: {
+                sessionID,
+                model,
+                contextWindow: await contextWindow(model),
+              },
             });
           } else if (type === "session.inbox.enqueued") {
             const { sessionID, inboxID, item } = data;
