@@ -1813,6 +1813,10 @@ Open-only and recovery launches in a writable mode also journal a fresh interval
 with its own confirmation ID, because startup hooks can write without a user turn.
 These launch records do not create user messages or change request deduplication.
 Confirmed historical intervals remain closed when a later process is opened.
+Any interval still awaiting confirmation blocks Undo independently of its start
+time, including side work started after the main turn's snapshot completed.
+Once confirmed, only intervals overlapping the main turn block historical Undo;
+the existing current-file conflict check still protects later edits.
 Detached processes and external tools can keep writing after either normal completion
 or forced close. The host keeps the write interval open until the user verifies
 those tasks have stopped. A confirmed local close can return `SideChatClosed`
@@ -1823,6 +1827,9 @@ and records a verified end separately from legacy inferred boundaries. Its
 response acknowledges whether this request closed an actor. Retrying a verified
 request preserves ownership of a reopened chat so the current App can close it
 on exit. Only verified ends count, including after running an older Server.
+Native resource cleanup captures a claim version before waiting for close.
+Every claim or adoption gets a new version, including by the same App; an older
+close acknowledgement cannot remove that newer ownership.
 Earlier overlapping turns remain protected. Side chats accept direct messages
 without native steering or a message queue.
 If native close itself was unconfirmed, users can verify the process and its

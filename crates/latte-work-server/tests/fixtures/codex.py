@@ -3,6 +3,7 @@
 import json
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 import threading
@@ -45,6 +46,36 @@ def complete(status='completed'):
     notify('turn/completed', {'turn': {'id': turn, 'status': status}})
 
 
+def launch_detached_writer():
+    worker = subprocess.Popen([sys.executable, '-c', """
+import pathlib
+import time
+
+release = pathlib.Path('release-detached-writer')
+deadline = time.monotonic() + 20
+while not release.exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+if release.exists():
+    pathlib.Path('shared.txt').write_text('side edit\\n')
+    pathlib.Path('detached-write-done').touch()
+"""], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL)
+    pathlib.Path('side-writer-pids').write_text(f'{os.getpid()} {worker.pid}')
+    return worker
+
+
+def close_signal(_signal, _frame):
+    if thread.startswith('side-thread-') and pathlib.Path('hold-side-close').exists():
+        pathlib.Path('side-close-entered').touch()
+        deadline = time.monotonic() + 10
+        while not pathlib.Path('release-side-close').exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, close_signal)
+
+
 for line in sys.stdin:
     value = json.loads(line)
     method = value.get('method')
@@ -74,6 +105,10 @@ for line in sys.stdin:
                 sys.exit(0)
         parent_thread = thread
         thread = f'side-thread-{os.getpid()}' if method == 'thread/fork' else params['threadId']
+        if method == 'thread/resume' and pathlib.Path('side-open-detached-writer').exists():
+            assert sandbox == 'dangerFullAccess'
+            pathlib.Path('side-open-detached-writer').unlink()
+            launch_detached_writer()
         reply(value, {'thread': {'id': thread, 'forkedFromId': parent_thread},
                       'sandbox': {'type': sandbox}, 'approvalPolicy': approval})
     elif method in ('thread/start', 'thread/resume'):
@@ -218,20 +253,7 @@ for line in sys.stdin:
         elif prompt in ('approval', 'approval-then-main-write', 'side-detached-writer', 'side-detached-writer-complete', 'question'):
             if prompt.startswith('side-detached-writer'):
                 assert thread.startswith('side-thread-') and sandbox == 'dangerFullAccess'
-                worker = subprocess.Popen([sys.executable, '-c', """
-import pathlib
-import time
-
-release = pathlib.Path('release-detached-writer')
-deadline = time.monotonic() + 20
-while not release.exists() and time.monotonic() < deadline:
-    time.sleep(0.02)
-if release.exists():
-    pathlib.Path('shared.txt').write_text('side edit\\n')
-    pathlib.Path('detached-write-done').touch()
-"""], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL)
-                pathlib.Path('side-writer-pids').write_text(f'{os.getpid()} {worker.pid}')
+                worker = launch_detached_writer()
                 if prompt == 'side-detached-writer-complete':
                     notify('item/completed', {'item': {'id': 'side-launcher', 'type': 'commandExecution',
                         'command': 'launch detached worker', 'cwd': os.getcwd(), 'status': 'completed',

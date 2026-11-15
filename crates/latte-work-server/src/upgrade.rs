@@ -16,8 +16,20 @@ use tokio_util::codec::{FramedRead, LinesCodec};
 pub struct Lifecycle {
     build_id: String,
     pub draining: RwLock<bool>,
-    owners: std::sync::Mutex<std::collections::HashMap<Resource, String>>,
+    owners: std::sync::Mutex<std::collections::HashMap<Resource, Ownership>>,
     pub shutdown: Notify,
+}
+struct Ownership {
+    owner_id: String,
+    version: uuid::Uuid,
+}
+impl Ownership {
+    fn new(owner_id: String) -> Self {
+        Self {
+            owner_id,
+            version: uuid::Uuid::new_v4(),
+        }
+    }
 }
 impl Lifecycle {
     pub fn new() -> Result<Self> {
@@ -30,11 +42,27 @@ impl Lifecycle {
     }
 }
 impl Lifecycle {
-    pub fn forget(&self, resource: &Resource) -> Result<()> {
-        self.owners
+    pub fn claim_version(&self, resource: &Resource) -> Result<Option<uuid::Uuid>> {
+        Ok(self
+            .owners
             .lock()
             .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?
-            .remove(resource);
+            .get(resource)
+            .map(|ownership| ownership.version))
+    }
+    /// A close can await the old actor while another connection reclaims its ID.
+    /// Even a reclaim by the same App is a new version, not the closed resource.
+    pub fn forget_claim(&self, resource: &Resource, version: Option<uuid::Uuid>) -> Result<()> {
+        let mut owners = self
+            .owners
+            .lock()
+            .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?;
+        if owners
+            .get(resource)
+            .is_some_and(|ownership| Some(ownership.version) == version)
+        {
+            owners.remove(resource);
+        }
         Ok(())
     }
 }
@@ -84,7 +112,7 @@ async fn handle_inner(service: &Service, request: Request) -> Result<Response> {
                 bail!("会话资源归属数量已达上限");
             }
             for resource in resources {
-                owners.insert(resource, owner_id.clone());
+                owners.insert(resource, Ownership::new(owner_id.clone()));
             }
             Ok(Response::ResourcesClaimed)
         }
@@ -126,11 +154,11 @@ async fn handle_inner(service: &Service, request: Request) -> Result<Response> {
                     Resource::Terminal(id) => terminals.is_open(id),
                 };
                 if live
-                    && owners
-                        .get(&resource)
-                        .is_some_and(|id| id == &previous_owner_id || id == &owner_id)
+                    && owners.get(&resource).is_some_and(|ownership| {
+                        ownership.owner_id == previous_owner_id || ownership.owner_id == owner_id
+                    })
                 {
-                    owners.insert(resource.clone(), owner_id.clone());
+                    owners.insert(resource.clone(), Ownership::new(owner_id.clone()));
                     adopted.push(resource);
                 }
             }
@@ -158,7 +186,7 @@ async fn handle_inner(service: &Service, request: Request) -> Result<Response> {
                     .lock()
                     .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?
                     .get(&resource)
-                    .is_some_and(|id| id == &owner_id);
+                    .is_some_and(|ownership| ownership.owner_id == owner_id);
                 if !owned {
                     continue;
                 }
@@ -365,6 +393,31 @@ async fn connect_local_inner(dir: &Path) -> Result<UnixStream> {
 mod tests {
     use super::*;
     use tokio::{io::AsyncReadExt, net::UnixListener};
+    #[test]
+    fn close_cleanup_requires_the_captured_claim_version() {
+        let lifecycle = Lifecycle::new().unwrap();
+        let resource = Resource::AgentSession("session".into());
+        let absent = lifecycle.claim_version(&resource).unwrap();
+        lifecycle
+            .owners
+            .lock()
+            .unwrap()
+            .insert(resource.clone(), Ownership::new("app".into()));
+        lifecycle.forget_claim(&resource, absent).unwrap();
+        let first = lifecycle.claim_version(&resource).unwrap();
+        assert!(first.is_some());
+        lifecycle
+            .owners
+            .lock()
+            .unwrap()
+            .insert(resource.clone(), Ownership::new("app".into()));
+        let newer = lifecycle.claim_version(&resource).unwrap();
+        assert_ne!(first, newer);
+        lifecycle.forget_claim(&resource, first).unwrap();
+        assert_eq!(lifecycle.claim_version(&resource).unwrap(), newer);
+        lifecycle.forget_claim(&resource, newer).unwrap();
+        assert!(lifecycle.claim_version(&resource).unwrap().is_none());
+    }
     #[tokio::test]
     async fn status_retries_a_closed_connection_without_requesting_upgrade() {
         let directory = tempfile::tempdir().unwrap();

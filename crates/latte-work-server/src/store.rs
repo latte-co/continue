@@ -1589,7 +1589,8 @@ impl Store {
         Ok(())
     }
     /// Native permissions can allow writes outside the project's canonical root.
-    /// Without a verified write scope, compare execution intervals host-wide.
+    /// Unknown ends block restoration now, even when they started after capture.
+    /// Verified ends still protect historically overlapping changes host-wide.
     pub fn overlapping_side_chat(
         &self,
         session_id: &str,
@@ -1610,8 +1611,8 @@ impl Store {
                 WHERE r.permission_mode IS NOT NULL AND r.side_write_end IS NOT 0
             UNION ALL SELECT session_id,start_seq,verified_end FROM side_launch_writes)
             SELECT writes.session_id, writes.verified_end IS NULL FROM writes CROSS JOIN main_turn
-                WHERE writes.session_id!=?1 AND writes.start_seq < main_turn.end_seq
-                AND (writes.verified_end IS NULL OR writes.verified_end >= main_turn.start_seq)
+                WHERE writes.session_id!=?1 AND (writes.verified_end IS NULL
+                    OR (writes.start_seq < main_turn.end_seq AND writes.verified_end >= main_turn.start_seq))
                 LIMIT 1",
             params![session_id, request_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2574,6 +2575,52 @@ mod tests {
                 .check_side_write_confirmation(&side.id, &latest)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn undo_checks_pending_writes_independently_of_the_captured_turn_interval() {
+        for launch in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = Store::open(&directory.path().join("state.sqlite")).unwrap();
+            let project = store.add_project(directory.path()).unwrap();
+            let mut main = store.create_session(project.id, "codex".into()).unwrap();
+            main.native_id = Some("native-main".into());
+            store.save(&main).unwrap();
+            let side = store.open_side_chat(&main.id, None).unwrap();
+            store
+                .begin(&main.id, "main", "edit", None, None, None, None)
+                .unwrap();
+            // The query consumes the persisted temporal markers, not file bytes.
+            store
+                .db
+                .execute(
+                    "INSERT INTO events(session_id,at,data) VALUES (?1,0,
+                '{\"kind\":\"turn_changes\",\"changes\":{\"request_id\":\"main\"}}')",
+                    [&main.id],
+                )
+                .unwrap();
+            store.state(&main.id, Status::Completed, None).unwrap();
+            let write = if launch {
+                store.start_side_launch_write(&side.id).unwrap().unwrap()
+            } else {
+                store
+                    .begin(&side.id, "side", "edit", None, None, None, Some("default"))
+                    .unwrap();
+                store.start_side_write("side").unwrap();
+                store.state(&side.id, Status::Completed, None).unwrap();
+                "side".into()
+            };
+            assert_eq!(
+                store.overlapping_side_chat(&main.id, "main").unwrap(),
+                Some((side.id.clone(), true))
+            );
+            store.confirm_side_writes_ended(&side.id, &write).unwrap();
+            assert_eq!(
+                store.overlapping_side_chat(&main.id, "main").unwrap(),
+                None,
+                "a verified later interval does not contaminate the historical snapshot"
+            );
+        }
     }
 
     #[test]

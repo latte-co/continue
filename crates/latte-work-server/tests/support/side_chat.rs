@@ -637,6 +637,163 @@ async fn completed_side_turn_can_leave_detached_writes() {
     check_detached_side_writes(true).await;
 }
 
+async fn wait_for_marker(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "missing fixture marker: {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn pending_side_writes_started_after_main_completion_still_block_undo() {
+    for open_only in [false, true] {
+        let host = Host::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("shared.txt");
+        std::fs::write(&file, "before\n").unwrap();
+        let mut client = host.client().await;
+        let project = terminal_project(&mut client, root.path()).await;
+        let main = create_session(&mut client, project, "codex").await;
+        send(&mut client, &main.id, "main-init", "hello").await;
+        wait(&mut client, &main.id, Status::Completed).await;
+        let side = open_side(&mut client, &main).await;
+        if open_only {
+            send_writable_side(
+                &mut client,
+                &side,
+                "hello",
+                "bypass_permissions",
+                TurnProvider::Cli,
+            )
+            .await;
+            wait(&mut client, &side.id, Status::Completed).await;
+            assert!(matches!(ask(&mut client, Request::ConfirmSideWritesEnded {
+                session_id: side.id.clone(), request_id: "side-write".into(),
+            }).await, Response::Session { session } if session.side_write_pending.is_none()));
+        }
+        send(&mut client, &main.id, "main-write", "main-foreground-write").await;
+        wait(&mut client, &main.id, Status::Completed).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "main edit\n");
+        if open_only {
+            std::fs::write(root.path().join("side-open-detached-writer"), "").unwrap();
+            assert!(matches!(
+                ask(
+                    &mut client,
+                    Request::OpenAgentSession {
+                        session_id: side.id.clone(),
+                        provider: Some(TurnProvider::Cli),
+                    }
+                )
+                .await,
+                Response::Ok
+            ));
+        } else {
+            send_writable_side(
+                &mut client,
+                &side,
+                "side-detached-writer-complete",
+                "bypass_permissions",
+                TurnProvider::Cli,
+            )
+            .await;
+            wait(&mut client, &side.id, Status::Completed).await;
+        }
+        let pids = std::fs::read_to_string(root.path().join("side-writer-pids")).unwrap();
+        let worker = pids.split_whitespace().nth(1).unwrap().parse().unwrap();
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::CloseAgentSession {
+                    session_id: side.id.clone(),
+                    only_if_idle: Some(false),
+                }
+            )
+            .await,
+            Response::SideChatClosed
+        ));
+        assert!(kill(Pid::from_raw(worker), None).is_ok());
+        assert!(matches!(ask(&mut client, Request::UndoTurnChanges {
+            session_id: main.id.clone(), request_id: "main-write".into(),
+        }).await, Response::Error { message, .. } if message.contains("写入结束时间待确认")));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "main edit\n");
+        std::fs::write(root.path().join("release-detached-writer"), "").unwrap();
+        wait_for_marker(&root.path().join("detached-write-done")).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "side edit\n");
+    }
+}
+
+#[tokio::test]
+async fn concurrent_side_confirmation_preserves_a_new_resource_claim() {
+    use latte_work_protocol::lifecycle::Resource;
+    for new_owner in ["reopened", "writer"] {
+        let host = Host::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = host.client().await;
+        let mut reopened = host.client().await;
+        let project = terminal_project(&mut writer, root.path()).await;
+        let parent = create_session(&mut writer, project, "codex").await;
+        send(&mut writer, &parent.id, "main-init", "hello").await;
+        wait(&mut writer, &parent.id, Status::Completed).await;
+        let side = open_side(&mut writer, &parent).await;
+        let resource = Resource::AgentSession(side.id.clone());
+        let server_id = writer.server_id().to_owned();
+        writer
+            .claim_resources("writer".into(), vec![resource.clone()])
+            .await
+            .unwrap();
+        start_writable_side(&mut writer, &side, "hello").await;
+        std::fs::write(root.path().join("hold-side-close"), "").unwrap();
+        let id = side.id.clone();
+        let closing = tokio::spawn(async move {
+            ask(
+                &mut writer,
+                Request::ConfirmSideWritesEnded {
+                    session_id: id,
+                    request_id: "side-write".into(),
+                },
+            )
+            .await
+        });
+        // The native SIGTERM handler holds the old actor open while the other
+        // connection acknowledges a new claim, establishing the exact interleave.
+        wait_for_marker(&root.path().join("side-close-entered")).await;
+        reopened
+            .claim_resources(new_owner.into(), vec![resource.clone()])
+            .await
+            .unwrap();
+        std::fs::write(root.path().join("release-side-close"), "").unwrap();
+        assert!(
+            matches!(closing.await.unwrap(), Response::Session { session }
+            if session.agent_closed_by_confirmation == Some(true))
+        );
+        assert!(matches!(
+            ask(
+                &mut reopened,
+                Request::OpenAgentSession {
+                    session_id: side.id.clone(),
+                    provider: Some(TurnProvider::Cli),
+                }
+            )
+            .await,
+            Response::Ok
+        ));
+        reopened
+            .close_owned_resources(server_id, new_owner.into(), vec![resource])
+            .await
+            .unwrap();
+        assert!(
+            matches!(ask(&mut reopened, Request::Session { session_id: side.id }).await,
+            Response::Session { session } if session.agent_session_open == Some(false)),
+            "the newer claim must retain responsibility for closing the new actor"
+        );
+    }
+}
+
 async fn check_detached_side_writes(completed: bool) {
     let host = Host::start().await;
     let root = tempfile::tempdir().unwrap();

@@ -398,6 +398,26 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         },
         other => other,
     };
+    // Capture before waiting on admission or the actor. Cleanup must never erase
+    // a later ClaimResources/AdoptResources, including one from the same App.
+    let closing_resource = match &request {
+        Request::CloseAgentSession { session_id, .. }
+        | Request::ConfirmSideWritesEnded { session_id, .. }
+        | Request::ConfirmAgentClosed { session_id, .. }
+        | Request::ArchiveSession {
+            session_id,
+            archived: true,
+        } => Some(upgrade::Resource::AgentSession(session_id.clone())),
+        Request::CloseTerminal { terminal_id } => {
+            Some(upgrade::Resource::Terminal(terminal_id.clone()))
+        }
+        _ => None,
+    };
+    let closing_claim = closing_resource
+        .as_ref()
+        .map(|resource| s.lifecycle.claim_version(resource))
+        .transpose()?
+        .flatten();
     // Undo, archive, and write confirmation hold exclusive admission through their durable result.
     // Archive must not race a new open/send between closing and saving metadata.
     // Ordinary turns retain concurrent admission; no request is replayed.
@@ -1912,7 +1932,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         }
     };
     if let Some(resource) = closed_resource {
-        s.lifecycle.forget(&resource)?;
+        s.lifecycle.forget_claim(&resource, closing_claim)?;
     }
     runtime::refresh_titles(&s.database, &s.runs, &s.title_refresh, &mut response).await?;
     db(&s.database, |d| {
