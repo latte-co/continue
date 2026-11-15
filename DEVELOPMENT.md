@@ -1815,10 +1815,12 @@ those tasks have stopped. A confirmed local close can return `SideChatClosed`
 with pending writes, so tabs can close and the parent can be archived. A side
 chat reopened from history displays the pending writes. `ConfirmSideWritesEnded`
 verifies the latest pending request ID, closes an idle local runtime when needed,
-and records a verified end separately from legacy inferred boundaries. Only
-verified ends count, including after running an older Server. Earlier overlapping
-turns remain protected. Side chats accept direct messages without native
-steering or a message queue.
+and records a verified end separately from legacy inferred boundaries. Its
+response acknowledges whether this request closed an actor. Retrying a verified
+request preserves ownership of a reopened chat so the current App can close it
+on exit. Only verified ends count, including after running an older Server.
+Earlier overlapping turns remain protected. Side chats accept direct messages
+without native steering or a message queue.
 If native close itself was unconfirmed, users can verify the process and its
 work on the execution host, then call `ConfirmAgentClosed` with the recorded
 close ID. This works for main and side chats after Server restart, and the

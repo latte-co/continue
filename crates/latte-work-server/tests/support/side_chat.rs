@@ -742,7 +742,8 @@ async fn check_detached_side_writes(completed: bool) {
         matches!(ask(&mut reconnect, Request::ConfirmSideWritesEnded {
         session_id: side.id.clone(),
         request_id: "side-write".into(),
-    }).await, Response::Session { session } if session.side_write_pending.is_none())
+    }).await, Response::Session { session } if session.side_write_pending.is_none()
+        && session.agent_closed_by_confirmation == Some(false))
     );
     assert!(matches!(ask(&mut client, Request::UndoTurnChanges {
         session_id: main.id, request_id: "main-write".into(),
@@ -831,7 +832,74 @@ async fn side_write_confirmation_handles_an_actor_without_a_native_process() {
         session.side_write_pending.as_deref() == Some("side-write")));
     assert!(matches!(ask(&mut client, Request::ConfirmSideWritesEnded {
         session_id: side.id, request_id: "side-write".into(),
-    }).await, Response::Session { session } if session.side_write_pending.is_none()));
+    }).await, Response::Session { session } if session.side_write_pending.is_none()
+        && session.agent_closed_by_confirmation == Some(true)));
+}
+
+#[tokio::test]
+async fn retrying_a_side_write_confirmation_preserves_reopened_resource_ownership() {
+    use latte_work_protocol::lifecycle::Resource;
+
+    let host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut writer = host.client().await;
+    let project = terminal_project(&mut writer, root.path()).await;
+    let parent = create_session(&mut writer, project, "codex").await;
+    send(&mut writer, &parent.id, "main-init", "hello").await;
+    wait(&mut writer, &parent.id, Status::Completed).await;
+    let side = open_side(&mut writer, &parent).await;
+    let resource = Resource::AgentSession(side.id.clone());
+    let server_id = writer.server_id().to_owned();
+    writer
+        .claim_resources("writer".into(), vec![resource.clone()])
+        .await
+        .unwrap();
+    start_writable_side(&mut writer, &side, "hello").await;
+    let confirm = || Request::ConfirmSideWritesEnded {
+        session_id: side.id.clone(),
+        request_id: "side-write".into(),
+    };
+    assert!(matches!(
+        ask(&mut writer, confirm()).await,
+        Response::Session { session } if session.side_write_pending.is_none()
+            && session.agent_session_open == Some(false)
+            && session.agent_closed_by_confirmation == Some(true)
+    ));
+
+    let mut reopened = host.client().await;
+    reopened
+        .claim_resources("reopened".into(), vec![resource.clone()])
+        .await
+        .unwrap();
+    assert!(matches!(
+        send(
+            &mut reopened,
+            &side.id,
+            "read-only-after-confirmation",
+            "hello"
+        )
+        .await,
+        Response::Accepted { .. }
+    ));
+    wait(&mut reopened, &side.id, Status::Completed).await;
+    assert!(matches!(
+        ask(&mut writer, confirm()).await,
+        Response::Session { session } if session.side_write_pending.is_none()
+            && session.agent_session_open == Some(true)
+            && session.agent_closed_by_confirmation == Some(false)
+    ));
+    reopened
+        .close_owned_resources(server_id, "reopened".into(), vec![resource])
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            ask(&mut reopened, Request::Session { session_id: side.id }).await,
+            Response::Session { session } if session.agent_session_open == Some(false)
+                && session.agent_closed_by_confirmation.is_none()
+        ),
+        "the reopened owner's exit must close the side chat"
+    );
 }
 
 #[tokio::test]

@@ -652,7 +652,8 @@ pub async fn archive(
     db(database, |s| s.archive_session(id, archived))
 }
 
-pub async fn close(database: &Database, runs: &Runs, id: &str, only_if_idle: bool) -> Result<()> {
+/// Returns whether an actor acknowledged closure.
+pub async fn close(database: &Database, runs: &Runs, id: &str, only_if_idle: bool) -> Result<bool> {
     db(database, |s| {
         s.session(id)?;
         if let Some(reason) = s.unconfirmed_agent_close(id)? {
@@ -665,6 +666,7 @@ pub async fn close(database: &Database, runs: &Runs, id: &str, only_if_idle: boo
         .map_err(|_| anyhow::anyhow!("执行状态锁异常"))?
         .get(id)
         .map(|r| r.control.clone());
+    let actor_closed = control.is_some();
     if let Some(control) = control {
         let (reply, receive) = oneshot::channel();
         control
@@ -685,7 +687,8 @@ pub async fn close(database: &Database, runs: &Runs, id: &str, only_if_idle: boo
             bail!(reason);
         }
         Ok(())
-    })
+    })?;
+    Ok(actor_closed)
 }
 async fn write(input: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) -> Result<()> {
     if bytes.len() > latte_work_protocol::MAX_FRAME {

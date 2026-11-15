@@ -560,6 +560,7 @@ async fn host_request(
             .entry((host_id.clone(), session_id.clone()))
             .or_insert_with(|| "open".into());
     }
+    let confirms_side_writes = matches!(request, Request::ConfirmSideWritesEnded { .. });
     let closed_agent = match &request {
         Request::CloseAgentSession { session_id, .. }
         | Request::ConfirmSideWritesEnded { session_id, .. }
@@ -680,10 +681,8 @@ async fn host_request(
             latte_work_protocol::lifecycle::Resource::Terminal(key.1),
         ));
     }
-    if matches!(
-        response,
-        Response::Ok | Response::SideChatClosed | Response::Session { .. }
-    ) && let Some(key) = closed_agent
+    if let Some(key) = closed_agent
+        && acknowledges_agent_close(&response, confirms_side_writes)
     {
         state.turns.lock().await.remove(&key);
         state.owned_instances.lock().await.remove(&(
@@ -692,6 +691,16 @@ async fn host_request(
         ));
     }
     ui_response(response)
+}
+fn acknowledges_agent_close(response: &Response, confirms_side_writes: bool) -> bool {
+    if confirms_side_writes {
+        return matches!(response, Response::Session { session }
+            if session.agent_closed_by_confirmation == Some(true));
+    }
+    matches!(
+        response,
+        Response::Ok | Response::SideChatClosed | Response::Session { .. }
+    )
 }
 fn ui_response(response: Response) -> Result<Response, String> {
     if matches!(response, Response::ProviderSnapshot { .. }) {
@@ -1314,6 +1323,39 @@ fn main() {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn side_write_confirmation_releases_ownership_only_with_a_close_acknowledgement() {
+        let response: Response = serde_json::from_value(serde_json::json!({
+            "kind": "session",
+            "session": {
+                "id": "side", "project_id": "project", "title": "Side", "agent": "codex",
+                "status": "completed", "created_at": 0,
+            },
+        }))
+        .unwrap();
+        let Response::Session { mut session } = response else {
+            panic!("session response");
+        };
+        assert!(!acknowledges_agent_close(
+            &Response::Session {
+                session: session.clone()
+            },
+            true
+        ));
+        session.agent_closed_by_confirmation = Some(false);
+        assert!(!acknowledges_agent_close(
+            &Response::Session {
+                session: session.clone()
+            },
+            true
+        ));
+        session.agent_closed_by_confirmation = Some(true);
+        assert!(acknowledges_agent_close(
+            &Response::Session { session },
+            true
+        ));
+    }
 
     #[test]
     fn native_provider_snapshots_cannot_reach_the_webview() {

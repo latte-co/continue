@@ -430,9 +430,8 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
     } else {
         None
     };
-    let closed_resource = match &request {
+    let mut closed_resource = match &request {
         Request::CloseAgentSession { session_id, .. }
-        | Request::ConfirmSideWritesEnded { session_id, .. }
         | Request::ConfirmAgentClosed { session_id, .. }
         | Request::ArchiveSession {
             session_id,
@@ -842,16 +841,19 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             session_id,
             request_id,
         } => {
-            if db(&s.database, |d| {
+            let needs_confirmation = db(&s.database, |d| {
                 d.check_side_write_confirmation(&session_id, &request_id)
-            })? {
-                runtime::close(&s.database, &s.runs, &session_id, true).await?;
+            })?;
+            let actor_closed = needs_confirmation
+                && runtime::close(&s.database, &s.runs, &session_id, true).await?;
+            let mut session = db(&s.database, |d| {
+                d.confirm_side_writes_ended(&session_id, &request_id)
+            })?;
+            if actor_closed {
+                closed_resource = Some(upgrade::Resource::AgentSession(session_id));
             }
-            Response::Session {
-                session: db(&s.database, |d| {
-                    d.confirm_side_writes_ended(&session_id, &request_id)
-                })?,
-            }
+            session.agent_closed_by_confirmation = Some(actor_closed);
+            Response::Session { session }
         }
         Request::ConfirmAgentClosed {
             session_id,

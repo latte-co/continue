@@ -67,6 +67,10 @@ export type Session = {
    * ID of the native close which still needs host-side verification.
    */
   agent_close_pending?: string;
+  /**
+   * Close acknowledgement carried only on a side-write confirmation response.
+   */
+  agent_closed_by_confirmation?: boolean;
 };
 export type RecentCursor = { updated_at: number; id: string };
 export type RecentSession = { session: Session; updated_at: number };

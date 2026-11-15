@@ -539,6 +539,7 @@ impl Store {
             agent_session_busy: None,
             side_write_pending: None,
             agent_close_pending: None,
+            agent_closed_by_confirmation: None,
         };
         self.db.execute(
             "INSERT INTO sessions VALUES (?1,?2,?3)",
