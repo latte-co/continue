@@ -29,6 +29,9 @@ store=project_store/(native_id+'.jsonl')
 if '--fork-session' in sys.argv or (resume_id and '--disable-slash-commands' in sys.argv):
     assert (project_store/(resume_id+'.jsonl')).is_file()
 readonly='--safe-mode' in sys.argv
+if resume_id and '--fork-session' not in sys.argv and '--disable-slash-commands' in sys.argv and not readonly and pathlib.Path('side-resume-hook-enabled').exists():
+    # Model a SessionStart resume hook: initialization can write without a prompt.
+    pathlib.Path('shared.txt').write_text('side resume hook edit\n')
 if readonly:
     assert '--strict-mcp-config' in sys.argv and '--disable-slash-commands' in sys.argv and '--no-chrome' in sys.argv
     assert sys.argv[sys.argv.index('--tools')+1]=='Read,Glob,Grep'

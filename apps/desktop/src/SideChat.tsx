@@ -32,6 +32,14 @@ const admissions = new WeakMap<
   Map<string, { draft: Draft; request: Send }>
 >();
 const operations = new WeakMap<DraftStore, Map<string, Promise<unknown>>>();
+type Selection = {
+  model: string | null;
+  effort: Effort | null;
+  permission: string | null;
+};
+// Workspace navigation unmounts side views. Keep unsent settings for the same
+// App lifetime and owner as the draft, without changing its admission version.
+const selections = new WeakMap<DraftStore, Map<string, Selection>>();
 
 function sideOperations(drafts: DraftStore) {
   let pending = operations.get(drafts);
@@ -85,6 +93,7 @@ export async function closeSideChat(
     }
     drafts.clear(key, drafts.get(key));
     admissions.get(drafts)?.delete(key);
+    selections.get(drafts)?.delete(key);
     return notice;
   })();
   pending.set(key, closing);
@@ -132,11 +141,18 @@ export function SideChat({
   const [revision, refresh] = useState(0);
   const picker = useRef<ModelPickerHandle>(null);
   const [focus, setFocus] = useState(0);
-  const [selection, setSelection] = useState<{
-    model: string | null;
-    effort: Effort | null;
-    permission: string | null;
-  }>();
+  const [selection, updateSelection] = useState<Selection | undefined>(() =>
+    selections.get(drafts)?.get(key),
+  );
+  function setSelection(value: Selection) {
+    let saved = selections.get(drafts);
+    if (!saved) {
+      saved = new Map();
+      selections.set(drafts, saved);
+    }
+    saved.set(key, value);
+    updateSelection(value);
+  }
   const [modelReadiness, setModelReadiness] = useState<{
     scope: string;
     ready: boolean;

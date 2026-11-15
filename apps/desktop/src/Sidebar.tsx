@@ -1093,8 +1093,9 @@ export function Sidebar({
           state={{
             ...state,
             sessionAction: async (hostId, action) => {
-              await state.sessionAction(hostId, action);
+              const result = await state.sessionAction(hostId, action);
               recent.reload(hostId);
+              return result;
             },
           }}
           close={() => setSessionContext(null)}

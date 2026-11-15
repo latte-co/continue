@@ -1808,8 +1808,12 @@ transcript. Side chats do not take undo snapshots because main and side file act
 overlap. The host rejects main-turn undo when write-capable side work on the
 same host overlaps the main turn. Native permissions and approvals can allow
 writes outside the side project's root. The host records possible writes just
-before launching the native process or dispatching to a live process. Detached
-processes and external tools can keep writing after either normal completion
+before launching the native process or dispatching to a live process.
+Open-only and recovery launches in a writable mode also journal a fresh interval,
+with its own confirmation ID, because startup hooks can write without a user turn.
+These launch records do not create user messages or change request deduplication.
+Confirmed historical intervals remain closed when a later process is opened.
+Detached processes and external tools can keep writing after either normal completion
 or forced close. The host keeps the write interval open until the user verifies
 those tasks have stopped. A confirmed local close can return `SideChatClosed`
 with pending writes, so tabs can close and the parent can be archived. A side
@@ -1832,6 +1836,12 @@ and use the main turn's saved diff to restore individual changes manually.
 `SideChatHistory` pages through a parent's children newest first, with `next` as
 the cursor for the next request. The desktop routes the same protocol through
 local and SSH transports.
+
+Project-wide close reads all side-history pages, including children of closed
+parents, before presenting the complete native-session count and busy confirmation.
+It reports a confirmed local side close separately from pending background writes.
+Unsent side model, effort and permission choices remain scoped to the same
+App-lifetime host/parent/side owner across main-conversation navigation.
 
 A null side-chat permission selection blocks external tools and permission requests.
 Codex and Traex use a read-only sandbox. Claude Code uses plan mode with only Read,

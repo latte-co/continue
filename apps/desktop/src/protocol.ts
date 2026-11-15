@@ -60,7 +60,7 @@ export type Session = {
    */
   agent_session_busy?: boolean;
   /**
-   * Latest side write request whose end has yet to be confirmed.
+   * Latest side write operation (turn or native launch) awaiting confirmation.
    */
   side_write_pending?: string;
   /**
@@ -480,7 +480,7 @@ export type Request =
       method: "confirm_side_writes_ended";
       session_id: string;
       /**
-       * Latest write request observed during verification.
+       * Latest side_write_pending operation ID observed during verification.
        */
       request_id: string;
     }

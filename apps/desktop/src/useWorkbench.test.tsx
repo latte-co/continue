@@ -546,6 +546,25 @@ it("retains history and an ambiguous send request ID without automatically repla
   expect(hook.result.current.admissionNotice).toBeUndefined();
 });
 
+it("returns a side close acknowledgement without clearing the selected main conversation", async () => {
+  const { result } = renderHook(() => useWorkbench());
+  await act(async () => {});
+  await act(async () =>
+    result.current.openSession({ ...session(), hostId: "local" }),
+  );
+  mocks.request.mockResolvedValueOnce({ kind: "side_chat_closed" });
+  await act(async () => {
+    expect(
+      await result.current.sessionAction("local", {
+        method: "close_agent_session",
+        session_id: "side",
+        only_if_idle: false,
+      }),
+    ).toEqual({ kind: "side_chat_closed" });
+  });
+  expect(result.current.sessionId).toBe("s");
+});
+
 it("opens selected Agent sessions and closes explicitly without reopening on refresh", async () => {
   const { result } = renderHook(() => useWorkbench());
   await act(async () => {});

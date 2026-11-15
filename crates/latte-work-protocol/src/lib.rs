@@ -80,7 +80,7 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_session_busy: Option<bool>,
-    /// Latest side write request whose end has yet to be confirmed.
+    /// Latest side write operation (turn or native launch) awaiting confirmation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub side_write_pending: Option<String>,
@@ -650,7 +650,7 @@ pub enum Request {
     /// The user has verified that the side chat's background writes have stopped.
     ConfirmSideWritesEnded {
         session_id: String,
-        /// Latest write request observed during verification.
+        /// Latest side_write_pending operation ID observed during verification.
         request_id: String,
     },
     /// The user has verified that the native process and its work stopped.

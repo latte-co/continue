@@ -1173,9 +1173,16 @@ impl Process {
             .process_group(0);
         // A launch may fail after starting the native process. Record the
         // possible write before calling spawn, after all launch validation.
-        if let Some(id) = request_id {
-            db(database, |s| s.start_side_write(id))?;
-        }
+        let write_id = db(database, |s| {
+            if let Some(id) = request_id {
+                s.start_side_write(id)?;
+                Ok(Some(id.to_owned()))
+            } else if config.permission_mode.is_some() {
+                s.start_side_launch_write(&session.id)
+            } else {
+                Ok(None)
+            }
+        })?;
         let child = command
             .spawn()
             .or_else(|error| -> Result<Child> {
@@ -1183,7 +1190,7 @@ impl Process {
                 // interpreter or cwd missing). Other errors can come from Tokio
                 // setting up child I/O or the reaper after a successful launch.
                 if error.raw_os_error() == Some(Errno::ENOENT as i32)
-                    && let Some(id) = request_id
+                    && let Some(id) = write_id.as_deref()
                 {
                     db(database, |s| s.mark_side_write_not_started(id))?;
                 }

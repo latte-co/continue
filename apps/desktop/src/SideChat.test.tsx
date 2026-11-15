@@ -26,6 +26,7 @@ vi.mock("./ModelPicker", async () => {
       effort,
       onReadyChange,
       onChange,
+      onEffortChange,
     }: ComponentProps<typeof ModelPicker>) => {
       useEffect(
         () =>
@@ -36,9 +37,14 @@ vi.mock("./ModelPicker", async () => {
         [hostId, projectId, agent, value, effort, onReadyChange],
       );
       return (
-        <button onClick={() => onChange("chosen-model")}>
-          选择侧边聊天模型
-        </button>
+        <>
+          <button onClick={() => onChange("chosen-model")}>
+            选择侧边聊天模型
+          </button>
+          <button onClick={() => onEffortChange("high")}>
+            选择侧边聊天思考强度
+          </button>
+        </>
       );
     },
   };
@@ -224,6 +230,81 @@ it("stops only the side turn and never reads a hidden tab", async () => {
     method: "cancel",
     session_id: "main",
   });
+});
+
+it("retains unsent read-only, model and effort choices across main conversation navigation", async () => {
+  HTMLElement.prototype.scrollIntoView = vi.fn();
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  const key = sideDraftKey("local", parent.id, child.id);
+  drafts.update(key, { text: "keep this draft" });
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method === "agent_permissions")
+      return {
+        kind: "agent_permissions",
+        modes: [
+          {
+            id: "bypass_permissions",
+            label: "完全访问权限",
+            elevated: true,
+            description: "测试权限",
+          },
+        ],
+      };
+    if (action.method === "send") return { kind: "accepted" };
+    if (action.method === "poll")
+      return {
+        kind: "events",
+        session: { ...child, permission_mode: "bypass_permissions" },
+        events: [],
+        has_more: false,
+      };
+    throw new Error("unexpected request");
+  });
+  const props = {
+    parent,
+    workspaceId,
+    sideId: child.id,
+    hostId: "local",
+    drafts,
+    active: true,
+    connected: true,
+    supported: true,
+  };
+  // Workspace removes the old page's SideChat renderer when a different main
+  // conversation is selected. Recreate that actual unmount/remount boundary.
+  const view = render(<SideChat {...props} />);
+  const send = () =>
+    screen.getByRole<HTMLButtonElement>("button", { name: "发送侧边聊天消息" });
+  await waitFor(() => expect(send().disabled).toBe(false));
+  fireEvent.click(screen.getByRole("combobox", { name: "侧边聊天权限" }));
+  fireEvent.click(screen.getByRole("option", { name: /只读/ }));
+  fireEvent.click(screen.getByRole("button", { name: "选择侧边聊天模型" }));
+  fireEvent.click(screen.getByRole("button", { name: "选择侧边聊天思考强度" }));
+  view.rerender(<div>另一主会话</div>);
+  view.rerender(<SideChat {...props} />);
+  await waitFor(() => expect(send().disabled).toBe(false));
+  expect(
+    screen.getByRole<HTMLTextAreaElement>("textbox", { name: "侧边聊天输入" })
+      .value,
+  ).toBe("keep this draft");
+  expect(
+    screen.getByRole("combobox", { name: "侧边聊天权限" }).textContent,
+  ).toContain("只读");
+  fireEvent.click(send());
+  await waitFor(() =>
+    expect(request).toHaveBeenCalledWith(
+      "local",
+      expect.objectContaining({
+        method: "send",
+        session_id: child.id,
+        text: "keep this draft",
+        permission_mode: null,
+        model: "chosen-model",
+        effort: "high",
+      }),
+    ),
+  );
 });
 
 it("closes an unsent draft locally and waits for the first send before closing the child session", async () => {

@@ -122,6 +122,8 @@ impl Store {
         CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS unconfirmed_agent_closes(session_id TEXT PRIMARY KEY REFERENCES sessions(id), reason TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS side_chats(parent_id TEXT NOT NULL REFERENCES sessions(id), session_id TEXT PRIMARY KEY REFERENCES sessions(id), parent_native_id TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS side_launch_writes(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), start_seq INTEGER NOT NULL, verified_end INTEGER);
+        CREATE INDEX IF NOT EXISTS side_launch_writes_session ON side_launch_writes(session_id);
         CREATE TABLE IF NOT EXISTS native_title_secrets(session_id TEXT NOT NULL REFERENCES sessions(id), native_id TEXT NOT NULL, secret_hash BLOB NOT NULL, secret_bytes INTEGER NOT NULL, PRIMARY KEY(session_id,native_id,secret_hash));
         CREATE TABLE IF NOT EXISTS native_session_contexts(session_id TEXT NOT NULL REFERENCES sessions(id), native_id TEXT NOT NULL, fingerprint TEXT, PRIMARY KEY(session_id,native_id));
         CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id), at REAL NOT NULL, data TEXT NOT NULL);
@@ -1438,14 +1440,37 @@ impl Store {
         )?;
         Ok(())
     }
+    /// Open/recovery has no user request, but native startup hooks can still write.
+    /// Keep a separate identity instead of reopening an already verified interval.
+    pub fn start_side_launch_write(&self, session_id: &str) -> Result<Option<String>> {
+        if self.side_parent(session_id)?.is_none() {
+            return Ok(None);
+        }
+        let id = Uuid::new_v4().to_string();
+        self.db.execute(
+            "INSERT INTO side_launch_writes(id,session_id,start_seq)
+             VALUES (?1,?2,COALESCE((SELECT MAX(seq) FROM events),0))",
+            params![id, session_id],
+        )?;
+        Ok(Some(id))
+    }
     pub fn pending_side_write(&self, session_id: &str) -> Result<Option<String>> {
         Ok(self
             .db
             .query_row(
-                "SELECT r.id FROM side_chats c JOIN requests r ON r.session_id=c.session_id
+                "SELECT id FROM (
+                 SELECT r.id,COALESCE(r.side_write_start,
+                    (SELECT MIN(seq) FROM events WHERE session_id=r.session_id
+                     AND json_extract(data,'$.kind')='user'
+                     AND json_extract(data,'$.request_id')=r.id),0) AS start_seq,
+                    0 AS launch_order
+                 FROM side_chats c JOIN requests r ON r.session_id=c.session_id
                  WHERE c.session_id=?1 AND r.permission_mode IS NOT NULL
                  AND r.side_write_end IS NOT 0 AND r.side_write_verified_end IS NULL
-                 ORDER BY r.rowid DESC LIMIT 1",
+                 UNION ALL
+                 SELECT id,start_seq,rowid AS launch_order FROM side_launch_writes
+                 WHERE session_id=?1 AND verified_end IS NULL)
+                 ORDER BY start_seq DESC,launch_order DESC LIMIT 1",
                 [session_id],
                 |row| row.get(0),
             )
@@ -1469,7 +1494,9 @@ impl Store {
         if pending.is_none()
             && self.db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM requests WHERE id=?1 AND session_id=?2
-                        AND side_write_verified_end IS NOT NULL)",
+                        AND side_write_verified_end IS NOT NULL
+                    UNION ALL SELECT 1 FROM side_launch_writes WHERE id=?1 AND session_id=?2
+                        AND verified_end IS NOT NULL)",
                 params![request_id, session_id],
                 |row| row.get::<_, bool>(0),
             )?
@@ -1482,13 +1509,20 @@ impl Store {
         if !self.check_side_write_confirmation(session_id, request_id)? {
             return self.session(session_id);
         }
-        self.db.execute(
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
             "UPDATE requests SET side_write_verified_end=(SELECT MAX(seq) FROM events),
                 side_write_end=(SELECT MAX(seq) FROM events)
              WHERE session_id=?1 AND permission_mode IS NOT NULL
                 AND side_write_end IS NOT 0 AND side_write_verified_end IS NULL",
             [session_id],
         )?;
+        tx.execute(
+            "UPDATE side_launch_writes SET verified_end=COALESCE((SELECT MAX(seq) FROM events),0)
+             WHERE session_id=?1 AND verified_end IS NULL",
+            [session_id],
+        )?;
+        tx.commit()?;
         self.session(session_id)
     }
     pub fn project_session_recovery(&self, session: &mut Session) -> Result<()> {
@@ -1548,6 +1582,10 @@ impl Store {
              WHERE id=?1 AND side_write_start IS NOT NULL AND side_write_end IS NULL",
             [request_id],
         )?;
+        self.db.execute(
+            "DELETE FROM side_launch_writes WHERE id=?1 AND verified_end IS NULL",
+            [request_id],
+        )?;
         Ok(())
     }
     /// Native permissions can allow writes outside the project's canonical root.
@@ -1564,14 +1602,16 @@ impl Store {
                         AND json_extract(data,'$.request_id')=?2) AS start_seq,
                     (SELECT MIN(seq) FROM events WHERE session_id=?1 AND json_extract(data,'$.kind')='turn_changes'
                         AND json_extract(data,'$.changes.request_id')=?2) AS end_seq
-            )
-            SELECT side.session_id, r.side_write_verified_end IS NULL FROM side_chats side
+            ), writes AS (
+            SELECT side.session_id, COALESCE(r.side_write_start, admitted.seq) AS start_seq,
+                r.side_write_verified_end AS verified_end FROM side_chats side
                 JOIN events admitted ON admitted.session_id=side.session_id AND json_extract(admitted.data,'$.kind')='user'
                 JOIN requests r ON r.session_id=side.session_id AND r.id=json_extract(admitted.data,'$.request_id')
-                CROSS JOIN main_turn
-                WHERE side.session_id!=?1 AND r.permission_mode IS NOT NULL AND r.side_write_end IS NOT 0
-                AND COALESCE(r.side_write_start, admitted.seq) < main_turn.end_seq
-                AND (r.side_write_verified_end IS NULL OR r.side_write_verified_end >= main_turn.start_seq)
+                WHERE r.permission_mode IS NOT NULL AND r.side_write_end IS NOT 0
+            UNION ALL SELECT session_id,start_seq,verified_end FROM side_launch_writes)
+            SELECT writes.session_id, writes.verified_end IS NULL FROM writes CROSS JOIN main_turn
+                WHERE writes.session_id!=?1 AND writes.start_seq < main_turn.end_seq
+                AND (writes.verified_end IS NULL OR writes.verified_end >= main_turn.start_seq)
                 LIMIT 1",
             params![session_id, request_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2490,6 +2530,50 @@ mod tests {
             )
             .unwrap();
         assert!(verified > 0);
+    }
+
+    #[test]
+    fn side_launch_writes_survive_restart_without_changing_the_request_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let mut store = Store::open(&path).unwrap();
+        let project = store.add_project(directory.path()).unwrap();
+        let mut parent = store.create_session(project.id, "claude".into()).unwrap();
+        parent.native_id = Some(uuid::Uuid::new_v4().to_string());
+        store.save(&parent).unwrap();
+        assert!(store.start_side_launch_write(&parent.id).unwrap().is_none());
+        let side = store.open_side_chat(&parent.id, None).unwrap();
+        store
+            .begin(&side.id, "sent", "hello", None, None, None, Some("default"))
+            .unwrap();
+        store.start_side_write("sent").unwrap();
+        store.state(&side.id, Status::Completed, None).unwrap();
+        store.confirm_side_writes_ended(&side.id, "sent").unwrap();
+        let first = store.start_side_launch_write(&side.id).unwrap().unwrap();
+        let latest = store.start_side_launch_write(&side.id).unwrap().unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.pending_side_write(&side.id).unwrap().as_deref(),
+            Some(latest.as_str())
+        );
+        assert!(store.confirm_side_writes_ended(&side.id, &first).is_err());
+        assert!(store.confirm_side_writes_ended(&side.id, "sent").is_err());
+        store.confirm_side_writes_ended(&side.id, &latest).unwrap();
+        assert!(
+            !store
+                .check_side_write_confirmation(&side.id, &latest)
+                .unwrap()
+        );
+        assert_eq!(store.latest_request(&side.id).unwrap(), "sent");
+        let missing = store.start_side_launch_write(&side.id).unwrap().unwrap();
+        store.mark_side_write_not_started(&missing).unwrap();
+        assert!(store.pending_side_write(&side.id).unwrap().is_none());
+        assert!(
+            !store
+                .check_side_write_confirmation(&side.id, &latest)
+                .unwrap()
+        );
     }
 
     #[test]

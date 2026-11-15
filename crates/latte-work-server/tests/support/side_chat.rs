@@ -1079,3 +1079,118 @@ async fn history_pages_past_one_hundred_and_can_reopen_the_oldest_chat() {
         session_id: parent.id, side_id: Some(oldest.id.clone()),
     }).await, Response::Session { session } if session.id == oldest.id));
 }
+
+#[tokio::test]
+async fn open_only_side_resume_journals_hook_writes_without_a_user_turn() {
+    let host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("shared.txt");
+    std::fs::write(&file, "before\n").unwrap();
+    let mut client = host.client().await;
+    let project = terminal_project(&mut client, root.path()).await;
+    let parent = create_session(&mut client, project.clone(), "claude").await;
+    send(&mut client, &parent.id, "parent-init", "hello").await;
+    wait(&mut client, &parent.id, Status::Completed).await;
+    let side = open_side(&mut client, &parent).await;
+    start_writable_side(&mut client, &side, "hello").await;
+    assert!(matches!(ask(&mut client, Request::ConfirmSideWritesEnded {
+        session_id: side.id.clone(), request_id: "side-write".into(),
+    }).await, Response::Session { session } if session.side_write_pending.is_none()));
+
+    let main = create_session(&mut client, project, "codex").await;
+    send(&mut client, &main.id, "main-write", "approval").await;
+    let pending = permission(&wait(&mut client, &main.id, Status::Waiting).await);
+    std::fs::write(root.path().join("side-resume-hook-enabled"), "").unwrap();
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::OpenAgentSession {
+                session_id: side.id.clone(),
+                provider: Some(TurnProvider::Cli),
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "side resume hook edit\n"
+    );
+    let Response::Events {
+        session, events, ..
+    } = ask(
+        &mut client,
+        Request::Poll {
+            session_id: side.id.clone(),
+            after: 0.0,
+        },
+    )
+    .await
+    else {
+        panic!("side history");
+    };
+    let launch_id = session
+        .side_write_pending
+        .expect("open-only write interval");
+    assert_ne!(launch_id, "side-write");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.event, EventKind::User { .. }))
+            .count(),
+        1
+    );
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::ConfirmSideWritesEnded {
+                session_id: side.id.clone(),
+                request_id: "side-write".into(),
+            }
+        )
+        .await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::CloseAgentSession {
+                session_id: side.id.clone(),
+                only_if_idle: Some(true),
+            }
+        )
+        .await,
+        Response::SideChatClosed
+    ));
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::Approve {
+                session_id: main.id.clone(),
+                request_id: pending,
+                allow: true,
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    wait(&mut client, &main.id, Status::Completed).await;
+    assert!(matches!(ask(&mut client, Request::UndoTurnChanges {
+        session_id: main.id.clone(), request_id: "main-write".into(),
+    }).await, Response::Error { message, .. } if message.contains("写入结束时间待确认")));
+    assert!(matches!(ask(&mut client, Request::ConfirmSideWritesEnded {
+        session_id: side.id, request_id: launch_id,
+    }).await, Response::Session { session } if session.side_write_pending.is_none()));
+    assert!(matches!(ask(&mut client, Request::UndoTurnChanges {
+        session_id: main.id.clone(), request_id: "main-write".into(),
+    }).await, Response::Error { message, .. } if message.contains("与本轮同时执行")));
+    send(&mut client, &main.id, "later", "main-foreground-write").await;
+    wait(&mut client, &main.id, Status::Completed).await;
+    assert!(matches!(ask(&mut client, Request::UndoTurnChanges {
+        session_id: main.id, request_id: "later".into(),
+    }).await, Response::TurnChanges { changes } if changes.undo == TurnUndoStatus::Reverted));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "side resume hook edit\n"
+    );
+}
