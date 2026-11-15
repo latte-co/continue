@@ -738,3 +738,96 @@ async fn opencode_parent_finishes_while_a_child_question_remains_answerable() {
     ));
     wait(&mut client, &id, Status::Completed).await;
 }
+
+#[tokio::test]
+async fn opencode_silent_successor_is_running_and_cancel_reaches_native_execution() {
+    let host = Host::start().await;
+    let folder = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let project_id = project(&mut client, folder.path()).await;
+    let id = create(&mut client, &project_id).await;
+    assert!(matches!(
+        ask(&mut client, turn(&id, "parent", "steer-parent")).await,
+        Response::Accepted { .. }
+    ));
+    assert!(matches!(ask(&mut client, open(&id)).await, Response::Ok));
+    assert!(matches!(
+        ask(&mut client, turn(&id, "silent", "silent successor")).await,
+        Response::MessageQueued { .. }
+    ));
+    let Response::MessageQueue { entries, .. } = ask(
+        &mut client,
+        Request::MessageQueue {
+            session_id: id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("queue")
+    };
+    let entry = &entries[0];
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::DispatchQueuedMessage {
+                session_id: id.clone(),
+                request_id: entry.request_id.clone(),
+                revision: entry.revision,
+                interrupt: false,
+                provider: Some(TurnProvider::Cli)
+            }
+        )
+        .await,
+        Response::MessageQueue { .. }
+    ));
+    let events = wait(&mut client, &id, Status::Completed).await;
+    assert!(events.iter().any(|e| matches!(&e.event, EventKind::Usage { context:Some(context), totals:Some(totals) }
+        if context.model == "test/other" && context.used_tokens == 28.0 && context.window_tokens == Some(10000.0) && totals.input_tokens == Some(25.0))));
+    let native = current(&mut client, &id).await.native_id;
+    std::fs::write(folder.path().join("release-steer"), "release").unwrap();
+    // Wait until the input is consumed, so cancellation cannot pass through
+    // the fallback that kills a process with an uncertain forwarded input.
+    let db = rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status: String = db
+            .query_row(
+                "SELECT status FROM message_queue WHERE session_id=?1 AND request_id='silent'",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if status == "dispatched" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "input remains {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(current(&mut client, &id).await.status, Status::Running);
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::Cancel {
+                session_id: id.clone()
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    wait(&mut client, &id, Status::Stopped).await;
+    assert_eq!(
+        std::fs::read_to_string(folder.path().join("native-interrupted")).unwrap(),
+        native.unwrap()
+    );
+    assert!(matches!(
+        ask(&mut client, turn(&id, "after", "after stop")).await,
+        Response::Accepted { .. }
+    ));
+    assert!(contains_text(
+        &wait(&mut client, &id, Status::Completed).await,
+        "reply"
+    ));
+}

@@ -94,11 +94,13 @@ def sideband():
                     pending_permission = inbox
                     native_done(native, "steered parent finished")
 
-                    def delayed_steering(root=native, inbox=inbox):
+                    def delayed_steering(root=native, inbox=inbox, silent=request["text"] == "silent successor"):
                         await_test_signal("release-steer")
                         native_event("session.inbox.enqueued", sessionID=root, inboxID=inbox, itemType="user")
                         native_event("session.execution.started", sessionID=root)
                         native_event("session.inbox.delivered", sessionID=root, inboxID=inbox)
+                        if silent:
+                            return  # Wait for a native interrupt without producing output.
                         native_event("permission.asked", sessionID=root, id=inbox, action="shell",
                                      source={"id": inbox}, resources=["printf delayed"])
 
@@ -151,6 +153,7 @@ def sideband():
                     native_event("session.execution.succeeded", sessionID=native)
                     continue
                 elif action == "interrupt":
+                    Path("native-interrupted").write_text(native)
                     pending_permission = None
                     native_event("session.execution.interrupted", sessionID=native)
                     reply["interrupted"] = True
@@ -213,7 +216,8 @@ def native_done(native, text):
     native_event("session.text.delta", sessionID="other", delta="wrong session")
     for fragment in text.split("|"):
         native_event("session.text.delta", sessionID=native, delta=fragment)
-    native_event("session.step.ended", sessionID=native, tokens={"input": 25, "output": 3})
+    native_event("session.step.started", sessionID=native, model={"providerID": "test", "id": model.split("/", 1)[1]}, contextWindow=10000)
+    native_event("session.step.ended", sessionID=native, tokens={"input": 25, "output": 3, "reasoning": 0, "cache": {"read": 0, "write": 0}})
     native_event("session.execution.succeeded", sessionID=native)
 
 

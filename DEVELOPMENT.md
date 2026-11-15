@@ -1734,11 +1734,18 @@ Latte correlates native execution and inbox delivery IDs to distinguish its
 foreground prompts from autonomous user or synthetic inputs submitted by a
 plugin. OpenCode prompt hooks see the original user text and its attachments.
 Steering submissions wake native execution even if a prompt hook finishes after
-the current turn. Their delivery IDs start a tracked successor when needed;
-its approvals, output, usage and terminal outcome use the native event stream.
-Stopping closes the owned process, including in-flight prompt preparation, and
-unconfirmed handed-off inputs remain unreplayed. The real CLI smoke covers
-delayed preparation both after foreground completion and during stop/resume.
+the current turn. Native execution start marks a successor as running before
+delivery or model output; its approvals, output, usage and terminal outcome use
+the native event stream. Stopping an active execution sends a native interrupt.
+If input delivery is still unconfirmed, stopping closes the owned process,
+including in-flight prompt preparation, and leaves that input unreplayed.
+The real CLI smoke covers delayed preparation after foreground completion,
+cancellation before the successor's first output, and stop/resume.
+Native usage reports turn totals separately from context occupancy. Occupancy
+matches OpenCode ACP's total tokens in the latest step (input, output, reasoning
+and cache); window capacity comes from that step's actual model in the native
+catalog. Missing capacity stays unknown. Catalog lookup is cached until a
+native model update and has a one-second timeout.
 Only a slash name in the execution session's catalog is treated as a command.
 Other slash-prefixed text is sent as an ordinary prompt.
 Compaction uses its ACP completion. OpenCode 2.0 implements `/compact` even

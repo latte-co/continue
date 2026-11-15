@@ -61,6 +61,7 @@ pub struct OpenCode {
     native_prompt: Option<String>,
     native_prompt_delivered: bool,
     native_usage: Option<TurnUsage>,
+    native_model: Option<(String, Option<f64>)>,
     native_stop: Option<&'static str>,
     acp_input: Option<AcpInput>,
     native_execution_open: bool,
@@ -483,28 +484,7 @@ impl OpenCode {
         let acp_prompt = self
             .request
             .is_some_and(|(_, kind)| kind == Request::Prompt);
-        let followup_start = self.native_execution_open
-            && self.autonomous_inbox_delivered
-            && !self.foreground_inbox_delivered
-            && self.native_prompt.is_none()
-            && self.native_command.is_none()
-            && !self.followup
-            && matches!(
-                kind,
-                "permission.asked"
-                    | "session.text.delta"
-                    | "session.reasoning.delta"
-                    | "session.tool.input.started"
-                    | "session.tool.called"
-                    | "session.tool.success"
-                    | "session.tool.failed"
-                    | "session.step.ended"
-                    | "session.step.failed"
-                    | "session.execution.succeeded"
-                    | "session.execution.failed"
-                    | "session.execution.interrupted"
-                    | "question"
-            );
+        let followup_start = self.followup_ready();
         if acp_prompt
             && (!self.deferred_followup.is_empty() || followup_start)
             && !matches!(kind, "session.inbox.enqueued" | "session.renamed")
@@ -554,7 +534,9 @@ impl OpenCode {
                     // In that case this delivery starts a tracked successor,
                     // with the same output and approval routing as a plugin wake.
                     self.autonomous_inbox_delivered = true;
-                    return Ok(vec![Action::InputsConsumed(vec![request])]);
+                    actions.extend(self.start_followup());
+                    actions.push(Action::InputsConsumed(vec![request]));
+                    return Ok(actions);
                 }
                 match foreground {
                     Some(true) => self.foreground_inbox_delivered = true,
@@ -660,6 +642,25 @@ impl OpenCode {
                 self.foreground_inbox_delivered = false;
                 Ok(vec![])
             }
+            "session.step.started"
+                if self.native_prompt.is_some()
+                    || self.followup
+                    || self.native_command.is_some() =>
+            {
+                self.native_model = data["model"]["providerID"]
+                    .as_str()
+                    .zip(data["model"]["id"].as_str())
+                    .map(|(provider, id)| {
+                        (
+                            format!("{provider}/{id}"),
+                            data["contextWindow"].as_f64().filter(|size| *size > 0.0),
+                        )
+                    });
+                // A different model (or missing telemetry) must never inherit
+                // the previous step's context capacity or token count.
+                self.context = None;
+                Ok(vec![])
+            }
             "session.step.ended" | "session.step.failed"
                 if self.native_prompt_delivered
                     || self.followup
@@ -682,7 +683,26 @@ impl OpenCode {
             _ => Ok(vec![]),
         }?;
         actions.extend(updates);
+        actions.extend(self.start_followup());
         Ok(actions)
+    }
+
+    fn followup_ready(&self) -> bool {
+        self.native_execution_open
+            && !self.foreground_inbox_delivered
+            && (self.autonomous_inbox_delivered || self.acp_input.is_none())
+            && self.native_prompt.is_none()
+            && self.native_command.is_none()
+            && !self.followup
+    }
+
+    fn start_followup(&mut self) -> Vec<Action> {
+        if self.followup_ready() && !self.running() {
+            self.followup = true;
+            vec![Action::TurnStarted]
+        } else {
+            vec![]
+        }
     }
 
     fn record_native_usage(&mut self, data: &Value) {
@@ -695,6 +715,28 @@ impl OpenCode {
         if !tokens.is_object() {
             return;
         }
+        // Match OpenCode ACP's TokenUsage.total(last), never the sum of steps.
+        self.context = self.native_model.as_ref().and_then(|(model, window)| {
+            let used = [
+                &tokens["input"],
+                &tokens["output"],
+                &tokens["reasoning"],
+                &tokens["cache"]["read"],
+                &tokens["cache"]["write"],
+            ]
+            .into_iter()
+            .try_fold(0.0, |sum, value| {
+                value
+                    .as_f64()
+                    .filter(|value| *value >= 0.0)
+                    .map(|value| sum + value)
+            })?;
+            Some(ContextUsage {
+                model: model.clone(),
+                used_tokens: used,
+                window_tokens: *window,
+            })
+        });
         let totals = self.native_usage.get_or_insert(TurnUsage {
             input_tokens: None,
             output_tokens: None,
@@ -889,6 +931,7 @@ impl OpenCode {
 
     fn finish_prompt(&mut self, failed: bool, message: Option<String>) -> Result<Vec<Action>> {
         let mut actions = self.finish(failed, message);
+        actions.extend(self.start_followup());
         self.deferred_followup_bytes = 0;
         for line in std::mem::take(&mut self.deferred_followup) {
             actions.extend(self.sideband(&line)?);
@@ -998,6 +1041,7 @@ impl OpenCode {
         self.acp_input = Some(input);
         self.tools.retain(|_, tool| tool.child);
         self.context = None;
+        self.native_model = None;
         self.saved = true;
         // OpenCode creates its durable session on session/new, before prompting.
         Ok(vec![Action::NativeSession(session), action])
@@ -1190,12 +1234,13 @@ impl OpenCode {
 
     fn finish(&mut self, failed: bool, message: Option<String>) -> Vec<Action> {
         self.tools.retain(|_, tool| tool.child);
-        self.context = None;
+        let context = self.context.take();
+        self.native_model = None;
         self.native_stop = None;
         let mut actions = Vec::new();
         if let Some(totals) = self.native_usage.take() {
             actions.push(Action::Event(EventKind::Usage {
-                context: None,
+                context,
                 totals: Some(totals),
             }));
         }

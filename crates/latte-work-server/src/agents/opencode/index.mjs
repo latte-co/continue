@@ -26,6 +26,28 @@ export default {
     const abort = new AbortController();
     const questions = new Map();
     const promptSubmissions = new Map();
+    let models;
+    async function contextWindow(ref) {
+      let timer;
+      try {
+        models ??= (ctx.model ?? ctx.catalog.model).list({ location: ctx.location });
+        // Plugin domain methods ignore client RequestOptions. Bound the wait
+        // ourselves, retaining one pending lookup rather than spawning retries.
+        const result = await Promise.race([
+          models,
+          new Promise((resolve) => { timer = setTimeout(resolve, 1000); }),
+        ]);
+        return result?.data.find(
+          (model) => model.providerID === ref.providerID && model.id === ref.id,
+        )?.limit.context;
+      } catch {
+        // Missing metadata stays unknown and is retried on the next step.
+        models = undefined;
+        return undefined;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
     const cleanup = () => {
       abort.abort();
       for (const resolve of questions.values()) resolve(null);
@@ -68,7 +90,15 @@ export default {
       void (async () => {
         send({ type: "ready" });
         for await (const { type, data } of stream) {
-          if (type === "session.inbox.enqueued") {
+          if (type === "model.updated" || type === "catalog.updated") {
+            models = undefined;
+          } else if (type === "session.step.started") {
+            const { sessionID, model } = data;
+            send({
+              type,
+              data: { sessionID, model, contextWindow: await contextWindow(model) },
+            });
+          } else if (type === "session.inbox.enqueued") {
             const { sessionID, inboxID, item } = data;
             if (
               item.type === "synthetic" ||

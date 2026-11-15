@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -20,6 +21,8 @@ class Model(BaseHTTPRequestHandler):
     paths = []
     steering_ready = threading.Event()
     steering_release = threading.Event()
+    silent_ready = threading.Event()
+    silent_release = threading.Event()
 
     def do_POST(self):
         path = self.path.split("?")[0]
@@ -60,6 +63,11 @@ class Model(BaseHTTPRequestHandler):
         if "steer start sentinel" in str(last["content"]):
             self.steering_ready.set()
             if not self.steering_release.wait(8):
+                self.send_error(504)
+                return
+        if "silent successor sentinel" in str(last["content"]):
+            self.silent_ready.set()
+            if not self.silent_release.wait(10):
                 self.send_error(504)
                 return
         if last["role"] == "tool" and any(
@@ -118,8 +126,10 @@ class Model(BaseHTTPRequestHandler):
                 }]})},
             }]}
             finish = "tool_calls"
-        elif any(sentinel in str(last["content"]) for sentinel in ("permission sentinel", "cancel sentinel", "background sentinel")):
+        elif any(sentinel in str(last["content"]) for sentinel in ("permission sentinel", "cancel sentinel", "background sentinel", "silent successor sentinel")):
             marker = "smoke-cancelled.txt" if "cancel sentinel" in str(last["content"]) else "smoke-approved.txt"
+            if "silent successor sentinel" in str(last["content"]):
+                marker = "smoke-silent-cancelled.txt"
             background = "background sentinel" in str(last["content"])
             delta = {"role": "assistant", "tool_calls": [{
                 "index": 0, "id": "call_permission", "type": "function",
@@ -380,6 +390,8 @@ export default {
                 send("first", "First smoke turn.")
                 first = wait("completed")
                 assert "OPEN_CODE_SMOKE_OK" in text(first), first
+                usage = next(e["event"] for e in reversed(first["events"]) if e["event"]["kind"] == "usage")
+                assert usage["context"] == {"model": "test/test-model", "used_tokens": 26.0, "window_tokens": 100000.0}, usage
                 native = first["session"]["native_id"]
                 assert native
                 deadline = time.monotonic() + 5
@@ -453,6 +465,10 @@ export default {
                 rpc("approve", session_id=sid, request_id=approval["request_id"], allow=True)
                 final = wait("completed")
                 assert "TOOL_SMOKE_OK" in text(final) and marker.read_text() == "OC_EXECUTED", final
+                usage = next(e["event"] for e in reversed(final["events"]) if e["event"]["kind"] == "usage")
+                assert usage["context"]["used_tokens"] == 26 and usage["context"]["window_tokens"] == 100000, usage
+                assert usage["totals"]["input_tokens"] == 40 and usage["totals"]["output_tokens"] == 12, usage
+                print(version + ": latest-step context occupancy and cumulative turn usage", flush=True)
                 diff = rpc("turn_change_diff", session_id=sid, request_id="permission", path=marker.name)
                 assert "+OC_EXECUTED" in diff["text"]
                 undone = rpc("undo_turn_changes", session_id=sid, request_id="permission")
@@ -531,6 +547,48 @@ export default {
                 assert text(result)[len(before_text):] == "OPEN_CODE_SMOKE_OK", result["events"][-8:]
                 assert not rpc("message_queue", session_id=sid)["entries"]
                 print(version + ": delayed steering wakes a tracked successor execution exactly once", flush=True)
+                # Hold the successor's HTTP response before any output. Consume
+                # its queue entry before cancelling to exercise native interrupt.
+                (project / "steer-hook-ready").unlink()
+                (project / "release-steer-hook").unlink()
+                Model.steering_ready.clear()
+                Model.steering_release.clear()
+                send("silent-parent", "steer start sentinel", "bypass_permissions")
+                assert Model.steering_ready.wait(5)
+                send("silent-input", "delayed steer sentinel silent successor sentinel", "bypass_permissions", queued=True)
+                entry = rpc("message_queue", session_id=sid)["entries"][0]
+                rpc("dispatch_queued_message", session_id=sid, request_id=entry["request_id"],
+                    revision=entry["revision"], interrupt=False, provider=provider)
+                deadline = time.monotonic() + 5
+                while not (project / "steer-hook-ready").exists():
+                    assert time.monotonic() < deadline, "silent successor hook did not start"
+                    time.sleep(.02)
+                Model.steering_release.set()
+                wait("completed")
+                before_text = text(rpc("poll", session_id=sid, after=0))
+                (project / "release-steer-hook").write_text("release")
+                assert Model.silent_ready.wait(5), "silent successor did not reach the model"
+                deadline = time.monotonic() + 5
+                with sqlite3.connect(f"file:{state / 'state.sqlite'}?mode=ro", uri=True) as db:
+                    while db.execute("SELECT status FROM message_queue WHERE session_id=? AND request_id=?",
+                                     (sid, "silent-input")).fetchone()[0] != "dispatched":
+                        assert time.monotonic() < deadline, "silent input was not consumed"
+                        time.sleep(.02)
+                running = rpc("poll", session_id=sid, after=0)
+                assert running["session"]["status"] == "running", running["session"]
+                assert text(running) == before_text, "successor must have no output before cancellation"
+                cancel_started = time.monotonic()
+                rpc("cancel", session_id=sid)
+                stopped = wait("stopped")
+                assert time.monotonic() - cancel_started < 5, "native cancellation waited for model output"
+                assert stopped["session"]["agent_session_open"], stopped["session"]
+                Model.silent_release.set()
+                send("after-silent-stop", "Continue after a silent successor stop.", "bypass_permissions")
+                resumed = wait("completed")
+                assert resumed["session"]["native_id"] == native
+                assert not (project / "smoke-silent-cancelled.txt").exists()
+                assert text(resumed)[len(before_text):] == "OPEN_CODE_SMOKE_OK"
+                print(version + ": silent successor is visibly running and native cancellation prevents its tool execution", flush=True)
                 # Closing while preparation is pending must not admit that input
                 # later, including when the same native session is reopened.
                 original_session = sid
@@ -726,6 +784,9 @@ export default {
                             text="Latte Provider smoke " + auth, model=metadata["model"], provider=snapshot)
                         result = wait("completed")
                         assert result["session"]["native_id"] == native
+                        usage = next(e["event"] for e in reversed(result["events"]) if e["event"]["kind"] == "usage")
+                        assert usage["context"]["model"].endswith("/gateway/work-model"), usage
+                        assert usage["context"]["used_tokens"] == 26, usage
                         assert Model.calls[before:]
                         assert all(req["model"] == "gateway/work-model" for req in Model.calls[before:])
                         assert all(path == endpoint for path in Model.paths[before:])
