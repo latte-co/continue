@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic ACP peer. The two 2.x command notification orders are deliberate."""
+"""Deterministic ACP and native OpenCode peer."""
 import json
 import os
 from pathlib import Path
@@ -20,9 +20,6 @@ assert sys.argv[1:] == ["acp"], sys.argv
 session = None
 model = "test/default"
 effort = "default"
-prompt_id = None
-permission_id = None
-rounds = 0
 titles = {}
 sideband_wire = None
 sideband_lock = threading.Lock()
@@ -52,6 +49,7 @@ def sideband():
         conn.connect(entry["options"]["socket"])
         with conn.makefile("rw") as wire:
             sideband_wire = wire
+            pending_permission = None
             wire.write('{"type":"ready"}\n')
             wire.flush()
             for line in wire:
@@ -63,6 +61,32 @@ def sideband():
                     titles[native] = request["title"]
                 elif action == "get":
                     reply["title"] = titles.get(native)
+                elif action == "prompt":
+                    text = request["text"]
+                    inbox = request["messageID"]
+                    assert inbox == request["id"] and inbox.startswith("msg_")
+                    log_prompt(native, text)
+                    if text == "before-delivery":
+                        native_event("session.inbox.enqueued", sessionID=native, inboxID="msg_plugin", itemType="user")
+                        native_event("session.execution.started", sessionID=native)
+                        native_event("session.inbox.delivered", sessionID=native, inboxID="msg_plugin")
+                        native_done(native, "plugin finished first")
+                        await_test_signal("release-prompt")
+                    native_event("session.inbox.enqueued", sessionID=native, inboxID=inbox, itemType="user")
+                    native_event("session.execution.started", sessionID=native)
+                    native_event("session.inbox.delivered", sessionID=native, inboxID=inbox)
+                    if text.startswith("permission"):
+                        pending_permission = inbox
+                        native_event("session.tool.input.started", sessionID=native, id=inbox, name="shell")
+                        native_event("session.tool.called", sessionID=native, id=inbox, input={"command": "printf fixture"})
+                        native_event("permission.asked", sessionID=native, id=inbox, action="shell",
+                                     source={"id": inbox}, resources=["printf fixture"])
+                    elif text == "unexpected-eof":
+                        os._exit(0)
+                    elif text in ("background", "background-question", "nested"):
+                        child_prompts(native, text)
+                    else:
+                        native_done(native, "fixture |reply")
                 elif action == "command":
                     assert request["name"] == "project:check"
                     Path(native).write_text("prompted")
@@ -77,6 +101,15 @@ def sideband():
                     event = {"type": "session.text.delta", "data": {"sessionID": native, "delta": "command reply"}}
                     wire.write(json.dumps(event) + "\n")
                 elif action == "permission":
+                    if request["requestID"] == pending_permission:
+                        decision = "once" if request["allow"] else "reject"
+                        native_event("permission.replied", sessionID=native, requestID=pending_permission, reply=decision)
+                        outcome = "success" if request["allow"] else "failed"
+                        native_event("session.tool." + outcome, sessionID=native, id=pending_permission,
+                                     content=[{"type": "text", "text": "fixture output"}])
+                        pending_permission = None
+                        native_done(native, "decision:" + ("once" if request["allow"] else "no"))
+                        continue
                     assert native == root + "_child" and request["requestID"] == "native-ask"
                     assert request["allow"]
                     if not rejected:
@@ -101,13 +134,14 @@ def sideband():
                     native_event("session.inbox.delivered", sessionID=native, inboxID="msg_answered")
                     native_event("session.execution.succeeded", sessionID=native)
                     continue
+                elif action == "interrupt":
+                    pending_permission = None
+                    native_event("session.execution.interrupted", sessionID=native)
+                    reply["interrupted"] = True
                 else:
                     raise AssertionError(request)
                 wire.write(json.dumps(reply) + "\n")
                 wire.flush()
-
-
-threading.Thread(target=sideband, daemon=True).start()
 
 
 def send(**message):
@@ -143,13 +177,67 @@ def options():
     ]
 
 
-def complete(text):
+def complete(id, text):
     update("agent_thought_chunk", content={"type": "text", "text": "private reasoning"})
     update("agent_message_chunk", content={"type": "text", "text": "wrong session"}, session_id="other")
     for fragment in text.split("|"):
         update("agent_message_chunk", content={"type": "text", "text": fragment})
     update("usage_update", used=28, size=10000)
-    reply(prompt_id, stopReason="end_turn", usage={"inputTokens": 25, "outputTokens": 3})
+    reply(id, stopReason="end_turn", usage={"inputTokens": 25, "outputTokens": 3})
+
+
+def log_prompt(native, text):
+    Path(native).write_text("prompted")
+    with Path("prompts").open("a") as log:
+        log.write(f"{native}:{model}:{effort}:{text}\n")
+
+
+def native_done(native, text):
+    native_event("session.reasoning.delta", sessionID=native, delta="private reasoning")
+    native_event("session.text.delta", sessionID="other", delta="wrong session")
+    for fragment in text.split("|"):
+        native_event("session.text.delta", sessionID=native, delta=fragment)
+    native_event("session.step.ended", sessionID=native, tokens={"input": 25, "output": 3})
+    native_event("session.execution.succeeded", sessionID=native)
+
+
+def child_prompts(native, text):
+    if text == "background":
+        native_event("session.created", sessionID="ses_child", parentID=native)
+        native_event("session.text.delta", sessionID="ses_child", delta="child only")
+    elif text == "background-question":
+        native_event("session.created", sessionID=native + "_child", parentID=native)
+        native_event("question", sessionID=native + "_child", id="child-question",
+                     prompts=[{"header": "Child", "question": "Which mode?",
+                               "options": [{"label": "One"}, {"label": "Two"}]}])
+        await_test_signal("release-parent")
+        parent_finished.set()
+        native_done(native, "parent finished")
+        return
+    else:
+        for child, parent in [
+            ("ses_child", native), ("ses_nested", "ses_child"),
+            ("ses_unowned", "ses_child"), ("ses_other_project", native),
+        ]:
+            native_event("session.created", sessionID=child, parentID=parent)
+            native_event("session.text.delta", sessionID=child, delta="stream " + child)
+            native_event("session.execution.succeeded", sessionID=child)
+            Path(child + ".json").write_text(json.dumps({
+                "info": {"id": child, "parentID": "ses_foreign" if child == "ses_unowned" else parent,
+                         "location": {"directory": str(Path.cwd().parent if child == "ses_other_project" else Path.cwd())}},
+                "messages": [{"type": "user", "id": "msg_child", "text": "native child instruction"},
+                             {"type": "assistant", "content": [
+                                 {"type": "text", "text": "native " + child},
+                                 {"type": "tool", "id": "tool_error", "name": "shell",
+                                  "state": {"status": "error", "error": {"message": "native shell failure"}}},
+                                 {"type": "tool", "id": "tool_unfinished", "name": "read",
+                                  "state": {"status": "running", "input": {"path": "file.txt"}}},
+                             ]}],
+            }))
+    native_done(native, "main only")
+
+
+threading.Thread(target=sideband, daemon=True).start()
 
 
 for line in sys.stdin:
@@ -203,43 +291,14 @@ for line in sys.stdin:
         reply(id)
     elif method == "session/prompt":
         assert params["sessionId"] == session
-        prompt_id = id
+        assert len(params["prompt"]) == 1
         text = params["prompt"][0]["text"]
-        if not text.startswith("/compact"):
-            config = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])
-            plugin = next(p for p in config["plugins"] if "socket" in p.get("options", {}))
-            kind, resource = params["prompt"][1]["type"], params["prompt"][1]["resource"]
-            assert kind == "resource"
-            assert resource["uri"] == plugin["options"]["promptMarkerUri"]
-        Path(session).write_text("prompted")
-        with Path("prompts").open("a") as log:
-            log.write(f"{session}:{model}:{effort}:{text}\n")
-        rounds += 1
-        if text.startswith("permission"):
-            permission_id = f"permission:{rounds}" if text == "permission-deny" else -rounds
-            update("tool_call", toolCallId=f"call-{rounds}", title="shell", kind="execute", status="pending")
-            tool = {"toolCallId": f"call-{rounds}", "title": "printf fixture", "kind": "execute",
-                    "rawInput": {"command": "printf fixture"}}
-            update("tool_call_update", status="in_progress", **tool)
-            send(id=permission_id, method="session/request_permission", params={
-                "sessionId": session, "toolCall": tool,
-                "options": [{"optionId": "permanent", "kind": "allow_always"},
-                            {"optionId": "once", "kind": "allow_once"},
-                            {"optionId": "no", "kind": "reject_once"}],
-            })
-        elif text == "unexpected-eof":
-            sys.exit(0)
-        elif text == "background":
-            child = {"rootSessionId": session, "childSessionId": "ses_child", "parentSessionId": session, "depth": 1}
-            send(method="opencode/session/child_update", params={**child, "type": "status", "status": "created"})
-            send(method="opencode/session/child_update", params={**child, "type": "update", "update": {
-                "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "child only"}
-            }})
-            complete("main only")
-        elif text == "late-native":
-            complete("ACP reply")
+        assert text.startswith("/compact"), text
+        log_prompt(session, text)
+        if text == "/compact late-native":
+            complete(id, "ACP reply")
             await_test_signal("release-native")
-            native_event("session.inbox.enqueued", sessionID=session, inboxID="msg_acp", itemType="user", foreground=True)
+            native_event("session.inbox.enqueued", sessionID=session, inboxID="msg_acp", itemType="compaction")
             native_event("session.execution.started", sessionID=session)
             native_event("session.inbox.delivered", sessionID=session, inboxID="msg_acp")
             native_event("session.text.delta", sessionID=session, delta="duplicate native reply")
@@ -247,57 +306,8 @@ for line in sys.stdin:
             native_event("session.inbox.enqueued", sessionID=session, inboxID="msg_bg", itemType="user")
             native_event("session.execution.started", sessionID=session)
             native_event("session.inbox.delivered", sessionID=session, inboxID="msg_bg")
-            native_event("session.text.delta", sessionID=session, delta="real follow-up")
-            native_event("session.execution.succeeded", sessionID=session)
-        elif text == "background-question":
-            native_event("session.created", sessionID=session + "_child", parentID=session)
-            native_event("question", sessionID=session + "_child", id="child-question",
-                         prompts=[{"header": "Child", "question": "Which mode?",
-                                   "options": [{"label": "One"}, {"label": "Two"}]}])
-            await_test_signal("release-parent")
-            parent_finished.set()
-            complete("parent finished")
-        elif text == "nested":
-            for child, parent, depth in [
-                ("ses_child", session, 1), ("ses_nested", "ses_child", 2),
-                ("ses_unowned", "ses_child", 2), ("ses_other_project", "ses_child", 2),
-            ]:
-                update_data = {"rootSessionId": session, "childSessionId": child, "parentSessionId": parent, "depth": depth}
-                send(method="opencode/session/child_update", params={**update_data, "type": "status", "status": "created"})
-                send(method="opencode/session/child_update", params={**update_data, "type": "update", "update": {
-                    "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "stream " + child}
-                }})
-                send(method="opencode/session/child_update", params={**update_data, "type": "status", "status": "completed"})
-                Path(child + ".json").write_text(json.dumps({
-                    "info": {"id": child, "parentID": "ses_foreign" if child == "ses_unowned" else parent,
-                             "location": {"directory": str(Path.cwd().parent if child == "ses_other_project" else Path.cwd())}},
-                    "messages": [{"type": "user", "id": "msg_child", "text": "native child instruction"},
-                                 {"type": "assistant", "content": [
-                                     {"type": "text", "text": "native " + child},
-                                     {"type": "tool", "id": "tool_error", "name": "shell",
-                                      "state": {"status": "error", "error": {"message": "native shell failure"}}},
-                                     {"type": "tool", "id": "tool_unfinished", "name": "read",
-                                      "state": {"status": "running", "input": {"path": "file.txt"}}},
-                                 ]}],
-                }))
-            complete("main only")
-        elif text != "await-cancel":
-            complete("fixture |reply")
-    elif method == "session/cancel":
-        assert params["sessionId"] == session
-        reply(prompt_id, stopReason="cancelled")
-        prompt_id = None
-    elif method is None and id == permission_id:
-        outcome = message["result"]["outcome"]
-        if prompt_id is None:
-            assert outcome == {"outcome": "cancelled"}
-            permission_id = None
-            continue
-        expected = "no" if isinstance(id, str) else "once"
-        assert outcome == {"outcome": "selected", "optionId": expected}, outcome
-        update("tool_call_update", toolCallId=f"call-{rounds}", status="completed" if expected == "once" else "failed",
-               content=[{"type": "content", "content": {"type": "text", "text": "fixture output"}}])
-        complete("decision:" + expected)
-        permission_id = None
+            native_done(session, "real follow-up")
+        else:
+            complete(id, "fixture |reply")
     else:
         raise AssertionError(message)

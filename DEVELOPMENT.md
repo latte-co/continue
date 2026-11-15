@@ -1717,24 +1717,24 @@ Bind an App Provider or use the host's native OpenCode configuration and login.
 Discovery uses host PATH or `LATTE_WORK_OPENCODE` and rejects 1.x. Local and SSH
 use the same host adapter.
 
-The host launches a private `opencode acp` process per open conversation and
-uses newline-delimited JSON-RPC on stdio for prompt streaming, approval and
-foreground cancellation. A bundled OpenCode plugin in a private temporary
-directory connects to a per-process Unix socket. It supplements ACP with
-native execution events, inbox delivery receipts, Shell exits and native title
-operations. Readiness waits for both channels. The owned process group and
-temporary files are released when the session closes.
+The host launches a private `opencode acp` process per open conversation. ACP
+over stdio negotiates the native session, model, effort and command catalog. A
+bundled OpenCode plugin connects to a per-process Unix socket and submits
+ordinary prompts with a caller-provided message ID. The plugin forwards native
+output, approvals, cancellation, inbox delivery, Shell exits and title events.
+Readiness waits for both channels. The owned process group and temporary files
+are released when the session closes.
 
 Open and resume are prompt-free. Latte persists requests before forwarding
 them and preserves the original native session ID on resume. A queued input
 is consumed only after a matching native inbox delivery event. A background
 Shell is displayed as running until its native exit. Native execution
 completion fences project slash commands and autonomous follow-up activity.
-Latte correlates native execution and inbox delivery IDs to distinguish ACP
+Latte correlates native execution and inbox delivery IDs to distinguish its
 foreground prompts from autonomous user or synthetic inputs submitted by a
-plugin. The foreground result and late copies of its native output can arrive
-on either transport first. Only a slash name in the execution session's catalog
-is treated as a command. Other slash-prefixed text is sent as an ordinary prompt.
+plugin. OpenCode prompt hooks see the original user text and its attachments.
+Only a slash name in the execution session's catalog is treated as a command.
+Other slash-prefixed text is sent as an ordinary prompt.
 Compaction uses its ACP completion. OpenCode 2.0 implements `/compact` even
 though its ACP catalog omits the command. Skill shortcuts advertised by
 older catalogs are activated through ACP. A custom title set before the
@@ -1745,15 +1745,15 @@ native denials and managed policies continue to apply. The question tool uses
 its plugin interface and native permission evaluation for foreground and
 autonomous executions. A 2.0 question that needs a separate native approval
 is reported as unsupported. Sideband approvals settle on a native permission
-decision event. A child's
-pending approval or question can outlive the foreground turn.
+decision event. A child's pending approval or question can outlive the
+foreground turn.
 The platform skill follows the host preference. OpenCode 2.0 receives
 it through its model context hook for the lifetime of the process, and 2.3 reads
 it as an ambient instruction file. ACP client filesystem and terminal RPCs
 are unavailable. Tool images are limited to bounded inline raster data.
 
 Child text and tools are persisted separately from the parent. A child can
-outlive its foreground ACP turn. Reconfiguration and undo remain fenced
+outlive its foreground turn. Reconfiguration and undo remain fenced
 while background work is active or a child-triggered continuation is
 unconfirmed. For a finished child, Latte can recover native history with a
 bounded, prompt-free export. Import requires the original launch context,

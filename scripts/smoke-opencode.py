@@ -185,8 +185,12 @@ export default {
   id: "latte-review-smoke",
   async setup(ctx) {
     await ctx.session.hook("prompt", (event) => {
-      if (event.prompt.text.includes("Check the prompt rewrite."))
-        event.prompt.text = "Context added by a project plugin.\\n" + event.prompt.text;
+      if (event.prompt.text.includes("Check the prompt rewrite.")) {
+        const fileCount = event.prompt.files?.length ?? 0;
+        const metadataCount = Object.keys(event.metadata ?? {}).length;
+        event.prompt.files = event.prompt.files?.filter((file) => file.uri.startsWith("file:"));
+        event.prompt.text = `Context added by a project plugin (${fileCount} files, ${metadataCount} metadata keys).\\n` + event.prompt.text;
+      }
     });
     await ctx.permission.hook("evaluate", (event) => {
       if (event.action === "question" && event.agent === "smoke-restricted")
@@ -387,10 +391,11 @@ export default {
                 rewritten = wait("completed")
                 assert text(rewritten).count("PROMPT_REWRITE_OK") == 1
                 submitted = [call["messages"][-1]["content"] for call in Model.calls[before:]]
-                assert "Context added by a project plugin.\nCheck the prompt rewrite." in submitted, submitted
+                assert ("Context added by a project plugin (0 files, 0 metadata keys).\n"
+                        "Check the prompt rewrite.") in submitted, submitted
                 assert all("application/x-latte-work-prompt" not in json.dumps(call)
                            for call in Model.calls[before:])
-                print(version + ": project prompt hook preserves ACP ownership and model input", flush=True)
+                print(version + ": project prompt hook sees no internal attachment or metadata and gets one reply", flush=True)
 
                 named = rpc("create_session", project_id=pid, agent="opencode")["session"]["id"]
                 rpc("rename_session", session_id=named, title="Initial OpenCode title", provider=provider)

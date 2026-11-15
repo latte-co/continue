@@ -261,16 +261,14 @@ async fn opencode_permissions_cancel_and_eof_do_not_infer_completion() {
         Response::Accepted { .. }
     ));
     let token = permission(&wait(&mut client, &id, Status::Waiting).await);
-    assert!(matches!(
-        ask(
-            &mut client,
-            Request::Cancel {
-                session_id: id.clone()
-            }
-        )
-        .await,
-        Response::Ok
-    ));
+    let stopped = ask(
+        &mut client,
+        Request::Cancel {
+            session_id: id.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(stopped, Response::Ok), "{stopped:?}");
     wait(&mut client, &id, Status::Stopped).await;
     assert!(matches!(
         ask(
@@ -467,7 +465,7 @@ async fn opencode_ignores_late_foreground_events_and_runs_the_background_notific
             "missing-path",
             "/missing-project explain why this path does not exist",
         ),
-        ("race", "late-native"),
+        ("race", "/compact late-native"),
     ] {
         assert!(matches!(
             ask(&mut client, turn(&id, request, text)).await,
@@ -489,6 +487,50 @@ async fn opencode_ignores_late_foreground_events_and_runs_the_background_notific
     .unwrap();
     assert!(contains_text(&events, "ACP reply"));
     assert!(!contains_text(&events, "duplicate native reply"));
+    let after = events.last().unwrap().seq;
+    assert!(matches!(
+        ask(&mut client, turn(&id, "ordered", "before-delivery")).await,
+        Response::Accepted { .. }
+    ));
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let Response::Events {
+                session, events, ..
+            } = ask(
+                &mut client,
+                Request::Poll {
+                    session_id: id.clone(),
+                    after: 0.0,
+                },
+            )
+            .await
+            else {
+                panic!("poll");
+            };
+            if contains_text(&events, "plugin finished first") {
+                assert_eq!(session.status, Status::Running);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::write(folder.path().join("release-prompt"), "").unwrap();
+    let events = wait(&mut client, &id, Status::Completed).await;
+    let usage: Vec<_> = events
+        .iter()
+        .filter(|event| event.seq > after)
+        .filter_map(|event| match &event.event {
+            EventKind::Usage {
+                totals: Some(totals),
+                ..
+            } => Some(totals),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].output_tokens, Some(3.0));
     let log = std::fs::read_to_string(folder.path().join("prompts")).unwrap();
     assert!(log.contains(":/missing-project explain why this path does not exist\n"));
 }

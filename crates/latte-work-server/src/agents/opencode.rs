@@ -1,4 +1,4 @@
-//! OpenCode 2.x ACP v1 over a dedicated stdio child.
+//! OpenCode 2.x ACP and native session events from an owned process.
 //! <https://opencode.ai/docs/cli/acp/>
 use super::{Action, AgentAdapter, AgentCommand, Input};
 use crate::providers::LaunchConfig;
@@ -23,7 +23,6 @@ const CHILD_CAPABILITY: &str = "opencode/child-session-updates";
 const CHILD_META: &str = "opencode/child-session";
 const MAX_CHILDREN: usize = 512;
 const MAX_TOOLS: usize = 2048;
-const PROMPT_MARKER_MIME: &str = "application/x-latte-work-prompt";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Request {
@@ -38,7 +37,6 @@ enum Request {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AcpInput {
-    Prompt,
     Compact,
     Skill,
 }
@@ -56,9 +54,12 @@ pub struct OpenCode {
     steering: Option<(String, String)>,
     native_permissions: HashMap<String, String>,
     child_interactions: HashSet<String>,
-    command_children: HashSet<String>,
+    native_permission_children: HashSet<String>,
     inbox_inputs: HashMap<String, bool>,
-    prompt_marker: String,
+    native_prompt: Option<String>,
+    native_prompt_delivered: bool,
+    native_usage: Option<TurnUsage>,
+    native_stop: Option<&'static str>,
     acp_input: Option<AcpInput>,
     native_execution_open: bool,
     autonomous_inbox_delivered: bool,
@@ -317,6 +318,19 @@ impl OpenCode {
                     result: Err("OpenCode 未确认审批回复，审批仍待处理".into()),
                 }]);
             }
+            if self.native_prompt.as_deref() == Some(id) && message["error"] == true {
+                // An error near durable admission can leave the input pending.
+                // Close the owned process rather than retrying or accepting a new turn.
+                bail!("OpenCode 未确认已提交的消息，执行结果待确认");
+            }
+            if id == "interrupt-root"
+                && self.cancelling
+                && self.native_prompt.is_some()
+                && (message["error"] == true
+                    || (message["interrupted"] == false && !self.native_prompt_delivered))
+            {
+                bail!("OpenCode 未确认停止消息，执行结果待确认");
+            }
             if self.native_command.as_deref() == Some(id) {
                 if message["viaACP"] == true {
                     if self.cancelling {
@@ -367,21 +381,23 @@ impl OpenCode {
                 }))?;
                 if self.children.contains_key(id) {
                     self.native_children.insert(id.into());
-                    if self.native_command.is_some()
+                    if self.native_prompt.is_some()
+                        || self.native_command.is_some()
                         || self.followup
-                        || self.command_children.contains(parent)
+                        || self.native_permission_children.contains(parent)
                     {
-                        self.command_children.insert(id.into());
+                        self.native_permission_children.insert(id.into());
                     }
                 }
                 return Ok(actions);
             }
             self.native_children.insert(id.into());
-            if self.native_command.is_some()
+            if self.native_prompt.is_some()
+                || self.native_command.is_some()
                 || self.followup
-                || self.command_children.contains(parent)
+                || self.native_permission_children.contains(parent)
             {
-                self.command_children.insert(id.into());
+                self.native_permission_children.insert(id.into());
             }
             if let Some(role) = self.child_roles.get(id) {
                 return Ok(vec![Action::Event(EventKind::Subagent {
@@ -427,7 +443,7 @@ impl OpenCode {
             }
             if kind == "permission.asked"
                 && self.children.get(child) == Some(&true)
-                && self.command_children.contains(child)
+                && self.native_permission_children.contains(child)
             {
                 return self.native_permission(data, child);
             }
@@ -468,6 +484,7 @@ impl OpenCode {
         let followup_start = self.native_execution_open
             && self.autonomous_inbox_delivered
             && !self.foreground_inbox_delivered
+            && self.native_prompt.is_none()
             && self.native_command.is_none()
             && !self.followup
             && matches!(
@@ -510,9 +527,8 @@ impl OpenCode {
                     self.inbox_inputs.len() < MAX_TOOLS,
                     "OpenCode 原生输入超出限制"
                 );
-                let foreground = data["foreground"] == true
-                    || (data["itemType"] == "compaction"
-                        && self.acp_input == Some(AcpInput::Compact));
+                let foreground =
+                    data["itemType"] == "compaction" && self.acp_input == Some(AcpInput::Compact);
                 self.inbox_inputs
                     .insert(string(data, "inboxID")?.into(), foreground);
                 Ok(vec![])
@@ -520,6 +536,10 @@ impl OpenCode {
             "session.inbox.delivered" => {
                 let inbox = string(data, "inboxID")?;
                 let foreground = self.inbox_inputs.remove(inbox);
+                if self.native_prompt.as_deref() == Some(inbox) {
+                    self.native_prompt_delivered = true;
+                    return Ok(vec![]);
+                }
                 if self
                     .steering
                     .as_ref()
@@ -538,6 +558,10 @@ impl OpenCode {
             "session.inbox.cancelled" => {
                 if let Some(id) = data["inboxID"].as_str() {
                     self.inbox_inputs.remove(id);
+                    if self.native_prompt.as_deref() == Some(id) {
+                        self.native_prompt = None;
+                        return Ok(self.finish(true, Some("OpenCode 已取消未投递的消息".into())));
+                    }
                 }
                 if self
                     .steering
@@ -569,6 +593,26 @@ impl OpenCode {
                 self.native_execution_open = true;
                 self.autonomous_inbox_delivered = false;
                 Ok(vec![])
+            }
+            "session.execution.succeeded"
+            | "session.execution.failed"
+            | "session.execution.interrupted"
+                if self.native_prompt.is_some() =>
+            {
+                self.native_execution_open = false;
+                self.autonomous_inbox_delivered = false;
+                if self.native_prompt_delivered {
+                    self.native_prompt = None;
+                    self.native_prompt_delivered = false;
+                    Ok(self.finish_native_prompt(kind, data))
+                } else if self.cancelling {
+                    // The inbox ID has not been delivered, so we cannot reuse
+                    // this process with an unconfirmed, possibly pending input.
+                    bail!("OpenCode 未确认停止待投递的消息，执行结果待确认");
+                } else {
+                    self.tools.retain(|_, tool| tool.child);
+                    Ok(vec![])
+                }
             }
             "session.execution.succeeded"
             | "session.execution.failed"
@@ -611,17 +655,79 @@ impl OpenCode {
                 self.foreground_inbox_delivered = false;
                 Ok(vec![])
             }
-            "permission.asked" if self.followup || self.native_command.is_some() => {
+            "session.step.ended" | "session.step.failed" if self.native_prompt_delivered => {
+                self.record_native_usage(data);
+                Ok(vec![])
+            }
+            "permission.asked"
+                if self.native_prompt.is_some()
+                    || self.followup
+                    || self.native_command.is_some() =>
+            {
                 self.native_permission(data, string(data, "sessionID")?)
             }
             "question" if self.running() || self.followup => self.native_question(data, None),
-            _ if self.followup || self.native_command.is_some() => {
+            _ if self.native_prompt.is_some() || self.followup || self.native_command.is_some() => {
                 self.native_output(kind, data, None)
             }
             _ => Ok(vec![]),
         }?;
         actions.extend(updates);
         Ok(actions)
+    }
+
+    fn record_native_usage(&mut self, data: &Value) {
+        self.native_stop = match data["finish"].as_str() {
+            Some("length") => Some("OpenCode 达到输出令牌上限"),
+            Some("content-filter") => Some("OpenCode 拒绝了本轮请求"),
+            _ => None,
+        };
+        let tokens = &data["tokens"];
+        if !tokens.is_object() {
+            return;
+        }
+        let totals = self.native_usage.get_or_insert(TurnUsage {
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            model_time_ms: None,
+            steps: None,
+        });
+        for (total, value) in [
+            (&mut totals.input_tokens, &tokens["input"]),
+            (&mut totals.output_tokens, &tokens["output"]),
+            (&mut totals.cache_read_tokens, &tokens["cache"]["read"]),
+            (&mut totals.cache_write_tokens, &tokens["cache"]["write"]),
+        ] {
+            if let Some(value) = value.as_f64().filter(|value| *value >= 0.0) {
+                *total = Some(total.unwrap_or_default() + value);
+            }
+        }
+    }
+
+    fn finish_native_prompt(&mut self, kind: &str, data: &Value) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if let Some(totals) = self.native_usage.take() {
+            actions.push(Action::Event(EventKind::Usage {
+                context: None,
+                totals: Some(totals),
+            }));
+        }
+        let message = match kind {
+            "session.execution.interrupted" => Some("OpenCode 已取消本轮".into()),
+            "session.execution.failed" => Some(data["error"]["message"].as_str().map_or_else(
+                || "OpenCode 原生执行失败".into(),
+                |message| message.chars().take(500).collect(),
+            )),
+            _ => self.native_stop.take().map(str::to_owned),
+        };
+        self.native_stop = None;
+        if !self.children.values().any(|active| *active) && self.background_shells.is_empty() {
+            self.possible_followup = false;
+        }
+        actions.extend(self.finish(message.is_some(), message));
+        actions
     }
 
     fn native_question(&mut self, data: &Value, child: Option<&str>) -> Result<Vec<Action>> {
@@ -866,28 +972,22 @@ impl OpenCode {
         if command.is_some() {
             self.start_prompt(text.trim_start(), AcpInput::Compact)
         } else {
-            self.start_prompt(text, AcpInput::Prompt)
+            let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+            let action =
+                self.sideband_request("prompt", &id, json!({"messageID":id,"text":text}))?;
+            self.native_prompt = Some(id);
+            self.tools.retain(|_, tool| tool.child);
+            self.saved = true;
+            Ok(vec![Action::NativeSession(session), action])
         }
     }
 
     fn start_prompt(&mut self, text: &str, input: AcpInput) -> Result<Vec<Action>> {
         let session = self.session_id()?.to_owned();
-        let mut prompt = vec![json!({"type":"text","text":text})];
-        if input == AcpInput::Prompt {
-            // ACP preserves embedded resources separately from prompt text.
-            prompt.push(json!({
-                "type": "resource",
-                "resource": {
-                    "uri": format!("data:{PROMPT_MARKER_MIME};base64,{}", self.prompt_marker),
-                    "mimeType": PROMPT_MARKER_MIME,
-                    "blob": self.prompt_marker,
-                }
-            }));
-        }
         let action = self.request(
             Request::Prompt,
             "session/prompt",
-            json!({"sessionId":session, "prompt":prompt}),
+            json!({"sessionId":session, "prompt":[{"type":"text","text":text}]}),
         )?;
         self.acp_input = Some(input);
         self.tools.retain(|_, tool| tool.child);
@@ -1085,6 +1185,8 @@ impl OpenCode {
     fn finish(&mut self, failed: bool, message: Option<String>) -> Vec<Action> {
         self.tools.retain(|_, tool| tool.child);
         self.context = None;
+        self.native_usage = None;
+        self.native_stop = None;
         let mut actions = Vec::new();
         if std::mem::take(&mut self.cancelling) {
             self.approvals.clear();
@@ -1104,7 +1206,8 @@ impl OpenCode {
     }
 
     fn running(&self) -> bool {
-        self.native_command.is_some()
+        self.native_prompt.is_some()
+            || self.native_command.is_some()
             || self
                 .request
                 .is_some_and(|(_, kind)| kind == Request::Prompt)
@@ -1129,7 +1232,9 @@ impl OpenCode {
             return Ok(vec![]);
         }
         if self.session.as_deref() != Some(id)
-            || !self.running()
+            || !self
+                .request
+                .is_some_and(|(_, kind)| kind == Request::Prompt)
             || !update["_meta"][CHILD_META].is_null()
         {
             return Ok(vec![]);
@@ -1523,6 +1628,7 @@ impl AgentAdapter for OpenCode {
     fn can_start_turn(&self) -> bool {
         self.ready
             && !self.followup
+            && self.native_prompt.is_none()
             && !self.native_execution_open
             && self.native_command.is_none()
             && self.request.is_none()
@@ -1585,15 +1691,8 @@ impl AgentAdapter for OpenCode {
             _directory: directory,
         };
         let instructions = crate::skills::platform_instructions(&config.settings_dir);
-        // The 32 ASCII hex digits are also valid unpadded base64.
-        self.prompt_marker = uuid::Uuid::new_v4().simple().to_string();
-        let marker_uri = format!("data:{PROMPT_MARKER_MIME};base64,{}", self.prompt_marker);
-        let (model, settings) = config::configure(
-            &mut command,
-            config,
-            &instructions,
-            Some((&sideband, &marker_uri)),
-        )?;
+        let (model, settings) =
+            config::configure(&mut command, config, &instructions, Some(&sideband))?;
         self.model = model;
         Ok(AgentCommand {
             command,
@@ -1650,16 +1749,30 @@ impl AgentAdapter for OpenCode {
             }
             Input::Message(line) => self.message(line),
             Input::Sideband(line) => self.sideband(line),
-            Input::Interrupt if self.followup || self.native_command.is_some() => {
+            Input::Interrupt
+                if self.followup
+                    || self.native_command.is_some()
+                    || self.native_prompt.is_some() =>
+            {
                 self.cancelling = true;
                 let mut actions = self.cancel_questions()?;
-                let mut sessions = HashSet::from([self.session_id()?.to_owned()]);
+                let root = self.session_id()?.to_owned();
+                let mut sessions = HashSet::from([root.clone()]);
                 sessions.extend(self.native_permissions.values().cloned());
                 for session in sessions {
+                    let permissions: Vec<_> = self
+                        .native_permissions
+                        .iter()
+                        .filter_map(|(id, owner)| (owner == &session).then_some(id))
+                        .collect();
                     actions.push(self.sideband_request(
                         "interrupt",
-                        "interrupt",
-                        json!({"sessionID":session}),
+                        if session == root {
+                            "interrupt-root"
+                        } else {
+                            "interrupt-child"
+                        },
+                        json!({"sessionID":session,"permissions":permissions}),
                     )?);
                 }
                 Ok(actions)

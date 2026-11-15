@@ -20,7 +20,7 @@ pub(super) fn configure(
     command: &mut Command,
     config: &LaunchConfig,
     instructions: &str,
-    sideband: Option<(&super::super::Sideband, &str)>,
+    sideband: Option<&super::super::Sideband>,
 ) -> Result<(Option<String>, Option<NamedTempFile>)> {
     let inherited = agent_environment::configured_variable(CONTENT, &config.environment);
     let inherited = inherited
@@ -53,7 +53,7 @@ pub(super) fn configure(
             );
         Some(file)
     };
-    if let Some((sideband, prompt_marker_uri)) = sideband {
+    if let Some(sideband) = sideband {
         ensure!(
             matches!(
                 config.permission_mode.as_deref(),
@@ -73,7 +73,6 @@ pub(super) fn configure(
                 "options": {
                     "socket": (directory.join("events").to_str().context("OpenCode Socket 路径不是 UTF-8")?),
                     "permissionMode": (config.permission_mode.as_deref().unwrap_or_default()),
-                    "promptMarkerUri": (prompt_marker_uri),
                     "instructions": (instructions.unwrap_or_default())
                 }
             }));

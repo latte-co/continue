@@ -2,7 +2,7 @@ import { createConnection } from "node:net";
 import { readFile } from "node:fs/promises";
 
 // Loaded by the same private OpenCode server that owns the ACP session.
-// Only forward lifecycle evidence that ACP does not carry.
+// Carry native prompt submission, execution and lifecycle evidence.
 export default {
   id: "latte-work.session",
   async setup(ctx) {
@@ -13,19 +13,6 @@ export default {
         event.system.push({ type: "text", text });
       });
     }
-    // ACP assigns the native inbox ID. Read our embedded resource independently
-    // of text hooks and remove it before OpenCode materializes attachments.
-    const markerUri = ctx.options.promptMarkerUri;
-    await ctx.session.hook("prompt", (event) => {
-      const files = event.prompt.files;
-      if (!files?.some((file) => file.uri === markerUri)) return;
-      const retained = files.filter((file) => file.uri !== markerUri);
-      event.prompt.files = retained.length ? retained : undefined;
-      event.metadata = {
-        ...event.metadata,
-        latteWorkPrompt: markerUri,
-      };
-    });
     if (ctx.options.permissionMode) {
       await ctx.permission.hook("evaluate", (event) => {
         // A preceding native or managed denial is authoritative.
@@ -38,6 +25,7 @@ export default {
     const socket = createConnection(ctx.options.socket);
     const abort = new AbortController();
     const questions = new Map();
+    const promptSubmissions = new Map();
     const cleanup = () => {
       abort.abort();
       for (const resolve of questions.values()) resolve(null);
@@ -93,14 +81,18 @@ export default {
                   sessionID,
                   inboxID,
                   itemType: item.type,
-                  foreground:
-                    item.payload.metadata?.latteWorkPrompt === markerUri,
                 },
               });
           } else if (type === "session.created") {
             const { sessionID, parentID, agent, title } = data;
             if (parentID)
               send({ type, data: { sessionID, parentID, agent, title } });
+          } else if (
+            type === "session.step.ended" ||
+            type === "session.step.failed"
+          ) {
+            const { sessionID, finish, tokens } = data;
+            send({ type, data: { sessionID, finish, tokens } });
           } else if (events.has(type)) {
             if (
               type === "session.tool.success" ||
@@ -163,14 +155,20 @@ export default {
             directory: session.location.directory,
           });
           return;
-        } else if (action === "steer") {
-          await ctx.session.prompt({
+        } else if (action === "prompt" || action === "steer") {
+          const submission = ctx.session.prompt({
             sessionID,
             id: request.messageID,
             text: request.text,
             delivery: "steer",
-            resume: false,
+            resume: action === "prompt",
           });
+          if (action === "prompt") promptSubmissions.set(sessionID, submission);
+          try {
+            await submission;
+          } finally {
+            if (action === "prompt") promptSubmissions.delete(sessionID);
+          }
         } else if (action === "command") {
           if (legacy) {
             // 2.0 mixes command and Skill shortcuts in its ACP catalog. Only
@@ -208,7 +206,22 @@ export default {
             reply: decision,
           });
         } else if (action === "interrupt") {
-          await ctx.session.interrupt({ sessionID });
+          // A prompt hook can still be preparing the input when the user stops.
+          await promptSubmissions.get(sessionID)?.catch(() => {});
+          const { interrupted } = await ctx.session.interrupt({ sessionID });
+          // A suspended tool can still be waiting for its permission decision.
+          await Promise.allSettled(
+            request.permissions.map((requestID) =>
+              ctx.permission.reply({
+                sessionID,
+                requestID,
+                decision: "reject",
+                reply: "reject",
+              }),
+            ),
+          );
+          send({ type: "reply", id, interrupted });
+          return;
         } else {
           throw new Error("Unsupported request");
         }
