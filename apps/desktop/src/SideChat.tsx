@@ -122,9 +122,11 @@ export function SideChat({
   const [events, setEvents] = useState<Event[]>([]);
   const [readError, setReadError] = useState("");
   const [error, setError] = useState("");
-  const [confirmingWrites, setConfirmingWrites] = useState<string>();
-  const showingWriteConfirmation =
-    !!confirmingWrites && confirmingWrites === session?.side_write_pending;
+  const [confirming, setConfirming] = useState<string>();
+  const closePending = session?.agent_close_pending;
+  const pendingVerification = closePending ?? session?.side_write_pending;
+  const showingConfirmation =
+    !!confirming && confirming === pendingVerification;
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState(false);
   const [revision, refresh] = useState(0);
@@ -249,23 +251,22 @@ export function SideChat({
   }, [active, events, session?.status]);
 
   const canInteract = enabled && (ready || isDraft);
-  async function confirmWrites() {
-    if (!confirmingWrites || confirmingWrites !== session?.side_write_pending)
-      return;
-    setConfirmingWrites(undefined);
-    if (session?.agent_session_open) {
-      const closed = await perform({
-        method: "close_agent_session",
-        session_id: sideId,
-        only_if_idle: true,
-      });
-      if (!closed) return;
-    }
-    await perform({
-      method: "confirm_side_writes_ended",
-      session_id: sideId,
-      request_id: confirmingWrites,
-    });
+  function confirmEnd() {
+    if (!confirming || confirming !== pendingVerification) return;
+    setConfirming(undefined);
+    void perform(
+      closePending
+        ? {
+            method: "confirm_agent_closed",
+            session_id: sideId,
+            close_id: confirming,
+          }
+        : {
+            method: "confirm_side_writes_ended",
+            session_id: sideId,
+            request_id: confirming,
+          },
+    );
   }
   function perform(action: Request, accepted?: () => void) {
     const pending = sideOperations(drafts);
@@ -294,16 +295,11 @@ export function SideChat({
         const expected =
           action.method === "send"
             ? "accepted"
-            : action.method === "confirm_side_writes_ended"
+            : action.method === "confirm_side_writes_ended" ||
+                action.method === "confirm_agent_closed"
               ? "session"
               : "ok";
-        if (
-          response.kind !== expected &&
-          !(
-            action.method === "close_agent_session" &&
-            response.kind === "side_chat_closed"
-          )
-        )
+        if (response.kind !== expected)
           throw new Error("操作结果待确认，请核对侧边聊天的记录");
         accepted?.();
         setReady(false);
@@ -504,31 +500,35 @@ export function SideChat({
         </div>
       </div>
       <div className="side-chat-compose">
-        {session?.side_write_pending && !running && (
+        {pendingVerification && !running && (
           <div className="notice" role="status">
-            {showingWriteConfirmation
-              ? "请先核对主机上的后台进程和外部工具。确认后，写入重叠的历史轮次仍受保护。"
-              : "后台写入待确认。确认前，主对话的撤销保护会继续生效。"}
-            {showingWriteConfirmation && (
+            {showingConfirmation
+              ? "请核对主机上的原生进程、后台任务和外部工具均已停止。"
+              : closePending
+                ? "原生会话关闭待确认。"
+                : "后台写入待确认。确认前，主对话的撤销保护会继续生效。"}
+            {showingConfirmation && (
               <button
                 className="secondary small"
-                onClick={() => setConfirmingWrites(undefined)}
+                onClick={() => setConfirming(undefined)}
               >
                 取消
               </button>
             )}
             <button
               className="secondary small"
-              disabled={!connected || busy || session.agent_session_busy}
+              disabled={!canInteract || busy || session?.agent_session_busy}
               onClick={() =>
-                showingWriteConfirmation
-                  ? void confirmWrites()
-                  : setConfirmingWrites(session.side_write_pending)
+                showingConfirmation
+                  ? confirmEnd()
+                  : setConfirming(pendingVerification)
               }
             >
-              {showingWriteConfirmation
+              {showingConfirmation
                 ? "我已核对，确认结束"
-                : "确认后台写入已结束"}
+                : closePending
+                  ? "核对原生会话关闭"
+                  : "确认后台写入已结束"}
             </button>
           </div>
         )}

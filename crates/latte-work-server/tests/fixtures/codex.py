@@ -70,6 +70,8 @@ for line in sys.stdin:
         assert 'inherited messages' in params['developerInstructions']
         if method == 'thread/fork':
             assert params['threadId'] == thread and params['excludeTurns']
+            if pathlib.Path('fail-side-initialization').exists():
+                sys.exit(0)
         parent_thread = thread
         thread = f'side-thread-{os.getpid()}' if method == 'thread/fork' else params['threadId']
         reply(value, {'thread': {'id': thread, 'forkedFromId': parent_thread},

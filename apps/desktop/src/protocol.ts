@@ -63,6 +63,10 @@ export type Session = {
    * Latest side write request whose end has yet to be confirmed.
    */
   side_write_pending?: string;
+  /**
+   * ID of the native close which still needs host-side verification.
+   */
+  agent_close_pending?: string;
 };
 export type RecentCursor = { updated_at: number; id: string };
 export type RecentSession = { session: Session; updated_at: number };
@@ -476,6 +480,7 @@ export type Request =
        */
       request_id: string;
     }
+  | { method: "confirm_agent_closed"; session_id: string; close_id: string }
   | {
       method: "send_queued";
       provider?: TurnProvider;

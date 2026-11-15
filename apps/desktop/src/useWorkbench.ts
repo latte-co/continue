@@ -790,7 +790,14 @@ export function useWorkbench() {
     };
   }, [sessionId, hostId, connected]);
   useEffect(() => {
-    if (!native || !connected || !sessionId || !session || session.archived)
+    if (
+      !native ||
+      !connected ||
+      !sessionId ||
+      !session ||
+      session.archived ||
+      session.agent_close_pending
+    )
       return;
     const targetHost = hostId,
       targetId = sessionId;
@@ -854,6 +861,7 @@ export function useWorkbench() {
     sessionId,
     connected,
     session?.archived,
+    session?.agent_close_pending,
     restoreVersions[hostId],
   ]);
   function updateSession(targetHostId: string, value: Session) {

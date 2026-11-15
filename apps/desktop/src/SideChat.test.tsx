@@ -316,7 +316,11 @@ it("closes locally with a warning and requires explicit confirmation after reope
     if (action.method === "poll")
       return {
         kind: "events",
-        session: { ...child, side_write_pending: pending },
+        session: {
+          ...child,
+          side_write_pending: pending,
+          agent_session_open: false,
+        },
         events: [],
         has_more: false,
       };
@@ -360,4 +364,9 @@ it("closes locally with a warning and requires explicit confirmation after reope
     }),
   );
   await waitFor(() => expect(screen.queryByText(/后台写入待确认/)).toBeNull());
+  expect(
+    request.mock.calls.filter(
+      ([, action]) => action.method === "close_agent_session",
+    ),
+  ).toHaveLength(1);
 });

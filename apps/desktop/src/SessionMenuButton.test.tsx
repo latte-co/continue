@@ -59,6 +59,35 @@ it("disables actions for an unsaved draft", () => {
   expect(state.sessionAction).not.toHaveBeenCalled();
 });
 
+it("requires a second action to verify the current native close record", async () => {
+  const pending = { ...session, agent_close_pending: "close-1" };
+  const view = render(
+    <SessionMenuButton state={{ ...state, session: pending }} />,
+  );
+  open();
+  fireEvent.click(screen.getByRole("menuitem", { name: "核对原生会话关闭" }));
+  expect(state.sessionAction).not.toHaveBeenCalled();
+  const confirm = () =>
+    screen.getByRole<HTMLButtonElement>("button", {
+      name: "我已核对，确认关闭",
+    });
+  const changed = {
+    ...state,
+    session: { ...pending, agent_close_pending: "close-2" },
+  };
+  view.rerender(<SessionMenuButton state={changed} />);
+  expect(confirm().disabled).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "取消" }));
+  open();
+  fireEvent.click(screen.getByRole("menuitem", { name: "核对原生会话关闭" }));
+  await act(async () => fireEvent.click(confirm()));
+  expect(state.sessionAction).toHaveBeenCalledExactlyOnceWith("remote", {
+    method: "confirm_agent_closed",
+    session_id: "s",
+    close_id: "close-2",
+  });
+});
+
 it("anchors the current menu to the right, supports toggling and restores keyboard focus", () => {
   render(<SessionMenuButton state={state} />);
   const button = screen.getByRole("button", { name: "当前对话操作" });

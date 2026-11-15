@@ -666,17 +666,19 @@ async fn check_detached_side_writes(completed: bool) {
         Status::Waiting
     };
     wait(&mut client, &side.id, status.clone()).await;
-    assert!(matches!(
-        ask(
-            &mut client,
-            Request::ConfirmSideWritesEnded {
-                session_id: side.id.clone(),
-                request_id: "side-write".into(),
-            }
-        )
-        .await,
-        Response::Error { .. }
-    ));
+    if !completed {
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::ConfirmSideWritesEnded {
+                    session_id: side.id.clone(),
+                    request_id: "side-write".into(),
+                }
+            )
+            .await,
+            Response::Error { .. }
+        ));
+    }
     let pids = std::fs::read_to_string(root.path().join("side-writer-pids")).unwrap();
     let mut pids = pids.split_whitespace().map(|pid| pid.parse().unwrap());
     let cli = pids.next().unwrap();
@@ -801,6 +803,99 @@ async fn an_interrupted_writable_side_chat_can_reopen_and_archive_its_parent() {
         session_id: side.id, after: 0.0,
     }).await, Response::Events { session, .. } if session.agent_session_open == Some(false) &&
         session.side_write_pending.as_deref() == Some("side-write")));
+}
+
+#[tokio::test]
+async fn side_write_confirmation_handles_an_actor_without_a_native_process() {
+    let host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let project = terminal_project(&mut client, root.path()).await;
+    let parent = create_session(&mut client, project, "codex").await;
+    send(&mut client, &parent.id, "main-init", "hello").await;
+    wait(&mut client, &parent.id, Status::Completed).await;
+    let side = open_side(&mut client, &parent).await;
+    std::fs::write(root.path().join("fail-side-initialization"), "").unwrap();
+    send_writable_side(
+        &mut client,
+        &side,
+        "never sent",
+        "default",
+        TurnProvider::Cli,
+    )
+    .await;
+    wait(&mut client, &side.id, Status::Failed).await;
+    assert!(matches!(ask(&mut client, Request::Poll {
+        session_id: side.id.clone(), after: 0.0
+    }).await, Response::Events { session, .. } if session.agent_session_open == Some(false) &&
+        session.side_write_pending.as_deref() == Some("side-write")));
+    assert!(matches!(ask(&mut client, Request::ConfirmSideWritesEnded {
+        session_id: side.id, request_id: "side-write".into(),
+    }).await, Response::Session { session } if session.side_write_pending.is_none()));
+}
+
+#[tokio::test]
+async fn main_and_read_only_side_closes_can_be_verified_after_a_restart() {
+    let mut host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let project = terminal_project(&mut client, root.path()).await;
+    let parent = create_session(&mut client, project, "codex").await;
+    send(&mut client, &parent.id, "main-init", "hello").await;
+    wait(&mut client, &parent.id, Status::Completed).await;
+    let side = open_side(&mut client, &parent).await;
+    send(&mut client, &side.id, "read-only", "hello").await;
+    wait(&mut client, &side.id, Status::Completed).await;
+    drop(client);
+
+    // Simulate interruption after the close journal commits and before its
+    // acknowledgement. Use the previous Server's record format as well.
+    let db = rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
+    for id in [&parent.id, &side.id] {
+        db.execute(
+            "INSERT INTO unconfirmed_agent_closes(session_id,reason) VALUES (?1,'close unknown')",
+            [id],
+        )
+        .unwrap();
+    }
+    drop(db);
+    host.process.kill().unwrap();
+    host.process.wait().unwrap();
+    std::fs::remove_file(host.directory.path().join("control.sock")).unwrap();
+    host.process = Host::spawn(host.directory.path(), &[]);
+    host.wait_ready().await;
+    let mut client = host.client().await;
+    for id in [&side.id, &parent.id] {
+        let lookup = || Request::Session {
+            session_id: id.clone(),
+        };
+        let close = || Request::CloseAgentSession {
+            session_id: id.clone(),
+            only_if_idle: Some(false),
+        };
+        let Response::Session { session } = ask(&mut client, lookup()).await else {
+            panic!("session")
+        };
+        assert!(session.side_write_pending.is_none());
+        let close_id = session.agent_close_pending.expect("durable close");
+        assert!(matches!(
+            ask(&mut client, close()).await,
+            Response::Error { .. }
+        ));
+        assert!(matches!(ask(&mut client, Request::ConfirmAgentClosed {
+            session_id: id.clone(), close_id,
+        }).await, Response::Session { session } if session.agent_close_pending.is_none()));
+        assert!(matches!(
+            send(&mut client, id, &format!("resumed-{id}"), "hello").await,
+            Response::Accepted { .. }
+        ));
+        wait(&mut client, id, Status::Completed).await;
+        assert!(matches!(ask(&mut client, close()).await, Response::Ok));
+    }
+    assert!(
+        matches!(ask(&mut client, Request::ArchiveSession { session_id: parent.id, archived: true }).await,
+        Response::Session { session } if session.archived)
+    );
 }
 
 #[tokio::test]

@@ -405,6 +405,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         &request,
         Request::UndoTurnChanges { .. }
             | Request::ConfirmSideWritesEnded { .. }
+            | Request::ConfirmAgentClosed { .. }
             | Request::ArchiveSession { archived: true, .. }
             | Request::RenameSession { .. }
     );
@@ -432,6 +433,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
     let closed_resource = match &request {
         Request::CloseAgentSession { session_id, .. }
         | Request::ConfirmSideWritesEnded { session_id, .. }
+        | Request::ConfirmAgentClosed { session_id, .. }
         | Request::ArchiveSession {
             session_id,
             archived: true,
@@ -840,16 +842,31 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             session_id,
             request_id,
         } => {
+            if db(&s.database, |d| {
+                d.check_side_write_confirmation(&session_id, &request_id)
+            })? {
+                runtime::close(&s.database, &s.runs, &session_id, true).await?;
+            }
+            Response::Session {
+                session: db(&s.database, |d| {
+                    d.confirm_side_writes_ended(&session_id, &request_id)
+                })?,
+            }
+        }
+        Request::ConfirmAgentClosed {
+            session_id,
+            close_id,
+        } => {
             if s.runs
                 .lock()
                 .map_err(|_| anyhow::anyhow!("执行状态锁异常"))?
                 .contains_key(&session_id)
             {
-                bail!("请先关闭侧边聊天的原生会话，再确认后台写入已结束");
+                bail!("原生会话仍由 Server 管理，请先关闭后再确认");
             }
             Response::Session {
                 session: db(&s.database, |d| {
-                    d.confirm_side_writes_ended(&session_id, &request_id)
+                    d.confirm_agent_closed(&session_id, &close_id)
                 })?,
             }
         }
@@ -1291,7 +1308,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             Response::SubagentTranscript { events, truncated }
         }
         Request::Poll { session_id, after } => db(&s.database, |d| {
-            let session = d.with_side_write_state(d.session(&session_id)?)?;
+            let session = d.session(&session_id)?;
             let (events, has_more) = d.events(&session_id, after)?;
             Ok(Response::Events {
                 session,
@@ -1896,6 +1913,25 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         s.lifecycle.forget(&resource)?;
     }
     runtime::refresh_titles(&s.database, &s.runs, &s.title_refresh, &mut response).await?;
+    db(&s.database, |d| {
+        match &mut response {
+            Response::Session { session }
+            | Response::Events { session, .. }
+            | Response::History { session, .. } => d.project_session_recovery(session)?,
+            Response::Sessions { sessions } | Response::SideChatHistory { sessions, .. } => {
+                for session in sessions {
+                    d.project_session_recovery(session)?;
+                }
+            }
+            Response::RecentSessions { sessions, .. } => {
+                for entry in sessions {
+                    d.project_session_recovery(&mut entry.session)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
     runtime::project_session_state(&s.runs, &mut response)?;
     Ok(response)
 }

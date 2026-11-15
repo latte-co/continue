@@ -84,6 +84,10 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub side_write_pending: Option<String>,
+    /// ID of the native close which still needs host-side verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_close_pending: Option<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -644,6 +648,11 @@ pub enum Request {
         session_id: String,
         /// Latest write request observed during verification.
         request_id: String,
+    },
+    /// The user has verified that the native process and its work stopped.
+    ConfirmAgentClosed {
+        session_id: String,
+        close_id: String,
     },
     SendQueued {
         #[serde(default)]

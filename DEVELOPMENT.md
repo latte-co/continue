@@ -1813,12 +1813,17 @@ processes and external tools can keep writing after either normal completion
 or forced close. The host keeps the write interval open until the user verifies
 those tasks have stopped. A confirmed local close can return `SideChatClosed`
 with pending writes, so tabs can close and the parent can be archived. A side
-chat reopened from history displays the pending writes. Once the local runtime
-is closed, `ConfirmSideWritesEnded` verifies the latest pending request ID and
-records the current event sequence as the end boundary. Earlier overlapping
-turns remain protected. Legacy boundaries inferred from CLI completion become
-pending on upgrade. Side chats accept direct messages without native steering
-or a message queue.
+chat reopened from history displays the pending writes. `ConfirmSideWritesEnded`
+verifies the latest pending request ID, closes an idle local runtime when needed,
+and records a verified end separately from legacy inferred boundaries. Only
+verified ends count, including after running an older Server. Earlier overlapping
+turns remain protected. Side chats accept direct messages without native
+steering or a message queue.
+If native close itself was unconfirmed, users can verify the process and its
+work on the execution host, then call `ConfirmAgentClosed` with the recorded
+close ID. This works for main and side chats after Server restart, and the
+Server refuses confirmation while a live actor owns the session. Side-write
+verification remains a separate step when a write interval is pending.
 Launch validation failures and Unix `ENOENT` launch errors leave no write
 interval. The undo error identifies the side chat, so users can check its history
 and use the main turn's saved diff to restore individual changes manually.

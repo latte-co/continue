@@ -141,7 +141,8 @@ impl Store {
         CREATE TABLE IF NOT EXISTS observed_tools(session_id TEXT NOT NULL REFERENCES sessions(id), id TEXT NOT NULL, PRIMARY KEY(session_id,id));
         CREATE TABLE IF NOT EXISTS reference_access(project_id TEXT NOT NULL REFERENCES projects(id), path TEXT NOT NULL, directory INTEGER NOT NULL, PRIMARY KEY(project_id,path));
         CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,text TEXT NOT NULL);")?;
-        let migration = db.unchecked_transaction()?;
+        let migration =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
         let legacy_side_chat = migration.query_row(
             "SELECT pk FROM pragma_table_info('side_chats') WHERE name='parent_id'",
             [],
@@ -156,54 +157,57 @@ impl Store {
         migration.execute_batch("CREATE INDEX IF NOT EXISTS side_chats_parent ON side_chats(parent_id);
         CREATE INDEX IF NOT EXISTS events_recent_activity_v2 ON events(session_id,seq DESC) WHERE json_extract(data,'$.kind') IN ('user','queued_message_sent','text','tool','tool_result','approval','approval_resolved','subagent');
         DROP INDEX IF EXISTS events_recent_activity;")?;
-        migration.commit()?;
-        let columns = db
+        let columns = migration
             .prepare("PRAGMA table_info(requests)")?
             .query_map([], |r| r.get::<_, String>(1))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if !columns.iter().any(|name| name == "model") {
-            db.execute("ALTER TABLE requests ADD COLUMN model TEXT", [])?;
+            migration.execute("ALTER TABLE requests ADD COLUMN model TEXT", [])?;
         }
         if !columns.iter().any(|name| name == "effort") {
-            db.execute("ALTER TABLE requests ADD COLUMN effort TEXT", [])?;
+            migration.execute("ALTER TABLE requests ADD COLUMN effort TEXT", [])?;
         }
         if !columns.iter().any(|name| name == "provider_fingerprint") {
-            db.execute(
+            migration.execute(
                 "ALTER TABLE requests ADD COLUMN provider_fingerprint TEXT",
                 [],
             )?;
         }
         if !columns.iter().any(|name| name == "permission_mode") {
-            db.execute("ALTER TABLE requests ADD COLUMN permission_mode TEXT", [])?;
+            migration.execute("ALTER TABLE requests ADD COLUMN permission_mode TEXT", [])?;
         }
         if !columns.iter().any(|name| name == "side_write_start") {
-            db.execute(
+            migration.execute(
                 "ALTER TABLE requests ADD COLUMN side_write_start INTEGER",
                 [],
             )?;
         }
         if !columns.iter().any(|name| name == "side_write_end") {
-            db.execute("ALTER TABLE requests ADD COLUMN side_write_end INTEGER", [])?;
+            migration.execute("ALTER TABLE requests ADD COLUMN side_write_end INTEGER", [])?;
         }
-        let write_migration = db.unchecked_transaction()?;
-        let has_confirmed_boundaries: bool = write_migration.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='pending_side_writes')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_confirmed_boundaries {
-            // Older Servers considered CLI completion proof of background exit.
-            // Those boundaries must be verified under the new contract.
-            write_migration.execute_batch(
-                "UPDATE requests SET side_write_end=NULL
-                 WHERE side_write_end>0 AND permission_mode IS NOT NULL
-                 AND session_id IN (SELECT session_id FROM side_chats);
-                 CREATE INDEX pending_side_writes ON requests(session_id)
-                 WHERE permission_mode IS NOT NULL AND side_write_end IS NULL;",
+        if !columns.iter().any(|name| name == "side_write_verified_end") {
+            migration.execute(
+                "ALTER TABLE requests ADD COLUMN side_write_verified_end INTEGER",
+                [],
             )?;
         }
-        write_migration.commit()?;
-        db.execute_batch("CREATE INDEX IF NOT EXISTS requests_session_provider ON requests(session_id,provider_fingerprint);")?;
+        // Older versions can still write inferred side_write_end values after a
+        // downgrade. Only zero (never started) and verified ends carry evidence.
+        migration.execute_batch(
+            "CREATE INDEX IF NOT EXISTS unverified_side_writes ON requests(session_id)
+             WHERE permission_mode IS NOT NULL AND side_write_end IS NOT 0 AND side_write_verified_end IS NULL;",
+        )?;
+        if !migration.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('unconfirmed_agent_closes') WHERE name='close_id')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )? {
+            migration.execute("ALTER TABLE unconfirmed_agent_closes ADD COLUMN close_id TEXT", [])?;
+        }
+        // Also assign IDs to records created after rolling back to an old Server.
+        migration.execute("UPDATE unconfirmed_agent_closes SET close_id=lower(hex(randomblob(16))) WHERE close_id IS NULL", [])?;
+        migration.execute_batch("CREATE INDEX IF NOT EXISTS requests_session_provider ON requests(session_id,provider_fingerprint);")?;
+        migration.commit()?;
         crate::message_queue::initialize(&db)?;
         let snapshot_dir = crate::snapshot_storage::prepare(&path.with_extension("snapshots"))?;
         crate::snapshot_migration::migrate(&db, &snapshot_dir)?;
@@ -534,6 +538,7 @@ impl Store {
             agent_session_open: None,
             agent_session_busy: None,
             side_write_pending: None,
+            agent_close_pending: None,
         };
         self.db.execute(
             "INSERT INTO sessions VALUES (?1,?2,?3)",
@@ -1436,14 +1441,20 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT id FROM requests WHERE session_id=?1 AND permission_mode IS NOT NULL
-                AND side_write_end IS NULL ORDER BY rowid DESC LIMIT 1",
+                "SELECT r.id FROM side_chats c JOIN requests r ON r.session_id=c.session_id
+                 WHERE c.session_id=?1 AND r.permission_mode IS NOT NULL
+                 AND r.side_write_end IS NOT 0 AND r.side_write_verified_end IS NULL
+                 ORDER BY r.rowid DESC LIMIT 1",
                 [session_id],
                 |row| row.get(0),
             )
             .optional()?)
     }
-    pub fn confirm_side_writes_ended(&self, session_id: &str, request_id: &str) -> Result<Session> {
+    pub fn check_side_write_confirmation(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<bool> {
         if self.side_parent(session_id)?.is_none() {
             bail!("此操作仅适用于侧边聊天");
         }
@@ -1451,38 +1462,45 @@ impl Store {
             bail!("请先停止侧边聊天，再确认后台写入已结束");
         }
         let pending = self.pending_side_write(session_id)?;
-        if pending.as_deref() != Some(request_id) {
-            if pending.is_none()
-                && self.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM requests WHERE id=?1 AND session_id=?2
-                        AND permission_mode IS NOT NULL AND side_write_end>0)",
-                    params![request_id, session_id],
-                    |row| row.get::<_, bool>(0),
-                )?
-            {
-                return self.with_side_write_state(self.session(session_id)?);
-            }
-            bail!("后台写入记录已变化，请重新核对后确认");
+        if pending.as_deref() == Some(request_id) {
+            return Ok(true);
         }
-        let tx = self.db.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE requests SET side_write_end=(SELECT MAX(seq) FROM events)
-             WHERE session_id=?1 AND permission_mode IS NOT NULL AND side_write_end IS NULL",
-            [session_id],
-        )?;
-        // The same host-side verification resolves a previously unknown close.
-        tx.execute(
-            "DELETE FROM unconfirmed_agent_closes WHERE session_id=?1",
-            [session_id],
-        )?;
-        tx.commit()?;
-        self.with_side_write_state(self.session(session_id)?)
+        if pending.is_none()
+            && self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM requests WHERE id=?1 AND session_id=?2
+                        AND side_write_verified_end IS NOT NULL)",
+                params![request_id, session_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Ok(false);
+        }
+        bail!("后台写入记录已变化，请重新核对后确认");
     }
-    pub fn with_side_write_state(&self, mut session: Session) -> Result<Session> {
-        if self.side_parent(&session.id)?.is_some() {
-            session.side_write_pending = self.pending_side_write(&session.id)?;
+    pub fn confirm_side_writes_ended(&self, session_id: &str, request_id: &str) -> Result<Session> {
+        if !self.check_side_write_confirmation(session_id, request_id)? {
+            return self.session(session_id);
         }
-        Ok(session)
+        self.db.execute(
+            "UPDATE requests SET side_write_verified_end=(SELECT MAX(seq) FROM events),
+                side_write_end=(SELECT MAX(seq) FROM events)
+             WHERE session_id=?1 AND permission_mode IS NOT NULL
+                AND side_write_end IS NOT 0 AND side_write_verified_end IS NULL",
+            [session_id],
+        )?;
+        self.session(session_id)
+    }
+    pub fn project_session_recovery(&self, session: &mut Session) -> Result<()> {
+        session.side_write_pending = self.pending_side_write(&session.id)?;
+        session.agent_close_pending = self
+            .db
+            .query_row(
+                "SELECT close_id FROM unconfirmed_agent_closes WHERE session_id=?1",
+                [&session.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(())
     }
     pub fn unconfirmed_agent_close(&self, id: &str) -> Result<Option<String>> {
         Ok(self
@@ -1496,8 +1514,8 @@ impl Store {
     }
     pub fn record_unconfirmed_agent_close(&self, id: &str, reason: &str) -> Result<()> {
         self.db.execute(
-            "INSERT OR IGNORE INTO unconfirmed_agent_closes(session_id,reason) VALUES (?1,?2)",
-            params![id, reason],
+            "INSERT OR IGNORE INTO unconfirmed_agent_closes(session_id,reason,close_id) VALUES (?1,?2,?3)",
+            params![id, reason, Uuid::new_v4().to_string()],
         )?;
         Ok(())
     }
@@ -1507,6 +1525,21 @@ impl Store {
             [id],
         )?;
         Ok(())
+    }
+    pub fn confirm_agent_closed(&self, id: &str, close_id: &str) -> Result<Session> {
+        let session = self.session(id)?;
+        if session.status.active() {
+            bail!("会话仍在执行，无法确认关闭");
+        }
+        if self.db.execute(
+            "DELETE FROM unconfirmed_agent_closes WHERE session_id=?1 AND close_id=?2",
+            params![id, close_id],
+        )? != 1
+            && self.unconfirmed_agent_close(id)?.is_some()
+        {
+            bail!("关闭记录已变化，请重新核对");
+        }
+        Ok(session)
     }
     pub fn mark_side_write_not_started(&self, request_id: &str) -> Result<()> {
         self.db.execute(
@@ -1531,13 +1564,13 @@ impl Store {
                     (SELECT MIN(seq) FROM events WHERE session_id=?1 AND json_extract(data,'$.kind')='turn_changes'
                         AND json_extract(data,'$.changes.request_id')=?2) AS end_seq
             )
-            SELECT side.session_id, r.side_write_end IS NULL FROM side_chats side
+            SELECT side.session_id, r.side_write_verified_end IS NULL FROM side_chats side
                 JOIN events admitted ON admitted.session_id=side.session_id AND json_extract(admitted.data,'$.kind')='user'
                 JOIN requests r ON r.session_id=side.session_id AND r.id=json_extract(admitted.data,'$.request_id')
                 CROSS JOIN main_turn
-                WHERE side.session_id!=?1 AND r.permission_mode IS NOT NULL
+                WHERE side.session_id!=?1 AND r.permission_mode IS NOT NULL AND r.side_write_end IS NOT 0
                 AND COALESCE(r.side_write_start, admitted.seq) < main_turn.end_seq
-                AND (r.side_write_end IS NULL OR r.side_write_end >= main_turn.start_seq)
+                AND (r.side_write_verified_end IS NULL OR r.side_write_verified_end >= main_turn.start_seq)
                 LIMIT 1",
             params![session_id, request_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2403,7 +2436,7 @@ mod tests {
     }
 
     #[test]
-    fn older_side_write_boundaries_require_verification_after_upgrade() {
+    fn older_side_write_boundaries_require_verification_even_after_downgrade() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.sqlite");
         let mut store = Store::open(&path).unwrap();
@@ -2421,8 +2454,8 @@ mod tests {
         store
             .db
             .execute_batch(
-                "DROP INDEX pending_side_writes;
-             UPDATE requests SET side_write_end=2 WHERE id='finished';",
+                "CREATE INDEX pending_side_writes ON requests(session_id);
+                 UPDATE requests SET side_write_end=2 WHERE id='finished';",
             )
             .unwrap();
         drop(store);
@@ -2437,6 +2470,25 @@ mod tests {
         drop(store);
         let store = Store::open(&path).unwrap();
         assert!(store.pending_side_write(&side.id).unwrap().is_none());
+        store.db.execute(
+            "INSERT INTO requests(id,session_id,text,permission_mode,side_write_start,side_write_end)
+             VALUES ('after-downgrade',?1,'edit','default',3,4)", [&side.id],
+        ).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.pending_side_write(&side.id).unwrap().as_deref(),
+            Some("after-downgrade")
+        );
+        let verified: i64 = store
+            .db
+            .query_row(
+                "SELECT side_write_verified_end FROM requests WHERE id='finished'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(verified > 0);
     }
 
     #[test]
@@ -2464,7 +2516,19 @@ mod tests {
                 .as_deref(),
             Some("background state unknown")
         );
-        store.clear_unconfirmed_agent_close(&session.id).unwrap();
+        let mut session = store.session(&session.id).unwrap();
+        store.project_session_recovery(&mut session).unwrap();
+        let close_id = session.agent_close_pending.take().unwrap();
+        assert!(store.confirm_agent_closed(&session.id, "stale").is_err());
+        store.confirm_agent_closed(&session.id, &close_id).unwrap();
+        store
+            .record_unconfirmed_agent_close(&session.id, "another close")
+            .unwrap();
+        assert!(store.confirm_agent_closed(&session.id, &close_id).is_err());
+        store.project_session_recovery(&mut session).unwrap();
+        store
+            .confirm_agent_closed(&session.id, &session.agent_close_pending.unwrap())
+            .unwrap();
         assert!(
             store
                 .unconfirmed_agent_close(&session.id)

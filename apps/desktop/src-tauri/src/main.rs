@@ -540,6 +540,7 @@ async fn host_request(
             | Request::OpenAgentSession { .. }
             | Request::CloseAgentSession { .. }
             | Request::ConfirmSideWritesEnded { .. }
+            | Request::ConfirmAgentClosed { .. }
     ) {
         Some(state.agent_admission.lock().await)
     } else {
@@ -561,7 +562,8 @@ async fn host_request(
     }
     let closed_agent = match &request {
         Request::CloseAgentSession { session_id, .. }
-        | Request::ConfirmSideWritesEnded { session_id, .. } => {
+        | Request::ConfirmSideWritesEnded { session_id, .. }
+        | Request::ConfirmAgentClosed { session_id, .. } => {
             Some((host_id.clone(), session_id.clone()))
         }
         _ => None,
