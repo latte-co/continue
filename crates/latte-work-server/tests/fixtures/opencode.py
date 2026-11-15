@@ -83,10 +83,26 @@ def sideband():
                                      source={"id": inbox}, resources=["printf fixture"])
                     elif text == "unexpected-eof":
                         os._exit(0)
+                    elif text == "steer-parent":
+                        pass  # Complete only after the test hands off another input.
                     elif text in ("background", "background-question", "nested"):
                         child_prompts(native, text)
                     else:
                         native_done(native, "fixture |reply")
+                elif action == "steer":
+                    inbox = request["messageID"]
+                    pending_permission = inbox
+                    native_done(native, "steered parent finished")
+
+                    def delayed_steering(root=native, inbox=inbox):
+                        await_test_signal("release-steer")
+                        native_event("session.inbox.enqueued", sessionID=root, inboxID=inbox, itemType="user")
+                        native_event("session.execution.started", sessionID=root)
+                        native_event("session.inbox.delivered", sessionID=root, inboxID=inbox)
+                        native_event("permission.asked", sessionID=root, id=inbox, action="shell",
+                                     source={"id": inbox}, resources=["printf delayed"])
+
+                    threading.Thread(target=delayed_steering, daemon=True).start()
                 elif action == "command":
                     assert request["name"] == "project:check"
                     Path(native).write_text("prompted")

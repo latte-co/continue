@@ -1733,6 +1733,12 @@ completion fences project slash commands and autonomous follow-up activity.
 Latte correlates native execution and inbox delivery IDs to distinguish its
 foreground prompts from autonomous user or synthetic inputs submitted by a
 plugin. OpenCode prompt hooks see the original user text and its attachments.
+Steering submissions wake native execution even if a prompt hook finishes after
+the current turn. Their delivery IDs start a tracked successor when needed;
+its approvals, output, usage and terminal outcome use the native event stream.
+Stopping closes the owned process, including in-flight prompt preparation, and
+unconfirmed handed-off inputs remain unreplayed. The real CLI smoke covers
+delayed preparation both after foreground completion and during stop/resume.
 Only a slash name in the execution session's catalog is treated as a command.
 Other slash-prefixed text is sent as an ordinary prompt.
 Compaction uses its ACP completion. OpenCode 2.0 implements `/compact` even

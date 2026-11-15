@@ -181,10 +181,20 @@ def run(binary, cli, llm, root):
         "name": "latte-review-smoke", "type": "module", "exports": "./index.mjs",
     }))
     (plugin / "index.mjs").write_text("""
+import { access, writeFile } from "node:fs/promises";
 export default {
   id: "latte-review-smoke",
   async setup(ctx) {
-    await ctx.session.hook("prompt", (event) => {
+    await ctx.session.hook("prompt", async (event) => {
+      if (event.prompt.text.includes("delayed steer sentinel")) {
+        await writeFile("steer-hook-ready", "ready");
+        const deadline = Date.now() + 10000;
+        while (true) {
+          try { await access("release-steer-hook"); break; } catch {}
+          if (Date.now() > deadline) throw new Error("prompt hook was not released");
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      }
       if (event.prompt.text.includes("Check the prompt rewrite.")) {
         const fileCount = event.prompt.files?.length ?? 0;
         const metadataCount = Object.keys(event.metadata ?? {}).length;
@@ -288,13 +298,26 @@ export default {
             conn.settimeout(25)
             conn.connect(str(sock))
             with conn.makefile("rw") as wire:
-                def rpc(method, **params):
+                def raw_rpc(method, **params):
                     wire.write(json.dumps({"method": method, **params}) + "\n")
                     wire.flush()
                     response = json.loads(wire.readline())
                     if response["kind"] == "error":
                         raise RuntimeError(response["message"])
                     return response
+
+                def rpc(method, **params):
+                    response = raw_rpc(method, **params)
+                    if method != "poll":
+                        return response
+                    events = response["events"][:]
+                    for _ in range(32):
+                        if not response["has_more"]:
+                            return {**response, "events": events}
+                        response = raw_rpc(method, **{**params, "after": events[-1]["seq"]})
+                        assert response["events"], "empty event page with has_more"
+                        events.extend(response["events"])
+                    raise AssertionError("smoke event history exceeded its page budget")
 
                 hello = rpc("hello", version=1)
                 assert any(a["id"] == "opencode" and a["available"] for a in hello["agents"]), hello
@@ -476,6 +499,72 @@ export default {
                 wait("completed")
                 assert not rpc("message_queue", session_id=sid)["entries"]
                 print(version + ": confirmed mid-turn input delivery", flush=True)
+                Model.steering_ready.clear()
+                Model.steering_release.clear()
+                send("late-steer-start", "steer start sentinel", "bypass_permissions")
+                assert Model.steering_ready.wait(5)
+                send("late-steered", "delayed steer sentinel", "bypass_permissions", queued=True)
+                queue = rpc("message_queue", session_id=sid)
+                entry = next(item for item in queue["entries"] if item["request_id"] == "late-steered")
+                rpc("dispatch_queued_message", session_id=sid, request_id="late-steered",
+                    revision=entry["revision"], interrupt=False, provider=provider)
+                deadline = time.monotonic() + 5
+                while not (project / "steer-hook-ready").exists():
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("Delayed steering hook did not start")
+                    time.sleep(.02)
+                Model.steering_release.set()
+                wait("completed")
+                before = len(Model.calls)
+                before_text = text(rpc("poll", session_id=sid, after=0))
+                (project / "release-steer-hook").write_text("release")
+                deadline = time.monotonic() + 8
+                while True:
+                    result = rpc("poll", session_id=sid, after=0)
+                    delivered = any("delayed steer sentinel" in str(call.get("messages", [])[-1:])
+                                    for call in Model.calls[before:])
+                    if delivered and text(result) != before_text and not result["session"]["agent_session_busy"]:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("Steering admitted after foreground completion did not finish visibly")
+                    time.sleep(.05)
+                assert text(result)[len(before_text):] == "OPEN_CODE_SMOKE_OK", result["events"][-8:]
+                assert not rpc("message_queue", session_id=sid)["entries"]
+                print(version + ": delayed steering wakes a tracked successor execution exactly once", flush=True)
+                # Closing while preparation is pending must not admit that input
+                # later, including when the same native session is reopened.
+                original_session = sid
+                sid = rpc("create_session", project_id=pid, agent="opencode")["session"]["id"]
+                (project / "steer-hook-ready").unlink()
+                (project / "release-steer-hook").unlink()
+                Model.steering_ready.clear()
+                Model.steering_release.clear()
+                send("stop-delayed-parent", "steer start sentinel", "bypass_permissions")
+                assert Model.steering_ready.wait(5)
+                send("stop-delayed-input", "delayed steer sentinel cancelled", "bypass_permissions", queued=True)
+                entry = rpc("message_queue", session_id=sid)["entries"][0]
+                rpc("dispatch_queued_message", session_id=sid, request_id=entry["request_id"],
+                    revision=entry["revision"], interrupt=False, provider=provider)
+                deadline = time.monotonic() + 5
+                while not (project / "steer-hook-ready").exists():
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("Cancellation hook did not start")
+                    time.sleep(.02)
+                stopped_native = rpc("session", session_id=sid)["session"]["native_id"]
+                rpc("cancel", session_id=sid)
+                wait("stopped")
+                (project / "release-steer-hook").write_text("release")
+                Model.steering_release.set()
+                before = len(Model.calls)
+                send("after-delayed-cancel", "Continue after cancellation.", "bypass_permissions")
+                resumed = wait("completed")
+                assert resumed["session"]["native_id"] == stopped_native
+                assert all("delayed steer sentinel cancelled" not in json.dumps(call)
+                           for call in Model.calls[before:])
+                assert text(resumed).count("OPEN_CODE_SMOKE_OK") == 1
+                rpc("close_agent_session", session_id=sid, only_if_idle=True)
+                sid = original_session
+                print(version + ": cancellation during a prompt hook cannot replay the input on resume", flush=True)
                 send("background", "background sentinel", "bypass_permissions")
                 wait("completed")
                 deadline = time.monotonic() + 10

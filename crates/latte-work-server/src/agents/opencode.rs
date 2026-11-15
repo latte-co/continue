@@ -14,6 +14,8 @@ mod config;
 mod history;
 mod metadata;
 mod question;
+#[cfg(test)]
+mod tests;
 pub(super) use history::read as child_history;
 pub(crate) use metadata::commands;
 pub(super) use metadata::{discover, models, permission_modes, skill_info};
@@ -496,6 +498,8 @@ impl OpenCode {
                     | "session.tool.called"
                     | "session.tool.success"
                     | "session.tool.failed"
+                    | "session.step.ended"
+                    | "session.step.failed"
                     | "session.execution.succeeded"
                     | "session.execution.failed"
                     | "session.execution.interrupted"
@@ -546,6 +550,10 @@ impl OpenCode {
                     .is_some_and(|(_, id)| data["inboxID"] == *id)
                 {
                     let (request, _) = self.steering.take().expect("matched");
+                    // Native prompt hooks may finish after the original turn.
+                    // In that case this delivery starts a tracked successor,
+                    // with the same output and approval routing as a plugin wake.
+                    self.autonomous_inbox_delivered = true;
                     return Ok(vec![Action::InputsConsumed(vec![request])]);
                 }
                 match foreground {
@@ -639,10 +647,7 @@ impl OpenCode {
                 self.autonomous_inbox_delivered = false;
                 self.possible_followup = self.children.values().any(|active| *active)
                     || !self.background_shells.is_empty();
-                Ok(self.finish(
-                    kind != "session.execution.succeeded",
-                    (kind == "session.execution.failed").then(|| "OpenCode 后续执行失败".into()),
-                ))
+                Ok(self.finish_native_prompt(kind, data))
             }
             "session.execution.succeeded"
             | "session.execution.failed"
@@ -655,7 +660,11 @@ impl OpenCode {
                 self.foreground_inbox_delivered = false;
                 Ok(vec![])
             }
-            "session.step.ended" | "session.step.failed" if self.native_prompt_delivered => {
+            "session.step.ended" | "session.step.failed"
+                if self.native_prompt_delivered
+                    || self.followup
+                    || self.native_command.is_some() =>
+            {
                 self.record_native_usage(data);
                 Ok(vec![])
             }
@@ -707,13 +716,6 @@ impl OpenCode {
     }
 
     fn finish_native_prompt(&mut self, kind: &str, data: &Value) -> Vec<Action> {
-        let mut actions = Vec::new();
-        if let Some(totals) = self.native_usage.take() {
-            actions.push(Action::Event(EventKind::Usage {
-                context: None,
-                totals: Some(totals),
-            }));
-        }
         let message = match kind {
             "session.execution.interrupted" => Some("OpenCode 已取消本轮".into()),
             "session.execution.failed" => Some(data["error"]["message"].as_str().map_or_else(
@@ -726,8 +728,7 @@ impl OpenCode {
         if !self.children.values().any(|active| *active) && self.background_shells.is_empty() {
             self.possible_followup = false;
         }
-        actions.extend(self.finish(message.is_some(), message));
-        actions
+        self.finish(message.is_some(), message)
     }
 
     fn native_question(&mut self, data: &Value, child: Option<&str>) -> Result<Vec<Action>> {
@@ -878,7 +879,12 @@ impl OpenCode {
         self.command_waiting_for_end = false;
         self.command_acknowledged = false;
         let failed = error || self.command_outcome.take() == Some(false);
-        self.finish(failed, failed.then(|| "OpenCode 原生命令执行失败".into()))
+        let message = if failed {
+            Some("OpenCode 原生命令执行失败".into())
+        } else {
+            self.native_stop.take().map(str::to_owned)
+        };
+        self.finish(message.is_some(), message)
     }
 
     fn finish_prompt(&mut self, failed: bool, message: Option<String>) -> Result<Vec<Action>> {
@@ -1185,9 +1191,14 @@ impl OpenCode {
     fn finish(&mut self, failed: bool, message: Option<String>) -> Vec<Action> {
         self.tools.retain(|_, tool| tool.child);
         self.context = None;
-        self.native_usage = None;
         self.native_stop = None;
         let mut actions = Vec::new();
+        if let Some(totals) = self.native_usage.take() {
+            actions.push(Action::Event(EventKind::Usage {
+                context: None,
+                totals: Some(totals),
+            }));
+        }
         if std::mem::take(&mut self.cancelling) {
             self.approvals.clear();
             self.questions.clear();

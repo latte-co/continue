@@ -161,7 +161,9 @@ export default {
             id: request.messageID,
             text: request.text,
             delivery: "steer",
-            resume: action === "prompt",
+            // Preparation can outlive the execution being steered. Ring the
+            // native doorbell even then, so the admitted input cannot be stranded.
+            resume: true,
           });
           if (action === "prompt") promptSubmissions.set(sessionID, submission);
           try {

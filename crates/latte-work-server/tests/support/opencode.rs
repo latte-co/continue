@@ -291,6 +291,88 @@ async fn opencode_permissions_cancel_and_eof_do_not_infer_completion() {
 }
 
 #[tokio::test]
+async fn opencode_delayed_steering_tracks_successor_approval_and_completion() {
+    let host = Host::start().await;
+    let folder = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let project_id = project(&mut client, folder.path()).await;
+    let id = create(&mut client, &project_id).await;
+    assert!(matches!(
+        ask(&mut client, turn(&id, "parent", "steer-parent")).await,
+        Response::Accepted { .. }
+    ));
+    // Reconcile metadata readiness through the existing open call.
+    assert!(matches!(ask(&mut client, open(&id)).await, Response::Ok));
+    assert!(matches!(
+        ask(&mut client, turn(&id, "delayed", "more work")).await,
+        Response::MessageQueued { .. }
+    ));
+    let Response::MessageQueue { entries, .. } = ask(
+        &mut client,
+        Request::MessageQueue {
+            session_id: id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("queue")
+    };
+    let entry = entries
+        .iter()
+        .find(|entry| entry.request_id == "delayed")
+        .unwrap();
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::DispatchQueuedMessage {
+                session_id: id.clone(),
+                request_id: entry.request_id.clone(),
+                revision: entry.revision,
+                interrupt: false,
+                provider: Some(TurnProvider::Cli),
+            }
+        )
+        .await,
+        Response::MessageQueue { .. }
+    ));
+    let events = wait(&mut client, &id, Status::Completed).await;
+    assert!(contains_text(&events, "steered parent finished"));
+    assert!(matches!(
+        ask(&mut client, close(&id, true)).await,
+        Response::Error { .. }
+    ));
+    std::fs::write(folder.path().join("release-steer"), "release").unwrap();
+    let token = permission(&wait(&mut client, &id, Status::Waiting).await);
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::Approve {
+                session_id: id.clone(),
+                request_id: token,
+                allow: true,
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    let events = wait(&mut client, &id, Status::Completed).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |event| matches!(&event.event, EventKind::Text { text } if text == "decision:once")
+            )
+            .count(),
+        1
+    );
+    assert_eq!(events.iter().filter(|event| matches!(&event.event, EventKind::Usage { totals:Some(totals), .. } if totals.output_tokens == Some(3.0))).count(), 2);
+    assert!(matches!(
+        ask(&mut client, close(&id, true)).await,
+        Response::Ok
+    ));
+}
+
+#[tokio::test]
 async fn opencode_project_command_waits_for_native_response_without_sending_a_prompt() {
     let host = Host::start().await;
     let folder = tempfile::tempdir().unwrap();
