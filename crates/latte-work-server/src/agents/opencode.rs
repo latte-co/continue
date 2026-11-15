@@ -23,6 +23,7 @@ const CHILD_CAPABILITY: &str = "opencode/child-session-updates";
 const CHILD_META: &str = "opencode/child-session";
 const MAX_CHILDREN: usize = 512;
 const MAX_TOOLS: usize = 2048;
+const PROMPT_MARKER_MIME: &str = "application/x-latte-work-prompt";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Request {
@@ -57,7 +58,7 @@ pub struct OpenCode {
     child_interactions: HashSet<String>,
     command_children: HashSet<String>,
     inbox_inputs: HashMap<String, bool>,
-    prompt_tag: String,
+    prompt_marker: String,
     acp_input: Option<AcpInput>,
     native_execution_open: bool,
     autonomous_inbox_delivered: bool,
@@ -871,17 +872,22 @@ impl OpenCode {
 
     fn start_prompt(&mut self, text: &str, input: AcpInput) -> Result<Vec<Action>> {
         let session = self.session_id()?.to_owned();
-        let text = if input == AcpInput::Prompt {
-            format!("{}\n{text}", self.prompt_tag)
-        } else {
-            text.into()
-        };
+        let mut prompt = vec![json!({"type":"text","text":text})];
+        if input == AcpInput::Prompt {
+            // ACP preserves embedded resources separately from prompt text.
+            prompt.push(json!({
+                "type": "resource",
+                "resource": {
+                    "uri": format!("data:{PROMPT_MARKER_MIME};base64,{}", self.prompt_marker),
+                    "mimeType": PROMPT_MARKER_MIME,
+                    "blob": self.prompt_marker,
+                }
+            }));
+        }
         let action = self.request(
             Request::Prompt,
             "session/prompt",
-            json!({
-                "sessionId": session, "prompt": [{"type":"text","text":text}]
-            }),
+            json!({"sessionId":session, "prompt":prompt}),
         )?;
         self.acp_input = Some(input);
         self.tools.retain(|_, tool| tool.child);
@@ -1579,12 +1585,14 @@ impl AgentAdapter for OpenCode {
             _directory: directory,
         };
         let instructions = crate::skills::platform_instructions(&config.settings_dir);
-        self.prompt_tag = format!("[latte-work:{}]", uuid::Uuid::new_v4());
+        // The 32 ASCII hex digits are also valid unpadded base64.
+        self.prompt_marker = uuid::Uuid::new_v4().simple().to_string();
+        let marker_uri = format!("data:{PROMPT_MARKER_MIME};base64,{}", self.prompt_marker);
         let (model, settings) = config::configure(
             &mut command,
             config,
             &instructions,
-            Some((&sideband, &self.prompt_tag)),
+            Some((&sideband, &marker_uri)),
         )?;
         self.model = model;
         Ok(AgentCommand {

@@ -13,15 +13,17 @@ export default {
         event.system.push({ type: "text", text });
       });
     }
-    // ACP assigns its own native inbox ID. Carry a process-local tag through
-    // ACP, remove it before admission, and correlate the resulting inbox ID.
-    const promptTag = ctx.options.promptTag + "\n";
+    // ACP assigns the native inbox ID. Read our embedded resource independently
+    // of text hooks and remove it before OpenCode materializes attachments.
+    const markerUri = ctx.options.promptMarkerUri;
     await ctx.session.hook("prompt", (event) => {
-      if (!event.prompt.text.startsWith(promptTag)) return;
-      event.prompt.text = event.prompt.text.slice(promptTag.length);
+      const files = event.prompt.files;
+      if (!files?.some((file) => file.uri === markerUri)) return;
+      const retained = files.filter((file) => file.uri !== markerUri);
+      event.prompt.files = retained.length ? retained : undefined;
       event.metadata = {
         ...event.metadata,
-        latteWorkPrompt: ctx.options.promptTag,
+        latteWorkPrompt: markerUri,
       };
     });
     if (ctx.options.permissionMode) {
@@ -92,8 +94,7 @@ export default {
                   inboxID,
                   itemType: item.type,
                   foreground:
-                    item.payload.metadata?.latteWorkPrompt ===
-                    ctx.options.promptTag,
+                    item.payload.metadata?.latteWorkPrompt === markerUri,
                 },
               });
           } else if (type === "session.created") {

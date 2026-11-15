@@ -208,9 +208,9 @@ for line in sys.stdin:
         if not text.startswith("/compact"):
             config = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])
             plugin = next(p for p in config["plugins"] if "socket" in p.get("options", {}))
-            tag = plugin["options"]["promptTag"] + "\n"
-            assert text.startswith(tag), text
-            text = text[len(tag):]
+            kind, resource = params["prompt"][1]["type"], params["prompt"][1]["resource"]
+            assert kind == "resource"
+            assert resource["uri"] == plugin["options"]["promptMarkerUri"]
         Path(session).write_text("prompted")
         with Path("prompts").open("a") as log:
             log.write(f"{session}:{model}:{effort}:{text}\n")

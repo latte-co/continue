@@ -53,7 +53,7 @@ pub(super) fn configure(
             );
         Some(file)
     };
-    if let Some((sideband, prompt_tag)) = sideband {
+    if let Some((sideband, prompt_marker_uri)) = sideband {
         ensure!(
             matches!(
                 config.permission_mode.as_deref(),
@@ -73,7 +73,7 @@ pub(super) fn configure(
                 "options": {
                     "socket": (directory.join("events").to_str().context("OpenCode Socket 路径不是 UTF-8")?),
                     "permissionMode": (config.permission_mode.as_deref().unwrap_or_default()),
-                    "promptTag": (prompt_tag),
+                    "promptMarkerUri": (prompt_marker_uri),
                     "instructions": (instructions.unwrap_or_default())
                 }
             }));

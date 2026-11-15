@@ -86,6 +86,9 @@ class Model(BaseHTTPRequestHandler):
         elif "plugin watch report" in str(last["content"]):
             delta = {"role": "assistant", "content": "PLUGIN_WATCH_OK"}
             finish = "stop"
+        elif "Check the prompt rewrite." in str(last["content"]):
+            delta = {"role": "assistant", "content": "PROMPT_REWRITE_OK"}
+            finish = "stop"
         elif last["role"] == "tool":
             delta = {"role": "assistant", "content": "TOOL_SMOKE_OK"}
             finish = "stop"
@@ -181,6 +184,10 @@ def run(binary, cli, llm, root):
 export default {
   id: "latte-review-smoke",
   async setup(ctx) {
+    await ctx.session.hook("prompt", (event) => {
+      if (event.prompt.text.includes("Check the prompt rewrite."))
+        event.prompt.text = "Context added by a project plugin.\\n" + event.prompt.text;
+    });
     await ctx.permission.hook("evaluate", (event) => {
       if (event.action === "question" && event.agent === "smoke-restricted")
         event.effect = "deny";
@@ -374,6 +381,16 @@ export default {
                 assert "Second smoke turn after resume." in submitted
                 assert not any("[latte-work:" in json.dumps(call) for call in Model.calls)
                 print(version + ": streamed turns and native close/resume", flush=True)
+
+                before = len(Model.calls)
+                send("rewrite-prompt", "Check the prompt rewrite.")
+                rewritten = wait("completed")
+                assert text(rewritten).count("PROMPT_REWRITE_OK") == 1
+                submitted = [call["messages"][-1]["content"] for call in Model.calls[before:]]
+                assert "Context added by a project plugin.\nCheck the prompt rewrite." in submitted, submitted
+                assert all("application/x-latte-work-prompt" not in json.dumps(call)
+                           for call in Model.calls[before:])
+                print(version + ": project prompt hook preserves ACP ownership and model input", flush=True)
 
                 named = rpc("create_session", project_id=pid, agent="opencode")["session"]["id"]
                 rpc("rename_session", session_id=named, title="Initial OpenCode title", provider=provider)
