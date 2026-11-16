@@ -14,6 +14,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   isSubagentPanelCommand,
   appCommandAction,
+  supportsSideChatAgent,
   hasCommandArguments,
   subagentPanelArgumentNotice,
 } from "./composerActions";
@@ -789,7 +790,14 @@ export function useWorkbench() {
     };
   }, [sessionId, hostId, connected]);
   useEffect(() => {
-    if (!native || !connected || !sessionId || !session || session.archived)
+    if (
+      !native ||
+      !connected ||
+      !sessionId ||
+      !session ||
+      session.archived ||
+      session.agent_close_pending
+    )
       return;
     const targetHost = hostId,
       targetId = sessionId;
@@ -853,6 +861,7 @@ export function useWorkbench() {
     sessionId,
     connected,
     session?.archived,
+    session?.agent_close_pending,
     restoreVersions[hostId],
   ]);
   function updateSession(targetHostId: string, value: Session) {
@@ -872,7 +881,8 @@ export function useWorkbench() {
   async function sessionAction(targetHostId: string, action: Request) {
     const result = await request(targetHostId, action);
     if (
-      (action.method === "close_agent_session" && result.kind === "ok") ||
+      (action.method === "close_agent_session" &&
+        (result.kind === "ok" || result.kind === "side_chat_closed")) ||
       (action.method === "archive_session" &&
         action.archived &&
         result.kind === "session" &&
@@ -918,7 +928,9 @@ export function useWorkbench() {
       }
     }
     if (result.kind === "session") updateSession(targetHostId, result.session);
-    else if (result.kind !== "ok") throw new Error("会话操作失败");
+    else if (result.kind !== "ok" && result.kind !== "side_chat_closed")
+      throw new Error("会话操作失败");
+    return result;
   }
   function openSession(target: HostedSession) {
     if (modal === "skills") setModal(null);
@@ -1104,9 +1116,8 @@ export function useWorkbench() {
     model: string | null,
     effort: Effort | null,
     permission_mode: string | null,
-    uiAction?: "subagents",
   ): Promise<boolean> {
-    if (project && (uiAction === "subagents" || isSubagentPanelCommand(text))) {
+    if (project && isSubagentPanelCommand(text)) {
       openSubagents(workspaceId);
       if (hasCommandArguments(text)) {
         setError(subagentPanelArgumentNotice);
@@ -1115,7 +1126,15 @@ export function useWorkbench() {
       setError("");
       return true;
     }
-    const appAction = appCommandAction(text);
+    const appAction = appCommandAction(
+      text,
+      [],
+      supportsSideChatAgent(session?.agent ?? agent?.id ?? ""),
+    );
+    if (appAction === "side") {
+      setError("请从当前主会话打开侧边聊天。");
+      return false;
+    }
     if (appAction === "model" || appAction === "effort") {
       setError("请通过输入区的模型菜单选择模型或思考强度。");
       return false;
@@ -1403,6 +1422,8 @@ export function useWorkbench() {
     hostId,
     setHostId,
     connected,
+    supportsSideChat: cachedHello(host)?.side_chat_controls === true,
+    supportsClaudeSideChat: cachedHello(host)?.claude_side_chat === true,
     connectionLost: connectedHosts.current.has(hostId),
     agentSessionTransitions,
     agentSessionState: (target: HostedSession) =>

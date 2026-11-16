@@ -546,6 +546,25 @@ it("retains history and an ambiguous send request ID without automatically repla
   expect(hook.result.current.admissionNotice).toBeUndefined();
 });
 
+it("returns a side close acknowledgement without clearing the selected main conversation", async () => {
+  const { result } = renderHook(() => useWorkbench());
+  await act(async () => {});
+  await act(async () =>
+    result.current.openSession({ ...session(), hostId: "local" }),
+  );
+  mocks.request.mockResolvedValueOnce({ kind: "side_chat_closed" });
+  await act(async () => {
+    expect(
+      await result.current.sessionAction("local", {
+        method: "close_agent_session",
+        session_id: "side",
+        only_if_idle: false,
+      }),
+    ).toEqual({ kind: "side_chat_closed" });
+  });
+  expect(result.current.sessionId).toBe("s");
+});
+
 it("opens selected Agent sessions and closes explicitly without reopening on refresh", async () => {
   const { result } = renderHook(() => useWorkbench());
   await act(async () => {});
@@ -1110,13 +1129,7 @@ it.each([
     mocks.request.mockClear();
     let accepted = true;
     await act(async () => {
-      accepted = await hook.result.current.send(
-        text,
-        null,
-        null,
-        null,
-        "subagents",
-      );
+      accepted = await hook.result.current.send(text, null, null, null);
     });
     expect(accepted).toBe(false);
     expect(hook.result.current.sessionId).toBe("");
@@ -1129,26 +1142,6 @@ it.each([
     expect(mocks.request).not.toHaveBeenCalled();
   },
 );
-
-it("treats adapter-provided UI hints as local navigation before any session creation", async () => {
-  const hook = renderHook(useWorkbench);
-  await act(async () => {});
-  mocks.request.mockClear();
-  await act(async () => {
-    expect(
-      await hook.result.current.send(
-        "/native-list",
-        null,
-        null,
-        null,
-        "subagents",
-      ),
-    ).toBe(true);
-  });
-  expect(hook.result.current.sessionId).toBe("");
-  expect(hook.result.current.workspace.current).toBe("subagents");
-  expect(mocks.request).not.toHaveBeenCalled();
-});
 
 it.each(["/list-agents", "/agents", "/tasks", "/subagents"])(
   "opens %s without creating a conversation or sending an agent request",

@@ -6,7 +6,19 @@ import {
 } from "./projectSessions";
 import type { Session } from "./protocol";
 const mocks = vi.hoisted(() => ({ request: vi.fn() }));
-vi.mock("./api", () => ({ request: mocks.request, message: String }));
+vi.mock("./api", () => ({
+  request: mocks.request,
+  message: String,
+  ServerRequestError: class extends Error {
+    constructor(
+      public readonly code: string,
+      message: string,
+    ) {
+      super(message);
+    }
+  },
+}));
+import { ServerRequestError } from "./api";
 const session = (id: string, patch = {}) =>
   ({
     id,
@@ -17,27 +29,26 @@ const session = (id: string, patch = {}) =>
     ...patch,
   }) as Session;
 beforeEach(() => vi.clearAllMocks());
-it("includes pinned and unselected open sessions and excludes closed history", async () => {
+it("reads managed actors without enumerating bounded parent history", async () => {
   mocks.request.mockResolvedValue({
-    kind: "sessions",
-    sessions: [
-      session("pinned", { pinned_at: 1 }),
-      session("other"),
-      session("history", { agent_session_open: false }),
-    ],
+    kind: "project_agent_sessions",
+    next: null,
+    sessions: [session("pinned", { pinned_at: 1 }), session("other")],
   });
   expect((await openProjectSessions("remote", "p")).map((s) => s.id)).toEqual([
     "pinned",
     "other",
   ]);
   expect(mocks.request).toHaveBeenCalledWith("remote", {
-    method: "sessions",
+    method: "project_agent_sessions",
     project_id: "p",
+    after: null,
   });
 });
 it("does not infer closed state from older servers or task completion", async () => {
   mocks.request.mockResolvedValue({
-    kind: "sessions",
+    kind: "project_agent_sessions",
+    next: null,
     sessions: [session("old", { agent_session_open: undefined })],
   });
   await expect(openProjectSessions("remote", "p")).rejects.toThrow(
@@ -83,4 +94,64 @@ it("reports partial failures and retries only failed sessions on their host", as
     ["remote", "b"],
     ["remote", "b"],
   ]);
+});
+
+it("reads all managed pages including processless actors and side chats", async () => {
+  mocks.request.mockImplementation(async (_host, action) => {
+    return action.after === null
+      ? {
+          kind: "project_agent_sessions",
+          sessions: [session("a-processless", { agent_session_open: false })],
+          next: "a-processless",
+        }
+      : {
+          kind: "project_agent_sessions",
+          sessions: [
+            session("running-side", {
+              status: "running",
+              agent_session_busy: true,
+            }),
+          ],
+          next: null,
+        };
+  });
+  const sessions = await openProjectSessions("remote", "p");
+  expect(sessions.map((s) => s.id)).toEqual(["a-processless", "running-side"]);
+  expect(needsCloseConfirmation(sessions)).toBe(true);
+  expect(mocks.request).toHaveBeenCalledWith("remote", {
+    method: "project_agent_sessions",
+    project_id: "p",
+    after: "a-processless",
+  });
+  const close = vi
+    .fn()
+    .mockResolvedValueOnce({ kind: "ok" })
+    .mockResolvedValueOnce({ kind: "side_chat_closed" });
+  const result = await closeProjectSessions("remote", "p", sessions, close);
+  expect(result.closed).toEqual(["a-processless", "running-side"]);
+  expect(result.failed).toEqual([]);
+  expect(result.pendingWrites.map((s) => s.id)).toEqual(["running-side"]);
+});
+
+it("fails incomplete side inventory instead of closing a partial project", async () => {
+  mocks.request.mockImplementation(async () => {
+    return {
+      kind: "project_agent_sessions",
+      sessions: [session("side")],
+      next: "same",
+    };
+  });
+  await expect(openProjectSessions("remote", "p")).rejects.toThrow(
+    "分页未前进",
+  );
+});
+
+it("requires an updated server rather than claiming a capped history is complete", async () => {
+  mocks.request.mockImplementation(async () => {
+    throw new ServerRequestError("invalid_request", "unknown method");
+  });
+  await expect(openProjectSessions("remote", "p")).rejects.toThrow(
+    "更新 Server",
+  );
+  expect(mocks.request).toHaveBeenCalledTimes(1);
 });

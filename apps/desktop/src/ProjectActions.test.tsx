@@ -40,8 +40,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   rows = [session("pinned"), session("other")];
   mocks.request.mockImplementation(async () => ({
-    kind: "sessions",
+    kind: "project_agent_sessions",
     sessions: rows,
+    next: null,
   }));
   mocks.closeSession.mockResolvedValue(undefined);
 });
@@ -123,4 +124,38 @@ it("shows unavailable live evidence instead of inventing a zero count", async ()
   }) as HTMLButtonElement;
   expect(button.disabled).toBe(true);
   expect(mocks.closeSession).not.toHaveBeenCalled();
+});
+
+it("confirms and closes a running side chat, preserving the pending-write notice", async () => {
+  rows = [{ ...session("main"), native_id: "native-main" }];
+  const side = { ...session("side", true), status: "running" as const };
+  mocks.request.mockResolvedValue({
+    kind: "project_agent_sessions",
+    sessions: [...rows, side],
+    next: null,
+  });
+  mocks.closeSession.mockImplementation(async (_host, action) => ({
+    kind: action.session_id === "side" ? "side_chat_closed" : "ok",
+  }));
+  const p = props();
+  render(<ProjectActions {...p} />);
+  fireEvent.click(
+    await screen.findByRole("menuitem", { name: "关闭全部对话（2）" }),
+  );
+  await screen.findByRole("dialog", { name: "关闭全部对话" });
+  expect(mocks.closeSession).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "关闭全部" }));
+  await screen.findByText(/side：本地会话已关闭，后台写入待确认/);
+  expect(
+    mocks.closeSession.mock.calls.map(([, action]) => [
+      action.session_id,
+      action.only_if_idle,
+    ]),
+  ).toEqual([
+    ["main", false],
+    ["side", false],
+  ]);
+  expect(p.close).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "完成" }));
+  expect(p.close).toHaveBeenCalledOnce();
 });

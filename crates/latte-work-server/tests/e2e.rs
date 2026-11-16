@@ -5,6 +5,8 @@ mod codex_e2e;
 mod environment_e2e;
 #[path = "support/opencode.rs"]
 mod opencode_e2e;
+#[path = "support/side_chat.rs"]
+mod side_chat_e2e;
 #[path = "support/ssh.rs"]
 mod ssh_e2e;
 #[path = "support/titles.rs"]
@@ -35,12 +37,18 @@ impl Host {
             .prefix("lw-")
             .tempdir_in("/tmp")
             .unwrap();
+        let process = Self::spawn(directory.path(), env);
+        let host = Self { directory, process };
+        host.wait_ready().await;
+        host
+    }
+    fn spawn(directory: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Child {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude.py");
-        let process = Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+        Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
             .env("LATTE_WORK_AGENT_ENV", "inherit")
             .arg("serve")
             .arg("--state-dir")
-            .arg(directory.path())
+            .arg(directory)
             .env("LATTE_WORK_CLAUDE", fixture)
             .env(
                 "LATTE_WORK_TRAEX",
@@ -54,20 +62,20 @@ impl Host {
                 "LATTE_WORK_OPENCODE",
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opencode.py"),
             )
-            .env("CLAUDE_CONFIG_DIR", directory.path().join("claude-config"))
+            .env("CLAUDE_CONFIG_DIR", directory.join("claude-config"))
             .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .unwrap();
-        let host = Self { directory, process };
+            .unwrap()
+    }
+    async fn wait_ready(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !host.directory.path().join("control.sock").exists() {
+        while !self.directory.path().join("control.sock").exists() {
             assert!(Instant::now() < deadline, "server readiness timeout");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        host
     }
     async fn client(&self) -> Client {
         Client::local(

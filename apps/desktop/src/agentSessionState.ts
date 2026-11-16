@@ -13,6 +13,7 @@ export function agentSessionState(
   transition?: AgentSessionTransition,
   selected = false,
 ): AgentSessionState {
+  if (session.agent_close_pending) return "unknown";
   if (!connected)
     return session.agent_session_open === true || transition || selected
       ? "unknown"

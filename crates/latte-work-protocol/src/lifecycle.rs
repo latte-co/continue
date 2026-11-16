@@ -2,6 +2,9 @@
 //! These control messages are native-only and deliberately excluded from the WebView API.
 use serde::{Deserialize, Serialize};
 
+/// Maximum resources in one native lifecycle RPC, not a limit on a quit journal.
+pub const RESOURCE_BATCH_LIMIT: usize = 128;
+
 /// One live resource claimed by a specific desktop App instance. Not durable chat state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]

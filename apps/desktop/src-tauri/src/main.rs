@@ -539,6 +539,9 @@ async fn host_request(
             | Request::ResumeMessageQueue { .. }
             | Request::OpenAgentSession { .. }
             | Request::CloseAgentSession { .. }
+            | Request::ConfirmSideWritesEnded { .. }
+            | Request::ConfirmAgentClosed { .. }
+            | Request::ArchiveSession { archived: true, .. }
     ) {
         Some(state.agent_admission.lock().await)
     } else {
@@ -558,10 +561,23 @@ async fn host_request(
             .entry((host_id.clone(), session_id.clone()))
             .or_insert_with(|| "open".into());
     }
-    let closed_agent = if let Request::CloseAgentSession { session_id, .. } = &request {
-        Some((host_id.clone(), session_id.clone()))
+    let confirms_side_writes = matches!(request, Request::ConfirmSideWritesEnded { .. });
+    let archive_targets = if let Request::ArchiveSession {
+        session_id,
+        archived: true,
+    } = &request
+    {
+        Some(archive_targets(&client, session_id).await?)
     } else {
         None
+    };
+    let closed_agent = match &request {
+        Request::CloseAgentSession { session_id, .. }
+        | Request::ConfirmSideWritesEnded { session_id, .. }
+        | Request::ConfirmAgentClosed { session_id, .. } => {
+            Some((host_id.clone(), session_id.clone()))
+        }
+        _ => None,
     };
     if let Request::Send {
         session_id,
@@ -675,8 +691,8 @@ async fn host_request(
             latte_work_protocol::lifecycle::Resource::Terminal(key.1),
         ));
     }
-    if matches!(response, Response::Ok)
-        && let Some(key) = closed_agent
+    if let Some(key) = closed_agent
+        && acknowledges_agent_close(&response, confirms_side_writes)
     {
         state.turns.lock().await.remove(&key);
         state.owned_instances.lock().await.remove(&(
@@ -684,7 +700,71 @@ async fn host_request(
             latte_work_protocol::lifecycle::Resource::AgentSession(key.1),
         ));
     }
+    if let Some(ids) = archive_targets
+        && matches!(&response, Response::Session { session } if session.archived && session.agent_session_open == Some(false))
+    {
+        forget_archived_sessions(&state, &host_id, &ids).await;
+    }
     ui_response(response)
+}
+async fn archive_targets(client: &Arc<Mutex<Client>>, parent: &str) -> Result<Vec<String>, String> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut ids = vec![parent.to_owned()];
+        let mut before = None;
+        let mut cursors = std::collections::HashSet::new();
+        loop {
+            let response = client
+                .lock()
+                .await
+                .request(Request::SideChatHistory {
+                    session_id: parent.to_owned(),
+                    before,
+                })
+                .await
+                .map_err(|e| format!("{e:#}"))?;
+            match response {
+                Response::SideChatHistory { sessions, next } => {
+                    if let Some(cursor) = &next
+                        && (sessions.is_empty() || !cursors.insert(cursor.clone()))
+                    {
+                        return Err("侧边聊天历史分页未前进，未归档".into());
+                    }
+                    ids.extend(sessions.into_iter().map(|s| s.id));
+                    before = next;
+                    if before.is_none() {
+                        return Ok(ids);
+                    }
+                }
+                // Older hosts without side chats still support main archive.
+                Response::Error { code, .. } if code == "invalid_request" => return Ok(ids),
+                Response::Error { message, .. } => return Err(message),
+                _ => return Err("无法核对归档会话，未归档".into()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "读取归档会话超时，未归档".to_owned())?
+}
+async fn forget_archived_sessions(state: &Connections, host: &str, ids: &[String]) {
+    let mut turns = state.turns.lock().await;
+    let mut owned = state.owned_instances.lock().await;
+    for id in ids {
+        turns.remove(&(host.to_owned(), id.clone()));
+        owned.remove(&(
+            host.to_owned(),
+            latte_work_protocol::lifecycle::Resource::AgentSession(id.clone()),
+        ));
+    }
+}
+fn acknowledges_agent_close(response: &Response, confirms_side_writes: bool) -> bool {
+    if confirms_side_writes {
+        return matches!(response, Response::Session { session }
+            if session.agent_closed_by_confirmation == Some(true));
+    }
+    matches!(
+        response,
+        Response::Ok | Response::SideChatClosed | Response::Session { .. }
+    )
 }
 fn ui_response(response: Response) -> Result<Response, String> {
     if matches!(response, Response::ProviderSnapshot { .. }) {
@@ -1307,6 +1387,114 @@ fn main() {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn archived_family_is_removed_from_quit_tracking_without_touching_other_hosts() {
+        use latte_work_protocol::lifecycle::Resource;
+        let state = Connections::default();
+        let ids: Vec<_> = (0..129).map(|n| format!("family-{n}")).collect();
+        for host in ["local", "remote"] {
+            for id in &ids {
+                state
+                    .turns
+                    .lock()
+                    .await
+                    .insert((host.into(), id.clone()), "request".into());
+                state.owned_instances.lock().await.insert(
+                    (host.into(), Resource::AgentSession(id.clone())),
+                    "server".into(),
+                );
+            }
+        }
+        state
+            .turns
+            .lock()
+            .await
+            .insert(("remote".into(), "other".into()), "request".into());
+        forget_archived_sessions(&state, "remote", &ids).await;
+        assert_eq!(state.turns.lock().await.len(), 130);
+        assert_eq!(state.owned_instances.lock().await.len(), 129);
+        assert!(
+            !state
+                .turns
+                .lock()
+                .await
+                .contains_key(&("remote".into(), ids[0].clone()))
+        );
+        assert!(matches!(
+            request_channels::lane(&Request::ArchiveSession {
+                session_id: "parent".into(),
+                archived: true
+            }),
+            request_channels::Lane::Control
+        ));
+    }
+
+    #[tokio::test]
+    async fn archive_snapshot_reads_all_child_pages_without_opening_or_sending() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("lw-archive-pages-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let binary = directory.join("bridge");
+        std::fs::write(&binary, r#"#!/usr/bin/env python3
+import sys,json
+for line in sys.stdin:
+    r=json.loads(line)
+    if r['method']=='hello': out={'kind':'hello','version':1,'server_id':'fixture','agents':[]}
+    elif r['method']=='side_chat_history':
+        assert r['session_id']=='parent'
+        start=0 if r['before'] is None else 100
+        end=100 if start==0 else 129
+        rows=[{'id':f'side-{n}','project_id':'p','title':'side','agent':'codex','status':'completed','created_at':0} for n in range(start,end)]
+        out={'kind':'side_chat_history','sessions':rows,'next':'side-99' if start==0 else None}
+    else: raise AssertionError(r)
+    print(json.dumps(out),flush=True)
+"#).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let client = Arc::new(Mutex::new(
+            Client::local(&binary, Some(&directory)).await.unwrap(),
+        ));
+        let ids = archive_targets(&client, "parent").await.unwrap();
+        assert_eq!(ids.len(), 130);
+        assert_eq!(ids[0], "parent");
+        assert_eq!(ids[129], "side-128");
+        drop(client);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn side_write_confirmation_releases_ownership_only_with_a_close_acknowledgement() {
+        let response: Response = serde_json::from_value(serde_json::json!({
+            "kind": "session",
+            "session": {
+                "id": "side", "project_id": "project", "title": "Side", "agent": "codex",
+                "status": "completed", "created_at": 0,
+            },
+        }))
+        .unwrap();
+        let Response::Session { mut session } = response else {
+            panic!("session response");
+        };
+        assert!(!acknowledges_agent_close(
+            &Response::Session {
+                session: session.clone()
+            },
+            true
+        ));
+        session.agent_closed_by_confirmation = Some(false);
+        assert!(!acknowledges_agent_close(
+            &Response::Session {
+                session: session.clone()
+            },
+            true
+        ));
+        session.agent_closed_by_confirmation = Some(true);
+        assert!(acknowledges_agent_close(
+            &Response::Session { session },
+            true
+        ));
+    }
 
     #[test]
     fn native_provider_snapshots_cannot_reach_the_webview() {

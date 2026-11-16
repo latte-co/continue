@@ -41,15 +41,16 @@ export function SessionActions({
   close: () => void;
   state: Workbench;
 }) {
-  const [view, setView] = useState<"menu" | "rename" | "copy" | "transcript">(
-    "menu",
-  );
+  const [view, setView] = useState<
+    "menu" | "rename" | "copy" | "transcript" | "confirm-close"
+  >("menu");
   const [title, setTitle] = useState(session.title);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [markdown, setMarkdown] = useState("");
   const [copied, setCopied] = useState(false);
   const [position, setPosition] = useState(point);
+  const [closeId, setCloseId] = useState<string>();
   const menu = useRef<HTMLDivElement>(null);
   const opener = useRef(document.activeElement as HTMLElement | null);
   useEffect(
@@ -280,6 +281,19 @@ export function SessionActions({
               复制…
             </button>
             <div role="separator" />
+            {session.agent_close_pending && (
+              <button
+                role="menuitem"
+                disabled={busy || active}
+                onClick={() => {
+                  setCloseId(session.agent_close_pending);
+                  setView("confirm-close");
+                }}
+              >
+                <Check size={17} />
+                核对原生会话关闭
+              </button>
+            )}
             {active && (
               <button
                 role="menuitem"
@@ -337,6 +351,12 @@ export function SessionActions({
       </div>,
       document.body,
     );
+  const dialogTitle =
+    view === "rename"
+      ? "重命名会话"
+      : view === "confirm-close"
+        ? "核对原生会话关闭"
+        : "复制对话";
   return createPortal(
     <div
       className="modal-backdrop"
@@ -348,7 +368,7 @@ export function SessionActions({
         className="modal"
         role="dialog"
         aria-modal="true"
-        aria-label={view === "rename" ? "重命名会话" : "复制对话"}
+        aria-label={dialogTitle}
       >
         <button
           className="modal-close icon-button"
@@ -358,7 +378,7 @@ export function SessionActions({
         >
           <X size={18} />
         </button>
-        <h2>{view === "rename" ? "重命名会话" : "复制对话"}</h2>
+        <h2>{dialogTitle}</h2>
         {view === "rename" ? (
           <form
             onSubmit={(e) => {
@@ -396,6 +416,38 @@ export function SessionActions({
               </button>
             </div>
           </form>
+        ) : view === "confirm-close" ? (
+          <>
+            <p className="form-note">
+              请先在执行主机上确认原生进程和后台任务已停止，再继续会话。
+            </p>
+            {error && (
+              <div className="form-error" role="alert">
+                {error}
+              </div>
+            )}
+            <div className="modal-actions">
+              <button className="secondary" disabled={busy} onClick={close}>
+                取消
+              </button>
+              <button
+                className="primary"
+                disabled={
+                  busy || !closeId || closeId !== session.agent_close_pending
+                }
+                onClick={() =>
+                  closeId &&
+                  run({
+                    method: "confirm_agent_closed",
+                    session_id: id,
+                    close_id: closeId,
+                  })
+                }
+              >
+                我已核对，确认关闭
+              </button>
+            </div>
+          </>
         ) : (
           <>
             <p className="form-note">

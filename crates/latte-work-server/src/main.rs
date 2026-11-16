@@ -292,10 +292,11 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(MAX_FRAME));
     let mut ready = false;
+    let mut claims = upgrade::ConnectionClaims::default();
     while let Some(line) = lines.next().await {
         let line = line?;
         if let Ok(request) = serde_json::from_str::<upgrade::Request>(&line) {
-            let response = upgrade::handle(&service, request).await;
+            let response = upgrade::handle(&service, request, &mut claims).await;
             let mut bytes = serde_json::to_vec(&response)?;
             bytes.push(b'\n');
             let written =
@@ -332,6 +333,8 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
                             skill_management: true,
                             skill_file_import: true,
                             change_preview: true,
+                            side_chat_controls: true,
+                            claude_side_chat: true,
                         }
                     } else {
                         Response::Error {
@@ -340,10 +343,12 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
                         }
                     }
                 }
-                Ok(request) if ready => match dispatch(&service, request).await {
+                Ok(request) if ready => match dispatch(&service, request, &mut claims).await {
                     Ok(response) => response,
                     Err(error) => Response::Error {
-                        code: if error.is::<files::NotGitRepository>() {
+                        code: if error.is::<runtime::AdmissionUnknown>() {
+                            "admission_unknown"
+                        } else if error.is::<files::NotGitRepository>() {
                             "not_git_repository"
                         } else {
                             "request_failed"
@@ -374,7 +379,11 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
     }
     Ok(())
 }
-async fn dispatch(s: &Service, request: Request) -> Result<Response> {
+async fn dispatch(
+    s: &Service,
+    request: Request,
+    claims: &mut upgrade::ConnectionClaims,
+) -> Result<Response> {
     let allow_queue = matches!(&request, Request::SendQueued { .. });
     let request = match request {
         Request::SendQueued {
@@ -396,12 +405,35 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         },
         other => other,
     };
-    // Undo and archive hold exclusive admission through their durable result.
+    // Capture before waiting on admission or the actor. Cleanup must never erase
+    // a later ClaimResources/AdoptResources, including one from the same App.
+    let closing_resource = match &request {
+        Request::CloseAgentSession { session_id, .. }
+        | Request::ConfirmSideWritesEnded { session_id, .. }
+        | Request::ConfirmAgentClosed { session_id, .. }
+        | Request::ArchiveSession {
+            session_id,
+            archived: true,
+        } => Some(upgrade::Resource::AgentSession(session_id.clone())),
+        Request::CloseTerminal { terminal_id } => {
+            Some(upgrade::Resource::Terminal(terminal_id.clone()))
+        }
+        _ => None,
+    };
+    let closing_claim = closing_resource
+        .as_ref()
+        .map(|resource| s.lifecycle.claim_version(resource))
+        .transpose()?
+        .flatten();
+    // Undo, archive, and write confirmation hold exclusive admission through their durable result.
     // Archive must not race a new open/send between closing and saving metadata.
     // Ordinary turns retain concurrent admission; no request is replayed.
     let exclusive = matches!(
         &request,
         Request::UndoTurnChanges { .. }
+            | Request::ConfirmSideWritesEnded { .. }
+            | Request::ConfirmAgentClosed { .. }
+            | Request::CloseTerminal { .. }
             | Request::ArchiveSession { archived: true, .. }
             | Request::RenameSession { .. }
     );
@@ -414,6 +446,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         &request,
         Request::Send { .. }
             | Request::OpenAgentSession { .. }
+            | Request::CloseAgentSession { .. }
             | Request::CreateTerminal { .. }
             | Request::WriteTerminal { .. }
             | Request::Approve { .. }
@@ -427,6 +460,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
     };
     let closed_resource = match &request {
         Request::CloseAgentSession { session_id, .. }
+        | Request::ConfirmAgentClosed { session_id, .. }
         | Request::ArchiveSession {
             session_id,
             archived: true,
@@ -436,6 +470,46 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         }
         _ => None,
     };
+    let admitted_resource = match &request {
+        Request::OpenAgentSession { session_id, .. }
+        | Request::Send { session_id, .. }
+        | Request::DispatchQueuedMessage { session_id, .. }
+        | Request::ResumeMessageQueue { session_id, .. } => {
+            Some(upgrade::Resource::AgentSession(session_id.clone()))
+        }
+        Request::CreateTerminal { terminal_id, .. } => {
+            Some(upgrade::Resource::Terminal(terminal_id.clone()))
+        }
+        _ => None,
+    };
+    let admitted_claim = admitted_resource
+        .as_ref()
+        .map(|resource| s.lifecycle.admit_claim(resource, claims))
+        .transpose()?
+        .flatten();
+    let result = dispatch_admitted(
+        s,
+        request,
+        claims,
+        allow_queue,
+        closed_resource,
+        closing_claim,
+    )
+    .await;
+    if let Some(resource) = admitted_resource {
+        s.lifecycle.finish_admission(&resource, admitted_claim)?;
+    }
+    result
+}
+
+async fn dispatch_admitted(
+    s: &Service,
+    request: Request,
+    claims: &mut upgrade::ConnectionClaims,
+    allow_queue: bool,
+    mut closed_resource: Option<upgrade::Resource>,
+    closing_claim: Option<uuid::Uuid>,
+) -> Result<Response> {
     let mut response = match request {
         Request::Hello { .. } => unreachable!(),
         Request::Providers => s
@@ -766,9 +840,49 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         Request::ArchiveSession {
             session_id,
             archived,
+        } => {
+            let children = if archived {
+                db(&s.database, |d| d.side_chat_ids(&session_id))?
+                    .into_iter()
+                    .map(|id| {
+                        let resource = upgrade::Resource::AgentSession(id);
+                        let version = s.lifecycle.claim_version(&resource)?;
+                        Ok((resource, version))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
+            let session = runtime::archive(&s.database, &s.runs, &session_id, archived).await?;
+            // Archive holds exclusive execution admission. Retire only the
+            // child claims captured before closing, preserving concurrent claims.
+            for (resource, version) in children {
+                s.lifecycle.forget_claim(&resource, version, claims)?;
+            }
+            Response::Session { session }
+        }
+        Request::OpenSideChat {
+            session_id,
+            side_id,
         } => Response::Session {
-            session: runtime::archive(&s.database, &s.runs, &session_id, archived).await?,
+            session: db(&s.database, |d| {
+                d.open_side_chat(&session_id, side_id.as_deref())
+            })?,
         },
+        Request::SideChats { session_id } => Response::Sessions {
+            sessions: db(&s.database, |d| {
+                Ok(d.side_chat_history(&session_id, None)?.0)
+            })?,
+        },
+        Request::SideChatHistory { session_id, before } => {
+            let (sessions, next) = db(&s.database, |d| {
+                d.side_chat_history(&session_id, before.as_deref())
+            })?;
+            Response::SideChatHistory { sessions, next }
+        }
+        Request::ProjectAgentSessions { project_id, after } => {
+            runtime::project_agent_sessions(&s.database, &s.runs, &project_id, after.as_deref())?
+        }
         Request::CreateSession { project_id, agent } => {
             s.agent_binary(&agent)?;
             Response::Session {
@@ -812,6 +926,41 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             .await?;
             Response::Ok
         }
+        Request::ConfirmSideWritesEnded {
+            session_id,
+            request_id,
+        } => {
+            let needs_confirmation = db(&s.database, |d| {
+                d.check_side_write_confirmation(&session_id, &request_id)
+            })?;
+            let actor_closed = needs_confirmation
+                && runtime::close(&s.database, &s.runs, &session_id, true).await?;
+            let mut session = db(&s.database, |d| {
+                d.confirm_side_writes_ended(&session_id, &request_id)
+            })?;
+            if actor_closed {
+                closed_resource = Some(upgrade::Resource::AgentSession(session_id));
+            }
+            session.agent_closed_by_confirmation = Some(actor_closed);
+            Response::Session { session }
+        }
+        Request::ConfirmAgentClosed {
+            session_id,
+            close_id,
+        } => {
+            if s.runs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("执行状态锁异常"))?
+                .contains_key(&session_id)
+            {
+                bail!("原生会话仍由 Server 管理，请先关闭后再确认");
+            }
+            Response::Session {
+                session: db(&s.database, |d| {
+                    d.confirm_agent_closed(&session_id, &close_id)
+                })?,
+            }
+        }
         Request::CloseAgentSession {
             session_id,
             only_if_idle,
@@ -823,7 +972,11 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
                 only_if_idle.unwrap_or(false),
             )
             .await?;
-            Response::Ok
+            if db(&s.database, |d| d.pending_side_write(&session_id))?.is_some() {
+                Response::SideChatClosed
+            } else {
+                Response::Ok
+            }
         }
         Request::SendQueued { .. } => unreachable!(),
         Request::Send {
@@ -835,6 +988,9 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             effort,
             permission_mode,
         } => {
+            if allow_queue && db(&s.database, |d| Ok(d.side_parent(&session_id)?.is_some()))? {
+                bail!("侧边聊天暂不支持消息排队");
+            }
             if allow_queue && provider.is_none() {
                 bail!("消息排队需要明确的执行配置，请更新客户端");
             }
@@ -1510,6 +1666,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
             if db(&s.database, |d| d.latest_request(&session_id))? != request_id {
                 bail!("只能撤销此会话最近一轮的修改，请查看历史 diff 后手动调整");
             }
+            db(&s.database, |d| d.check_no_unconfirmed_closes())?;
             if db(&s.database, |d| d.has_active_sessions())?
                 || s.runs
                     .lock()
@@ -1523,6 +1680,18 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
                     .is_empty()
             {
                 bail!("此主机仍有运行任务、后台 Agent 或终端；请结束后再撤销");
+            }
+            if let Some((side_id, unknown)) = db(&s.database, |d| {
+                d.overlapping_side_chat(&session_id, &request_id)
+            })? {
+                let reason = if unknown {
+                    "的写入结束时间待确认"
+                } else {
+                    "与本轮同时执行"
+                };
+                bail!(
+                    "具备写权限的侧边聊天（{side_id}）{reason}，无法安全撤销。请核对侧边聊天记录，并按本轮差异手动调整文件。"
+                );
             }
             let session = db(&s.database, |d| d.session(&session_id))?;
             let project = db(&s.database, |d| d.project(&session.project_id))?;
@@ -1545,6 +1714,7 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
                 }
             }
             turn = turn.check_undo(root.to_owned(), false).await?;
+            db(&s.database, |d| d.check_no_unconfirmed_closes())?;
             turn.changes.undo = TurnUndoStatus::Unknown;
             db(&s.database, |d| d.update_turn(&session_id, &turn))?;
             turn = turn
@@ -1833,9 +2003,30 @@ async fn dispatch(s: &Service, request: Request) -> Result<Response> {
         }
     };
     if let Some(resource) = closed_resource {
-        s.lifecycle.forget(&resource)?;
+        s.lifecycle.forget_claim(&resource, closing_claim, claims)?;
     }
     runtime::refresh_titles(&s.database, &s.runs, &s.title_refresh, &mut response).await?;
+    db(&s.database, |d| {
+        match &mut response {
+            Response::Session { session }
+            | Response::Events { session, .. }
+            | Response::History { session, .. } => d.project_session_recovery(session)?,
+            Response::Sessions { sessions }
+            | Response::SideChatHistory { sessions, .. }
+            | Response::ProjectAgentSessions { sessions, .. } => {
+                for session in sessions {
+                    d.project_session_recovery(session)?;
+                }
+            }
+            Response::RecentSessions { sessions, .. } => {
+                for entry in sessions {
+                    d.project_session_recovery(&mut entry.session)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
     runtime::project_session_state(&s.runs, &mut response)?;
     Ok(response)
 }
@@ -1890,15 +2081,19 @@ mod skill_admission_tests {
         });
         start.await.unwrap();
         assert!(
-            dispatch(&service, Request::Skills { project_id: None })
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("仍在进行")
+            dispatch(
+                &service,
+                Request::Skills { project_id: None },
+                &mut upgrade::ConnectionClaims::default()
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("仍在进行")
         );
         let _other_probe = service.command_probes.try_acquire().unwrap();
         assert!(
-            matches!(dispatch(&service,Request::AgentPermissions{agent:"claude".into()}).await.unwrap(),Response::AgentPermissions{modes}if !modes.is_empty())
+            matches!(dispatch(&service,Request::AgentPermissions{agent:"claude".into()}, &mut upgrade::ConnectionClaims::default()).await.unwrap(),Response::AgentPermissions{modes}if !modes.is_empty())
         );
         release.send(()).unwrap();
         job.await.unwrap().unwrap();
