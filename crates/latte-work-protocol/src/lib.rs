@@ -632,6 +632,11 @@ pub enum Request {
         session_id: String,
         before: Option<String>,
     },
+    /// Current managed actors, independent of the project's bounded chat history.
+    ProjectAgentSessions {
+        project_id: String,
+        after: Option<String>,
+    },
     /// Open/resume the native Agent without sending a prompt. Idempotent.
     OpenAgentSession {
         session_id: String,
@@ -1123,6 +1128,10 @@ pub enum Response {
         next: Option<RecentCursor>,
     },
     SideChatHistory {
+        sessions: Vec<Session>,
+        next: Option<String>,
+    },
+    ProjectAgentSessions {
         sessions: Vec<Session>,
         next: Option<String>,
     },

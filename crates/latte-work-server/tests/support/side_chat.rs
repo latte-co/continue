@@ -904,6 +904,126 @@ async fn superseded_connection_claim_cannot_admit_a_turn_or_steal_ownership() {
     );
 }
 
+#[tokio::test]
+async fn project_runtime_inventory_includes_side_chat_beyond_parent_history_limit() {
+    let host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let project = terminal_project(&mut client, root.path()).await;
+    let parent = create_session(&mut client, project.clone(), "codex").await;
+    send(&mut client, &parent.id, "init", "hello").await;
+    wait(&mut client, &parent.id, Status::Completed).await;
+    let side = open_side(&mut client, &parent).await;
+    send_writable_side(&mut client, &side, "approval", "default", TurnProvider::Cli).await;
+    wait(&mut client, &side.id, Status::Waiting).await;
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::CloseAgentSession {
+                session_id: parent.id.clone(),
+                only_if_idle: Some(true),
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    for _ in 0..500 {
+        create_session(&mut client, project.clone(), "codex").await;
+    }
+    assert!(
+        matches!(ask(&mut client, Request::Sessions { project_id: project.clone() }).await,
+        Response::Sessions { sessions } if sessions.len() == 500 && !sessions.iter().any(|s| s.id == parent.id))
+    );
+    let Response::ProjectAgentSessions { sessions, next } = ask(
+        &mut client,
+        Request::ProjectAgentSessions {
+            project_id: project.clone(),
+            after: None,
+        },
+    )
+    .await
+    else {
+        panic!("managed inventory");
+    };
+    assert!(next.is_none());
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, side.id);
+    assert_eq!(sessions[0].agent_session_open, Some(true));
+    assert_eq!(sessions[0].agent_session_busy, Some(true));
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::CloseAgentSession {
+                session_id: side.id,
+                only_if_idle: Some(false),
+            }
+        )
+        .await,
+        Response::SideChatClosed
+    ));
+    assert!(
+        matches!(ask(&mut client, Request::ProjectAgentSessions { project_id: project, after: None }).await,
+        Response::ProjectAgentSessions { sessions, next: None } if sessions.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn cross_connection_cleanup_reclaims_capacity_without_reviving_old_claims() {
+    use latte_work_protocol::lifecycle::Resource;
+    let host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut control = host.client().await;
+    let mut cleanup = host.client().await;
+    let project = terminal_project(&mut control, root.path()).await;
+    let session = create_session(&mut control, project, "codex").await;
+    let resource = Resource::AgentSession(session.id.clone());
+    let server_id = control.server_id().to_owned();
+    control
+        .claim_resources("app".into(), vec![resource.clone()])
+        .await
+        .unwrap();
+    cleanup
+        .close_owned_resources(server_id.clone(), "app".into(), vec![resource.clone()])
+        .await
+        .unwrap();
+    // Resource intents are claimed before creation. Releasing them on another
+    // native lane must not exhaust this long-lived connection's 4096-entry bound.
+    for batch in 0..33 {
+        let resources: Vec<_> = (0..128)
+            .map(|n| Resource::AgentSession(format!("intent-{batch}-{n}")))
+            .collect();
+        control
+            .claim_resources("app".into(), resources.clone())
+            .await
+            .unwrap();
+        cleanup
+            .close_owned_resources(server_id.clone(), "app".into(), resources)
+            .await
+            .unwrap();
+    }
+    assert!(
+        matches!(send(&mut control, &session.id, "stale", "hello").await,
+        Response::Error { message, .. } if message.contains("资源认领已变化"))
+    );
+    control
+        .claim_resources("app".into(), vec![resource.clone()])
+        .await
+        .unwrap();
+    assert!(matches!(
+        send(&mut control, &session.id, "fresh", "hello").await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut control, &session.id, Status::Completed).await;
+    cleanup
+        .close_owned_resources(server_id, "app".into(), vec![resource])
+        .await
+        .unwrap();
+    assert!(
+        matches!(ask(&mut control, Request::Session { session_id: session.id }).await,
+        Response::Session { session } if session.agent_session_open == Some(false))
+    );
+}
+
 async fn check_detached_side_writes(completed: bool) {
     let host = Host::start().await;
     let root = tempfile::tempdir().unwrap();

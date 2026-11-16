@@ -29,27 +29,26 @@ const session = (id: string, patch = {}) =>
     ...patch,
   }) as Session;
 beforeEach(() => vi.clearAllMocks());
-it("includes pinned and unselected open sessions and excludes closed history", async () => {
+it("reads managed actors without enumerating bounded parent history", async () => {
   mocks.request.mockResolvedValue({
-    kind: "sessions",
-    sessions: [
-      session("pinned", { pinned_at: 1 }),
-      session("other"),
-      session("history", { agent_session_open: false }),
-    ],
+    kind: "project_agent_sessions",
+    next: null,
+    sessions: [session("pinned", { pinned_at: 1 }), session("other")],
   });
   expect((await openProjectSessions("remote", "p")).map((s) => s.id)).toEqual([
     "pinned",
     "other",
   ]);
   expect(mocks.request).toHaveBeenCalledWith("remote", {
-    method: "sessions",
+    method: "project_agent_sessions",
     project_id: "p",
+    after: null,
   });
 });
 it("does not infer closed state from older servers or task completion", async () => {
   mocks.request.mockResolvedValue({
-    kind: "sessions",
+    kind: "project_agent_sessions",
+    next: null,
     sessions: [session("old", { agent_session_open: undefined })],
   });
   await expect(openProjectSessions("remote", "p")).rejects.toThrow(
@@ -97,27 +96,16 @@ it("reports partial failures and retries only failed sessions on their host", as
   ]);
 });
 
-it("includes active children of a closed parent across every history page", async () => {
+it("reads all managed pages including processless actors and side chats", async () => {
   mocks.request.mockImplementation(async (_host, action) => {
-    if (action.method === "sessions")
-      return {
-        kind: "sessions",
-        sessions: [
-          session("parent", {
-            agent: "claude",
-            native_id: "native",
-            agent_session_open: false,
-          }),
-        ],
-      };
-    return action.before === null
+    return action.after === null
       ? {
-          kind: "side_chat_history",
-          sessions: [session("new", { agent_session_open: false })],
-          next: "new",
+          kind: "project_agent_sessions",
+          sessions: [session("a-processless", { agent_session_open: false })],
+          next: "a-processless",
         }
       : {
-          kind: "side_chat_history",
+          kind: "project_agent_sessions",
           sessions: [
             session("running-side", {
               status: "running",
@@ -128,29 +116,27 @@ it("includes active children of a closed parent across every history page", asyn
         };
   });
   const sessions = await openProjectSessions("remote", "p");
-  expect(sessions.map((s) => s.id)).toEqual(["running-side"]);
+  expect(sessions.map((s) => s.id)).toEqual(["a-processless", "running-side"]);
   expect(needsCloseConfirmation(sessions)).toBe(true);
   expect(mocks.request).toHaveBeenCalledWith("remote", {
-    method: "side_chat_history",
-    session_id: "parent",
-    before: "new",
+    method: "project_agent_sessions",
+    project_id: "p",
+    after: "a-processless",
   });
-  const close = vi.fn().mockResolvedValue({ kind: "side_chat_closed" });
+  const close = vi
+    .fn()
+    .mockResolvedValueOnce({ kind: "ok" })
+    .mockResolvedValueOnce({ kind: "side_chat_closed" });
   const result = await closeProjectSessions("remote", "p", sessions, close);
-  expect(result.closed).toEqual(["running-side"]);
+  expect(result.closed).toEqual(["a-processless", "running-side"]);
   expect(result.failed).toEqual([]);
   expect(result.pendingWrites.map((s) => s.id)).toEqual(["running-side"]);
 });
 
 it("fails incomplete side inventory instead of closing a partial project", async () => {
-  mocks.request.mockImplementation(async (_host, action) => {
-    if (action.method === "sessions")
-      return {
-        kind: "sessions",
-        sessions: [session("parent", { agent: "codex", native_id: "native" })],
-      };
+  mocks.request.mockImplementation(async () => {
     return {
-      kind: "side_chat_history",
+      kind: "project_agent_sessions",
       sessions: [session("side")],
       next: "same",
     };
@@ -160,26 +146,12 @@ it("fails incomplete side inventory instead of closing a partial project", async
   );
 });
 
-it("handles pre-side-chat hosts and rejects capped legacy side history", async () => {
-  let legacyAvailable = false;
-  mocks.request.mockImplementation(async (_host, action) => {
-    if (action.method === "sessions")
-      return {
-        kind: "sessions",
-        sessions: [session("parent", { agent: "codex", native_id: "native" })],
-      };
-    if (action.method === "side_chats" && legacyAvailable)
-      return {
-        kind: "sessions",
-        sessions: Array.from({ length: 100 }, (_, i) => session(`side-${i}`)),
-      };
+it("requires an updated server rather than claiming a capped history is complete", async () => {
+  mocks.request.mockImplementation(async () => {
     throw new ServerRequestError("invalid_request", "unknown method");
   });
-  expect((await openProjectSessions("remote", "p")).map((s) => s.id)).toEqual([
-    "parent",
-  ]);
-  legacyAvailable = true;
   await expect(openProjectSessions("remote", "p")).rejects.toThrow(
     "更新 Server",
   );
+  expect(mocks.request).toHaveBeenCalledTimes(1);
 });

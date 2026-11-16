@@ -464,6 +464,11 @@ export type Request =
   | { method: "side_chats"; session_id: string }
   | { method: "side_chat_history"; session_id: string; before: string | null }
   | {
+      method: "project_agent_sessions";
+      project_id: string;
+      after: string | null;
+    }
+  | {
       method: "open_agent_session";
       session_id: string;
       provider?: TurnProvider;
@@ -693,6 +698,11 @@ export type Response =
       next: RecentCursor | null;
     }
   | { kind: "side_chat_history"; sessions: Array<Session>; next: string | null }
+  | {
+      kind: "project_agent_sessions";
+      sessions: Array<Session>;
+      next: string | null;
+    }
   | { kind: "last_turn_changes"; changes: TurnChanges | null }
   | { kind: "turn_changes"; changes: TurnChanges }
   | { kind: "change_summary"; summary: ChangeSummary }

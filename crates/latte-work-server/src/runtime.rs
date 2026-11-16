@@ -196,6 +196,50 @@ pub fn db<T>(database: &Database, f: impl FnOnce(&mut Store) -> Result<T>) -> Re
     }
 }
 
+/// Page the current managed actors without consulting limited navigation history.
+pub fn project_agent_sessions(
+    database: &Database,
+    runs: &Runs,
+    project_id: &str,
+    after: Option<&str>,
+) -> Result<Response> {
+    db(database, |store| store.project(project_id))?;
+    // Enumerate live actors, not the limited navigation history (which also
+    // excludes side chats). Never hold the runs lock while reading the database.
+    let mut ids: Vec<_> = runs
+        .lock()
+        .map_err(|_| anyhow::anyhow!("执行状态锁异常"))?
+        .iter()
+        .filter(|(id, run)| {
+            !run.control.is_closed() && after.is_none_or(|cursor| id.as_str() > cursor)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    ids.sort();
+    db(database, |store| {
+        let mut sessions = Vec::new();
+        let mut bytes = 0;
+        let mut next = None;
+        for id in ids {
+            let session = store.session(&id)?;
+            if session.project_id != project_id {
+                continue;
+            }
+            let size = serde_json::to_vec(&session)?.len();
+            if size > 256 * 1024 {
+                bail!("会话元数据超出读取上限");
+            }
+            if sessions.len() >= 64 || bytes + size > 256 * 1024 {
+                next = sessions.last().map(|session: &Session| session.id.clone());
+                break;
+            }
+            bytes += size;
+            sessions.push(session);
+        }
+        Ok(Response::ProjectAgentSessions { sessions, next })
+    })
+}
+
 /// Attach live process evidence to all session projections, never to the database.
 pub fn project_session_state(runs: &Runs, response: &mut Response) -> Result<()> {
     let map = runs.lock().map_err(|_| anyhow::anyhow!("执行状态锁异常"))?;
@@ -212,9 +256,9 @@ pub fn project_session_state(runs: &Runs, response: &mut Response) -> Result<()>
         Response::Session { session }
         | Response::Events { session, .. }
         | Response::History { session, .. } => project(session),
-        Response::Sessions { sessions } | Response::SideChatHistory { sessions, .. } => {
-            sessions.iter_mut().for_each(project)
-        }
+        Response::Sessions { sessions }
+        | Response::SideChatHistory { sessions, .. }
+        | Response::ProjectAgentSessions { sessions, .. } => sessions.iter_mut().for_each(project),
         Response::RecentSessions { sessions, .. } => sessions
             .iter_mut()
             .for_each(|entry| project(&mut entry.session)),
@@ -310,11 +354,13 @@ pub async fn rename_title(
                 bail!("OpenCode 会话正在打开，请稍后修改标题");
             }
             let mut process = Process::spawn(
+                database,
                 &binary,
                 &current,
                 &path,
                 config,
                 Arc::new(AtomicBool::new(false)),
+                None,
             )?;
             let result = tokio::time::timeout(Duration::from_secs(8), async {
                 let initial = process.adapter.advance(Input::Open)?;
@@ -2516,6 +2562,64 @@ pub async fn commands(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_project_pages_include_processless_actors_and_keep_a_stable_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("state.sqlite")).unwrap();
+        let project = store.add_project(directory.path()).unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = store.add_project(other_dir.path()).unwrap();
+        let database = Arc::new(Mutex::new(store));
+        let runs: Runs = Arc::default();
+        let mut receivers = Vec::new();
+        let mut expected = Vec::new();
+        for n in 0..66 {
+            let project_id = if n == 65 { &other.id } else { &project.id };
+            let session = db(&database, |store| {
+                store.create_session(project_id.clone(), "codex".into())
+            })
+            .unwrap();
+            if n != 65 {
+                expected.push(session.id.clone());
+            }
+            let (control, receive) = mpsc::channel(1);
+            receivers.push(receive);
+            runs.lock().unwrap().insert(
+                session.id,
+                Run {
+                    control,
+                    safe_to_close: Arc::new(AtomicBool::new(true)),
+                    session_open: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        expected.sort();
+        let mut page = project_agent_sessions(&database, &runs, &project.id, None).unwrap();
+        project_session_state(&runs, &mut page).unwrap();
+        let Response::ProjectAgentSessions {
+            sessions,
+            next: Some(cursor),
+        } = page
+        else {
+            panic!("first page");
+        };
+        assert_eq!(sessions.len(), 64);
+        assert!(sessions.iter().all(|s| s.agent_session_open == Some(false)));
+        assert_eq!(cursor, expected[63]);
+        runs.lock().unwrap().remove(&cursor);
+        let Response::ProjectAgentSessions {
+            sessions,
+            next: None,
+        } = project_agent_sessions(&database, &runs, &project.id, Some(&cursor)).unwrap()
+        else {
+            panic!("last page");
+        };
+        assert_eq!(
+            sessions.iter().map(|s| &s.id).collect::<Vec<_>>(),
+            vec![&expected[64]]
+        );
+    }
     #[test]
     fn durable_admission_acknowledges_before_slow_snapshot_preparation() {
         let runtime = tokio::runtime::Builder::new_current_thread()

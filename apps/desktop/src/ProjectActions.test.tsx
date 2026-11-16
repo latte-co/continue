@@ -40,8 +40,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   rows = [session("pinned"), session("other")];
   mocks.request.mockImplementation(async () => ({
-    kind: "sessions",
+    kind: "project_agent_sessions",
     sessions: rows,
+    next: null,
   }));
   mocks.closeSession.mockResolvedValue(undefined);
 });
@@ -128,11 +129,11 @@ it("shows unavailable live evidence instead of inventing a zero count", async ()
 it("confirms and closes a running side chat, preserving the pending-write notice", async () => {
   rows = [{ ...session("main"), native_id: "native-main" }];
   const side = { ...session("side", true), status: "running" as const };
-  mocks.request.mockImplementation(async (_host, action) =>
-    action.method === "sessions"
-      ? { kind: "sessions", sessions: rows }
-      : { kind: "side_chat_history", sessions: [side], next: null },
-  );
+  mocks.request.mockResolvedValue({
+    kind: "project_agent_sessions",
+    sessions: [...rows, side],
+    next: null,
+  });
   mocks.closeSession.mockImplementation(async (_host, action) => ({
     kind: action.session_id === "side" ? "side_chat_closed" : "ok",
   }));

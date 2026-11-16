@@ -1837,6 +1837,9 @@ reservation across asynchronous Open/Send, refreshing the runtime version both
 before execution and when dispatch settles. Ordinary close can still interrupt
 pending message delivery; it cannot erase another connection's in-flight reservation.
 A connection's own explicit close or archive retires its reservation.
+Claim/adoption capacity checks prune entries no longer matching global ownership.
+After eviction the connection requires explicit claims for execution, so a removed
+old claim cannot be mistaken for an unowned legacy request or steal a newer owner.
 A superseded claim fails before execution and never implicitly reclaims or replays
 the request. Adopted resources are already active and do not reserve a future open.
 Earlier overlapping turns remain protected. Side chats accept direct messages
@@ -1853,8 +1856,11 @@ and use the main turn's saved diff to restore individual changes manually.
 the cursor for the next request. The desktop routes the same protocol through
 local and SSH transports.
 
-Project-wide close reads all side-history pages, including children of closed
-parents, before presenting the complete native-session count and busy confirmation.
+Project-wide close uses `project_agent_sessions` to page the current managed actors
+directly, including children of closed parents outside the 500-row navigation history.
+Pages contain at most 64 sessions and 256 KiB of stored metadata, ordered by session
+ID; failed reads or non-advancing cursors never produce a partial close inventory.
+Older Servers must update for this inventory. Processless actors remain closeable.
 It reports a confirmed local side close separately from pending background writes.
 Unsent side model, effort and permission choices remain scoped to the same
 App-lifetime host/parent/side owner across main-conversation navigation.

@@ -860,6 +860,9 @@ async fn dispatch_admitted(
             })?;
             Response::SideChatHistory { sessions, next }
         }
+        Request::ProjectAgentSessions { project_id, after } => {
+            runtime::project_agent_sessions(&s.database, &s.runs, &project_id, after.as_deref())?
+        }
         Request::CreateSession { project_id, agent } => {
             s.agent_binary(&agent)?;
             Response::Session {
@@ -1986,7 +1989,9 @@ async fn dispatch_admitted(
             Response::Session { session }
             | Response::Events { session, .. }
             | Response::History { session, .. } => d.project_session_recovery(session)?,
-            Response::Sessions { sessions } | Response::SideChatHistory { sessions, .. } => {
+            Response::Sessions { sessions }
+            | Response::SideChatHistory { sessions, .. }
+            | Response::ProjectAgentSessions { sessions, .. } => {
                 for session in sessions {
                     d.project_session_recovery(session)?;
                 }
