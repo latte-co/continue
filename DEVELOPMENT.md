@@ -334,6 +334,11 @@ RPC. Successful quit batches retire their local records immediately; failures
 retain only the remaining work. The size-bounded quit journal accepts larger
 host inventories and retains acknowledged remote adoption owners across a partial
 recovery, so a later reconnect can finish without reopening or replaying work.
+Each remote batch durably records its source and target owner before transfer.
+If the acknowledgement is lost, recovery first reconciles that exact transfer
+(the Server accepts either owner) before journaling a transfer to the current App.
+Repeated App restarts therefore retain both possible owners without accumulating
+an unbounded list of candidates; unrelated owners and changed daemons stay fenced.
 The host closes and reaps the Agent process group before acknowledging. An App
 reclaim fences stale closes from an earlier App instance. New requests are blocked
 while quitting; admitted requests cannot send new work after claiming a resource

@@ -25,6 +25,15 @@ struct HostIntent {
     /// A prior recovery may have adopted this batch before a later batch failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     adopted_owner_id: Option<String>,
+    /// Write-ahead record for one bounded batch. Replay this exact transfer to
+    /// reconcile either possible owner before attempting a different target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_adoption: Option<Adoption>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Adoption {
+    previous_owner_id: String,
+    owner_id: String,
 }
 const LIMIT: u64 = 1024 * 1024;
 fn directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -117,6 +126,12 @@ fn read(path: &Path) -> Result<Intent, String> {
             h.resources
                 .iter()
                 .any(|r| r.id().is_empty() || r.id().len() > 256)
+                || h.pending_adoption.as_ref().is_some_and(|pending| {
+                    h.resources.len() > latte_work_protocol::lifecycle::RESOURCE_BATCH_LIMIT
+                        || [&pending.previous_owner_id, &pending.owner_id]
+                            .iter()
+                            .any(|id| id.is_empty() || id.len() > 128)
+                })
         })
     {
         return Err("无效关闭记录".into());
@@ -146,6 +161,7 @@ pub(crate) async fn persist(app: &tauri::AppHandle, state: &Connections) -> Resu
             server_id,
             resources,
             adopted_owner_id: None,
+            pending_adoption: None,
         });
     }
     let intent = Intent {
@@ -224,35 +240,25 @@ async fn drain_directory(
                 .cloned()
                 .collect::<Vec<_>>();
             if host.ssh.is_some() {
-                let batch_owner = item
-                    .adopted_owner_id
-                    .as_deref()
-                    .unwrap_or(&intent.owner_id)
-                    .to_owned();
-                let resources = client
-                    .adopt_resources(
-                        item.server_id.clone(),
-                        batch_owner,
-                        owner_id.to_owned(),
-                        batch.clone(),
-                    )
-                    .await
-                    .map_err(|e| format!("{e:#}"))?;
-                adopted.extend(resources.clone());
-                // Preserve acknowledged adoption ownership if a subsequent batch
-                // fails. A new App can adopt these entries from this App's ID.
-                let acknowledged = HostIntent {
-                    host: item.host.clone(),
-                    server_id: item.server_id.clone(),
-                    resources,
-                    adopted_owner_id: Some(owner_id.to_owned()),
-                };
-                intent.hosts[index].resources.drain(..batch.len());
+                // Split before journaling: an uncertain transfer must identify
+                // exactly the resource batch sent, not the untouched remainder.
+                if intent.hosts[index].resources.len() > batch.len() {
+                    let remaining = intent.hosts[index].resources.split_off(batch.len());
+                    let item = &intent.hosts[index];
+                    let remainder = HostIntent {
+                        host: item.host.clone(),
+                        server_id: item.server_id.clone(),
+                        resources: remaining,
+                        adopted_owner_id: item.adopted_owner_id.clone(),
+                        pending_adoption: None,
+                    };
+                    intent.hosts.insert(index + 1, remainder);
+                }
+                adopt_batch(directory, &mut intent, index, client, owner_id).await?;
+                adopted.extend(intent.hosts[index].resources.clone());
                 if intent.hosts[index].resources.is_empty() {
                     intent.hosts.remove(index);
-                }
-                if !acknowledged.resources.is_empty() {
-                    intent.hosts.insert(index, acknowledged);
+                } else {
                     index += 1;
                 }
             } else {
@@ -285,6 +291,65 @@ async fn drain_directory(
     Ok(adopted)
 }
 
+async fn adopt_batch(
+    directory: &Path,
+    intent: &mut Intent,
+    index: usize,
+    client: &mut Client,
+    owner_id: &str,
+) -> Result<(), String> {
+    // Reconcile the previous A -> B request as A -> B, even in App C. The
+    // Server accepts both A and B, while unrelated owners and daemon IDs remain
+    // fenced. Repeated response loss keeps the same two candidates on disk.
+    if intent.hosts[index].pending_adoption.is_some() {
+        finish_adoption(directory, intent, index, client).await?;
+        if intent.hosts[index].resources.is_empty()
+            || intent.hosts[index].adopted_owner_id.as_deref() == Some(owner_id)
+        {
+            return Ok(());
+        }
+    }
+    let item = &mut intent.hosts[index];
+    item.pending_adoption = Some(Adoption {
+        previous_owner_id: item
+            .adopted_owner_id
+            .clone()
+            .unwrap_or_else(|| intent.owner_id.clone()),
+        owner_id: owner_id.to_owned(),
+    });
+    // A failed fsync/rename must prevent the ownership-changing RPC entirely.
+    write(directory, intent)?;
+    finish_adoption(directory, intent, index, client).await
+}
+
+async fn finish_adoption(
+    directory: &Path,
+    intent: &mut Intent,
+    index: usize,
+    client: &mut Client,
+) -> Result<(), String> {
+    let item = &intent.hosts[index];
+    let pending = item
+        .pending_adoption
+        .as_ref()
+        .expect("journaled adoption")
+        .clone();
+    let resources = client
+        .adopt_resources(
+            item.server_id.clone(),
+            pending.previous_owner_id,
+            pending.owner_id.clone(),
+            item.resources.clone(),
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let item = &mut intent.hosts[index];
+    item.resources = resources;
+    item.adopted_owner_id = Some(pending.owner_id);
+    item.pending_adoption = None;
+    write(directory, intent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +368,7 @@ mod tests {
                 server_id: "old-server".into(),
                 resources: vec![Resource::AgentSession("session".into())],
                 adopted_owner_id: None,
+                pending_adoption: None,
             }],
         };
         write(&directory, &intent).unwrap();
@@ -386,6 +452,7 @@ for line in sys.stdin:
                         server_id: "fixture".into(),
                         resources: resources.clone(),
                         adopted_owner_id: None,
+                        pending_adoption: None,
                     }],
                 },
             )
@@ -451,6 +518,7 @@ for line in sys.stdin:
                     server_id: "fixture".into(),
                     resources: resources.clone(),
                     adopted_owner_id: None,
+                    pending_adoption: None,
                 }],
             },
         )
@@ -476,10 +544,122 @@ for line in sys.stdin:
         assert_eq!(adopted, resources);
         assert_eq!(
             std::fs::read_to_string(directory.join("owners")).unwrap(),
-            format!("{owner}\n{owner}\nfirst-recovery\n{owner}\n")
+            format!("{owner}\n{owner}\nfirst-recovery\n{owner}\nfirst-recovery\n")
         );
         assert!(!directory.join(format!("{owner}.json")).exists());
         drop(client);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lost_adoption_replies_reconcile_both_owners_across_repeated_app_restarts() {
+        for transferred in [false, true] {
+            let directory =
+                std::env::temp_dir().join(format!("lw-adoption-loss-{}", uuid::Uuid::new_v4()));
+            let guard = lock(&directory).unwrap();
+            let owner = uuid::Uuid::new_v4().to_string();
+            let path = directory.join(format!("{owner}.json"));
+            let mut remote = host();
+            remote.ssh = Some("fixture-ssh".into());
+            let resources = vec![
+                Resource::AgentSession("session".into()),
+                Resource::Terminal("terminal".into()),
+                Resource::AgentSession("foreign".into()),
+            ];
+            write(
+                &directory,
+                &Intent {
+                    owner_id: owner.clone(),
+                    hosts: vec![HostIntent {
+                        host: remote.clone(),
+                        server_id: "fixture".into(),
+                        resources: resources.clone(),
+                        adopted_owner_id: None,
+                        pending_adoption: None,
+                    }],
+                },
+            )
+            .unwrap();
+            std::fs::write(
+                directory.join("owners.state"),
+                serde_json::to_vec(&serde_json::json!({
+                    "session":owner, "terminal":owner, "foreign":"unrelated-app"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            if transferred {
+                std::fs::write(directory.join("transfer-before-loss"), "").unwrap();
+            }
+            let binary = directory.join("bridge");
+            std::fs::write(&binary, r#"#!/usr/bin/env python3
+import sys,json,pathlib
+base=pathlib.Path(sys.argv[sys.argv.index('--state-dir')+1])
+for line in sys.stdin:
+    r=json.loads(line)
+    if r['method']=='hello':
+        out={'kind':'hello','version':1,'server_id':'fixture','agents':[]}
+    elif r['method']=='adopt_resources':
+        assert len(r['resources'])<=128
+        journal=next(base.glob('*.json'))
+        saved=json.loads(journal.read_text())
+        assert any(h.get('pending_adoption')=={'previous_owner_id':r['previous_owner_id'],'owner_id':r['owner_id']} and h['resources']==r['resources'] for h in saved['hosts']), 'transfer sent before write-ahead journal'
+        owners=json.loads((base/'owners.state').read_text())
+        marker=base/('lost-'+r['owner_id'])
+        lose=r['owner_id'] in ('app-b','app-c') and not marker.exists()
+        selected=[]
+        if not lose or (base/'transfer-before-loss').exists():
+            for resource in r['resources']:
+                if r['server_id']=='fixture' and owners.get(resource['id']) in (r['previous_owner_id'],r['owner_id']):
+                    owners[resource['id']]=r['owner_id']
+                    selected.append(resource)
+            (base/'owners.state').write_text(json.dumps(owners))
+        if lose:
+            marker.touch()
+            sys.exit(0)
+        out={'kind':'resources_adopted','resources':selected}
+    elif r['method']=='close_owned_resources':
+        owners=json.loads((base/'owners.state').read_text())
+        for resource in r['resources']:
+            if owners.get(resource['id'])==r['owner_id']: del owners[resource['id']]
+        (base/'owners.state').write_text(json.dumps(owners))
+        out={'kind':'resources_closed'}
+    else: raise AssertionError('recovery must not Open or Send: '+str(r))
+    print(json.dumps(out),flush=True)
+"#).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            drop(guard);
+            for target in ["app-b", "app-c"] {
+                let mut client = Client::local(&binary, Some(&directory)).await.unwrap();
+                assert!(
+                    drain_directory(&directory, &remote, &mut client, target)
+                        .await
+                        .is_err()
+                );
+                let saved = read(&path).unwrap();
+                assert_eq!(
+                    saved.hosts[0].pending_adoption.as_ref().unwrap().owner_id,
+                    target
+                );
+                assert!(!saved.hosts[0].resources.is_empty());
+                drop(client);
+            }
+            let mut client = Client::local(&binary, Some(&directory)).await.unwrap();
+            let adopted = drain_directory(&directory, &remote, &mut client, "app-d")
+                .await
+                .unwrap();
+            assert_eq!(adopted, resources[..2]);
+            assert!(!path.exists());
+            client
+                .close_owned_resources("fixture".into(), "app-d".into(), adopted)
+                .await
+                .unwrap();
+            let owners: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(directory.join("owners.state")).unwrap())
+                    .unwrap();
+            assert_eq!(owners, serde_json::json!({"foreign":"unrelated-app"}));
+            drop(client);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 }
