@@ -271,14 +271,25 @@ async fn drain_directory_with_cleanup(
                     index += 1;
                 }
             } else {
-                client
+                let closed = client
                     .close_owned_resources(
                         item.server_id.clone(),
                         intent.owner_id.clone(),
                         batch.clone(),
                     )
-                    .await
-                    .map_err(|e| format!("{e:#}"))?;
+                    .await;
+                if let Err(error) = closed {
+                    // The daemon can be reachable while a native close needs
+                    // explicit user verification. Keep its durable intent, but
+                    // expose this healthy connection so ConfirmAgentClosed is
+                    // reachable. Transport/other failures still fail recovery.
+                    if !client.is_broken() && has_unconfirmed_close(client, &batch).await? {
+                        eprintln!("本机会话关闭待核对，保留恢复记录：{error:#}");
+                        index += 1;
+                        continue;
+                    }
+                    return Err(format!("{error:#}"));
+                }
                 intent.hosts[index].resources.drain(..batch.len());
                 if intent.hosts[index].resources.is_empty() {
                     intent.hosts.remove(index);
@@ -293,23 +304,36 @@ async fn drain_directory_with_cleanup(
     // a crash can occur before the caller registers resources in App memory too.
     // The next recovery consolidates this record along with any remaining old
     // records; closed or foreign-owned resources simply do not get re-adopted.
+    let mut handoff_path = None;
     if host.ssh.is_some() && !adopted.is_empty() {
-        write(
-            directory,
-            &Intent {
-                owner_id: uuid::Uuid::new_v4().to_string(),
-                hosts: vec![HostIntent {
-                    host: host.clone(),
-                    server_id: client.server_id().to_owned(),
-                    resources: adopted.clone(),
-                    adopted_owner_id: Some(owner_id.to_owned()),
-                    pending_adoption: None,
-                }],
-            },
-        )?;
+        // Reuse a source file as the durable handoff. Adding a UUID file could
+        // exceed the 128-file reader bound when every old file has other hosts.
+        for path in &paths {
+            if !path.exists() {
+                continue;
+            }
+            let mut handoff = read(path)?;
+            if !handoff.hosts.iter().any(|h| same_target(&h.host, host)) {
+                continue;
+            }
+            handoff.hosts.retain(|h| !same_target(&h.host, host));
+            handoff.hosts.push(HostIntent {
+                host: host.clone(),
+                server_id: client.server_id().to_owned(),
+                resources: adopted.clone(),
+                adopted_owner_id: Some(owner_id.to_owned()),
+                pending_adoption: None,
+            });
+            write(directory, &handoff)?;
+            handoff_path = Some(path);
+            break;
+        }
+        if handoff_path.is_none() {
+            return Err("接管交接缺少原始记录".into());
+        }
     }
     for path in &paths {
-        if !path.exists() {
+        if !path.exists() || handoff_path == Some(path) || host.ssh.is_none() {
             continue;
         }
         let mut intent = read(path)?;
@@ -317,6 +341,32 @@ async fn drain_directory_with_cleanup(
         cleanup(directory, &intent)?;
     }
     Ok(adopted)
+}
+
+async fn has_unconfirmed_close(
+    client: &mut Client,
+    resources: &[Resource],
+) -> Result<bool, String> {
+    for resource in resources {
+        let Resource::AgentSession(id) = resource else {
+            continue;
+        };
+        match client
+            .request(latte_work_protocol::Request::Session {
+                session_id: id.clone(),
+            })
+            .await
+        {
+            Ok(latte_work_protocol::Response::Session { session })
+                if session.id == *id && session.agent_close_pending.is_some() =>
+            {
+                return Ok(true);
+            }
+            Ok(_) => {}
+            Err(error) => return Err(format!("{error:#}")),
+        }
+    }
+    Ok(false)
 }
 
 async fn adopt_batch(
@@ -491,7 +541,7 @@ for line in sys.stdin:
                 .await
                 .unwrap();
             assert_eq!(adopted, if remote { resources } else { vec![] });
-            assert!(!directory.join(format!("{owner}.json")).exists());
+            assert_eq!(directory.join(format!("{owner}.json")).exists(), remote);
             assert_eq!(
                 std::fs::read_to_string(directory.join("requests")).unwrap(),
                 if remote {
@@ -574,7 +624,14 @@ for line in sys.stdin:
             std::fs::read_to_string(directory.join("owners")).unwrap(),
             format!("{owner}\n{owner}\nfirst-recovery\n{owner}\nfirst-recovery\n")
         );
-        assert!(!directory.join(format!("{owner}.json")).exists());
+        assert_eq!(
+            read(&directory.join(format!("{owner}.json")))
+                .unwrap()
+                .hosts[0]
+                .adopted_owner_id
+                .as_deref(),
+            Some("second-recovery")
+        );
         drop(client);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -677,7 +734,10 @@ for line in sys.stdin:
                 .await
                 .unwrap();
             assert_eq!(adopted, resources[..2]);
-            assert!(!path.exists());
+            assert_eq!(
+                read(&path).unwrap().hosts[0].adopted_owner_id.as_deref(),
+                Some("app-d")
+            );
             client
                 .close_owned_resources("fixture".into(), "app-d".into(), adopted)
                 .await
@@ -698,7 +758,7 @@ for line in sys.stdin:
         let mut remote = host();
         remote.ssh = Some("fixture".into());
         let mut owners = serde_json::Map::new();
-        for n in 0..2 {
+        for n in 0..3 {
             let owner = uuid::Uuid::new_v4().to_string();
             let id = format!("session-{n}");
             owners.insert(id.clone(), serde_json::Value::String(owner.clone()));
@@ -773,7 +833,8 @@ for line in sys.stdin:
             recovered,
             vec![
                 Resource::AgentSession("session-0".into()),
-                Resource::AgentSession("session-1".into())
+                Resource::AgentSession("session-1".into()),
+                Resource::AgentSession("session-2".into())
             ]
         );
         let journals: Vec<_> = std::fs::read_dir(&directory)
@@ -789,6 +850,171 @@ for line in sys.stdin:
             Some("app-c")
         );
         drop(restarted);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_unknown_close_retains_journal_but_allows_manual_confirmation_on_connection() {
+        let directory =
+            std::env::temp_dir().join(format!("lw-local-confirm-{}", uuid::Uuid::new_v4()));
+        let guard = lock(&directory).unwrap();
+        let owner = uuid::Uuid::new_v4().to_string();
+        let local = host();
+        write(
+            &directory,
+            &Intent {
+                owner_id: owner.clone(),
+                hosts: vec![HostIntent {
+                    host: local.clone(),
+                    server_id: "fixture".into(),
+                    resources: vec![Resource::AgentSession("session".into())],
+                    adopted_owner_id: None,
+                    pending_adoption: None,
+                }],
+            },
+        )
+        .unwrap();
+        let binary = directory.join("bridge");
+        std::fs::write(&binary, r#"#!/usr/bin/env python3
+import sys,json,pathlib
+base=pathlib.Path(sys.argv[sys.argv.index('--state-dir')+1]); confirmed=base/'confirmed'
+for line in sys.stdin:
+    r=json.loads(line)
+    if r['method']=='hello': out={'kind':'hello','version':1,'server_id':'fixture','agents':[]}
+    elif r['method']=='close_owned_resources': out={'kind':'resources_closed'} if confirmed.exists() else {'kind':'error','code':'upgrade_blocked','message':'close unknown'}
+    elif r['method']=='session':
+        out={'kind':'session','session':{'id':'session','project_id':'p','title':'main','agent':'codex','status':'unknown','created_at':0,'agent_close_pending':'verify-1'}}
+    elif r['method']=='confirm_agent_closed':
+        assert r['close_id']=='verify-1'
+        confirmed.touch(); out={'kind':'ok'}
+    else: raise AssertionError('No Open/Send during recovery: '+str(r))
+    print(json.dumps(out),flush=True)
+"#).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        drop(guard);
+        let mut client = Client::local(&binary, Some(&directory)).await.unwrap();
+        assert!(
+            drain_directory(&directory, &local, &mut client, "new-app")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let path = directory.join(format!("{owner}.json"));
+        assert_eq!(read(&path).unwrap().hosts[0].resources.len(), 1);
+        assert!(!client.is_broken());
+        assert!(matches!(
+            client
+                .request(latte_work_protocol::Request::Hello { version: 1 })
+                .await
+                .unwrap(),
+            latte_work_protocol::Response::Hello { .. }
+        ));
+        client
+            .request(latte_work_protocol::Request::ConfirmAgentClosed {
+                session_id: "session".into(),
+                close_id: "verify-1".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            drain_directory(&directory, &local, &mut client, "new-app")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!path.exists());
+        drop(client);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn handoff_reuses_a_source_file_at_the_128_record_boundary() {
+        let directory =
+            std::env::temp_dir().join(format!("lw-handoff-cap-{}", uuid::Uuid::new_v4()));
+        let guard = lock(&directory).unwrap();
+        let mut remote = host();
+        remote.id = "remote".into();
+        remote.ssh = Some("fixture".into());
+        let mut other = remote.clone();
+        other.id = "other".into();
+        other.ssh = Some("other".into());
+        for n in 0..128 {
+            let mut hosts = vec![HostIntent {
+                host: other.clone(),
+                server_id: "fixture".into(),
+                resources: vec![Resource::AgentSession(format!("other-{n}"))],
+                adopted_owner_id: None,
+                pending_adoption: None,
+            }];
+            if n == 0 {
+                hosts.push(HostIntent {
+                    host: remote.clone(),
+                    server_id: "fixture".into(),
+                    resources: vec![Resource::AgentSession("target".into())],
+                    adopted_owner_id: None,
+                    pending_adoption: None,
+                });
+            }
+            write(
+                &directory,
+                &Intent {
+                    owner_id: uuid::Uuid::new_v4().to_string(),
+                    hosts,
+                },
+            )
+            .unwrap();
+        }
+        let binary = directory.join("bridge");
+        std::fs::write(
+            &binary,
+            r#"#!/usr/bin/env python3
+import sys,json
+for line in sys.stdin:
+    r=json.loads(line)
+    if r['method']=='hello': out={'kind':'hello','version':1,'server_id':'fixture','agents':[]}
+    elif r['method']=='adopt_resources': out={'kind':'resources_adopted','resources':r['resources']}
+    else: raise AssertionError(r)
+    print(json.dumps(out),flush=True)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        drop(guard);
+        let mut client = Client::local(&binary, Some(&directory)).await.unwrap();
+        for app in ["app-b", "app-c"] {
+            assert_eq!(
+                drain_directory(&directory, &remote, &mut client, app)
+                    .await
+                    .unwrap(),
+                vec![Resource::AgentSession("target".into())]
+            );
+            let paths: Vec<_> = std::fs::read_dir(&directory)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.extension().is_some_and(|e| e == "json"))
+                .collect();
+            assert_eq!(paths.len(), 128);
+            assert_eq!(
+                paths
+                    .iter()
+                    .map(|p| read(p)
+                        .unwrap()
+                        .hosts
+                        .iter()
+                        .filter(|h| same_target(&h.host, &other))
+                        .count())
+                    .sum::<usize>(),
+                128
+            );
+        }
+        assert_eq!(
+            drain_directory(&directory, &other, &mut client, "app-c")
+                .await
+                .unwrap()
+                .len(),
+            128
+        );
+        drop(client);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -1103,6 +1103,9 @@ fn native_output<R: tokio::io::AsyncRead>(reader: R) -> FramedRead<R, LinesCodec
     FramedRead::new(reader, LinesCodec::new())
 }
 struct Process {
+    /// A failed journal write leaves this handle managed for an explicit retry.
+    close_blocked: bool,
+    close_started: bool,
     adapter: Box<dyn agents::AgentAdapter>,
     binary: String,
     title_job: Option<tokio::task::JoinHandle<()>>,
@@ -1184,7 +1187,8 @@ impl Process {
         }
     }
     fn can_start_turn(&self) -> bool {
-        self.state.ready
+        !self.close_blocked
+            && self.state.ready
             && !self.turn_active
             && !self.stopping
             && !self.interrupt_ack_pending
@@ -1282,6 +1286,8 @@ impl Process {
             }
         });
         Ok(Self {
+            close_blocked: false,
+            close_started: false,
             adapter,
             binary: binary.into(),
             title_job: None,
@@ -1560,12 +1566,18 @@ impl Process {
         }
     }
     async fn close_confirmed(&mut self, database: &Database, id: &str) -> Result<()> {
-        db(database, |s| {
+        let journal = db(database, |s| {
             if let Some(reason) = s.unconfirmed_agent_close(id)? {
                 bail!(reason);
             }
             s.record_unconfirmed_agent_close(id, CLOSE_PENDING)
-        })?;
+        });
+        if let Err(error) = journal {
+            self.close_blocked = true;
+            return Err(error);
+        }
+        self.close_blocked = false;
+        self.close_started = true;
         let confirmed = self.close().await;
         finish_native_close(database, id, confirmed)
     }
@@ -1717,7 +1729,9 @@ async fn accept_turn(
             bail!(RECONFIGURE_BLOCKED);
         }
         let closed = current.close_confirmed(database, &session.id).await;
-        *process = None;
+        if current.close_started {
+            *process = None;
+        }
         closed?;
     }
     db(database, |s| {
@@ -1807,7 +1821,10 @@ async fn accept_turn(
             .is_some_and(|p| p.turn_active && p.background_at_start);
         let message = if let Some(p) = process.as_mut() {
             let message = p.config.redact(&error.to_string());
-            let _ = p.close_confirmed(database, &session.id).await;
+            let closed = p.close_confirmed(database, &session.id).await;
+            if closed.is_err() && !p.close_started {
+                return Ok(true);
+            }
             message
         } else {
             config.redact(&error.to_string())
@@ -1917,11 +1934,11 @@ async fn actor(
     loop {
         let init_deadline = process
             .as_ref()
-            .filter(|p| !p.state.ready)
+            .filter(|p| !p.close_blocked && !p.state.ready)
             .map(|p| p.init_deadline);
         let turn_deadline = process
             .as_ref()
-            .filter(|p| p.turn_active)
+            .filter(|p| !p.close_blocked && p.turn_active)
             .map(|p| p.turn_deadline);
         // A handoff delivered near the end of a long turn gets its own full
         // confirmation window. New deliveries never extend older inputs or the
@@ -1956,6 +1973,10 @@ async fn actor(
                     } else {let _=reply.send(Err("原生会话尚未就绪，标题未修改".into()));Ok(())}
                 }
                 Some(Control::Open { config, reply }) => {
+                    if process.as_ref().is_some_and(|p| p.close_blocked) {
+                        let _ = reply.send(Err("关闭记录写入失败，请重试关闭后再打开".into()));
+                        continue;
+                    }
                     let result = async {
                         if process.is_none() {
                             let current = db(&database, |s| s.session(&session.id))?;
@@ -2176,7 +2197,13 @@ async fn actor(
                         .as_ref()
                         .is_some_and(|p| p.turn_active && p.background_at_start);
                     let close_unconfirmed = if let Some(p) = process.as_mut() {
-                        p.close_confirmed(&database, &session.id).await.is_err()
+                        let result = p.close_confirmed(&database, &session.id).await;
+                        if let Err(error) = &result && !p.close_started {
+                            safe_to_close.store(false, Ordering::SeqCst);
+                            if let Some(reply) = reply { let _ = reply.send(Err(error.to_string())); }
+                            continue;
+                        }
+                        result.is_err()
                     } else { false };
                     process = None;
                     if let Err(error) =
@@ -2274,7 +2301,7 @@ async fn actor(
                 }
                 None => break,
             },
-            line = async { match process.as_mut() { Some(p) => p.next_message().await, None => std::future::pending().await } } => {
+            line = async { match process.as_mut().filter(|p| !p.close_blocked) { Some(p) => p.next_message().await, None => std::future::pending().await } } => {
                 async {
                     let p = process.as_mut().context("Agent process missing")?;
                     let (line, sideband) = line?;
@@ -2336,7 +2363,16 @@ async fn actor(
                 if let Some(reply) = p.stop_reply.take() {
                     let _ = reply.send(Err(text.clone()));
                 }
-                let _ = p.close_confirmed(&database, &session.id).await;
+                let closed = p.close_confirmed(&database, &session.id).await;
+                if let Err(error) = closed
+                    && !p.close_started
+                {
+                    safe_to_close.store(false, Ordering::SeqCst);
+                    for reply in opening.drain(..) {
+                        let _ = reply.send(Err(error.to_string()));
+                    }
+                    continue;
+                }
                 text
             } else {
                 error.to_string()
@@ -2527,7 +2563,8 @@ async fn actor(
                 && immediate.is_none()
                 && forwarded.is_empty()
                 && process.as_ref().is_none_or(|p| {
-                    !p.interrupt_ack_pending
+                    !p.close_blocked
+                        && !p.interrupt_ack_pending
                         && p.state.pending.is_empty()
                         && p.adapter.can_reconfigure()
                 }),

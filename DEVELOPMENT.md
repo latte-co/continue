@@ -342,6 +342,10 @@ an unbounded list of candidates; unrelated owners and changed daemons stay fence
 After all batches acknowledge, recovery writes a consolidated durable handoff
 before deleting any old record. The handoff survives final-cleanup errors and a
 crash before in-memory registration; later recovery deduplicates overlapping records.
+Handoff reuses an existing source file and preserves its other hosts, so recovery
+at the 128-record limit never creates an unreadable 129th record. A reachable
+local daemon's durable unknown-close state retains the quit journal while allowing
+the connection to open for manual verification; transport failures remain errors.
 The host closes and reaps the Agent process group before acknowledging. An App
 reclaim fences stale closes from an earlier App instance. New requests are blocked
 while quitting; admitted requests cannot send new work after claiming a resource
@@ -1853,7 +1857,10 @@ A connection's own explicit close or archive retires its reservation.
 Undo and owned-resource exit cleanup also check durable unknown native closes,
 even after the actor is gone. Configuration replacement and fault recovery share
 the journaled close path; an unconfirmed reap blocks replacement until explicit
-reconciliation. Actor receipt timeouts return `admission_unknown`; side drafts
+reconciliation.
+When journaling a close fails before signalling the process, the actor and handle
+remain managed for an explicit close retry; replacement and new work stay blocked.
+Actor receipt timeouts return `admission_unknown`; side drafts
 retain their request ID for polling or an explicit idempotent retry. Legacy
 receipt-timeout errors are treated as uncertain as well.
 Claim/adoption capacity checks prune entries no longer matching global ownership.

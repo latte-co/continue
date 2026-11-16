@@ -1618,6 +1618,59 @@ async fn history_pages_past_one_hundred_and_can_reopen_the_oldest_chat() {
 }
 
 #[tokio::test]
+async fn failed_close_journal_keeps_actor_for_repeated_close_and_reconfigure_attempts() {
+    let host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let project = terminal_project(&mut client, root.path()).await;
+    let main = create_session(&mut client, project, "codex").await;
+    send(&mut client, &main.id, "init", "hello").await;
+    wait(&mut client, &main.id, Status::Completed).await;
+    let db = rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_close_journal BEFORE INSERT ON unconfirmed_agent_closes BEGIN SELECT RAISE(FAIL, 'injected close journal write failure'); END;").unwrap();
+    // Configuration replacement also must retain the old handle if it cannot
+    // first journal the close. The rejected request cannot enter the ledger.
+    assert!(matches!(ask(&mut client, Request::Send {
+        session_id: main.id.clone(), request_id: "reconfigure".into(), text: "hello".into(),
+        model: None, effort: None, permission_mode: Some("bypass_permissions".into()), provider: Some(TurnProvider::Cli),
+    }).await, Response::Error { message, .. } if message.contains("injected")));
+    for _ in 0..2 {
+        assert!(matches!(ask(&mut client, Request::CloseAgentSession {
+            session_id: main.id.clone(), only_if_idle: Some(false),
+        }).await, Response::Error { message, .. } if message.contains("injected")));
+        assert!(
+            matches!(ask(&mut client, Request::Session { session_id: main.id.clone() }).await,
+            Response::Session { session } if session.agent_session_open == Some(true) && session.agent_close_pending.is_none())
+        );
+    }
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM requests WHERE id='reconfigure'",
+            [],
+            |row| row.get::<_, u32>(0)
+        )
+        .unwrap(),
+        0
+    );
+    db.execute_batch("DROP TRIGGER fail_close_journal").unwrap();
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::CloseAgentSession {
+                session_id: main.id.clone(),
+                only_if_idle: Some(false)
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    assert!(
+        matches!(ask(&mut client, Request::Session { session_id: main.id }).await,
+        Response::Session { session } if session.agent_session_open == Some(false))
+    );
+}
+
+#[tokio::test]
 async fn open_only_side_resume_journals_hook_writes_without_a_user_turn() {
     let host = Host::start().await;
     let root = tempfile::tempdir().unwrap();
