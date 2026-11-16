@@ -211,6 +211,15 @@ async fn drain_directory(
     client: &mut Client,
     owner_id: &str,
 ) -> Result<Vec<Resource>, String> {
+    drain_directory_with_cleanup(directory, host, client, owner_id, write).await
+}
+async fn drain_directory_with_cleanup(
+    directory: &Path,
+    host: &Host,
+    client: &mut Client,
+    owner_id: &str,
+    mut cleanup: impl FnMut(&Path, &Intent) -> Result<(), String>,
+) -> Result<Vec<Resource>, String> {
     let _lock = lock(directory)?;
     let mut paths = Vec::new();
     for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
@@ -278,15 +287,34 @@ async fn drain_directory(
             write(directory, &intent)?;
         }
     }
-    // Earlier files may have adopted resources before a later file fails. Keep
-    // every acknowledged owner journaled until the whole recovery can return it.
+    let mut seen = std::collections::HashSet::new();
+    adopted.retain(|resource| seen.insert(resource.clone()));
+    // Durable handoff precedes any old-record deletion. Keep it after returning:
+    // a crash can occur before the caller registers resources in App memory too.
+    // The next recovery consolidates this record along with any remaining old
+    // records; closed or foreign-owned resources simply do not get re-adopted.
+    if host.ssh.is_some() && !adopted.is_empty() {
+        write(
+            directory,
+            &Intent {
+                owner_id: uuid::Uuid::new_v4().to_string(),
+                hosts: vec![HostIntent {
+                    host: host.clone(),
+                    server_id: client.server_id().to_owned(),
+                    resources: adopted.clone(),
+                    adopted_owner_id: Some(owner_id.to_owned()),
+                    pending_adoption: None,
+                }],
+            },
+        )?;
+    }
     for path in &paths {
         if !path.exists() {
             continue;
         }
         let mut intent = read(path)?;
         intent.hosts.retain(|h| !same_target(&h.host, host));
-        write(directory, &intent)?;
+        cleanup(directory, &intent)?;
     }
     Ok(adopted)
 }
@@ -661,5 +689,106 @@ for line in sys.stdin:
             drop(client);
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn second_record_cleanup_failure_keeps_first_resources_in_durable_handoff() {
+        let directory = std::env::temp_dir().join(format!("lw-handoff-{}", uuid::Uuid::new_v4()));
+        let guard = lock(&directory).unwrap();
+        let mut remote = host();
+        remote.ssh = Some("fixture".into());
+        let mut owners = serde_json::Map::new();
+        for n in 0..2 {
+            let owner = uuid::Uuid::new_v4().to_string();
+            let id = format!("session-{n}");
+            owners.insert(id.clone(), serde_json::Value::String(owner.clone()));
+            write(
+                &directory,
+                &Intent {
+                    owner_id: owner,
+                    hosts: vec![HostIntent {
+                        host: remote.clone(),
+                        server_id: "fixture".into(),
+                        resources: vec![Resource::AgentSession(id)],
+                        adopted_owner_id: None,
+                        pending_adoption: None,
+                    }],
+                },
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            directory.join("owners.state"),
+            serde_json::to_vec(&owners).unwrap(),
+        )
+        .unwrap();
+        let binary = directory.join("bridge");
+        std::fs::write(
+            &binary,
+            r#"#!/usr/bin/env python3
+import sys,json,pathlib
+base=pathlib.Path(sys.argv[sys.argv.index('--state-dir')+1])
+for line in sys.stdin:
+    r=json.loads(line)
+    if r['method']=='hello': out={'kind':'hello','version':1,'server_id':'fixture','agents':[]}
+    elif r['method']=='adopt_resources':
+        owners=json.loads((base/'owners.state').read_text()); selected=[]
+        for resource in r['resources']:
+            if owners.get(resource['id']) in (r['previous_owner_id'],r['owner_id']):
+                owners[resource['id']]=r['owner_id']; selected.append(resource)
+        (base/'owners.state').write_text(json.dumps(owners))
+        out={'kind':'resources_adopted','resources':selected}
+    else: raise AssertionError(r)
+    print(json.dumps(out),flush=True)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        drop(guard);
+        let mut client = Client::local(&binary, Some(&directory)).await.unwrap();
+        let mut cleanups = 0;
+        let result = drain_directory_with_cleanup(
+            &directory,
+            &remote,
+            &mut client,
+            "app-b",
+            |directory, intent| {
+                cleanups += 1;
+                if cleanups == 2 {
+                    return Err("injected second record write failure".into());
+                }
+                write(directory, intent)
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(cleanups, 2);
+        drop(client);
+        let mut restarted = Client::local(&binary, Some(&directory)).await.unwrap();
+        let mut recovered = drain_directory(&directory, &remote, &mut restarted, "app-c")
+            .await
+            .unwrap();
+        recovered.sort_by(|a, b| a.id().cmp(b.id()));
+        assert_eq!(
+            recovered,
+            vec![
+                Resource::AgentSession("session-0".into()),
+                Resource::AgentSession("session-1".into())
+            ]
+        );
+        let journals: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|s| s == "json"))
+            .collect();
+        assert_eq!(journals.len(), 1);
+        assert_eq!(
+            read(&journals[0]).unwrap().hosts[0]
+                .adopted_owner_id
+                .as_deref(),
+            Some("app-c")
+        );
+        drop(restarted);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

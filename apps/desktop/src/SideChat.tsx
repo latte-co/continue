@@ -322,7 +322,16 @@ export function SideChat({
         refresh((v) => v + 1);
         return true;
       } catch (cause) {
-        if (action.method === "send" && cause instanceof ServerRequestError) {
+        if (
+          action.method === "send" &&
+          cause instanceof ServerRequestError &&
+          cause.code !== "admission_unknown" &&
+          // Older Servers expose actor receipt timeouts as request_failed.
+          !(
+            cause.code === "request_failed" &&
+            /会话接收超时|会话接收结果待确认/.test(cause.message)
+          )
+        ) {
           const pending = admissions.get(drafts)?.get(key);
           if (pending?.request.request_id === action.request_id)
             admissions.get(drafts)?.delete(key);
@@ -420,7 +429,7 @@ export function SideChat({
             el.scrollHeight - el.clientHeight - el.scrollTop < 90;
         }}
       >
-        {!ready && !events.length && enabled && !readError && (
+        {!isDraft && !ready && !events.length && enabled && !readError && (
           <WorkingStatus label="正在读取记录…" animated />
         )}
         <div className="side-chat-messages">

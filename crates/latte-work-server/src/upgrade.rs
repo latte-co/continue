@@ -295,6 +295,14 @@ async fn handle_inner(
                 }
                 match &resource {
                     Resource::AgentSession(id) => {
+                        // Missing actors also cover uncertain native closes. A
+                        // durable unknown close must retain the owner's quit intent.
+                        db(&service.database, |d| {
+                            if let Some(reason) = d.unconfirmed_agent_close(id)? {
+                                bail!(reason);
+                            }
+                            Ok(())
+                        })?;
                         let exists = service
                             .runs
                             .lock()

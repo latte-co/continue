@@ -1093,6 +1093,87 @@ async fn archive_retires_parent_and_side_ownership_before_unowned_reopen() {
     );
 }
 
+#[tokio::test]
+async fn durable_unknown_main_close_blocks_undo_quit_and_replacement_until_confirmed() {
+    use latte_work_protocol::lifecycle::Resource;
+    let host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("shared.txt");
+    std::fs::write(&file, "before\n").unwrap();
+    let mut client = host.client().await;
+    let project = terminal_project(&mut client, root.path()).await;
+    let main = create_session(&mut client, project, "codex").await;
+    send(&mut client, &main.id, "edit", "main-foreground-write").await;
+    wait(&mut client, &main.id, Status::Completed).await;
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::CloseAgentSession {
+                session_id: main.id.clone(),
+                only_if_idle: Some(true)
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    let resource = Resource::AgentSession(main.id.clone());
+    client
+        .claim_resources("app".into(), vec![resource.clone()])
+        .await
+        .unwrap();
+    // Model a close which has lost its actor but retained its durable uncertainty.
+    let db = rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
+    db.execute("INSERT INTO unconfirmed_agent_closes(session_id,reason,close_id) VALUES (?1,'close unconfirmed','close-token')", [&main.id]).unwrap();
+    for _ in 0..2 {
+        assert!(
+            client
+                .close_owned_resources(
+                    client.server_id().to_owned(),
+                    "app".into(),
+                    vec![resource.clone()]
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            matches!(ask(&mut client, Request::UndoTurnChanges { session_id: main.id.clone(), request_id: "edit".into() }).await,
+            Response::Error { message, .. } if message.contains("关闭状态待确认"))
+        );
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::OpenAgentSession {
+                    session_id: main.id.clone(),
+                    provider: Some(TurnProvider::Cli)
+                }
+            )
+            .await,
+            Response::Error { .. }
+        ));
+        assert!(matches!(
+            send(&mut client, &main.id, "replacement", "hello").await,
+            Response::Error { .. }
+        ));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "main edit\n");
+    }
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::ConfirmAgentClosed {
+                session_id: main.id.clone(),
+                close_id: "close-token".into()
+            }
+        )
+        .await,
+        Response::Session { .. }
+    ));
+    assert!(
+        matches!(ask(&mut client, Request::UndoTurnChanges { session_id: main.id.clone(), request_id: "edit".into() }).await,
+        Response::TurnChanges { changes } if changes.undo == TurnUndoStatus::Reverted)
+    );
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "before\n");
+}
+
 async fn check_detached_side_writes(completed: bool) {
     let host = Host::start().await;
     let root = tempfile::tempdir().unwrap();

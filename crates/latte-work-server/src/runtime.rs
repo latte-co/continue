@@ -36,6 +36,15 @@ const CLOSE_PENDING: &str = "原生会话的关闭状态待确认，请核对主
 const SIDE_CLOSE_PENDING: &str = "本地侧边聊天已关闭，后台写入待确认。";
 const RECONFIGURE_BLOCKED: &str = "当前会话仍有后台任务或待确认状态，无法更换模型、Provider、权限或思考强度；请沿用当前配置发送，消息未发送";
 
+#[derive(Debug)]
+pub struct AdmissionUnknown;
+impl std::fmt::Display for AdmissionUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("会话接收结果待确认，请使用原请求 ID 核对；消息不会自动重发")
+    }
+}
+impl std::error::Error for AdmissionUnknown {}
+
 #[derive(Default)]
 struct ForwardedInputs(HashMap<String, tokio::time::Instant>);
 impl ForwardedInputs {
@@ -289,7 +298,8 @@ pub async fn submit(
         .context("会话正在停止或请求队列已满，请重试；消息不会自动重发")?;
     tokio::time::timeout(Duration::from_secs(10), receive)
         .await
-        .context("会话接收超时，请核对请求状态；消息不会自动重发")??
+        .map_err(|_| AdmissionUnknown)?
+        .map_err(|_| AdmissionUnknown)?
         .map_err(anyhow::Error::msg)
 }
 pub async fn queue_action(
@@ -394,7 +404,7 @@ pub async fn rename_title(
             })
             .await
             .context("OpenCode 原生标题修改结果待确认");
-            process.close().await;
+            process.close_confirmed(database, &session.id).await?;
             result??;
             return db(database, |s| s.session(&session.id));
         }
@@ -1190,6 +1200,12 @@ impl Process {
         session_open: Arc<AtomicBool>,
         request_id: Option<&str>,
     ) -> Result<Self> {
+        db(database, |s| {
+            if let Some(reason) = s.unconfirmed_agent_close(&session.id)? {
+                bail!(reason);
+            }
+            Ok(())
+        })?;
         let mut adapter = agents::create(&session.agent)?;
         adapter.set_session_title(
             session.custom_title.then(|| session.title.clone()),
@@ -1543,6 +1559,16 @@ impl Process {
             let _ = job.await;
         }
     }
+    async fn close_confirmed(&mut self, database: &Database, id: &str) -> Result<()> {
+        db(database, |s| {
+            if let Some(reason) = s.unconfirmed_agent_close(id)? {
+                bail!(reason);
+            }
+            s.record_unconfirmed_agent_close(id, CLOSE_PENDING)
+        })?;
+        let confirmed = self.close().await;
+        finish_native_close(database, id, confirmed)
+    }
     async fn close(&mut self) -> bool {
         self.cancel_title().await;
         self.clear_approval_replies();
@@ -1586,6 +1612,12 @@ impl Process {
         .await
         .unwrap_or(false)
     }
+}
+fn finish_native_close(database: &Database, id: &str, confirmed: bool) -> Result<()> {
+    if !confirmed {
+        bail!(CLOSE_PENDING);
+    }
+    db(database, |s| s.clear_unconfirmed_agent_close(id))
 }
 async fn finish_turn(
     database: &Database,
@@ -1684,8 +1716,9 @@ async fn accept_turn(
         if !current.adapter.can_reconfigure() {
             bail!(RECONFIGURE_BLOCKED);
         }
-        current.close().await;
+        let closed = current.close_confirmed(database, &session.id).await;
         *process = None;
+        closed?;
     }
     db(database, |s| {
         s.begin(
@@ -1774,7 +1807,7 @@ async fn accept_turn(
             .is_some_and(|p| p.turn_active && p.background_at_start);
         let message = if let Some(p) = process.as_mut() {
             let message = p.config.redact(&error.to_string());
-            p.close().await;
+            let _ = p.close_confirmed(database, &session.id).await;
             message
         } else {
             config.redact(&error.to_string())
@@ -1949,7 +1982,7 @@ async fn actor(
                     if let Some(pending) = immediate.take() { let _ = pending.reply.send(Err("发送已取消，消息保留在队列".into())); }
                     if !forwarded.is_empty() {
                         let background_pending=process.as_ref().is_some_and(|p|p.turn_active&&p.background_at_start);
-                        if let Some(p)=process.as_mut(){p.close().await;}
+                        if let Some(p)=process.as_mut(){p.close_confirmed(&database, &session.id).await?;}
                         process=None;
                         forwarded.clear();
                         db(&database,|d|{d.uncertain_forwarded(&session.id)?;d.end_subagents(&session.id,latte_work_protocol::SubagentStatus::Unknown)?;d.pause_queue(&session.id,Some("当前执行已停止，队列已暂停"))})?;
@@ -1959,7 +1992,7 @@ async fn actor(
                         Ok(())
                     } else if process.as_ref().is_some_and(|p| !p.turn_active && !p.state.pending.is_empty()) {
                         if let Some(p) = process.as_mut() {
-                            p.close().await;
+                            p.close_confirmed(&database, &session.id).await?;
                         }
                         process = None;
                         db(&database, |d| {
@@ -2079,7 +2112,7 @@ async fn actor(
                             immediate=Some(Immediate {turn,restore_reason,reply,deadline:tokio::time::Instant::now()+Duration::from_secs(8)});
                             if interrupt && !forwarded.is_empty() {
                                 let background_pending=process.as_ref().is_some_and(|p|p.turn_active&&p.background_at_start);
-                                if let Some(p)=process.as_mut() {p.close().await;}
+                                if let Some(p)=process.as_mut() {p.close_confirmed(&database, &session.id).await?;}
                                 process=None;
                                 forwarded.clear();
                                 db(&database,|d|{d.uncertain_forwarded(&session.id)?;d.end_subagents(&session.id,latte_work_protocol::SubagentStatus::Unknown)})?;
@@ -2142,15 +2175,8 @@ async fn actor(
                     let background_pending = process
                         .as_ref()
                         .is_some_and(|p| p.turn_active && p.background_at_start);
-                    let had_process = process.is_some();
-                    if had_process
-                        && let Err(error) = db(&database, |s| s.record_unconfirmed_agent_close(&session.id, CLOSE_PENDING))
-                    {
-                        if let Some(reply) = reply { let _ = reply.send(Err(error.to_string())); }
-                        continue;
-                    }
                     let close_unconfirmed = if let Some(p) = process.as_mut() {
-                        !p.close().await
+                        p.close_confirmed(&database, &session.id).await.is_err()
                     } else { false };
                     process = None;
                     if let Err(error) =
@@ -2176,9 +2202,6 @@ async fn actor(
                         }
                         if close_unconfirmed {
                             bail!(message);
-                        }
-                        if had_process {
-                            s.clear_unconfirmed_agent_close(&session.id)?;
                         }
                         Ok(())
                     });
@@ -2313,7 +2336,7 @@ async fn actor(
                 if let Some(reply) = p.stop_reply.take() {
                     let _ = reply.send(Err(text.clone()));
                 }
-                p.close().await;
+                let _ = p.close_confirmed(&database, &session.id).await;
                 text
             } else {
                 error.to_string()
@@ -2330,7 +2353,10 @@ async fn actor(
             }) {
                 eprintln!("cannot persist terminal state: {e}");
             }
-            if let Some(config) = recovery {
+            if let Some(config) = recovery
+                && db(&database, |s| s.unconfirmed_agent_close(&session.id))
+                    .is_ok_and(|pending| pending.is_none())
+            {
                 let restore = async {
                     let current = db(&database, |s| s.session(&session.id))?;
                     let mut p = Process::spawn(
@@ -2351,6 +2377,24 @@ async fn actor(
                     process = Some(p);
                 }
             }
+        }
+        if db(&database, |s| s.unconfirmed_agent_close(&session.id))
+            .is_ok_and(|pending| pending.is_some())
+        {
+            let _ = db(&database, |s| {
+                s.pause_queue(&session.id, Some(CLOSE_PENDING))?;
+                s.end_subagents(&session.id, latte_work_protocol::SubagentStatus::Unknown)?;
+                s.state(&session.id, Status::Unknown, Some(CLOSE_PENDING.into()))
+            });
+            for reply in opening.drain(..) {
+                let _ = reply.send(Err(CLOSE_PENDING.into()));
+            }
+            if let Ok(mut map) = runs.lock() {
+                map.remove(&session.id);
+            }
+            // Retain durable uncertainty; do not retry close or spawn a replacement.
+            process = None;
+            break;
         }
         if process.as_ref().is_some_and(|p| p.state.ready) {
             for reply in opening.drain(..) {
@@ -2491,7 +2535,7 @@ async fn actor(
         );
     }
     if let Some(p) = process.as_mut() {
-        p.close().await;
+        let _ = p.close_confirmed(&database, &session.id).await;
     }
 }
 async fn deadline(at: Option<tokio::time::Instant>) {
@@ -2562,6 +2606,124 @@ pub async fn commands(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_admission_timeout_remains_unknown_and_late_acceptance_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.sqlite")).unwrap();
+        let project = store.add_project(dir.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        let database = Arc::new(Mutex::new(store));
+        let runs: Runs = Arc::default();
+        let (control, mut queued) = mpsc::channel(4);
+        runs.lock().unwrap().insert(
+            session.id.clone(),
+            Run {
+                control,
+                safe_to_close: Arc::new(AtomicBool::new(true)),
+                session_open: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let config = crate::providers::ProviderStore::open(dir.path())
+            .unwrap()
+            .turn_config("claude", None, None)
+            .unwrap();
+        let result = submit(
+            database.clone(),
+            runs,
+            "/missing/cli".into(),
+            session.clone(),
+            dir.path().to_string_lossy().into_owned(),
+            SendTurn {
+                request_id: "delayed".into(),
+                text: "once".into(),
+                model: None,
+                fingerprint: None,
+                config,
+            },
+            false,
+        )
+        .await;
+        assert!(result.unwrap_err().is::<AdmissionUnknown>());
+        let Control::Send { turn, reply, .. } = queued.recv().await.unwrap() else {
+            panic!("queued send");
+        };
+        assert!(reply.is_closed());
+        db(&database, |s| {
+            s.begin(
+                &session.id,
+                &turn.request_id,
+                &turn.text,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .unwrap();
+        assert!(
+            db(&database, |s| s.already_accepted(
+                &session.id,
+                "delayed",
+                "once",
+                None,
+                None,
+                None,
+                None
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            db(&database, |s| s.events(&session.id, 0.0))
+                .unwrap()
+                .0
+                .iter()
+                .filter(|e| matches!(e.event, EventKind::User { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_native_reap_blocks_every_replacement_spawn_until_reconciled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.sqlite")).unwrap();
+        let project = store.add_project(dir.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        let database = Arc::new(Mutex::new(store));
+        db(&database, |s| {
+            s.record_unconfirmed_agent_close(&session.id, CLOSE_PENDING)
+        })
+        .unwrap();
+        assert!(finish_native_close(&database, &session.id, false).is_err());
+        let config = crate::providers::ProviderStore::open(dir.path())
+            .unwrap()
+            .turn_config("claude", None, None)
+            .unwrap();
+        for request_id in [None, Some("replacement")] {
+            let result = Process::spawn(
+                &database,
+                "/missing/cli",
+                &session,
+                dir.path().to_str().unwrap(),
+                config.clone(),
+                Arc::new(AtomicBool::new(false)),
+                request_id,
+            );
+            assert!(matches!(result, Err(error) if error.to_string() == CLOSE_PENDING));
+        }
+        assert!(
+            db(&database, |s| s.unconfirmed_agent_close(&session.id))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db(&database, |s| s.events(&session.id, 0.0))
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
 
     #[test]
     fn managed_project_pages_include_processless_actors_and_keep_a_stable_cursor() {

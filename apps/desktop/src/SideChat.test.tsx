@@ -14,6 +14,7 @@ import { DraftStore } from "./drafts";
 import { closeSideChat, SideChat, sideDraftKey } from "./SideChat";
 import { openSideChatTab, useWorkspaceState } from "./workspaceState";
 import type { Request, Session } from "./protocol";
+import { ServerRequestError } from "./api";
 
 vi.mock("./ModelPicker", async () => {
   const { useEffect } = await import("react");
@@ -53,7 +54,14 @@ const { request } = vi.hoisted(() => ({ request: vi.fn() }));
 vi.mock("./api", () => ({
   request,
   message: String,
-  ServerRequestError: class extends Error {},
+  ServerRequestError: class extends Error {
+    constructor(
+      public code: string,
+      message: string,
+    ) {
+      super(message);
+    }
+  },
 }));
 afterEach(() => {
   cleanup();
@@ -155,6 +163,7 @@ it("opens without sending, reconciles an ambiguous admission and keeps main inpu
   }) as HTMLButtonElement;
   await waitFor(() => expect(send.disabled).toBe(false));
   expect(received).toBe("");
+  expect(screen.queryByText("正在读取记录…")).toBeNull();
   expect(request.mock.calls.map(([, action]) => action.method)).toEqual([
     "agent_permissions",
   ]);
@@ -191,6 +200,57 @@ it("opens without sending, reconciles an ambiguous admission and keeps main inpu
   ).toHaveLength(1);
   expect(drafts.get(mainKey).text).toBe("main draft");
 });
+
+it.each(["admission_unknown", "request_failed"])(
+  "keeps the same request ID after an ambiguous server %s receipt",
+  async (code) => {
+    const drafts = new DraftStore();
+    const key = sideDraftKey("local", parent.id, child.id);
+    drafts.update(key, { text: "execute once" });
+    let attempts = 0;
+    request.mockImplementation(async (_host, action: Request) => {
+      if (action.method === "agent_permissions")
+        return { kind: "agent_permissions", modes: [] };
+      if (action.method === "poll")
+        return { kind: "events", session: child, events: [], has_more: false };
+      if (action.method === "send") {
+        attempts++;
+        if (attempts === 1)
+          throw new ServerRequestError(code, "会话接收超时，请核对请求状态");
+        return { kind: "accepted", duplicate: true };
+      }
+      throw new Error("unexpected request");
+    });
+    render(
+      <SideChat
+        parent={parent}
+        sideId={child.id}
+        workspaceId={crypto.randomUUID()}
+        hostId="local"
+        drafts={drafts}
+        active
+        connected
+        supported
+      />,
+    );
+    const send = () =>
+      screen.getByRole<HTMLButtonElement>("button", {
+        name: "发送侧边聊天消息",
+      });
+    await waitFor(() => expect(send().disabled).toBe(false));
+    fireEvent.click(send());
+    await screen.findByRole("alert");
+    await waitFor(() => expect(send().disabled).toBe(false));
+    expect(drafts.get(key).text).toBe("execute once");
+    fireEvent.click(send());
+    await waitFor(() => expect(drafts.get(key).text).toBe(""));
+    const sends = request.mock.calls
+      .map(([, action]) => action)
+      .filter((action) => action.method === "send");
+    expect(sends).toHaveLength(2);
+    expect(sends[1].request_id).toBe(sends[0].request_id);
+  },
+);
 
 it("stops only the side turn and never reads a hidden tab", async () => {
   const drafts = new DraftStore();

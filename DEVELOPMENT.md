@@ -339,6 +339,9 @@ If the acknowledgement is lost, recovery first reconciles that exact transfer
 (the Server accepts either owner) before journaling a transfer to the current App.
 Repeated App restarts therefore retain both possible owners without accumulating
 an unbounded list of candidates; unrelated owners and changed daemons stay fenced.
+After all batches acknowledge, recovery writes a consolidated durable handoff
+before deleting any old record. The handoff survives final-cleanup errors and a
+crash before in-memory registration; later recovery deduplicates overlapping records.
 The host closes and reaps the Agent process group before acknowledging. An App
 reclaim fences stale closes from an earlier App instance. New requests are blocked
 while quitting; admitted requests cannot send new work after claiming a resource
@@ -1847,6 +1850,12 @@ reservation across asynchronous Open/Send, refreshing the runtime version both
 before execution and when dispatch settles. Ordinary close can still interrupt
 pending message delivery; it cannot erase another connection's in-flight reservation.
 A connection's own explicit close or archive retires its reservation.
+Undo and owned-resource exit cleanup also check durable unknown native closes,
+even after the actor is gone. Configuration replacement and fault recovery share
+the journaled close path; an unconfirmed reap blocks replacement until explicit
+reconciliation. Actor receipt timeouts return `admission_unknown`; side drafts
+retain their request ID for polling or an explicit idempotent retry. Legacy
+receipt-timeout errors are treated as uncertain as well.
 Claim/adoption capacity checks prune entries no longer matching global ownership.
 After eviction the connection requires explicit claims for execution, so a removed
 old claim cannot be mistaken for an unowned legacy request or steal a newer owner.

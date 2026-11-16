@@ -1547,6 +1547,20 @@ impl Store {
             )
             .optional()?)
     }
+    pub fn check_no_unconfirmed_closes(&self) -> Result<()> {
+        let pending: Option<String> = self
+            .db
+            .query_row(
+                "SELECT session_id FROM unconfirmed_agent_closes LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = pending {
+            bail!("会话（{id}）的原生关闭状态待确认，请核对后再撤销");
+        }
+        Ok(())
+    }
     pub fn record_unconfirmed_agent_close(&self, id: &str, reason: &str) -> Result<()> {
         self.db.execute(
             "INSERT OR IGNORE INTO unconfirmed_agent_closes(session_id,reason,close_id) VALUES (?1,?2,?3)",

@@ -346,7 +346,9 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
                 Ok(request) if ready => match dispatch(&service, request, &mut claims).await {
                     Ok(response) => response,
                     Err(error) => Response::Error {
-                        code: if error.is::<files::NotGitRepository>() {
+                        code: if error.is::<runtime::AdmissionUnknown>() {
+                            "admission_unknown"
+                        } else if error.is::<files::NotGitRepository>() {
                             "not_git_repository"
                         } else {
                             "request_failed"
@@ -1664,6 +1666,7 @@ async fn dispatch_admitted(
             if db(&s.database, |d| d.latest_request(&session_id))? != request_id {
                 bail!("只能撤销此会话最近一轮的修改，请查看历史 diff 后手动调整");
             }
+            db(&s.database, |d| d.check_no_unconfirmed_closes())?;
             if db(&s.database, |d| d.has_active_sessions())?
                 || s.runs
                     .lock()
@@ -1711,6 +1714,7 @@ async fn dispatch_admitted(
                 }
             }
             turn = turn.check_undo(root.to_owned(), false).await?;
+            db(&s.database, |d| d.check_no_unconfirmed_closes())?;
             turn.changes.undo = TurnUndoStatus::Unknown;
             db(&s.database, |d| d.update_turn(&session_id, &turn))?;
             turn = turn
