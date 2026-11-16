@@ -329,6 +329,11 @@ Tao window/reopen handling intact; Rust contains no unsafe code.
 Dock Quit and Command-Q silently close resources opened or sent by this App
 instance. A dedicated transport bypasses local upgrade checks and UI polling;
 cleanup batches are idempotent and bound to both the daemon ID and App owner ID.
+Quit and reconnect split resource inventories into at most 128 IDs per lifecycle
+RPC. Successful quit batches retire their local records immediately; failures
+retain only the remaining work. The size-bounded quit journal accepts larger
+host inventories and retains acknowledged remote adoption owners across a partial
+recovery, so a later reconnect can finish without reopening or replaying work.
 The host closes and reaps the Agent process group before acknowledging. An App
 reclaim fences stale closes from an earlier App instance. New requests are blocked
 while quitting; admitted requests cannot send new work after claiming a resource
@@ -1862,6 +1867,11 @@ Pages contain at most 64 sessions and 256 KiB of stored metadata, ordered by ses
 ID; failed reads or non-advancing cursors never produce a partial close inventory.
 Older Servers must update for this inventory. Processless actors remain closeable.
 It reports a confirmed local side close separately from pending background writes.
+Successful archive retires captured resource claims for the parent and every
+closed side chat. The desktop snapshots child IDs before archive, serializes it
+with Agent admission on the control lane, and removes that family from its quit
+records only after the archived, closed response is confirmed. Failed archive
+keeps the local records for reconciliation and bounded quit cleanup.
 Unsent side model, effort and permission choices remain scoped to the same
 App-lifetime host/parent/side owner across main-conversation navigation.
 

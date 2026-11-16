@@ -359,7 +359,7 @@ async fn handle_inner(
 fn validate_resources(owner: &str, resources: &[Resource]) -> Result<()> {
     if owner.is_empty()
         || owner.len() > 128
-        || resources.len() > 128
+        || resources.len() > latte_work_protocol::lifecycle::RESOURCE_BATCH_LIMIT
         || resources
             .iter()
             .any(|r| r.id().is_empty() || r.id().len() > 256)

@@ -838,9 +838,27 @@ async fn dispatch_admitted(
         Request::ArchiveSession {
             session_id,
             archived,
-        } => Response::Session {
-            session: runtime::archive(&s.database, &s.runs, &session_id, archived).await?,
-        },
+        } => {
+            let children = if archived {
+                db(&s.database, |d| d.side_chat_ids(&session_id))?
+                    .into_iter()
+                    .map(|id| {
+                        let resource = upgrade::Resource::AgentSession(id);
+                        let version = s.lifecycle.claim_version(&resource)?;
+                        Ok((resource, version))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
+            let session = runtime::archive(&s.database, &s.runs, &session_id, archived).await?;
+            // Archive holds exclusive execution admission. Retire only the
+            // child claims captured before closing, preserving concurrent claims.
+            for (resource, version) in children {
+                s.lifecycle.forget_claim(&resource, version, claims)?;
+            }
+            Response::Session { session }
+        }
         Request::OpenSideChat {
             session_id,
             side_id,

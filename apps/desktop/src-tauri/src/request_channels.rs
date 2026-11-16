@@ -16,6 +16,7 @@ pub fn lane(request: &Request) -> Lane {
         | Request::CloseAgentSession { .. }
         | Request::ConfirmSideWritesEnded { .. }
         | Request::ConfirmAgentClosed { .. }
+        | Request::ArchiveSession { archived: true, .. }
         | Request::Send { .. }
         | Request::SendQueued { .. }
         | Request::ResumeMessageQueue { .. }

@@ -106,15 +106,18 @@ where
             // Use a dedicated bridge: an in-flight reply or UI polling cannot
             // prevent the server from receiving the whole cleanup batch.
             let mut client = reconnect(host.clone()).await?;
-            client
-                .close_owned_resources(server, state.owner_id().to_owned(), resources.clone())
-                .await
-                .map_err(|e| format!("{e:#}"))
-        }
-        .await;
-        match result {
-            Ok(()) => {
-                for resource in resources {
+            for batch in resources.chunks(latte_work_protocol::lifecycle::RESOURCE_BATCH_LIMIT) {
+                client
+                    .close_owned_resources(
+                        server.clone(),
+                        state.owner_id().to_owned(),
+                        batch.to_vec(),
+                    )
+                    .await
+                    .map_err(|e| format!("{e:#}"))?;
+                // A later batch can fail or exceed the overall quit deadline.
+                // Remove only resources whose batch has already acknowledged.
+                for resource in batch {
                     state
                         .owned_instances
                         .lock()
@@ -122,14 +125,23 @@ where
                         .remove(&(host.clone(), resource.clone()));
                     match resource {
                         latte_work_protocol::lifecycle::Resource::AgentSession(id) => {
-                            state.turns.lock().await.remove(&(host.clone(), id));
+                            state.turns.lock().await.remove(&(host.clone(), id.clone()));
                         }
                         latte_work_protocol::lifecycle::Resource::Terminal(id) => {
-                            state.terminals.lock().await.remove(&(host.clone(), id));
+                            state
+                                .terminals
+                                .lock()
+                                .await
+                                .remove(&(host.clone(), id.clone()));
                         }
                     }
                 }
             }
+            Ok::<_, String>(())
+        }
+        .await;
+        match result {
+            Ok(()) => {}
             Err(error) => {
                 errors.push(format!("{host}：{error}"));
                 failed_hosts.insert(host);
@@ -494,6 +506,68 @@ for line in sys.stdin:
         std::fs::remove_file(binary).unwrap();
         std::fs::remove_file(directory.join("requests")).unwrap();
         std::fs::remove_dir(directory).unwrap();
+    }
+    #[tokio::test]
+    async fn quit_batches_large_inventories_and_retains_only_unacknowledged_resources() {
+        use latte_work_protocol::lifecycle::Resource;
+        use std::os::unix::fs::PermissionsExt;
+        for fail_last in [false, true] {
+            let directory =
+                std::env::temp_dir().join(format!("lw-quit-batches-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            let binary = directory.join("bridge");
+            std::fs::write(&binary, r#"#!/usr/bin/env python3
+import sys,json,pathlib
+base=pathlib.Path(sys.argv[sys.argv.index('--state-dir')+1])
+for line in sys.stdin:
+    r=json.loads(line)
+    if r['method']=='hello': out={'kind':'hello','version':1,'server_id':'fixture','agents':[]}
+    elif r['method']=='close_owned_resources':
+        assert 0<len(r['resources'])<=128
+        with (base/'sizes').open('a') as f: f.write(str(len(r['resources']))+'\n')
+        out={'kind':'error','code':'held','message':'last batch unconfirmed'} if len(r['resources'])==1 and (base/'fail').exists() else {'kind':'resources_closed'}
+    else: raise AssertionError(r)
+    print(json.dumps(out),flush=True)
+"#).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if fail_last {
+                std::fs::write(directory.join("fail"), "").unwrap();
+            }
+            let state = Connections::default();
+            for n in 0..129 {
+                let id = format!("session-{n}");
+                state
+                    .turns
+                    .lock()
+                    .await
+                    .insert(("remote".into(), id.clone()), "turn".into());
+                state.owned_instances.lock().await.insert(
+                    ("remote".into(), Resource::AgentSession(id)),
+                    "fixture".into(),
+                );
+            }
+            let result = stop_owned(&state, &|_| {
+                let binary = binary.clone();
+                let directory = directory.clone();
+                async move {
+                    latte_work_client::Client::local(&binary, Some(&directory))
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            })
+            .await;
+            assert_eq!(result.is_err(), fail_last);
+            assert_eq!(
+                state.owned_instances.lock().await.len(),
+                usize::from(fail_last)
+            );
+            assert_eq!(state.turns.lock().await.len(), usize::from(fail_last));
+            assert_eq!(
+                std::fs::read_to_string(directory.join("sizes")).unwrap(),
+                "128\n1\n"
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
     #[tokio::test]
     async fn only_current_tab_cleanup_ack_can_finish_exit() {

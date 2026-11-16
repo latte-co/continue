@@ -1024,6 +1024,75 @@ async fn cross_connection_cleanup_reclaims_capacity_without_reviving_old_claims(
     );
 }
 
+#[tokio::test]
+async fn archive_retires_parent_and_side_ownership_before_unowned_reopen() {
+    use latte_work_protocol::lifecycle::Resource;
+    let host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut control = host.client().await;
+    let mut archive = host.client().await;
+    let project = terminal_project(&mut control, root.path()).await;
+    let parent = create_session(&mut control, project, "codex").await;
+    let main_resource = Resource::AgentSession(parent.id.clone());
+    control
+        .claim_resources("old-app".into(), vec![main_resource.clone()])
+        .await
+        .unwrap();
+    send(&mut control, &parent.id, "init", "hello").await;
+    wait(&mut control, &parent.id, Status::Completed).await;
+    let side = open_side(&mut control, &parent).await;
+    let side_resource = Resource::AgentSession(side.id.clone());
+    control
+        .claim_resources("old-app".into(), vec![side_resource.clone()])
+        .await
+        .unwrap();
+    send(&mut control, &side.id, "side", "hello").await;
+    wait(&mut control, &side.id, Status::Completed).await;
+    assert!(
+        matches!(ask(&mut archive, Request::ArchiveSession { session_id: parent.id.clone(), archived: true }).await,
+        Response::Session { session } if session.archived)
+    );
+    assert!(
+        matches!(ask(&mut archive, Request::ProjectAgentSessions { project_id: parent.project_id.clone(), after: None }).await,
+        Response::ProjectAgentSessions { sessions, .. } if sessions.is_empty())
+    );
+    ask(
+        &mut archive,
+        Request::ArchiveSession {
+            session_id: parent.id.clone(),
+            archived: false,
+        },
+    )
+    .await;
+    let mut unowned = host.client().await;
+    for id in [&parent.id, &side.id] {
+        assert!(matches!(
+            ask(
+                &mut unowned,
+                Request::OpenAgentSession {
+                    session_id: id.clone(),
+                    provider: Some(TurnProvider::Cli)
+                }
+            )
+            .await,
+            Response::Ok
+        ));
+    }
+    assert!(
+        unowned
+            .adopt_resources(
+                unowned.server_id().to_owned(),
+                "old-app".into(),
+                "new-app".into(),
+                vec![main_resource, side_resource]
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+        "archived child ownership must not survive into unrelated reopens"
+    );
+}
+
 async fn check_detached_side_writes(completed: bool) {
     let host = Host::start().await;
     let root = tempfile::tempdir().unwrap();

@@ -22,6 +22,9 @@ struct HostIntent {
     host: Host,
     server_id: String,
     resources: Vec<Resource>,
+    /// A prior recovery may have adopted this batch before a later batch failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adopted_owner_id: Option<String>,
 }
 const LIMIT: u64 = 1024 * 1024;
 fn directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -109,8 +112,12 @@ fn read(path: &Path) -> Result<Intent, String> {
     let intent: Intent = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
     let owner = uuid::Uuid::parse_str(&intent.owner_id).map_err(|e| e.to_string())?;
     if path.file_name().and_then(|s| s.to_str()) != Some(format!("{owner}.json").as_str())
-        || intent.hosts.len() > 128
-        || intent.hosts.iter().any(|h| h.resources.len() > 128)
+        || intent.hosts.len() > 4096
+        || intent.hosts.iter().any(|h| {
+            h.resources
+                .iter()
+                .any(|r| r.id().is_empty() || r.id().len() > 256)
+        })
     {
         return Err("无效关闭记录".into());
     }
@@ -138,6 +145,7 @@ pub(crate) async fn persist(app: &tauri::AppHandle, state: &Connections) -> Resu
             host,
             server_id,
             resources,
+            adopted_owner_id: None,
         });
     }
     let intent = Intent {
@@ -200,32 +208,77 @@ async fn drain_directory(
     }
     paths.sort();
     let mut adopted = Vec::new();
-    for path in paths {
-        let mut intent = read(&path)?;
-        for item in intent.hosts.iter().filter(|h| same_target(&h.host, host)) {
+    for path in &paths {
+        let mut intent = read(path)?;
+        let mut index = 0;
+        while index < intent.hosts.len() {
+            if !same_target(&intent.hosts[index].host, host) {
+                index += 1;
+                continue;
+            }
+            let item = &intent.hosts[index];
+            let batch = item
+                .resources
+                .iter()
+                .take(latte_work_protocol::lifecycle::RESOURCE_BATCH_LIMIT)
+                .cloned()
+                .collect::<Vec<_>>();
             if host.ssh.is_some() {
-                adopted.extend(
-                    client
-                        .adopt_resources(
-                            item.server_id.clone(),
-                            intent.owner_id.clone(),
-                            owner_id.to_owned(),
-                            item.resources.clone(),
-                        )
-                        .await
-                        .map_err(|e| format!("{e:#}"))?,
-                );
+                let batch_owner = item
+                    .adopted_owner_id
+                    .as_deref()
+                    .unwrap_or(&intent.owner_id)
+                    .to_owned();
+                let resources = client
+                    .adopt_resources(
+                        item.server_id.clone(),
+                        batch_owner,
+                        owner_id.to_owned(),
+                        batch.clone(),
+                    )
+                    .await
+                    .map_err(|e| format!("{e:#}"))?;
+                adopted.extend(resources.clone());
+                // Preserve acknowledged adoption ownership if a subsequent batch
+                // fails. A new App can adopt these entries from this App's ID.
+                let acknowledged = HostIntent {
+                    host: item.host.clone(),
+                    server_id: item.server_id.clone(),
+                    resources,
+                    adopted_owner_id: Some(owner_id.to_owned()),
+                };
+                intent.hosts[index].resources.drain(..batch.len());
+                if intent.hosts[index].resources.is_empty() {
+                    intent.hosts.remove(index);
+                }
+                if !acknowledged.resources.is_empty() {
+                    intent.hosts.insert(index, acknowledged);
+                    index += 1;
+                }
             } else {
                 client
                     .close_owned_resources(
                         item.server_id.clone(),
                         intent.owner_id.clone(),
-                        item.resources.clone(),
+                        batch.clone(),
                     )
                     .await
                     .map_err(|e| format!("{e:#}"))?;
+                intent.hosts[index].resources.drain(..batch.len());
+                if intent.hosts[index].resources.is_empty() {
+                    intent.hosts.remove(index);
+                }
             }
+            write(directory, &intent)?;
         }
+    }
+    // Earlier files may have adopted resources before a later file fails. Keep
+    // every acknowledged owner journaled until the whole recovery can return it.
+    for path in &paths {
+        if !path.exists() {
+            continue;
+        }
+        let mut intent = read(path)?;
         intent.hosts.retain(|h| !same_target(&h.host, host));
         write(directory, &intent)?;
     }
@@ -249,6 +302,7 @@ mod tests {
                 host: host(),
                 server_id: "old-server".into(),
                 resources: vec![Resource::AgentSession("session".into())],
+                adopted_owner_id: None,
             }],
         };
         write(&directory, &intent).unwrap();
@@ -304,8 +358,12 @@ for line in sys.stdin:
     request=json.loads(line)
     with (base/'requests').open('a') as f: f.write(request['method']+'\n')
     if request['method']=='hello': response={'kind':'hello','version':1,'server_id':'fixture','agents':[]}
-    elif request['method']=='adopt_resources': response={'kind':'resources_adopted','resources':request['resources']}
-    elif request['method']=='close_owned_resources': response={'kind':'resources_closed'}
+    elif request['method']=='adopt_resources':
+        assert len(request['resources'])<=128
+        response={'kind':'resources_adopted','resources':request['resources']}
+    elif request['method']=='close_owned_resources':
+        assert len(request['resources'])<=128
+        response={'kind':'resources_closed'}
     else: response={'kind':'error','code':'unexpected','message':'No Open or Send allowed'}
     print(json.dumps(response),flush=True)
 "#).unwrap();
@@ -316,7 +374,9 @@ for line in sys.stdin:
                 host.ssh = Some("devbox".into());
             }
             let owner = uuid::Uuid::new_v4().to_string();
-            let resource = Resource::AgentSession("session".into());
+            let resources: Vec<_> = (0..129)
+                .map(|n| Resource::AgentSession(format!("session-{n}")))
+                .collect();
             write(
                 &directory,
                 &Intent {
@@ -324,7 +384,8 @@ for line in sys.stdin:
                     hosts: vec![HostIntent {
                         host: host.clone(),
                         server_id: "fixture".into(),
-                        resources: vec![resource.clone()],
+                        resources: resources.clone(),
+                        adopted_owner_id: None,
                     }],
                 },
             )
@@ -334,18 +395,91 @@ for line in sys.stdin:
             let adopted = drain_directory(&directory, &host, &mut client, "new-app")
                 .await
                 .unwrap();
-            assert_eq!(adopted, if remote { vec![resource] } else { vec![] });
+            assert_eq!(adopted, if remote { resources } else { vec![] });
             assert!(!directory.join(format!("{owner}.json")).exists());
             assert_eq!(
                 std::fs::read_to_string(directory.join("requests")).unwrap(),
                 if remote {
-                    "hello\nadopt_resources\n"
+                    "hello\nadopt_resources\nadopt_resources\n"
                 } else {
-                    "hello\nclose_owned_resources\n"
+                    "hello\nclose_owned_resources\nclose_owned_resources\n"
                 }
             );
             drop(client);
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+    #[tokio::test]
+    async fn partial_remote_adoption_retains_acknowledged_owner_for_retry() {
+        let directory =
+            std::env::temp_dir().join(format!("lw-pending-batches-{}", uuid::Uuid::new_v4()));
+        let guard = lock(&directory).unwrap();
+        let binary = directory.join("bridge");
+        std::fs::write(
+            &binary,
+            r#"#!/usr/bin/env python3
+import sys,json,pathlib
+base=pathlib.Path(sys.argv[sys.argv.index('--state-dir')+1])
+for line in sys.stdin:
+    r=json.loads(line)
+    if r['method']=='hello': out={'kind':'hello','version':1,'server_id':'fixture','agents':[]}
+    elif r['method']=='adopt_resources':
+        assert 0<len(r['resources'])<=128
+        with (base/'owners').open('a') as f: f.write(r['previous_owner_id']+'\n')
+        if len(r['resources'])==1 and not (base/'failed').exists():
+            (base/'failed').touch()
+            out={'kind':'error','code':'held','message':'second batch failed'}
+        else: out={'kind':'resources_adopted','resources':r['resources']}
+    else: raise AssertionError(r)
+    print(json.dumps(out),flush=True)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut host = host();
+        host.ssh = Some("ssh".into());
+        let owner = uuid::Uuid::new_v4().to_string();
+        let resources: Vec<_> = (0..129)
+            .map(|n| Resource::AgentSession(format!("session-{n}")))
+            .collect();
+        write(
+            &directory,
+            &Intent {
+                owner_id: owner.clone(),
+                hosts: vec![HostIntent {
+                    host: host.clone(),
+                    server_id: "fixture".into(),
+                    resources: resources.clone(),
+                    adopted_owner_id: None,
+                }],
+            },
+        )
+        .unwrap();
+        drop(guard);
+        let mut client = Client::local(&binary, Some(&directory)).await.unwrap();
+        assert!(
+            drain_directory(&directory, &host, &mut client, "first-recovery")
+                .await
+                .is_err()
+        );
+        let saved = read(&directory.join(format!("{owner}.json"))).unwrap();
+        assert_eq!(saved.hosts.len(), 2);
+        assert_eq!(
+            saved.hosts[0].adopted_owner_id.as_deref(),
+            Some("first-recovery")
+        );
+        assert_eq!(saved.hosts[0].resources.len(), 128);
+        assert_eq!(saved.hosts[1].resources.len(), 1);
+        let adopted = drain_directory(&directory, &host, &mut client, "second-recovery")
+            .await
+            .unwrap();
+        assert_eq!(adopted, resources);
+        assert_eq!(
+            std::fs::read_to_string(directory.join("owners")).unwrap(),
+            format!("{owner}\n{owner}\nfirst-recovery\n{owner}\n")
+        );
+        assert!(!directory.join(format!("{owner}.json")).exists());
+        drop(client);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
