@@ -1709,3 +1709,85 @@ tool execution in the disposable project without a paid
 model API. `smoke-codex.py --live` optionally sends two small actual model turns;
 `--live-tools` also requests a file write in its disposable project. Fixture,
 localhost-upstream, actual model, native desktop and real SSH evidence are separate.
+
+## OpenCode integration
+
+Install OpenCode 2.x on each execution host and restart Latte Work Server.
+Bind an App Provider or use the host's native OpenCode configuration and login.
+Discovery uses host PATH or `LATTE_WORK_OPENCODE` and rejects 1.x. Local and SSH
+use the same host adapter.
+
+The host launches a private `opencode acp` process per open conversation. ACP
+over stdio negotiates the native session, model, effort and command catalog. A
+bundled OpenCode plugin connects to a per-process Unix socket and submits
+ordinary prompts with a caller-provided message ID. The plugin forwards native
+output, approvals, cancellation, inbox delivery, Shell exits and title events.
+Readiness waits for both channels. The owned process group and temporary files
+are released when the session closes.
+
+Open and resume are prompt-free. Latte persists requests before forwarding
+them and preserves the original native session ID on resume. A queued input
+is consumed only after a matching native inbox delivery event. A background
+Shell is displayed as running until its native exit. Native execution
+completion fences project slash commands and autonomous follow-up activity.
+Latte correlates native execution and inbox delivery IDs to distinguish its
+foreground prompts from autonomous user or synthetic inputs submitted by a
+plugin. OpenCode prompt hooks see the original user text and its attachments.
+Steering submissions wake native execution even if a prompt hook finishes after
+the current turn. Native execution start marks a successor as running before
+delivery or model output; its approvals, output, usage and terminal outcome use
+the native event stream. Stopping an active execution sends a native interrupt.
+If input delivery is still unconfirmed, stopping closes the owned process,
+including in-flight prompt preparation, and leaves that input unreplayed.
+The real CLI smoke covers delayed preparation after foreground completion,
+cancellation before the successor's first output, and stop/resume.
+Native usage reports turn totals separately from context occupancy. Occupancy
+matches OpenCode ACP's total tokens in the latest step (input, output, reasoning
+and cache); window capacity comes from that step's actual model in the native
+catalog. Missing capacity stays unknown. Catalog lookup is cached until a
+native model update. A lookup waits at most one second across all steps, so a
+stalled catalog cannot accumulate delays before a cancellation event. A late
+successful lookup restores capacity for subsequent steps. `make test-unit`
+and CI also test the plugin's cache, failure and timeout behavior over a real
+Unix socket without an OpenCode process.
+Only a slash name in the execution session's catalog is treated as a command.
+Other slash-prefixed text is sent as an ordinary prompt.
+Compaction uses its ACP completion. OpenCode 2.0 implements `/compact` even
+though its ACP catalog omits the command. Skill shortcuts advertised by
+older catalogs are activated through ACP. A custom title set before the
+first prompt is applied to the new native session before it can run.
+
+Permission modes use a process-local OpenCode permission hook. Explicit
+native denials and managed policies continue to apply. The question tool uses
+its plugin interface and native permission evaluation for foreground and
+autonomous executions. A 2.0 question that needs a separate native approval
+is reported as unsupported. Sideband approvals settle on a native permission
+decision event. A child's pending approval or question can outlive the
+foreground turn.
+The platform skill follows the host preference. OpenCode 2.0 receives
+it through its model context hook for the lifetime of the process, and 2.3 reads
+it as an ambient instruction file. ACP client filesystem and terminal RPCs
+are unavailable. Tool images are limited to bounded inline raster data. Tool display input is
+limited to 256 KiB of encoded JSON; oversized input is replaced by an explicit
+truncation marker and preview. Output content has a 384 KiB encoded budget,
+and unused event fields are not forwarded. Native inputs and approval requests
+remain unchanged. The event stream waits for socket drain with a five-second
+deadline, so display bursts do not exhaust the sideband write buffer.
+
+Child text and tools are persisted separately from the parent. A child can
+outlive its foreground turn. Reconfiguration and undo remain fenced
+while background work is active or a child-triggered continuation is
+unconfirmed. For a finished child, Latte can recover native history with a
+bounded, prompt-free export. Import requires the original launch context,
+matching child and ancestor IDs, and the same project directory. The stored
+stream remains available if the native export is unavailable.
+An export with unfinished tools is marked incomplete and preserves any
+reported tool errors.
+
+The implementation follows the [OpenCode ACP contract](https://opencode.ai/docs/cli/acp/).
+The final-binary tests use a deterministic ACP peer. For an installed CLI,
+`python3 scripts/smoke-opencode.py --opencode /path/to/opencode` uses an isolated
+host and loopback Anthropic Messages, Chat Completions and Responses fixtures.
+It exercises prompt-free metadata, native resume, Provider switching,
+permissions, questions, steering, Shell exits and native commands. Native
+desktop, real SSH and live model acceptance are separate checks.
