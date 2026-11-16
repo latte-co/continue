@@ -343,6 +343,13 @@ impl OpenCode {
                     self.native_command = None;
                     return self.start_prompt(&prompt, AcpInput::Skill);
                 }
+                if message["error"] == true && self.command_waiting_for_end {
+                    // Submission failure does not prove that admitted native
+                    // work stopped. Keep the turn interruptible until its end.
+                    self.command_acknowledged = true;
+                    self.command_outcome = Some(false);
+                    return Ok(vec![]);
+                }
                 if message["error"] == true || !self.command_waiting_for_end {
                     return Ok(self.finish_command(message["error"] == true));
                 }
@@ -609,7 +616,9 @@ impl OpenCode {
             | "session.execution.interrupted"
                 if self.native_command.is_some() =>
             {
-                self.command_outcome = Some(kind == "session.execution.succeeded");
+                self.command_outcome = Some(
+                    self.command_outcome != Some(false) && kind == "session.execution.succeeded",
+                );
                 self.command_waiting_for_end = false;
                 self.native_execution_open = false;
                 self.autonomous_inbox_delivered = false;

@@ -1767,7 +1767,12 @@ foreground turn.
 The platform skill follows the host preference. OpenCode 2.0 receives
 it through its model context hook for the lifetime of the process, and 2.3 reads
 it as an ambient instruction file. ACP client filesystem and terminal RPCs
-are unavailable. Tool images are limited to bounded inline raster data.
+are unavailable. Tool images are limited to bounded inline raster data. Tool display input is
+limited to 256 KiB of encoded JSON; oversized input is replaced by an explicit
+truncation marker and preview. Output content has a 384 KiB encoded budget,
+and unused event fields are not forwarded. Native inputs and approval requests
+remain unchanged. The event stream waits for socket drain with a five-second
+deadline, so display bursts do not exhaust the sideband write buffer.
 
 Child text and tools are persisted separately from the parent. A child can
 outlive its foreground turn. Reconfiguration and undo remain fenced

@@ -179,3 +179,102 @@ for (const version of ["2.0.0", "2.3.0"]) {
       },
     ));
 }
+
+for (const version of ["2.0.0", "2.3.0"]) {
+  await test(`${version}: large tool display frames preserve execution and subsequent events`, async () => {
+    const input = {
+      filePath: "/workspace/large.txt",
+      content: '中\u0000\\"'.repeat(300000),
+    };
+    const original = JSON.stringify(input);
+    const huge = "x".repeat(2 * 1024 * 1024);
+    const tools = ["input.started", "called", "success", "failed"].map(
+      (kind) => ({
+        type: `session.tool.${kind}`,
+        data: {
+          sessionID: "root",
+          id: "tool-1",
+          name: huge,
+          input,
+          metadata: { shellID: "shell-1", status: "running", unused: huge },
+          content: [
+            { type: "text", text: "\u0000".repeat(200000) },
+            { type: "text", text: "small output", unused: huge },
+          ],
+          error: { message: huge },
+          unused: huge,
+        },
+      }),
+    );
+    const approval = {
+      type: "permission.asked",
+      data: {
+        sessionID: "root",
+        id: "approve-1",
+        action: "write",
+        resources: ["/workspace/large.txt"],
+      },
+    };
+    const ordinary = {
+      type: "session.tool.called",
+      data: {
+        sessionID: "root",
+        id: "tool-2",
+        name: "read",
+        input: { filePath: "small.txt" },
+      },
+    };
+    await probe(
+      version,
+      [...tools, approval, ordinary, end],
+      () => catalog(10000),
+      (messages) => {
+        assert.equal(messages.length, 8);
+        for (const message of messages)
+          assert(
+            Buffer.byteLength(JSON.stringify(message) + "\n") < 1024 * 1024,
+          );
+        for (const message of messages.slice(1, 5)) {
+          assert.equal(message.data.id, "tool-1");
+          assert.equal(message.data.input._latte_display_truncated, true);
+          assert.equal(message.data.metadata.shellID, "shell-1");
+          assert.equal(message.data.metadata.status, "running");
+          assert.equal(message.data.content[0].text, "small output");
+        }
+        assert.deepEqual(messages[5], approval);
+        assert.deepEqual(messages[6].data.input, ordinary.data.input);
+        assert.deepEqual(messages.at(-1), end);
+      },
+    );
+    assert.equal(
+      JSON.stringify(input),
+      original,
+      "native input must remain untouched",
+    );
+  });
+  await test(`${version}: tool event burst drains without losing the terminal`, () =>
+    probe(
+      version,
+      [
+        ...Array.from({ length: 24 }, (_, i) => ({
+          type: "session.tool.called",
+          data: {
+            sessionID: "root",
+            id: `tool-${i}`,
+            name: "write",
+            input: { content: "界".repeat(80000) },
+          },
+        })),
+        end,
+      ],
+      () => catalog(10000),
+      (messages) => {
+        assert.equal(messages.length, 26);
+        assert.deepEqual(
+          messages.slice(1, -1).map((m) => m.data.id),
+          Array.from({ length: 24 }, (_, i) => `tool-${i}`),
+        );
+        assert.deepEqual(messages.at(-1), end);
+      },
+    ));
+}

@@ -311,3 +311,35 @@ fn native_context_uses_last_step_actual_model_and_all_token_components() {
         if context.model == "custom/unknown" && context.used_tokens == 3.0 && context.window_tokens.is_none() && totals.input_tokens == Some(1.0))
     );
 }
+
+#[test]
+fn failed_command_submission_keeps_admitted_execution_interruptible_until_terminal() {
+    for terminal in [
+        "session.execution.succeeded",
+        "session.execution.interrupted",
+    ] {
+        let mut adapter = adapter();
+        adapter.native_command = Some("command".into());
+        event(&mut adapter, "session.execution.started", json!({}));
+        assert!(
+            adapter
+                .sideband(r#"{"type":"reply","id":"command","error":true}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(adapter.running());
+        assert!(!adapter.can_start_turn());
+        if terminal.ends_with("interrupted") {
+            assert!(matches!(
+                adapter.advance(Input::Interrupt).unwrap().as_slice(),
+                [Action::SidebandWrite(_)]
+            ));
+        }
+        let actions = event(&mut adapter, terminal, json!({}));
+        assert!(matches!(
+            actions.last(),
+            Some(Action::Finished { failed: true, .. })
+        ));
+        assert!(adapter.can_start_turn());
+    }
+}

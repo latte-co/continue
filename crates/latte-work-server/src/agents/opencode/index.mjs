@@ -1,3 +1,4 @@
+import { once } from "node:events";
 import { createConnection } from "node:net";
 import { readFile } from "node:fs/promises";
 
@@ -144,12 +145,21 @@ export default {
             const { sessionID, finish, tokens } = data;
             send({ type, data: { sessionID, finish, tokens } });
           } else if (events.has(type)) {
-            if (
-              type === "session.tool.success" ||
-              type === "session.tool.failed"
-            ) {
+            if (type.startsWith("session.tool.")) {
+              // Count encoded bytes, including JSON escapes and object fields.
+              // These are display copies; native execution and approvals retain
+              // the original input and are never rewritten by this projection.
+              const encodedInput = JSON.stringify(data.input);
+              const input =
+                encodedInput && Buffer.byteLength(encodedInput) > 256 * 1024
+                  ? {
+                      _latte_display_truncated: true,
+                      preview: encodedInput.slice(0, 8192),
+                    }
+                  : data.input;
               let remaining = 384 * 1024;
               const content = [];
+              let omitted = false;
               for (const item of data.content ?? []) {
                 const value = item.type === "text" ? item.text : item.uri;
                 if (
@@ -157,30 +167,59 @@ export default {
                   (item.type !== "text" && !value.startsWith("data:image/"))
                 )
                   continue;
-                const size = Buffer.byteLength(value);
-                if (size > remaining) continue;
-                content.push(item);
+                const display =
+                  item.type === "text"
+                    ? { type: "text", text: value }
+                    : { type: "image", uri: value };
+                const size = Buffer.byteLength(JSON.stringify(display)) + 1;
+                if (size > remaining) {
+                  omitted = true;
+                  continue;
+                }
+                content.push(display);
                 remaining -= size;
               }
+              if (omitted)
+                content.push({
+                  type: "text",
+                  text: "[OpenCode tool display content omitted: size limit]",
+                });
               send({
                 type,
                 data: {
                   sessionID: data.sessionID,
                   id: data.id,
-                  name: data.name,
+                  name:
+                    typeof data.name === "string"
+                      ? data.name.slice(0, 1024)
+                      : undefined,
+                  input,
                   content,
                   error: data.error?.message
                     ? { message: data.error.message.slice(0, 500) }
                     : undefined,
                   metadata: data.metadata && {
                     shellID: data.metadata.shellID,
-                    status: data.metadata.status,
+                    status:
+                      typeof data.metadata.status === "string"
+                        ? data.metadata.status.slice(0, 1024)
+                        : undefined,
                   },
                 },
               });
             } else {
               send({ type, data });
             }
+          }
+          // Pause the event source while the host catches up instead of
+          // destroying a healthy session after a burst of display events.
+          if (socket.writableNeedDrain) {
+            await once(socket, "drain", {
+              signal: AbortSignal.any([
+                abort.signal,
+                AbortSignal.timeout(5000),
+              ]),
+            });
           }
         }
       })().catch(() => socket.destroy());
