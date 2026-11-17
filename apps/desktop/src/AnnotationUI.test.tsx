@@ -10,6 +10,11 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AnnotatedMessage, AnnotationSummary } from "./AnnotationUI";
 import type { Annotation } from "./annotations";
 import { useState } from "react";
+import { MessageActionsProvider } from "./MessageContent";
+import { copyText } from "./clipboard";
+vi.mock("./clipboard", () => ({
+  copyText: vi.fn().mockResolvedValue(undefined),
+}));
 const rect = {
   left: 100,
   right: 240,
@@ -22,6 +27,7 @@ const rect = {
   toJSON: () => ({}),
 };
 beforeEach(() => {
+  vi.mocked(copyText).mockResolvedValue(undefined);
   Range.prototype.getBoundingClientRect = () => rect;
   Range.prototype.getClientRects = () => [rect] as unknown as DOMRectList;
 });
@@ -31,11 +37,13 @@ afterEach(() => {
   window.getSelection()?.removeAllRanges();
 });
 function select(node: HTMLElement) {
+  fireEvent.pointerDown(node);
+  fireEvent.mouseDown(node, { clientX: 0, clientY: 0 });
   const range = document.createRange();
   range.selectNodeContents(node);
   window.getSelection()!.removeAllRanges();
   window.getSelection()!.addRange(range);
-  fireEvent.mouseUp(node);
+  fireEvent.mouseUp(node, { clientX: 20, clientY: 0 });
 }
 const base: Annotation = {
   id: "one",
@@ -248,8 +256,159 @@ it("does not navigate a linked caption on selection", () => {
   const parent = link.closest("article")!;
   parent.addEventListener("click", activation);
   select(link);
-  fireEvent.click(link);
+  fireEvent.click(link, { detail: 1 });
   expect(activation).not.toHaveBeenCalled();
   expect(screen.getByRole("menuitem", { name: "添加注释" })).toBeTruthy();
   parent.removeEventListener("click", activation);
+});
+
+it.each(["escape", "cancel", "save"])(
+  "keeps copy, file and keyboard actions usable after %s",
+  async (action) => {
+    vi.mocked(copyText).mockClear();
+    const openFile = vi.fn();
+    render(
+      <MessageActionsProvider value={{ openFile }}>
+        <AnnotatedMessage
+          text={"原文\n\n`src/main.rs`\n\n```rs\nlet a = 1;\n```"}
+          message={2}
+          entries={[]}
+          enabled
+          onSave={() => null}
+          onRemove={vi.fn()}
+        />
+      </MessageActionsProvider>,
+    );
+    select(screen.getByText("原文"));
+    if (action === "escape") fireEvent.keyDown(document, { key: "Escape" });
+    else {
+      fireEvent.click(screen.getByRole("menuitem", { name: "添加注释" }));
+      if (action === "save")
+        fireEvent.change(screen.getByRole("textbox"), {
+          target: { value: "建议" },
+        });
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: action === "cancel" ? "取消" : "保存",
+        }),
+      );
+      expect(window.getSelection()?.toString()).toBe("");
+    }
+    // Recreate a retained prose selection to cover browsers that keep it across
+    // button focus and keyboard activation.
+    const range = document.createRange();
+    range.selectNodeContents(screen.getByText("原文"));
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent.click(screen.getByRole("button", { name: "复制代码" }), {
+      detail: 1,
+    });
+    expect(copyText).toHaveBeenCalledWith("let a = 1;");
+    const file = screen.getByRole("button", {
+      name: "在工作区中打开，右键查看更多操作",
+    });
+    fireEvent.pointerDown(file);
+    fireEvent.mouseDown(file);
+    fireEvent.mouseUp(file);
+    fireEvent.click(file, { detail: 1 });
+    act(() => file.focus());
+    fireEvent.keyDown(file, { key: "Enter" });
+    fireEvent.click(file, { detail: 0 });
+    expect(openFile).toHaveBeenCalledTimes(2);
+    await act(async () => {});
+  },
+);
+
+it("suppresses only a selecting gesture's release, not a second click or keyboard activation", () => {
+  const openFile = vi.fn();
+  render(
+    <MessageActionsProvider value={{ openFile }}>
+      <AnnotatedMessage
+        text="`src/main.rs`"
+        message={2}
+        entries={[]}
+        enabled
+        onSave={() => null}
+        onRemove={vi.fn()}
+      />
+    </MessageActionsProvider>,
+  );
+  const control = screen.getByRole("button");
+  // Select only text, avoiding the decorative icon in the caption.
+  fireEvent.mouseDown(control, { clientX: 0 });
+  const range = document.createRange();
+  range.selectNodeContents(control.lastChild!);
+  window.getSelection()!.removeAllRanges();
+  window.getSelection()!.addRange(range);
+  fireEvent.mouseUp(control, { clientX: 20 });
+  fireEvent.click(control, { detail: 1 });
+  expect(openFile).not.toHaveBeenCalled();
+  fireEvent.click(control, { detail: 1 });
+  expect(openFile).toHaveBeenCalledTimes(1);
+  // A fresh ordinary click on the same caption with the old selection still
+  // present is not a new selecting gesture.
+  fireEvent.pointerDown(control);
+  fireEvent.mouseDown(control, { clientX: 10 });
+  fireEvent.mouseUp(control, { clientX: 10 });
+  fireEvent.click(control, { detail: 1 });
+  expect(openFile).toHaveBeenCalledTimes(2);
+  fireEvent.mouseDown(control, { clientX: 0 });
+  fireEvent.mouseUp(control, { clientX: 20 });
+  fireEvent.keyDown(control, { key: "Enter" });
+  fireEvent.click(control, { detail: 0 });
+  expect(openFile).toHaveBeenCalledTimes(3);
+});
+
+it.each(["取消", "保存", "Escape"])(
+  "restores a surviving annotation marker after %s",
+  async (action) => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
+      rect as DOMRect,
+    );
+    render(
+      <AnnotatedMessage
+        text="原文"
+        message={2}
+        entries={[base]}
+        enabled
+        onSave={() => null}
+        onRemove={vi.fn()}
+      />,
+    );
+    const marker = screen.getByRole("button", { name: "编辑注释 1" });
+    fireEvent.click(marker);
+    if (action === "Escape")
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Escape" });
+    else fireEvent.click(screen.getByRole("button", { name: action }));
+    await act(async () => {});
+    expect(document.activeElement).toBe(marker);
+  },
+);
+
+it("does not steal focus from the activated side-chat composer", async () => {
+  const side = vi.fn(() =>
+    screen.getByRole("textbox", { name: "侧聊" }).focus(),
+  );
+  render(
+    <>
+      <AnnotatedMessage
+        text="原文"
+        message={2}
+        entries={[]}
+        enabled
+        onSave={() => null}
+        onRemove={vi.fn()}
+        askInSideChat={side}
+      />
+      <textarea aria-label="侧聊" />
+    </>,
+  );
+  select(screen.getByText("原文"));
+  fireEvent.click(screen.getByRole("menuitem", { name: "在侧边聊天中提问" }));
+  await act(async () => {});
+  expect(side).toHaveBeenCalledWith("原文");
+  expect(document.activeElement).toBe(
+    screen.getByRole("textbox", { name: "侧聊" }),
+  );
+  expect(window.getSelection()?.toString()).toBe("");
 });

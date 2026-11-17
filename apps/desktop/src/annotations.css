@@ -1,6 +1,8 @@
 .annotated-message {
   position: relative;
-  padding-right: 4px;
+}
+.annotated-message[data-annotations="true"] {
+  padding-right: 36px;
 }
 .annotation-body {
   min-width: 0;

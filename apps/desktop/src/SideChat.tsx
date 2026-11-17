@@ -428,6 +428,12 @@ export function SideChat({
             effort,
             permission_mode: permission,
           };
+    // Include quoted side-chat context before creating a first-use session or
+    // recording an admission. The Composer has only checked its own prompt.
+    if (new TextEncoder().encode(send.text).length > 128 * 1024) {
+      setError("消息、引用文本与注释总内容过长，请缩短后再发送。");
+      return Promise.resolve(false);
+    }
     requests.set(key, { draft, request: send });
     follow.current = true;
     return perform(send, () => {

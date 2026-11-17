@@ -15,7 +15,82 @@ import { closeSideChat, SideChat, sideDraftKey } from "./SideChat";
 import { openSideChatTab, useWorkspaceState } from "./workspaceState";
 import type { Request, Session } from "./protocol";
 import { ServerRequestError } from "./api";
-import { userMessageContent } from "./annotations";
+import { annotationPrompt, userMessageContent } from "./annotations";
+import { readWorkspace } from "./workspaceState";
+
+it.each([0, 1])(
+  "validates final UTF-8 context before first-side-chat creation (over limit by %s)",
+  async (excess) => {
+    const drafts = new DraftStore();
+    const workspaceId = crypto.randomUUID();
+    openSideChatTab(workspaceId, child.id, true);
+    const key = sideDraftKey("local", parent.id, child.id);
+    const annotation = {
+      id: "one",
+      quote: "原文",
+      comment: "建议",
+      source: { message: 2, start: 0, end: 2 },
+    };
+    const prompt = annotationPrompt("", [annotation]);
+    const budget = 128 * 1024 - new TextEncoder().encode(prompt).length - 4;
+    const quote =
+      "中".repeat(Math.floor(budget / 3)) + "a".repeat((budget % 3) + excess);
+    drafts.update(key, { quotes: [quote], annotations: [annotation] });
+    request.mockImplementation(async (_host, action: Request) => {
+      if (action.method === "agent_permissions")
+        return { kind: "agent_permissions", modes: [] };
+      if (action.method === "open_side_chat")
+        return { kind: "session", session: child };
+      if (action.method === "send")
+        return { kind: "accepted", duplicate: false };
+      if (action.method === "poll")
+        return { kind: "events", session: child, events: [], has_more: false };
+      throw new Error("unexpected");
+    });
+    render(
+      <ChatTab
+        parent={parent}
+        sideId={child.id}
+        workspaceId={workspaceId}
+        hostId="local"
+        drafts={drafts}
+        active
+        connected
+        supported
+      />,
+    );
+    const send = screen.getByRole<HTMLButtonElement>("button", {
+      name: "发送侧边聊天消息",
+    });
+    await waitFor(() => expect(send.disabled).toBe(false));
+    fireEvent.click(send);
+    if (excess) {
+      await screen.findByText(
+        "消息、引用文本与注释总内容过长，请缩短后再发送。",
+      );
+      expect(
+        request.mock.calls.some(([, cmd]) =>
+          ["open_side_chat", "send"].includes(cmd.method),
+        ),
+      ).toBe(false);
+      expect(
+        readWorkspace(workspaceId).tabs.find(
+          (tab) => tab.id === `sideChat:${child.id}`,
+        ),
+      ).toMatchObject({ draft: true });
+      expect(drafts.get(key)).toMatchObject({
+        quotes: [quote],
+        annotations: [annotation],
+      });
+    } else {
+      await waitFor(() => expect(drafts.get(key).annotations).toBeUndefined());
+      const sent = request.mock.calls.find(
+        ([, cmd]) => cmd.method === "send",
+      )![1];
+      expect(new TextEncoder().encode(sent.text).length).toBe(128 * 1024);
+    }
+  },
+);
 
 it("sends side-chat annotations through its own durable request and retains main drafts", async () => {
   const drafts = new DraftStore();

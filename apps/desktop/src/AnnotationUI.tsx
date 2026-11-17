@@ -351,6 +351,18 @@ export function AnnotatedMessage({
   askInSideChat?: (quote: string) => void;
 }) {
   const body = useRef<HTMLDivElement>(null);
+  const releaseClick = useRef<Element | null>(null);
+  const gesture = useRef<{ x: number; y: number; range: Range | null } | null>(
+    null,
+  );
+  function clearSelection() {
+    const selected = window.getSelection();
+    if (
+      body.current?.contains(selected?.anchorNode ?? null) &&
+      body.current?.contains(selected?.focusNode ?? null)
+    )
+      selected?.removeAllRanges();
+  }
   const [selection, setSelection] = useState<{
     entry: Annotation;
     anchor: Rect;
@@ -368,13 +380,21 @@ export function AnnotatedMessage({
   const close = () => {
     setSelection(null);
     setEditing(false);
+    releaseClick.current = null;
+    clearSelection();
     queueMicrotask(() => {
-      if (body.current?.isConnected && !body.current.closest("[inert]"))
+      if (
+        document.activeElement === document.body &&
+        body.current?.isConnected &&
+        !body.current.closest("[inert]")
+      )
         body.current.focus({ preventScroll: true });
     });
   };
   useEffect(() => {
     if (!enabled) {
+      releaseClick.current = null;
+      gesture.current = null;
       setSelection(null);
       setEditing(false);
       setNotice("");
@@ -474,7 +494,10 @@ export function AnnotatedMessage({
       root.removeEventListener("scroll", schedule, true);
     };
   }, [entries, message, text]);
-  function select() {
+  function select(event?: React.MouseEvent<HTMLDivElement>) {
+    const started = gesture.current;
+    gesture.current = null;
+    releaseClick.current = null;
     if (!enabled || editing || !body.current) return;
     const entry = selectedAnnotation(body.current, message);
     if (!entry) {
@@ -491,24 +514,78 @@ export function AnnotatedMessage({
     }
     setNotice("");
     const range = annotationRange(body.current, entry);
-    if (range) setSelection({ entry, anchor: range.getBoundingClientRect() });
+    if (range) {
+      const current = window.getSelection()?.getRangeAt(0);
+      const previous = started?.range;
+      const changed =
+        current &&
+        (!previous ||
+          current.startContainer !== previous.startContainer ||
+          current.startOffset !== previous.startOffset ||
+          current.endContainer !== previous.endContainer ||
+          current.endOffset !== previous.endOffset);
+      const moved =
+        event &&
+        started &&
+        Math.hypot(event.clientX - started.x, event.clientY - started.y) > 3;
+      const control =
+        event?.target instanceof Element
+          ? event.target.closest("a, button")
+          : null;
+      if (
+        started &&
+        (changed || moved) &&
+        control &&
+        body.current.contains(control) &&
+        range.intersectsNode(control)
+      )
+        releaseClick.current = control;
+      setSelection({ entry, anchor: range.getBoundingClientRect() });
+    }
   }
   return (
-    <article className="assistant-message annotated-message">
+    <article
+      className="assistant-message annotated-message"
+      data-annotations={
+        enabled && entries.some((entry) => entry.source.message === message)
+      }
+    >
       <div
         className="markdown annotation-body"
         tabIndex={-1}
         ref={body}
+        onPointerDownCapture={() => {
+          releaseClick.current = null;
+        }}
+        onMouseDownCapture={(event) => {
+          releaseClick.current = null;
+          const selected = window.getSelection();
+          gesture.current =
+            event.button === 0
+              ? {
+                  x: event.clientX,
+                  y: event.clientY,
+                  range: selected?.rangeCount
+                    ? selected.getRangeAt(0).cloneRange()
+                    : null,
+                }
+              : null;
+        }}
+        onKeyDownCapture={() => {
+          releaseClick.current = null;
+          gesture.current = null;
+        }}
         onMouseUp={select}
         onClickCapture={(event) => {
-          // Selecting a file/link caption must not also navigate on mouse release.
+          // Suppress only the release click of the gesture that selected this
+          // control's caption. An old selection cannot disable other actions.
+          const control = releaseClick.current;
+          releaseClick.current = null;
           if (
-            event.target instanceof Element &&
-            event.target.closest("a, button") &&
-            body.current &&
-            window.getSelection()?.toString().trim() &&
-            body.current.contains(window.getSelection()?.anchorNode ?? null) &&
-            body.current.contains(window.getSelection()?.focusNode ?? null)
+            event.detail > 0 &&
+            control &&
+            event.target instanceof Node &&
+            control.contains(event.target)
           ) {
             event.preventDefault();
             event.stopPropagation();
@@ -535,8 +612,9 @@ export function AnnotatedMessage({
                 className="annotation-marker"
                 aria-label={`编辑注释 ${number}`}
                 title={entry.comment}
-                style={{ top: markerTop, right: -24 }}
+                style={{ top: markerTop, right: 0 }}
                 onClick={(e) => {
+                  e.currentTarget.focus();
                   setSelection({
                     entry,
                     anchor: e.currentTarget.getBoundingClientRect(),
@@ -561,7 +639,11 @@ export function AnnotatedMessage({
           <AnnotationEditor
             entry={selection.entry}
             anchor={selection.anchor}
-            onSave={onSave}
+            onSave={(entry) => {
+              const error = onSave(entry);
+              if (!error) clearSelection();
+              return error;
+            }}
             onRemove={
               entries.some((entry) => entry.id === selection.entry.id)
                 ? () => onRemove(selection.entry.id)
@@ -621,9 +703,12 @@ export function AnnotatedMessage({
                 <button
                   role="menuitem"
                   onClick={() => {
-                    askInSideChat(selection.entry.quote);
-                    close();
-                    window.getSelection()?.removeAllRanges();
+                    const quote = selection.entry.quote;
+                    setSelection(null);
+                    setEditing(false);
+                    releaseClick.current = null;
+                    clearSelection();
+                    askInSideChat(quote);
                   }}
                 >
                   在侧边聊天中提问

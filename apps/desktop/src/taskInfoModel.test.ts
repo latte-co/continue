@@ -1,8 +1,43 @@
 import { expect, it } from "vitest";
 import type { Event, EventKind } from "./protocol";
 import { artifactPath, taskInfo, createTaskInfoReader } from "./taskInfoModel";
+import { annotationPrompt } from "./annotations";
+import { referencePrompt } from "./referenceMessage";
 const events = (...items: EventKind[]): Event[] =>
   items.map((event, i) => ({ seq: i + 1, session_id: "s", at: i, event }));
+it.each(["user", "queued_message_sent"] as const)(
+  "excludes annotation manifests from %s resource scanning while keeping prose and attachments",
+  (kind) => {
+    const quote =
+      "https://example.com/quoted\n下一段\n```sh\nhttps://example.com/code\n`/project/example.md`\n```";
+    const prompt = referencePrompt(
+      annotationPrompt(
+        "[文档](https://example.com/docs) [正文文件](/project/body.md)",
+        [
+          {
+            id: "a",
+            quote,
+            comment: '查看 "https://example.com/comment"',
+            source: { message: 2, start: 0, end: quote.length },
+          },
+        ],
+      ),
+      [{ name: "input.pdf", path: "/project/input.pdf", directory: false }],
+    );
+    const data = taskInfo(
+      events({ kind, request_id: "r", text: prompt }),
+      "s",
+      "/project",
+    );
+    expect(data.links).toEqual([
+      { url: "https://example.com/docs", title: "文档" },
+    ]);
+    expect(data.files.map((file) => file.path)).toEqual([
+      "input.pdf",
+      "body.md",
+    ]);
+  },
+);
 it("includes references in handed-off input before its execution starts", () => {
   const input = {
     request_id: "queued",

@@ -177,6 +177,11 @@ malformed text visible. Limits are 20 entries, 8,000 UTF-16 quote units, 4,000 c
 units, 96 KiB UTF-8 manifest and 128 KiB combined prompt. Native slash commands cannot
 carry annotations. Queue take restores both annotations and references atomically;
 if merged limits would overflow, the complete taken prompt remains in draft text.
+Task Summary also strips the annotation manifest before scanning user or handed-off
+input for resources. Side-chat admission checks the final UTF-8 message after adding
+quoted context, before first-use session creation. Selection click suppression is
+single-use and scoped to the control intersecting the current mouse gesture; it never
+uses a retained document selection to block unrelated or keyboard actions.
 
 Focused checks: annotations/AnnotationUI, Conversation, SideChat and drafts frontend
 tests, plus final-binary `session_annotations_reach_native_input_and_replay_exactly_once`.
