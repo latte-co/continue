@@ -42,7 +42,21 @@
 - 本轮全量前端测试：103 个文件、987 项通过。浏览器同时验证旧选区下文件打开、编号焦点恢复与侧聊焦点保留。
 - 本轮 `env -u OPENCODE_CONFIG_CONTENT make ci` 完整通过：987 项前端测试、165 项 server E2E（1 个既有 ignored）、35 项桌面测试，以及格式、类型一致性、Clippy、脚本检查、构建和 Rustdoc。
 
-## 原生桌面手动复核步骤
+## Linux CI：侧聊 EOF 恢复与 Undo 时序
+
+`9a1ecda` 的 Linux E2E 在 `undo_ignores_prelaunch_rejection_and_fences_unconfirmed_native_exit` 失败：期望侧聊写入未确认错误，实际先收到主机仍忙错误。
+运行时会先持久化 Failed，再恢复原生会话并更新 `agent_session_busy`；仅等待 Failed/Completed 不代表 actor 已完成恢复和队列结算。
+
+测试在 Undo 前等待主、侧会话的公开 `agent_session_busy == false` 投影，并保持状态断言。
+Codex fixture 增加受控的 side-resume 握手：恢复被阻塞时，断言主机忙保护且文件不变；释放后，再断言侧聊写入待确认保护和文件不变。预启动拒绝分支仍必须可以撤销。
+这不是延长固定等待或放宽错误匹配，也未改动生产代码的安全判定。
+
+恢复本地验证时，完整并行单测还复现了 Skill staging 回收测试的租约时序问题：并发子进程创建可短暂持有已关闭的锁描述符，单次回收会正确跳过该目录。
+测试采用与相邻回收边界测试一致的 5 秒有界重试，并在每次尝试中断言活跃目录、无标记目录和符号链接保持不变；锁未释放时保留 marker 和 payload，最终必须实际回收。生产回收代码不变。
+
+修复后 `env -u OPENCODE_CONFIG_CONTENT make ci` 完整通过：277 项 server 单测、987 项前端测试、165 项 server E2E（1 个既有 ignored）、35 项桌面测试；格式、Clippy、脚本检查、构建和 Rustdoc 同时通过。
+
+## 原生桌面手动复核清单
 
 以下是交付后的原生验收入口，不代表本次已经验证：
 
