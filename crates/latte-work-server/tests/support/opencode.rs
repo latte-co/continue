@@ -923,10 +923,26 @@ async fn opencode_resume_keeps_a_worktree_session_in_its_worktree() {
         ask(&mut client, turn(&id, "wt", "from worktree")).await,
         Response::Accepted { duplicate: false }
     ));
-    wait(&mut client, &id, Status::Completed).await;
+    let events = wait(&mut client, &id, Status::Completed).await;
     assert_eq!(
         current(&mut client, &id).await.native_id.as_deref(),
         Some(native.as_str())
+    );
+    // The turn's before and after snapshots both cover the project directory;
+    // running the agent in the worktree must not fabricate cross-directory
+    // changes (the session export file is not reported as deleted).
+    let changes = events
+        .iter()
+        .find_map(|event| match &event.event {
+            EventKind::TurnChanges { changes } if changes.request_id == "wt" => {
+                Some(&changes.summary)
+            }
+            _ => None,
+        })
+        .expect("turn changes");
+    assert!(
+        changes.entries.is_empty() && changes.unavailable.is_none(),
+        "snapshot stays rooted at the project directory: {changes:?}"
     );
     let log = std::fs::read_to_string(worktree.path().join("prompts")).unwrap();
     assert_eq!(

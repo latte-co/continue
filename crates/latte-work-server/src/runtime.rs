@@ -1122,6 +1122,9 @@ struct Process {
     session_open: Arc<AtomicBool>,
     config: LaunchConfig,
     path: String,
+    /// The native process's working directory. It follows a resumed session
+    /// into its recorded directory while `path` stays at the project root.
+    agent_cwd: String,
     turn_active: bool,
     /// The main turn can settle while a child still needs input.
     settled_turn: Option<Outcome>,
@@ -1200,6 +1203,13 @@ impl Process {
     // project directory, so a conversation that moved into a worktree keeps
     // working after its process was restarted. A failed lookup keeps the
     // project directory; the adapter's mismatch repair recovers from there.
+    // Resume the native session where it now lives instead of only the
+    // project directory, so a conversation that moved into a worktree keeps
+    // working after its process was restarted. A failed lookup keeps the
+    // project directory; the adapter's mismatch repair recovers from there.
+    // The agent cwd only steers the native process: snapshots, undo and task
+    // changes stay rooted at the project path so a turn's before and after
+    // are always captured in the same directory.
     async fn launch(
         database: &Database,
         binary: &str,
@@ -1209,7 +1219,15 @@ impl Process {
         session_open: Arc<AtomicBool>,
         request_id: Option<&str>,
     ) -> Result<Self> {
-        let path = match session.native_id.as_deref() {
+        // Gate the launch before any native helper runs: an unconfirmed
+        // close must block the export probe exactly as it blocks the agent.
+        db(database, |s| {
+            if let Some(reason) = s.unconfirmed_agent_close(&session.id)? {
+                bail!(reason);
+            }
+            Ok(())
+        })?;
+        let agent_cwd = match session.native_id.as_deref() {
             Some(id) => agents::resume_directory(
                 &session.agent,
                 binary,
@@ -1227,17 +1245,20 @@ impl Process {
             database,
             binary,
             session,
-            &path,
+            path,
+            &agent_cwd,
             config,
             session_open,
             request_id,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         database: &Database,
         binary: &str,
         session: &Session,
         path: &str,
+        agent_cwd: &str,
         config: LaunchConfig,
         session_open: Arc<AtomicBool>,
         request_id: Option<&str>,
@@ -1267,7 +1288,7 @@ impl Process {
             }
             adapter.set_side_parent(native)?;
         }
-        let prepared = adapter.command(binary, path, session.native_id.as_deref(), &config)?;
+        let prepared = adapter.command(binary, agent_cwd, session.native_id.as_deref(), &config)?;
         let mut command = prepared.command;
         command
             .stdin(Stdio::piped())
@@ -1344,6 +1365,7 @@ impl Process {
             session_open,
             config,
             path: path.into(),
+            agent_cwd: agent_cwd.into(),
             turn_active: false,
             settled_turn: None,
             background_at_start: false,
@@ -2099,13 +2121,17 @@ async fn actor(
                 }.await,
                 Some(Control::SubagentHistory { task_id, permit, reply }) => {
                     let source=db(&database,|d|Ok((d.subagent(&session.id,&task_id)?,d.session(&session.id)?.native_id,d.child_history_cursor(&session.id,&task_id)?))).map(|(child,parent,cursor)|{
-                        let config=process.as_ref().filter(|p|p.adapter.knows_subagent(&child.native_id)).map(|p|p.config.clone());
-                        (child,parent,cursor,config)
+                        let process=process.as_ref().filter(|p|p.adapter.knows_subagent(&child.native_id));
+                        let config=process.map(|p|p.config.clone());
+                        // A resumed OpenCode session may run from its recorded
+                        // directory; children export from that same directory.
+                        let cwd=process.map(|p|p.agent_cwd.clone()).unwrap_or_else(||path.clone());
+                        (child,parent,cursor,config,cwd)
                     });
                     let result=async {
-                        let (child,parent,cursor,config)=source?;
+                        let (child,parent,cursor,config,cwd)=source?;
                         let (Some(config),Some(parent))=(config,parent) else {return Ok(false);};
-                        let page=agents::child_history(std::path::PathBuf::from(&path),parent,child.native_id,session.id.clone(),config,cursor,permit).await?;
+                        let page=agents::child_history(std::path::PathBuf::from(cwd),parent,child.native_id,session.id.clone(),config,cursor,permit).await?;
                         if let Some(page)=page {
                             db(&database,|d|d.cache_child_history(&session.id,&task_id,&page))?;
                             return Ok(page.has_more);
@@ -2777,7 +2803,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.sqlite")).unwrap();
         let project = store.add_project(dir.path()).unwrap();
-        let session = store.create_session(project.id, "claude".into()).unwrap();
+        let session = store.create_session(project.id, "opencode".into()).unwrap();
         let database = Arc::new(Mutex::new(store));
         db(&database, |s| {
             s.record_unconfirmed_agent_close(&session.id, CLOSE_PENDING)
@@ -2786,20 +2812,38 @@ mod tests {
         assert!(finish_native_close(&database, &session.id, false).is_err());
         let config = crate::providers::ProviderStore::open(dir.path())
             .unwrap()
-            .turn_config("claude", None, None)
+            .turn_config("opencode", None, None)
             .unwrap();
+        // A saved native session would make launch probe the recorded
+        // directory first; an unconfirmed close must gate even that helper.
+        let mut saved = db(&database, |s| s.session(&session.id)).unwrap();
+        saved.native_id = Some("ses_reaping".into());
+        db(&database, |s| s.save(&saved)).unwrap();
+        let probe = dir.path().join("probe.sh");
+        std::fs::write(
+            &probe,
+            "#!/bin/sh\necho ran >> \"$0.log\"\necho '{\"info\":{\"id\":\"ses_reaping\",\"location\":{\"directory\":\"/\"}},\"messages\":[]}'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
         for request_id in [None, Some("replacement")] {
-            let result = Process::spawn(
+            let result = Process::launch(
                 &database,
-                "/missing/cli",
+                probe.to_string_lossy().as_ref(),
                 &session,
                 dir.path().to_str().unwrap(),
                 config.clone(),
                 Arc::new(AtomicBool::new(false)),
                 request_id,
-            );
+            )
+            .await;
             assert!(matches!(result, Err(error) if error.to_string() == CLOSE_PENDING));
         }
+        assert!(
+            !dir.path().join("probe.sh.log").exists(),
+            "the export probe never runs while the close is unconfirmed"
+        );
         assert!(
             db(&database, |s| s.unconfirmed_agent_close(&session.id))
                 .unwrap()

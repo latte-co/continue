@@ -7,7 +7,12 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use latte_work_protocol::{Event, EventKind};
 use serde_json::{Value, json};
-use std::{collections::HashSet, path::Path, process::Stdio, time::Duration};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const LIMIT: u64 = 4 * 1024 * 1024;
@@ -25,8 +30,20 @@ pub(in crate::agents) async fn read(
     if parent == child {
         return Ok(None);
     }
+    // The parent session may run from a moved or symlink-spelled directory
+    // (for example a worktree resume); its children record that directory.
+    // Accept both the project path and the parent's recorded directory, so a
+    // legitimate export is never rejected while foreign sessions still are.
+    let mut allowed = vec![cwd.to_path_buf()];
+    if let Some(directory) = super::resume::directory(binary, cwd, parent, config)
+        .await
+        .ok()
+        .flatten()
+    {
+        allowed.push(Path::new(&directory).to_path_buf());
+    }
     tokio::time::timeout(Duration::from_secs(6), async {
-        let Some(document) = export(binary, cwd, child, config).await? else {
+        let Some(document) = export(binary, &allowed, child, config).await? else {
             return Ok(None);
         };
         let mut current = &document;
@@ -42,7 +59,7 @@ pub(in crate::agents) async fn read(
             if depth == MAX_DEPTH || !known_children.contains(id) || !seen.insert(id.to_owned()) {
                 break;
             }
-            let Some(next) = export(binary, cwd, id, config).await? else {
+            let Some(next) = export(binary, &allowed, id, config).await? else {
                 break;
             };
             ancestor = next;
@@ -62,7 +79,7 @@ pub(in crate::agents) fn plausible_session_id(id: &str) -> bool {
 
 async fn export(
     binary: &str,
-    cwd: &Path,
+    allowed: &[std::path::PathBuf],
     id: &str,
     config: &LaunchConfig,
 ) -> Result<Option<Value>> {
@@ -71,7 +88,12 @@ async fn export(
     }
     let process = crate::agent_environment::command(binary)
         .envs(&config.environment.0)
-        .current_dir(cwd)
+        .current_dir(
+            allowed
+                .first()
+                .map(PathBuf::as_path)
+                .unwrap_or_else(|| Path::new(".")),
+        )
         .args(["session", "export", "--standalone", id])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -98,8 +120,18 @@ async fn export(
         document = data.take();
     }
     let info = &document["info"];
-    let directory = info["location"]["directory"].as_str().map(Path::new);
-    Ok((info["id"] == id && directory == Some(cwd)).then_some(document))
+    // Compare canonical forms so a symlinked spelling (macOS /var versus
+    // /private/var) does not reject a session this project owns.
+    let known = info["location"]["directory"]
+        .as_str()
+        .map(Path::new)
+        .and_then(|directory| directory.canonicalize().ok())
+        .is_some_and(|recorded| {
+            allowed
+                .iter()
+                .any(|allowed| allowed.canonicalize().is_ok_and(|base| base == recorded))
+        });
+    Ok((info["id"] == id && known).then_some(document))
 }
 
 fn history(
@@ -219,4 +251,102 @@ fn message_events(message: &Value, pending_tail: &mut bool) -> Vec<EventKind> {
         }
     }
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_binary() -> String {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/opencode.py")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    async fn read_history(
+        home: &Path,
+        parent: &str,
+        child: &str,
+    ) -> Result<Option<ChildHistoryPage>> {
+        let store = crate::providers::ProviderStore::open(home)?;
+        let config = store.turn_config("opencode", None, None)?;
+        let known = HashSet::from([parent.to_owned()]);
+        read(
+            &fixture_binary(),
+            home,
+            parent,
+            child,
+            &known,
+            "sess",
+            &config,
+        )
+        .await
+    }
+
+    fn export_file(home: &Path, id: &str, parent: Option<&str>, directory: &str) {
+        std::fs::write(
+            home.join(format!("{id}.json")),
+            serde_json::json!({
+                "info": {"id": id, "parentID": parent,
+                         "location": {"directory": directory}},
+                "messages": [
+                    {"type": "user", "id": "msg_child", "text": "native child instruction"},
+                    {"type": "assistant", "content": [{"type": "text", "text": "native reply"}]},
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_history_follows_a_parent_into_its_recorded_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        // The parent export reports the worktree (in its raw spelling, which
+        // canonicalizes differently on macOS); the child lives there too.
+        export_file(
+            home.path(),
+            "ses_parent",
+            None,
+            worktree.path().to_str().unwrap(),
+        );
+        export_file(
+            home.path(),
+            "ses_child",
+            Some("ses_parent"),
+            worktree.path().to_str().unwrap(),
+        );
+        let page = read_history(home.path(), "ses_parent", "ses_child")
+            .await
+            .unwrap();
+        assert!(
+            page.is_some(),
+            "a child of a moved parent is still readable"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_history_rejects_sessions_in_foreign_directories() {
+        let home = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        // The parent never moved, so only the project path is accepted.
+        export_file(
+            home.path(),
+            "ses_parent",
+            None,
+            home.path().to_str().unwrap(),
+        );
+        export_file(
+            home.path(),
+            "ses_child",
+            Some("ses_parent"),
+            foreign.path().to_str().unwrap(),
+        );
+        let page = read_history(home.path(), "ses_parent", "ses_child")
+            .await
+            .unwrap();
+        assert!(page.is_none(), "a foreign directory is never adopted");
+    }
 }
