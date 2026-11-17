@@ -442,6 +442,54 @@ async fn singleton_multi_client_reconnect_approval_dedup_and_resume() {
     );
 }
 #[tokio::test]
+async fn session_annotations_reach_native_input_and_replay_exactly_once() {
+    let host = Host::start().await;
+    let mut client = host.client().await;
+    let project = tempfile::tempdir().unwrap();
+    let id = session(&mut client, project.path()).await;
+    let manifest = serde_json::json!({"version":1,"annotations":[
+        {"id":"first","quote":"原文😀","comment":"为什么？","source":{"message":2,"start":0,"end":4}},
+        {"id":"second","quote":"缓存","comment":"请比较价格","source":{"message":2,"start":10,"end":12}}
+    ]});
+    let prompt = format!("annotation-fixture\n\n会话注释（所选原文与用户评论）：\n{manifest}");
+    assert!(matches!(
+        send(&mut client, &id, "annotated-send", &prompt).await,
+        Response::Accepted { duplicate: false }
+    ));
+    let events = wait(&mut client, &id, Status::Completed).await;
+    let reply: String = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            EventKind::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reply, prompt,
+        "native fixture must receive the entire annotation context"
+    );
+    drop(client);
+    let mut reconnected = host.client().await;
+    let events = wait(&mut reconnected, &id, Status::Completed).await;
+    assert_eq!(events.iter().filter(|e| matches!(&e.event, EventKind::User {text, request_id} if text == &prompt && request_id == "annotated-send")).count(), 1);
+    assert!(matches!(
+        send(&mut reconnected, &id, "annotated-send", &prompt).await,
+        Response::Accepted { duplicate: true }
+    ));
+    let events = wait(&mut reconnected, &id, Status::Completed).await;
+    assert_eq!(events.iter().filter(|e| matches!(&e.event, EventKind::User {request_id, ..} if request_id == "annotated-send")).count(), 1);
+    assert!(matches!(
+        send(
+            &mut reconnected,
+            &id,
+            "annotated-send",
+            &prompt.replace("为什么？", "不同问题")
+        )
+        .await,
+        Response::Error { .. }
+    ));
+}
+#[tokio::test]
 async fn denies_permissions_and_bounds_paths_and_failures() {
     let host = Host::start().await;
     let mut c = host.client().await;

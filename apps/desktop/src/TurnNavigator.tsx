@@ -7,14 +7,14 @@ import {
 } from "react";
 import { ChevronUp, LoaderCircle } from "lucide-react";
 import type { TranscriptTurn } from "./TurnTranscript";
-import { referenceMessage } from "./referenceMessage";
+import { userMessageContent } from "./annotations";
 
 export function turnNavigationEntries(turns: TranscriptTurn[]) {
   return turns.flatMap((turn) => {
     // A history page can start halfway through a turn. It has no known prompt
     // and must not acquire a fabricated navigation marker.
     if (turn.user?.type !== "user") return [];
-    const content = referenceMessage(turn.user.text);
+    const content = userMessageContent(turn.user.text);
     const reply = [...turn.visible]
       .reverse()
       .find((item) => item.type === "assistant");

@@ -15,6 +15,51 @@ import { closeSideChat, SideChat, sideDraftKey } from "./SideChat";
 import { openSideChatTab, useWorkspaceState } from "./workspaceState";
 import type { Request, Session } from "./protocol";
 import { ServerRequestError } from "./api";
+import { userMessageContent } from "./annotations";
+
+it("sends side-chat annotations through its own durable request and retains main drafts", async () => {
+  const drafts = new DraftStore();
+  const key = sideDraftKey("remote", parent.id, child.id);
+  const annotation = {
+    id: "one",
+    quote: "原文",
+    comment: "针对侧聊",
+    source: { message: 2, start: 0, end: 2 },
+  };
+  drafts.update(key, { annotations: [annotation] });
+  drafts.update("main", { text: "不要清空" });
+  request.mockImplementation(async (_host, action: Request) => {
+    if (action.method === "agent_permissions")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.method === "poll")
+      return { kind: "events", session: child, events: [], has_more: false };
+    if (action.method === "send") return { kind: "accepted", duplicate: false };
+    throw new Error("unexpected");
+  });
+  render(
+    <SideChat
+      parent={parent}
+      sideId={child.id}
+      workspaceId={crypto.randomUUID()}
+      hostId="remote"
+      drafts={drafts}
+      active
+      connected
+      supported
+    />,
+  );
+  const button = screen.getByRole<HTMLButtonElement>("button", {
+    name: "发送侧边聊天消息",
+  });
+  await waitFor(() => expect(button.disabled).toBe(false));
+  fireEvent.click(button);
+  await waitFor(() => expect(drafts.get(key).annotations).toBeUndefined());
+  const call = request.mock.calls.find(([, cmd]) => cmd.method === "send")!;
+  expect(call[0]).toBe("remote");
+  expect(call[1].session_id).toBe(child.id);
+  expect(userMessageContent(call[1].text).annotations).toEqual([annotation]);
+  expect(drafts.get("main").text).toBe("不要清空");
+});
 
 vi.mock("./ModelPicker", async () => {
   const { useEffect } = await import("react");

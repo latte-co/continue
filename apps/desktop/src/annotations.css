@@ -1,0 +1,205 @@
+.annotated-message {
+  position: relative;
+  padding-right: 4px;
+}
+.annotation-body {
+  min-width: 0;
+}
+.annotation-marks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.annotation-highlight {
+  position: absolute;
+  background: var(--color-selection);
+  border-radius: 2px;
+}
+.annotation-marker {
+  position: absolute;
+  pointer-events: auto;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 4px;
+  border-radius: var(--radius-pill);
+  background: var(--color-action);
+  color: var(--color-on-action);
+  font-size: var(--text-sm);
+}
+.annotation-selection-menu {
+  position: fixed;
+  z-index: 110;
+  display: flex;
+  flex-wrap: wrap;
+  padding: 4px;
+  gap: 4px;
+  background: var(--color-elevated);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--shadow-popover);
+}
+.annotation-selection-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 4px 8px;
+  font-size: var(--text-md);
+  white-space: nowrap;
+  background: transparent;
+}
+.annotation-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+}
+.annotation-popover {
+  position: fixed;
+  max-height: calc(100vh - 24px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--color-elevated);
+  color: var(--color-text);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--shadow-popover);
+  font-size: var(--text-md);
+}
+.annotation-editor {
+  padding: 16px;
+}
+.annotation-editor label {
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+}
+.annotation-editor textarea {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  background: var(--color-input);
+  color: var(--color-text);
+  outline: none;
+  box-shadow: none;
+  display: block;
+  width: 100%;
+  min-height: 84px;
+  max-height: 200px;
+  resize: vertical;
+  margin: 8px 0 12px;
+  padding: 8px 12px;
+  font-size: var(--text-lg);
+  line-height: var(--leading-ui);
+}
+.annotation-editor blockquote,
+.annotation-copy blockquote {
+  margin: 0 0 12px;
+  padding: 0 0 0 12px;
+  border-left: 2px solid var(--color-border-strong);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.annotation-editor blockquote {
+  max-height: 112px;
+  overflow: auto;
+  color: var(--color-text-secondary);
+}
+.annotation-editor footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.annotation-limit {
+  flex: 1;
+  color: var(--color-text-muted);
+  font-size: var(--text-xs);
+}
+.annotation-error {
+  color: var(--color-danger);
+  font-size: var(--text-sm);
+  margin: 8px 0;
+}
+.annotation-summary {
+  margin: 0 0 8px;
+}
+.annotation-chip {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--color-hover);
+}
+.annotation-chip button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  min-height: 32px;
+  background: transparent;
+  font-size: var(--text-md);
+  border-radius: var(--radius-pill);
+}
+.annotation-chip .annotation-clear {
+  min-width: 28px;
+  padding: 4px;
+  margin-right: 4px;
+  justify-content: center;
+}
+.annotation-list-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  color: var(--color-text-secondary);
+}
+.annotation-list {
+  list-style: none;
+  padding: 0 12px 8px;
+  margin: 0;
+  max-height: 360px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.annotation-list li {
+  display: flex;
+  gap: 12px;
+  padding: 12px 4px;
+}
+.annotation-list li + li {
+  border-top: 1px solid var(--color-border-subtle);
+}
+.annotation-index {
+  color: var(--color-text-muted);
+  min-width: 16px;
+}
+.annotation-copy {
+  flex: 1;
+  min-width: 0;
+  line-height: var(--leading-ui);
+}
+.annotation-copy > span {
+  display: block;
+  color: var(--color-text-muted);
+  margin-bottom: 4px;
+  font-size: var(--text-sm);
+}
+.annotation-copy blockquote {
+  padding: 0;
+  border: 0;
+}
+.annotation-copy p {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.annotation-entry-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.annotation-editor button:disabled,
+.annotation-chip button:disabled {
+  background: var(--color-disabled-bg);
+  color: var(--color-disabled-text);
+}
+.annotation-marker:hover:not(:disabled) {
+  background: var(--color-action-hover);
+}

@@ -1,5 +1,26 @@
 import { expect, it } from "vitest";
 import { DraftStore } from "./drafts";
+import type { Annotation } from "./annotations";
+
+it("versions annotation additions, edits and deletion independently from unchanged text", () => {
+  const store = new DraftStore();
+  const annotation: Annotation = {
+    id: "one",
+    quote: "原文",
+    comment: "建议",
+    source: { message: 2, start: 0, end: 2 },
+  };
+  store.update("a", { annotations: [annotation] });
+  const sent = store.get("a");
+  store.update("a", { annotations: [{ ...annotation, comment: "修改建议" }] });
+  store.clear("a", sent);
+  expect(store.get("a").annotations?.[0].comment).toBe("修改建议");
+  const edited = store.get("a");
+  store.update("a", { annotations: [] });
+  store.clear("a", edited);
+  expect(store.get("a").annotations).toEqual([]);
+  expect(store.get("b").annotations).toBeUndefined();
+});
 
 it("clears an acknowledged message after duplicate input and empty-reference initialization", () => {
   const store = new DraftStore();

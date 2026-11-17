@@ -20,7 +20,7 @@ import { request, message } from "./api";
 import type { Request, QueuedMessage } from "./protocol";
 import { usePollingSnapshot, LIVE_POLL_MS } from "./usePollingSnapshot";
 import { useStatusIssues } from "./statusNotices";
-import { referenceMessage } from "./referenceMessage";
+import { userMessageContent } from "./annotations";
 const initial = {
   entries: [] as QueuedMessage[],
   paused: false,
@@ -310,7 +310,7 @@ export function MessageQueue({
       </span>
       <ol>
         {entries.map((entry, index) => {
-          const content = referenceMessage(entry.text);
+          const content = userMessageContent(entry.text);
           return (
             <li
               key={entry.request_id}

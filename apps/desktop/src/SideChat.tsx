@@ -8,7 +8,8 @@ import { modelSelectionScope } from "./modelSelectionScope";
 import { PermissionPicker } from "./PermissionPicker";
 import { message, request, ServerRequestError } from "./api";
 import { DraftStore, useDraft, type Draft } from "./drafts";
-import { MessageContent } from "./MessageContent";
+import { AnnotatedMessage, AnnotationSummary } from "./AnnotationUI";
+import { annotationError, type Annotation } from "./annotations";
 import { QuestionCard } from "./QuestionCard";
 import { TurnTranscript } from "./TurnTranscript";
 import { ToolGroup, ToolRow } from "./ToolActivity";
@@ -167,6 +168,24 @@ export function SideChat({
     ? selection.permission
     : (session?.permission_mode ?? null);
   const quotes = draft.quotes ?? [];
+  const annotations = draft.annotations ?? [];
+  function saveAnnotation(entry: Annotation) {
+    const existing = drafts.get(key).annotations ?? [];
+    const next = existing.some((item) => item.id === entry.id)
+      ? existing.map((item) => (item.id === entry.id ? entry : item))
+      : [...existing, entry];
+    const error = annotationError(next);
+    if (error) return error;
+    drafts.update(key, { annotations: next });
+    return null;
+  }
+  function removeAnnotation(id: string) {
+    drafts.update(key, {
+      annotations: (drafts.get(key).annotations ?? []).filter(
+        (entry) => entry.id !== id,
+      ),
+    });
+  }
   const scroll = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
   const after = useRef(0);
@@ -449,9 +468,15 @@ export function SideChat({
                 );
               if (item.type === "assistant")
                 return (
-                  <article className="assistant-message markdown">
-                    <MessageContent text={item.text} />
-                  </article>
+                  <AnnotatedMessage
+                    key={`${key}:${item.key}`}
+                    text={item.text}
+                    message={item.key}
+                    entries={annotations}
+                    enabled={active && !busy && !parent.archived}
+                    onSave={saveAnnotation}
+                    onRemove={removeAnnotation}
+                  />
                 );
               if (item.type === "tool")
                 return (
@@ -577,38 +602,49 @@ export function SideChat({
         <Composer
           focusRequest={focus}
           inputLabel="侧边聊天输入"
-          hasContext={quotes.length > 0}
+          hasContext={quotes.length > 0 || annotations.length > 0}
+          annotations={annotations}
           sideChat
           context={
-            quotes.length > 0 && (
-              <div
-                className="composer-references side-chat-quotes"
-                aria-label="引用的文本片段"
-              >
-                {quotes.map((quote, index) => (
-                  <span key={index}>
-                    <details>
-                      <summary>
-                        <Quote size={14} /> 文本片段
-                        {quotes.length > 1 ? ` ${index + 1}` : ""}
-                      </summary>
-                      <p>{quote}</p>
-                    </details>
-                    <button
-                      aria-label={`移除文本片段 ${index + 1}`}
-                      disabled={busy}
-                      onClick={() =>
-                        drafts.update(key, {
-                          quotes: quotes.filter((_, i) => i !== index),
-                        })
-                      }
-                    >
-                      <X size={13} />
-                    </button>
-                  </span>
-                ))}
-              </div>
-            )
+            <>
+              <AnnotationSummary
+                entries={annotations}
+                onSave={saveAnnotation}
+                onRemove={removeAnnotation}
+                onClear={() => drafts.update(key, { annotations: [] })}
+                disabled={busy || parent.archived}
+                active={active}
+              />
+              {quotes.length > 0 && (
+                <div
+                  className="composer-references side-chat-quotes"
+                  aria-label="引用的文本片段"
+                >
+                  {quotes.map((quote, index) => (
+                    <span key={index}>
+                      <details>
+                        <summary>
+                          <Quote size={14} /> 文本片段
+                          {quotes.length > 1 ? ` ${index + 1}` : ""}
+                        </summary>
+                        <p>{quote}</p>
+                      </details>
+                      <button
+                        aria-label={`移除文本片段 ${index + 1}`}
+                        disabled={busy}
+                        onClick={() =>
+                          drafts.update(key, {
+                            quotes: quotes.filter((_, i) => i !== index),
+                          })
+                        }
+                      >
+                        <X size={13} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </>
           }
           referenceState={draft.references}
           onReferencesChange={(references) =>
