@@ -1,4 +1,9 @@
 import { referencePrompt } from "./referenceMessage";
+import {
+  annotationPrompt,
+  userMessageContent,
+  type Annotation,
+} from "./annotations";
 // @vitest-environment jsdom
 import {
   act,
@@ -744,6 +749,177 @@ it("shows one reconnect action for a lost connection and preserves the draft", (
   view.rerender(<Conversation {...p} session={session("a")} />);
   expect(input().value).toBe("保留未发送的消息");
   expect(p.send).not.toHaveBeenCalled();
+});
+
+const annotation: Annotation = {
+  id: "first",
+  quote: "原文",
+  comment: "请解释",
+  source: { message: 2, start: 0, end: 2 },
+};
+it.each(["claude", "codex", "traex", "opencode"])(
+  "sends annotation-only followups for %s and preserves the draft on failure",
+  async (agent) => {
+    const p = props();
+    p.send.mockResolvedValue(false);
+    const key = JSON.stringify(["local", "a"]);
+    p.drafts.update(key, { annotations: [annotation] });
+    const view = render(
+      <Conversation {...p} session={{ ...session("a"), agent }} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "发送任务" }));
+    await waitFor(() => expect(p.send).toHaveBeenCalledTimes(1));
+    expect(userMessageContent(p.send.mock.calls[0][0]).annotations).toEqual([
+      annotation,
+    ]);
+    await screen.findByRole("button", { name: "1 条注释" });
+    expect(p.drafts.get(key).annotations).toEqual([annotation]);
+    view.rerender(
+      <Conversation
+        {...p}
+        session={{ ...session("a"), agent }}
+        connected={false}
+      />,
+    );
+    expect(
+      (screen.getByRole("button", { name: "发送任务" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(p.send).toHaveBeenCalledTimes(1);
+  },
+);
+
+it("captures a rich-text selection, sends two annotations together, then reads them from persisted history", async () => {
+  const p = props();
+  const rectangle = {
+    left: 100,
+    right: 200,
+    top: 250,
+    bottom: 270,
+    width: 100,
+    height: 20,
+  } as DOMRect;
+  Range.prototype.getBoundingClientRect = () => rectangle;
+  Range.prototype.getClientRects = () => [rectangle] as unknown as DOMRectList;
+  const events: Event[] = [
+    {
+      seq: 1,
+      at: 1,
+      session_id: "a",
+      event: { kind: "user", text: "问题", request_id: "r" },
+    },
+    {
+      seq: 2,
+      at: 2,
+      session_id: "a",
+      event: { kind: "text", text: "这段**原文**和另一条建议。" },
+    },
+    {
+      seq: 3,
+      at: 3,
+      session_id: "a",
+      event: { kind: "state", status: "completed", message: null },
+    },
+  ];
+  const view = render(
+    <Conversation {...p} session={session("a")} events={events} />,
+  );
+  await waitFor(() =>
+    expect(
+      view.container.querySelector('[data-history-loading="false"]'),
+    ).toBeTruthy(),
+  );
+  const selected = screen.getByText("原文");
+  const range = document.createRange();
+  range.selectNodeContents(selected);
+  window.getSelection()!.removeAllRanges();
+  window.getSelection()!.addRange(range);
+  fireEvent.mouseUp(selected);
+  fireEvent.click(screen.getByRole("menuitem", { name: "添加注释" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "用户评论" }), {
+    target: { value: "为什么？" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "保存" }));
+  const key = JSON.stringify(["local", "a"]);
+  act(() =>
+    p.drafts.update(key, {
+      annotations: [
+        ...p.drafts.get(key).annotations!,
+        { ...annotation, id: "second" },
+      ],
+    }),
+  );
+  fireEvent.change(input(), { target: { value: "看看这两个问题" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送任务" }));
+  await waitFor(() => expect(p.send).toHaveBeenCalledTimes(1));
+  const prompt = p.send.mock.calls[0][0];
+  expect(userMessageContent(prompt).annotations.map((a) => a.comment)).toEqual([
+    "为什么？",
+    "请解释",
+  ]);
+  await waitFor(() => expect(p.drafts.get(key).annotations).toBeUndefined());
+  view.rerender(
+    <Conversation
+      {...p}
+      session={session("a")}
+      events={[
+        ...events,
+        {
+          seq: 4,
+          at: 4,
+          session_id: "a",
+          event: { kind: "user", text: prompt, request_id: "new" },
+        },
+      ]}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "2 条注释" }));
+  expect(screen.getByText("为什么？")).toBeTruthy();
+  expect(
+    screen.queryByRole("button", { name: /编辑注释|删除注释/ }),
+  ).toBeNull();
+  expect(
+    screen.getByText("看看这两个问题").closest(".user-message"),
+  ).toBeTruthy();
+});
+
+it("keeps annotation drafts scoped and a newer edit survives an earlier acknowledgement", async () => {
+  const p = props();
+  const key = JSON.stringify(["local", "a"]);
+  p.drafts.update(key, { annotations: [annotation] });
+  let finish!: (value: boolean) => void;
+  p.send.mockReturnValue(
+    new Promise((resolve) => {
+      finish = resolve;
+    }),
+  );
+  const view = render(<Conversation {...p} session={session("a")} />);
+  fireEvent.click(screen.getByRole("button", { name: "发送任务" }));
+  expect(screen.queryByRole("button", { name: "1 条注释" })).toBeNull();
+  view.rerender(<Conversation {...p} session={session("b")} />);
+  expect(screen.queryByRole("button", { name: "1 条注释" })).toBeNull();
+  act(() =>
+    p.drafts.update(key, {
+      annotations: [{ ...annotation, comment: "更新的评论" }],
+    }),
+  );
+  await act(async () => finish(true));
+  view.rerender(<Conversation {...p} session={session("a")} />);
+  fireEvent.click(screen.getByRole("button", { name: "1 条注释" }));
+  expect(screen.getByText("更新的评论")).toBeTruthy();
+});
+
+it("blocks native slash commands with annotations and leaves context intact", async () => {
+  const p = props();
+  p.drafts.update(JSON.stringify(["local", "a"]), {
+    text: "/compact",
+    annotations: [annotation],
+  });
+  render(<Conversation {...p} session={session("a")} />);
+  fireEvent.click(screen.getByRole("button", { name: "发送任务" }));
+  await screen.findByText("请先移除注释，再使用 Agent 原生命令。");
+  expect(p.send).not.toHaveBeenCalled();
+  expect(input().value).toBe("/compact");
 });
 
 it("keeps the reading anchor when older history is prepended without concealing the current transcript", async () => {
@@ -1643,7 +1819,7 @@ it("keeps stop available while an empty composer waits for a queued message take
   expect(p.send).not.toHaveBeenCalled();
 });
 
-it("takes a queued message into the composer, retains existing draft and references, and resubmits it as a new queued message", async () => {
+it("takes a queued message into the composer, retains existing draft, annotations and references, and resubmits it as a new queued message", async () => {
   const p = props();
   const old = { name: "existing.txt", path: "existing.txt", directory: false };
   const added = {
@@ -1653,7 +1829,10 @@ it("takes a queued message into the composer, retains existing draft and referen
   };
   const entry = {
     request_id: "queued",
-    text: referencePrompt("Queued instruction", [added]),
+    text: referencePrompt(
+      annotationPrompt("Queued instruction", [annotation]),
+      [added],
+    ),
     model: null,
     effort: null,
     permission_mode: null,
@@ -1698,11 +1877,19 @@ it("takes a queued message into the composer, retains existing draft and referen
     "/host/input.pdf",
   ]);
   expect(p.send).not.toHaveBeenCalled();
+  expect(p.drafts.get(key).annotations?.[0].comment).toBe(annotation.comment);
+  const restoredAnnotations = p.drafts.get(key).annotations!;
   await act(async () =>
     fireEvent.click(screen.getByRole("button", { name: "加入队列" })),
   );
   expect(p.send).toHaveBeenCalledWith(
-    referencePrompt("Existing draft\n\nQueued instruction", [old, added]),
+    referencePrompt(
+      annotationPrompt(
+        "Existing draft\n\nQueued instruction",
+        restoredAnnotations,
+      ),
+      [old, added],
+    ),
     null,
     null,
     null,

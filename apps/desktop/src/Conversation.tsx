@@ -1,6 +1,11 @@
 import { ImageGallery } from "./ImageGallery";
 import { Select } from "./Select";
-import { referenceMessage } from "./referenceMessage";
+import {
+  annotationError,
+  userMessageContent,
+  type Annotation,
+} from "./annotations";
+import { AnnotatedMessage, AnnotationSummary } from "./AnnotationUI";
 import { MessageQueue } from "./MessageQueue";
 import { TurnChangesCard } from "./TurnChangesCard";
 import { UserMessage } from "./UserMessage";
@@ -17,7 +22,7 @@ import { ApprovalCard } from "./ApprovalCard";
 import { activityTranscript } from "./activity";
 import { ComposerAction } from "./ComposerAction";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { MessageActionsProvider, MessageContent } from "./MessageContent";
+import { MessageActionsProvider } from "./MessageContent";
 import { createExternalImageLoader } from "./externalImageLoader";
 import { loadSource } from "./sourceLoader";
 import { DraftStore, useDraft, type Draft } from "./drafts";
@@ -155,6 +160,27 @@ export function Conversation({
   const editingScope = useRef(draftKey);
   editingScope.current = draftKey;
   const text = draft.text;
+  const annotations = useMemo(
+    () => draft.annotations ?? [],
+    [draft.annotations],
+  );
+  function saveAnnotation(entry: Annotation) {
+    const existing = drafts.get(draftKey).annotations ?? [];
+    const next = existing.some((item) => item.id === entry.id)
+      ? existing.map((item) => (item.id === entry.id ? entry : item))
+      : [...existing, entry];
+    const error = annotationError(next);
+    if (error) return error;
+    drafts.update(draftKey, { annotations: next });
+    return null;
+  }
+  function removeAnnotation(id: string) {
+    drafts.update(draftKey, {
+      annotations: (drafts.get(draftKey).annotations ?? []).filter(
+        (entry) => entry.id !== id,
+      ),
+    });
+  }
   const setText = (text: string) => drafts.update(draftKey, { text });
   const root = useRef<HTMLElement>(null);
   const modelPicker = useRef<ModelPickerHandle>(null);
@@ -717,12 +743,22 @@ export function Conversation({
                           active={!settingsOpen && !preparingHistory}
                         />
                       ) : item.type === "assistant" ? (
-                        <article
-                          className="assistant-message markdown"
-                          key={item.key}
-                        >
-                          <MessageContent text={item.text} />
-                        </article>
+                        <AnnotatedMessage
+                          key={`${historyScope}:${item.key}`}
+                          message={item.key}
+                          text={item.text}
+                          entries={annotations}
+                          enabled={
+                            !settingsOpen &&
+                            !preparingHistory &&
+                            !sendingInCurrentScope &&
+                            !queueEditing &&
+                            !session?.archived
+                          }
+                          onSave={saveAnnotation}
+                          onRemove={removeAnnotation}
+                          askInSideChat={quoteInSideChat}
+                        />
                       ) : item.type === "tool_images" ? (
                         <ToolImages
                           key={item.key}
@@ -1016,7 +1052,7 @@ export function Conversation({
           }
           onEdit={(entry) => {
             const current = drafts.get(draftKey);
-            const restored = referenceMessage(entry.text);
+            const restored = userMessageContent(entry.text);
             const scope = `${hostId}:${projectId}:${agentId}`;
             const existing =
               current.references.scope === scope
@@ -1028,23 +1064,45 @@ export function Conversation({
                 (item) => !existing.some((old) => old.path === item.path),
               ),
             ];
+            const combinedAnnotations = [
+              ...(current.annotations ?? []),
+              ...restored.annotations.map((item) => ({
+                ...item,
+                id: crypto.randomUUID(),
+              })),
+            ];
+            const canRestore =
+              combined.length <= 20 && !annotationError(combinedAnnotations);
             drafts.update(draftKey, {
-              text: [
-                current.text,
-                combined.length <= 20 ? restored.text : entry.text,
-              ]
+              text: [current.text, canRestore ? restored.text : entry.text]
                 .filter(Boolean)
                 .join("\n\n"),
               references: {
                 scope,
-                entries: combined.length <= 20 ? combined : existing,
+                entries: canRestore ? combined : existing,
               },
+              annotations: canRestore
+                ? combinedAnnotations
+                : current.annotations,
             });
             if (editingScope.current === draftKey)
               setComposerFocus((v) => v + 1);
           }}
         />
         <Composer
+          annotations={annotations}
+          hasContext={annotations.length > 0}
+          context={
+            <AnnotationSummary
+              key={draftKey}
+              entries={annotations}
+              onSave={saveAnnotation}
+              onRemove={removeAnnotation}
+              onClear={() => drafts.update(draftKey, { annotations: [] })}
+              disabled={sending || queueEditing || !!session?.archived}
+              active={!settingsOpen}
+            />
+          }
           focusRequest={composerFocus}
           skillCreator={draft.skillCreator}
           onRemoveSkillCreator={() =>

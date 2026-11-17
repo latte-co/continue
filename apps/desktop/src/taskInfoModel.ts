@@ -1,5 +1,5 @@
 import type { Event, JsonValue } from "./protocol";
-import { referenceMessage } from "./referenceMessage";
+import { userMessageContent } from "./annotations";
 import { webLink } from "./browserLinks";
 import { isTaskResourceFile } from "./taskResourceFiles";
 
@@ -107,7 +107,7 @@ function collector(projectPath?: string, state = newState()) {
   };
   const scan = (body: string, user: boolean) => {
     if (user) {
-      const parsed = referenceMessage(body);
+      const parsed = userMessageContent(body);
       for (const entry of parsed.references)
         file(entry.path, entry.name, false, entry.directory, entry.name);
       body = parsed.text;

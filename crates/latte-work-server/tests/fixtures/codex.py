@@ -105,6 +105,12 @@ for line in sys.stdin:
                 sys.exit(0)
         parent_thread = thread
         thread = f'side-thread-{os.getpid()}' if method == 'thread/fork' else params['threadId']
+        if method == 'thread/resume' and pathlib.Path('hold-side-resume').exists():
+            pathlib.Path('side-resume-entered').touch()
+            deadline = time.monotonic() + 10
+            while not pathlib.Path('release-side-resume').exists():
+                assert time.monotonic() < deadline, 'side resume was not released'
+                time.sleep(.01)
         if method == 'thread/resume' and pathlib.Path('side-open-detached-writer').exists():
             assert sandbox == 'dangerFullAccess'
             pathlib.Path('side-open-detached-writer').unlink()

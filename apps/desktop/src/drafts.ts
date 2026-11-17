@@ -1,10 +1,12 @@
 import { useSyncExternalStore } from "react";
 import type { ComposerReference } from "./pasteAttachments";
+import type { Annotation } from "./annotations";
 
 export interface Draft {
   text: string;
   skillCreator?: boolean;
   quotes?: string[];
+  annotations?: Annotation[];
   references: { scope: string; entries: ComposerReference[] };
 }
 const empty: Draft = { text: "", references: { scope: "", entries: [] } };
@@ -35,6 +37,7 @@ export class DraftStore {
       previous.text === next.text &&
       previous.skillCreator === next.skillCreator &&
       previous.quotes === next.quotes &&
+      previous.annotations === next.annotations &&
       sameReferences;
     this.versions.set(
       next,

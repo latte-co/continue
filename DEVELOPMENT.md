@@ -160,6 +160,33 @@ behavior with the deterministic CLI fixture. These do not measure coverage or
 validate a live model service. Internal interface changes do not require a wire
 protocol version increment.
 
+## Session annotations
+
+`annotations.ts` captures exact rendered-text offsets within one assistant message;
+`AnnotationUI.tsx` provides selection actions, a shared-Modal editor, draft highlights
+and a read-only history disclosure. Main and side-chat drafts store annotations in
+the existing App-lifetime `DraftStore`; editing them advances the submission version.
+Cross-message selections and UI controls are excluded. Anchors validate the exact
+quote before highlighting, with no fuzzy relocation after history projection changes.
+
+The versioned annotation manifest is appended to ordinary prompt text before the
+existing file-reference manifest. It travels unchanged through Send, queue admission,
+native Agent input and persisted user events; no protocol field or Server upgrade is
+required. Parsing collapses only a complete valid manifest and leaves unknown or
+malformed text visible. Limits are 20 entries, 8,000 UTF-16 quote units, 4,000 comment
+units, 96 KiB UTF-8 manifest and 128 KiB combined prompt. Native slash commands cannot
+carry annotations. Queue take restores both annotations and references atomically;
+if merged limits would overflow, the complete taken prompt remains in draft text.
+Task Summary also strips the annotation manifest before scanning user or handed-off
+input for resources. Side-chat admission checks the final UTF-8 message after adding
+quoted context, before first-use session creation. Selection click suppression is
+single-use and scoped to the control intersecting the current mouse gesture; it never
+uses a retained document selection to block unrelated or keyboard actions.
+
+Focused checks: annotations/AnnotationUI, Conversation, SideChat and drafts frontend
+tests, plus final-binary `session_annotations_reach_native_input_and_replay_exactly_once`.
+Browser fixture verification and real macOS WebKit/Agent smoke are separate evidence.
+
 ## Composer references and native Agent commands
 
 `agent_commands` is an additive protocol request scoped to agent and project. The

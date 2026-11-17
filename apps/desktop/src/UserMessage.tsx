@@ -4,7 +4,9 @@ import { MessageTimestamp } from "./MessageTimestamp";
 import { useMemo } from "react";
 import { FileText, Folder } from "lucide-react";
 import { AttachmentImage } from "./AttachmentImage";
-import { referenceKind, referenceMessage } from "./referenceMessage";
+import { referenceKind } from "./referenceMessage";
+import { userMessageContent } from "./annotations";
+import { AnnotationSummary } from "./AnnotationUI";
 
 export function UserMessage({
   text,
@@ -23,10 +25,11 @@ export function UserMessage({
   connected?: boolean;
   active?: boolean;
 }) {
-  const content = useMemo(() => referenceMessage(text), [text]);
+  const content = useMemo(() => userMessageContent(text), [text]);
   return (
     <ImageGalleryBoundary>
       <div className="user-message-group">
+        <AnnotationSummary entries={content.annotations} active={active} />
         {content.references.length > 0 && (
           <div className="user-message-attachments" aria-label="消息附件">
             {content.references.map((reference, index) =>

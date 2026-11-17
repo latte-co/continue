@@ -418,6 +418,10 @@ for line in sys.stdin:
                     emit({'type':'result','subtype':'success','is_error':False})
                     emit({'type':'system','subtype':'session_state_changed','state':'idle'})
                 threading.Thread(target=report,daemon=True).start()
+        elif text.startswith('annotation-fixture\n'):
+            # Echo the actual native input to verify transport and persistence agree.
+            emit({'type':'assistant','message':{'content':[{'type':'text','text':text}]}})
+            emit({'type':'result','subtype':'success','is_error':False})
         elif text.startswith('/'):
             if text=='/agents':
                 emit({'type':'system','subtype':'task_updated','task_id':'native-child','patch':{'status':'killed'}})

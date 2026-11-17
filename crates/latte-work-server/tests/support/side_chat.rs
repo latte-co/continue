@@ -578,6 +578,11 @@ async fn undo_ignores_prelaunch_rejection_and_fences_unconfirmed_native_exit() {
                 ),
             }
         };
+        if launch {
+            // Hold recovery at the native initialization boundary, not at a
+            // guessed delay after the persisted Failed event.
+            std::fs::write(root.path().join("hold-side-resume"), "").unwrap();
+        }
         send_writable_side(&mut client, &side, "eof", "default", provider).await;
         let events = wait(&mut client, &side.id, Status::Failed).await;
         let inputs = std::fs::read_to_string(root.path().join("codex-inputs")).unwrap();
@@ -601,6 +606,39 @@ async fn undo_ignores_prelaunch_rejection_and_fences_unconfirmed_native_exit() {
         ));
         wait(&mut client, main, Status::Completed).await;
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "main edit\n");
+        wait_for_agent_idle(&mut client, main, Status::Completed).await;
+        if launch {
+            wait_for_marker(&root.path().join("side-resume-entered")).await;
+            let recovering = ask(
+                &mut client,
+                Request::Session {
+                    session_id: side.id.clone(),
+                },
+            )
+            .await;
+            assert!(
+                matches!(&recovering, Response::Session { session }
+                if session.status == Status::Failed && session.agent_session_busy == Some(true)),
+                "{recovering:?}"
+            );
+            let busy_undo = ask(
+                &mut client,
+                Request::UndoTurnChanges {
+                    session_id: main.clone(),
+                    request_id: "main-write".into(),
+                },
+            )
+            .await;
+            assert!(
+                matches!(&busy_undo, Response::Error { message, .. }
+                if message.contains("此主机仍有运行任务")),
+                "{busy_undo:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "main edit\n");
+            std::fs::write(root.path().join("release-side-resume"), "").unwrap();
+        }
+        let settled = wait_for_agent_idle(&mut client, &side.id, Status::Failed).await;
+        assert_eq!(settled.side_write_pending.is_some(), launch);
         let undo = ask(
             &mut client,
             Request::UndoTurnChanges {
@@ -624,6 +662,36 @@ async fn undo_ignores_prelaunch_rejection_and_fences_unconfirmed_native_exit() {
             );
             assert_eq!(std::fs::read_to_string(&file).unwrap(), "before\n");
         }
+    }
+}
+
+/// Durable turn status can precede native recovery/queue settlement. Observe the
+/// same live evidence as Undo without closing an actor or retrying a mutation.
+async fn wait_for_agent_idle(client: &mut Client, id: &str, status: Status) -> Session {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = ask(
+            client,
+            Request::Session {
+                session_id: id.into(),
+            },
+        )
+        .await;
+        let Response::Session { session } = response else {
+            panic!("{response:?}")
+        };
+        assert_eq!(
+            session.status, status,
+            "unexpected recovery outcome: {session:?}"
+        );
+        if session.agent_session_busy == Some(false) {
+            return session;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native runtime did not settle: {session:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

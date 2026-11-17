@@ -134,7 +134,27 @@ mod tests {
             .unwrap();
         let linked = parent.path().join("skill-upload-ABCDEF");
         std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
-        let fresh = Staging::new(parent.path(), "skill-upload-", None).unwrap();
+        // Concurrent process spawning can briefly retain the dropped lease.
+        // Recovery must skip a locked stage and retry it on a later import.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let fresh = loop {
+            let fresh = Staging::new(parent.path(), "skill-upload-", None).unwrap();
+            assert!(active.path().exists());
+            assert!(unmarked.path().exists());
+            assert!(linked.symlink_metadata().unwrap().file_type().is_symlink());
+            assert!(outside.path().join("keep").exists());
+            if !abandoned.exists() {
+                break fresh;
+            }
+            assert!(abandoned.join(LEASE).exists());
+            assert!(abandoned.join("partial").exists());
+            drop(fresh);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "abandoned lease never became recoverable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert!(!abandoned.exists());
         assert!(active.path().exists());
         assert!(unmarked.path().exists());

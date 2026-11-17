@@ -47,6 +47,7 @@ import { skillCreatorPrompt } from "./skillCreator";
 import { dragHasFiles } from "./fileDrag";
 import { AttachmentImage } from "./AttachmentImage";
 import { referenceKind } from "./referenceMessage";
+import { annotationPrompt, type Annotation } from "./annotations";
 
 interface Props {
   skillCreator?: boolean;
@@ -56,6 +57,7 @@ interface Props {
   sideChat?: boolean;
   context?: ReactNode;
   hasContext?: boolean;
+  annotations?: Annotation[];
   referenceState?: { scope: string; entries: ComposerReference[] };
   onReferencesChange?: (value: {
     scope: string;
@@ -679,6 +681,10 @@ export function Composer(props: Props) {
       setNotice("侧边聊天暂不支持 Agent 原生命令，请输入普通消息。");
       return;
     }
+    if (value.trimStart().startsWith("/") && props.annotations?.length) {
+      setNotice("请先移除注释，再使用 Agent 原生命令。");
+      return;
+    }
     if (
       agent !== "opencode" &&
       value.trimStart().startsWith("/") &&
@@ -729,9 +735,17 @@ export function Composer(props: Props) {
         return;
       }
       const prompt = referencePrompt(
-        props.skillCreator ? skillCreatorPrompt(value) : value,
+        annotationPrompt(
+          props.skillCreator ? skillCreatorPrompt(value) : value,
+          props.annotations ?? [],
+        ),
         attached,
       );
+      if (
+        props.annotations?.length &&
+        new TextEncoder().encode(prompt).length > 128 * 1024
+      )
+        throw new Error("消息与注释总内容过长，请缩短后再发送。");
       if (await onSubmit(prompt)) {
         if (!props.referenceState && currentScope.current === owner)
           setReferences({ scope: owner, entries: [] });
