@@ -54,16 +54,19 @@ pub(in crate::agents) async fn read(
     .context("读取 OpenCode 子任务历史超时")?
 }
 
+pub(in crate::agents) fn plausible_session_id(id: &str) -> bool {
+    id.starts_with("ses_")
+        && id.len() <= 128
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 async fn export(
     binary: &str,
     cwd: &Path,
     id: &str,
     config: &LaunchConfig,
 ) -> Result<Option<Value>> {
-    if !id.starts_with("ses_")
-        || id.len() > 128
-        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
+    if !plausible_session_id(id) {
         return Ok(None);
     }
     let process = crate::agent_environment::command(binary)

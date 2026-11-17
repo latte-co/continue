@@ -831,3 +831,113 @@ async fn opencode_silent_successor_is_running_and_cancel_reaches_native_executio
         "reply"
     ));
 }
+
+#[tokio::test]
+async fn opencode_resume_repairs_a_moved_native_session_directory() {
+    let host = Host::start().await;
+    let folder = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let project_id = project(&mut client, folder.path()).await;
+    let id = create(&mut client, &project_id).await;
+    assert!(matches!(
+        ask(&mut client, turn(&id, "first", "hello")).await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &id, Status::Completed).await;
+    let native = current(&mut client, &id).await.native_id.unwrap();
+    assert!(matches!(
+        ask(&mut client, close(&id, true)).await,
+        Response::Ok
+    ));
+    // The fixture pins the session to a directory that no longer matches the
+    // project, mirroring an OpenCode session moved into a deleted worktree.
+    std::fs::write(folder.path().join(&native), "moved").unwrap();
+    assert!(matches!(ask(&mut client, open(&id)).await, Response::Ok));
+    assert!(matches!(
+        ask(&mut client, turn(&id, "second", "after move")).await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &id, Status::Completed).await;
+    assert_eq!(
+        current(&mut client, &id).await.native_id.as_deref(),
+        Some(native.as_str())
+    );
+    let log = std::fs::read_to_string(folder.path().join("prompts")).unwrap();
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        [
+            format!("{native}:test/other:max:hello"),
+            format!("{native}:test/other:max:after move"),
+        ]
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(folder.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("ses_"))
+        })
+        .collect();
+    assert_eq!(
+        leftovers,
+        vec![folder.path().join(&native)],
+        "the disposable repair session is deleted"
+    );
+}
+
+#[tokio::test]
+async fn opencode_resume_keeps_a_worktree_session_in_its_worktree() {
+    let host = Host::start().await;
+    let folder = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let project_id = project(&mut client, folder.path()).await;
+    let id = create(&mut client, &project_id).await;
+    assert!(matches!(
+        ask(&mut client, turn(&id, "seed", "in project")).await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &id, Status::Completed).await;
+    let native = current(&mut client, &id).await.native_id.unwrap();
+    assert!(matches!(
+        ask(&mut client, close(&id, true)).await,
+        Response::Ok
+    ));
+    // The session moved into a worktree that still exists; its export
+    // reports the new directory, and the native session state moved along.
+    std::fs::write(
+        folder.path().join(format!("{native}.json")),
+        serde_json::json!({
+            "info": {"id": native, "location": {"directory": worktree.path()}},
+            "messages": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(worktree.path().join(&native), "prompted").unwrap();
+    let response = ask(&mut client, open(&id)).await;
+    let Response::Ok = response else {
+        panic!("open failed: {response:?}");
+    };
+    assert!(matches!(
+        ask(&mut client, turn(&id, "wt", "from worktree")).await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &id, Status::Completed).await;
+    assert_eq!(
+        current(&mut client, &id).await.native_id.as_deref(),
+        Some(native.as_str())
+    );
+    let log = std::fs::read_to_string(worktree.path().join("prompts")).unwrap();
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        [format!("{native}:test/other:max:from worktree")],
+        "the agent process resumed inside the worktree"
+    );
+    let seeded = std::fs::read_to_string(folder.path().join("prompts")).unwrap();
+    assert_eq!(
+        seeded.lines().collect::<Vec<_>>(),
+        [format!("{native}:test/other:max:in project")],
+        "only the first turn ran in the project directory"
+    );
+}

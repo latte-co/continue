@@ -59,6 +59,9 @@ def sideband():
                 reply = {"type": "reply", "id": request["id"]}
                 if action == "rename":
                     titles[native] = request["title"]
+                elif action == "move":
+                    # A repaired session becomes resumable from this cwd.
+                    Path(request["sessionID"]).write_text("prompted")
                 elif action == "get":
                     reply["title"] = titles.get(native)
                 elif action == "prompt":
@@ -284,6 +287,13 @@ for line in sys.stdin:
             session = params["sessionId"]
             if not Path(session).exists():
                 send(id=id, error={"code": -32602, "message": "Session not found"})
+                continue
+            if Path(session).read_text() == "moved":
+                # Mirror OpenCode's directory pin: the session belongs to
+                # another cwd and cannot be resumed from this one.
+                send(id=id, error={"code": -32602,
+                                   "message": f"Invalid params: session {session} does not belong to cwd: {Path.cwd()}",
+                                   "data": {"sessionId": session, "cwd": str(Path.cwd())}})
                 continue
             assert Path(session).read_text() == "prompted"
             reply(id, configOptions=options())

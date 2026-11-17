@@ -14,11 +14,13 @@ mod config;
 mod history;
 mod metadata;
 mod question;
+mod resume;
 #[cfg(test)]
 mod tests;
 pub(super) use history::read as child_history;
 pub(crate) use metadata::commands;
 pub(super) use metadata::{discover, models, permission_modes, skill_info};
+pub(in crate::agents) use resume::directory as resume_directory;
 
 const FRAME_LIMIT: usize = 4 * 1024 * 1024;
 const CHILD_CAPABILITY: &str = "opencode/child-session-updates";
@@ -30,6 +32,8 @@ const MAX_TOOLS: usize = 2048;
 enum Request {
     Initialize,
     Attach,
+    RepairNew,
+    RepairDelete,
     DefaultModel,
     DeleteProbe,
     Model,
@@ -47,6 +51,8 @@ enum AcpInput {
 pub struct OpenCode {
     cwd: String,
     resume: Option<String>,
+    repair: Option<Repair>,
+    repair_attempted: bool,
     fallback_model_on_open: bool,
     managed_provider: bool,
     initial_title: Option<String>,
@@ -106,6 +112,18 @@ struct Permission {
     wire_id: Value,
     allow: String,
     reject: Option<String>,
+}
+
+// OpenCode pins a native session to its recorded directory and rejects a
+// resume from any other cwd. When that blocks a saved conversation, wake the
+// bundled plugin with a disposable session, move the saved session back to
+// this process's cwd, drop the disposable session, and retry the resume once.
+struct Repair {
+    original: String,
+    temp: Option<String>,
+    move_sent: bool,
+    moved: bool,
+    deleting: bool,
 }
 
 #[derive(Default)]
@@ -282,10 +300,26 @@ impl OpenCode {
             if self.session.is_some() && self.saved {
                 actions.push(self.sideband_request("get", "title", json!({}))?);
             }
+            actions.extend(self.repair_move()?);
             return Ok(actions);
         }
         if kind == "reply" {
             let id = string(&message, "id")?;
+            if id == "repair-move" {
+                let Some(repair) = &mut self.repair else {
+                    return Ok(vec![]);
+                };
+                if message["error"] == true {
+                    bail!(
+                        "OpenCode 会话目录已变化，自动迁移未成功：{}",
+                        repair.original
+                    );
+                }
+                repair.moved = true;
+                let mut actions = Vec::new();
+                actions.extend(self.repair_delete()?);
+                return Ok(actions);
+            }
             if id == "initial-title" && self.initial_title_pending {
                 self.initial_title_pending = false;
                 let mut actions = Vec::new();
@@ -964,6 +998,83 @@ impl OpenCode {
         )?])
     }
 
+    fn repair_original(&self) -> String {
+        self.repair
+            .as_ref()
+            .map(|repair| repair.original.clone())
+            .unwrap_or_else(|| "OpenCode 会话恢复失败".into())
+    }
+
+    // The plugin loads only after the server hosts a session, so the repair
+    // first opens a disposable one and moves the saved session once the
+    // sideband reports readiness.
+    fn begin_repair(&mut self, original: String) -> Result<Vec<Action>> {
+        self.repair_attempted = true;
+        self.repair = Some(Repair {
+            original,
+            temp: None,
+            move_sent: false,
+            moved: false,
+            deleting: false,
+        });
+        let mut actions = vec![self.request(
+            Request::RepairNew,
+            "session/new",
+            json!({"cwd": self.cwd, "mcpServers": []}),
+        )?];
+        actions.extend(self.repair_move()?);
+        Ok(actions)
+    }
+
+    fn repair_move(&mut self) -> Result<Option<Action>> {
+        if !self.sideband_ready {
+            return Ok(None);
+        }
+        let Some(repair) = &mut self.repair else {
+            return Ok(None);
+        };
+        if repair.move_sent {
+            return Ok(None);
+        }
+        repair.move_sent = true;
+        let session = self.resume.clone().context("OpenCode 修复缺少待恢复会话")?;
+        Ok(Some(self.sideband_request(
+            "move",
+            "repair-move",
+            json!({"sessionID": session, "directory": self.cwd}),
+        )?))
+    }
+
+    fn repair_delete(&mut self) -> Result<Option<Action>> {
+        let Some(repair) = &mut self.repair else {
+            return Ok(None);
+        };
+        if !repair.moved || repair.deleting {
+            return Ok(None);
+        }
+        let Some(temp) = repair.temp.clone() else {
+            return Ok(None);
+        };
+        repair.deleting = true;
+        Ok(Some(self.request(
+            Request::RepairDelete,
+            "session/delete",
+            json!({"sessionId": temp}),
+        )?))
+    }
+
+    fn retry_resume(&mut self) -> Result<Vec<Action>> {
+        self.repair = None;
+        let mut params = json!({"cwd": self.cwd, "mcpServers": []});
+        let session = self.resume.clone().context("OpenCode 修复缺少待恢复会话")?;
+        params["sessionId"] = json!(session);
+        Ok(vec![self.request(
+            Request::Attach,
+            "session/resume",
+            params,
+        )?])
+    }
+
     fn session_id(&self) -> Result<&str> {
         self.session.as_deref().context("OpenCode ACP 会话尚未打开")
     }
@@ -1093,6 +1204,23 @@ impl OpenCode {
             if kind == Request::Prompt {
                 return self.finish_prompt(true, Some(rpc_error(error)));
             }
+            if kind == Request::RepairDelete {
+                // The disposable session outlives the repair at worst; the
+                // saved conversation still has to come back.
+                return self.retry_resume();
+            }
+            if kind == Request::RepairNew {
+                bail!("{}", self.repair_original());
+            }
+            if kind == Request::Attach
+                && self.repair.is_none()
+                && !self.repair_attempted
+                && self.resume.is_some()
+                && error["data"]["cwd"].is_string()
+                && rpc_error(error).contains("does not belong to cwd")
+            {
+                return self.begin_repair(rpc_error(error));
+            }
             bail!("{}", rpc_error(error));
         }
         let result = message.get("result").context("OpenCode ACP 缺少响应结果")?;
@@ -1135,6 +1263,17 @@ impl OpenCode {
                 }
                 self.attach_model(result)
             }
+            Request::RepairNew => {
+                let temp = string(result, "sessionId")?.to_owned();
+                if let Some(repair) = &mut self.repair {
+                    repair.temp = Some(temp);
+                }
+                let mut actions = Vec::new();
+                actions.extend(self.repair_move()?);
+                actions.extend(self.repair_delete()?);
+                Ok(actions)
+            }
+            Request::RepairDelete => self.retry_resume(),
             Request::DefaultModel => {
                 let probe = string(result, "sessionId")?;
                 ensure!(

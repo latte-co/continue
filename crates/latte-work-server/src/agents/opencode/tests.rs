@@ -343,3 +343,176 @@ fn failed_command_submission_keeps_admitted_execution_interruptible_until_termin
         assert!(adapter.can_start_turn());
     }
 }
+
+fn resuming() -> OpenCode {
+    OpenCode {
+        cwd: "/proj".into(),
+        resume: Some("ses_moved".into()),
+        saved: true,
+        ..OpenCode::default()
+    }
+}
+
+fn wire(actions: &[Action]) -> (String, String) {
+    let mut writes = String::new();
+    let mut sideband = String::new();
+    for action in actions {
+        match action {
+            Action::Write(bytes) => writes.push_str(&String::from_utf8_lossy(bytes)),
+            Action::SidebandWrite(bytes) => sideband.push_str(&String::from_utf8_lossy(bytes)),
+            _ => {}
+        }
+    }
+    (writes, sideband)
+}
+
+fn result(id: u64, result: Value) -> String {
+    json!({"jsonrpc":"2.0", "id": id, "result": result}).to_string()
+}
+
+const MISMATCH: &str = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32602,
+"message":"Invalid params: session ses_moved does not belong to cwd: /proj",
+"data":{"sessionId":"ses_moved","cwd":"/proj"}}}"#;
+
+fn initialize_response() -> Value {
+    json!({
+        "protocolVersion": 1,
+        "agentInfo": {"name": "OpenCode", "version": "2.3.0"},
+        "agentCapabilities": {"sessionCapabilities": {"resume": {}, "close": {}, "delete": {}}}
+    })
+}
+
+fn resumed_response() -> Value {
+    json!({"configOptions": [
+        {"id": "model", "type": "select", "currentValue": "test/default",
+         "options": [{"value": "test/default", "name": "default"}]},
+        {"id": "effort", "type": "select", "currentValue": "default",
+         "options": [{"value": "default", "name": "default"}]}
+    ]})
+}
+
+#[test]
+fn directory_mismatch_resume_is_repaired_and_retried() {
+    let mut adapter = resuming();
+    adapter.advance(Input::Open).unwrap();
+    let (writes, _) = wire(
+        &adapter
+            .advance(Input::Message(&result(1, initialize_response())))
+            .unwrap(),
+    );
+    assert!(writes.contains("session/resume") && writes.contains("ses_moved"));
+    // The mismatch launches the repair with a disposable session.
+    let (writes, _) = wire(&adapter.advance(Input::Message(MISMATCH)).unwrap());
+    assert!(writes.contains("session/new"));
+    let (writes, sideband) = wire(
+        &adapter
+            .advance(Input::Message(&result(3, json!({"sessionId": "ses_temp"}))))
+            .unwrap(),
+    );
+    assert!(writes.is_empty() && sideband.is_empty());
+    // The plugin joins only after the disposable session hosted it.
+    let (_, sideband) = wire(
+        &adapter
+            .advance(Input::Sideband(r#"{"type":"ready"}"#))
+            .unwrap(),
+    );
+    assert!(
+        sideband.contains("repair-move")
+            && sideband.contains("ses_moved")
+            && sideband.contains(r#""directory":"/proj""#)
+    );
+    // A moved session drops its disposable twin and retries the resume.
+    let (writes, _) = wire(
+        &adapter
+            .advance(Input::Sideband(r#"{"type":"reply","id":"repair-move"}"#))
+            .unwrap(),
+    );
+    assert!(writes.contains("session/delete") && writes.contains("ses_temp"));
+    let (writes, _) = wire(
+        &adapter
+            .advance(Input::Message(&result(4, json!({}))))
+            .unwrap(),
+    );
+    assert!(writes.contains("session/resume") && writes.contains("ses_moved"));
+    // The retried resume adopts the saved session and refreshes its title.
+    let (_, sideband) = wire(
+        &adapter
+            .advance(Input::Message(&result(5, resumed_response())))
+            .unwrap(),
+    );
+    assert_eq!(adapter.session.as_deref(), Some("ses_moved"));
+    assert!(sideband.contains(r#""action":"get""#));
+}
+
+#[test]
+fn failed_move_reports_the_original_error() {
+    let mut adapter = resuming();
+    adapter.advance(Input::Open).unwrap();
+    adapter
+        .advance(Input::Message(&result(1, initialize_response())))
+        .unwrap();
+    adapter.advance(Input::Message(MISMATCH)).unwrap();
+    adapter
+        .advance(Input::Message(&result(3, json!({"sessionId": "ses_temp"}))))
+        .unwrap();
+    adapter
+        .advance(Input::Sideband(r#"{"type":"ready"}"#))
+        .unwrap();
+    let error = match adapter.advance(Input::Sideband(
+        r#"{"type":"reply","id":"repair-move","error":true}"#,
+    )) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("the failed move must fail the resume"),
+    };
+    assert!(error.contains("自动迁移未成功"));
+}
+
+#[test]
+fn repair_runs_at_most_once() {
+    let mut adapter = resuming();
+    adapter.advance(Input::Open).unwrap();
+    adapter
+        .advance(Input::Message(&result(1, initialize_response())))
+        .unwrap();
+    adapter.advance(Input::Message(MISMATCH)).unwrap();
+    adapter
+        .advance(Input::Message(&result(3, json!({"sessionId": "ses_temp"}))))
+        .unwrap();
+    adapter
+        .advance(Input::Sideband(r#"{"type":"ready"}"#))
+        .unwrap();
+    adapter
+        .advance(Input::Sideband(r#"{"type":"reply","id":"repair-move"}"#))
+        .unwrap();
+    adapter
+        .advance(Input::Message(&result(4, json!({}))))
+        .unwrap();
+    // A second mismatch is terminal instead of looping through the repair.
+    let second = json!({"jsonrpc":"2.0","id":5,"error":{"code":-32602,
+        "message":"Invalid params: session ses_moved does not belong to cwd: /proj",
+        "data":{"sessionId":"ses_moved","cwd":"/proj"}}})
+    .to_string();
+    let error = match adapter.advance(Input::Message(&second)) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("the second mismatch must not repair again"),
+    };
+    assert!(error.contains("does not belong to cwd"));
+}
+
+#[test]
+fn failed_probe_session_reports_original_error() {
+    let mut adapter = resuming();
+    adapter.advance(Input::Open).unwrap();
+    adapter
+        .advance(Input::Message(&result(1, initialize_response())))
+        .unwrap();
+    adapter.advance(Input::Message(MISMATCH)).unwrap();
+    let error = match adapter.advance(Input::Message(
+        &json!({"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Invalid params"}})
+            .to_string(),
+    )) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("the failed probe session must fail the resume"),
+    };
+    assert!(error.contains("does not belong to cwd"));
+}

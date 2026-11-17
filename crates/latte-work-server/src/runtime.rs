@@ -363,7 +363,7 @@ pub async fn rename_title(
             {
                 bail!("OpenCode 会话正在打开，请稍后修改标题");
             }
-            let mut process = Process::spawn(
+            let mut process = Process::launch(
                 database,
                 &binary,
                 &current,
@@ -371,7 +371,8 @@ pub async fn rename_title(
                 config,
                 Arc::new(AtomicBool::new(false)),
                 None,
-            )?;
+            )
+            .await?;
             let result = tokio::time::timeout(Duration::from_secs(8), async {
                 let initial = process.adapter.advance(Input::Open)?;
                 process.apply(initial, database, &session.id).await?;
@@ -1195,6 +1196,43 @@ impl Process {
             && self.state.pending.is_empty()
             && self.adapter.can_start_turn()
     }
+    // Resume the native session where it now lives instead of only the
+    // project directory, so a conversation that moved into a worktree keeps
+    // working after its process was restarted. A failed lookup keeps the
+    // project directory; the adapter's mismatch repair recovers from there.
+    async fn launch(
+        database: &Database,
+        binary: &str,
+        session: &Session,
+        path: &str,
+        config: LaunchConfig,
+        session_open: Arc<AtomicBool>,
+        request_id: Option<&str>,
+    ) -> Result<Self> {
+        let path = match session.native_id.as_deref() {
+            Some(id) => agents::resume_directory(
+                &session.agent,
+                binary,
+                std::path::Path::new(path),
+                id,
+                &config,
+            )
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| path.to_owned()),
+            None => path.to_owned(),
+        };
+        Self::spawn(
+            database,
+            binary,
+            session,
+            &path,
+            config,
+            session_open,
+            request_id,
+        )
+    }
     fn spawn(
         database: &Database,
         binary: &str,
@@ -1779,15 +1817,18 @@ async fn accept_turn(
             db(database, |s| s.start_side_write(&turn.request_id))?;
         } else {
             let current = db(database, |s| s.session(&session.id))?;
-            *process = Some(Process::spawn(
-                database,
-                binary,
-                &current,
-                path,
-                turn.config,
-                session_open.clone(),
-                Some(&turn.request_id),
-            )?);
+            *process = Some(
+                Process::launch(
+                    database,
+                    binary,
+                    &current,
+                    path,
+                    turn.config,
+                    session_open.clone(),
+                    Some(&turn.request_id),
+                )
+                .await?,
+            );
         }
         let p = process.as_mut().context("Agent process missing")?;
         p.turn_active = true;
@@ -1980,7 +2021,16 @@ async fn actor(
                     let result = async {
                         if process.is_none() {
                             let current = db(&database, |s| s.session(&session.id))?;
-                            let mut p = Process::spawn(&database, &binary, &current, &path, config, session_open.clone(), None)?;
+                            let mut p = Process::launch(
+                                &database,
+                                &binary,
+                                &current,
+                                &path,
+                                config,
+                                session_open.clone(),
+                                None,
+                            )
+                            .await?;
                             let actions = p.adapter.advance(Input::Open)?;
                             p.apply(actions, &database, &session.id).await?;
                             process = Some(p);
@@ -2395,7 +2445,7 @@ async fn actor(
             {
                 let restore = async {
                     let current = db(&database, |s| s.session(&session.id))?;
-                    let mut p = Process::spawn(
+                    let mut p = Process::launch(
                         &database,
                         &binary,
                         &current,
@@ -2403,7 +2453,8 @@ async fn actor(
                         config,
                         session_open.clone(),
                         None,
-                    )?;
+                    )
+                    .await?;
                     let actions = p.adapter.advance(Input::Open)?;
                     p.apply(actions, &database, &session.id).await?;
                     Ok::<_, anyhow::Error>(p)
