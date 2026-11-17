@@ -235,6 +235,10 @@ export default {
           if (ctx.session.update)
             await ctx.session.update({ sessionID, title: request.title });
           else await ctx.session.rename({ sessionID, title: request.title });
+        } else if (action === "move") {
+          // Repair a saved session whose recorded directory no longer matches
+          // the process cwd before its resume is retried.
+          await ctx.session.move({ sessionID, directory: request.directory });
         } else if (action === "get") {
           const session = await ctx.session.get({ sessionID });
           send({

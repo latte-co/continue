@@ -364,6 +364,21 @@ pub fn rename_saved_session(
     }
 }
 
+// Before relaunching a saved conversation, an agent may reveal the directory
+// its native session now lives in. None keeps the project directory.
+pub async fn resume_directory(
+    agent: &str,
+    binary: &str,
+    project: &std::path::Path,
+    id: &str,
+    config: &crate::providers::LaunchConfig,
+) -> Result<Option<String>> {
+    match agent {
+        "opencode" => opencode::resume_directory(binary, project, id, config).await,
+        _ => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

@@ -1770,7 +1770,22 @@ Readiness waits for both channels. The owned process group and temporary files
 are released when the session closes.
 
 Open and resume are prompt-free. Latte persists requests before forwarding
-them and preserves the original native session ID on resume. A queued input
+them and preserves the original native session ID on resume. OpenCode pins
+each native session to its recorded directory — which the agent itself can
+move (`worktree_create`, `/cd`) — and rejects a resume from any other cwd.
+Before relaunching a saved conversation Latte therefore asks the CLI, via a
+bounded `session export`, where that session now lives, and resumes it there
+when the directory still exists. The recorded directory only steers the
+native process cwd; snapshots, undo and task changes stay rooted at the
+project path, and child history accepts both spellings, so a turn's before
+and after are always captured in the same directory. An unconfirmed close
+blocks the probe exactly as it blocks the agent. Otherwise the resume runs
+from the project directory, and a rejected resume is repaired in place: a
+disposable native session wakes the bundled plugin, the saved session is
+moved back over the sideband (`ctx.session.move`), the disposable session
+is deleted, and the resume is retried exactly once before surfacing the
+original error. The recorded directory is canonicalized so a symlinked
+spelling still matches the process cwd. A queued input
 is consumed only after a matching native inbox delivery event. A background
 Shell is displayed as running until its native exit. Native execution
 completion fences project slash commands and autonomous follow-up activity.
