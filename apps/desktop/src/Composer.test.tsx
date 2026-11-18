@@ -72,9 +72,33 @@ function Harness({
   );
 }
 function type(value: string, cursor = value.length) {
-  fireEvent.change(screen.getByRole("textbox", { name: "任务输入" }), {
-    target: { value, selectionStart: cursor, selectionEnd: cursor },
-  });
+  const input = screen.getByRole("textbox", { name: "任务输入" });
+  if (input instanceof HTMLTextAreaElement) {
+    fireEvent.change(input, {
+      target: { value, selectionStart: cursor, selectionEnd: cursor },
+    });
+    return;
+  }
+  const nodes = Array.from(input.childNodes).filter(
+    (node) => node.nodeType === Node.TEXT_NODE,
+  );
+  const first = nodes[0] ?? input.appendChild(document.createTextNode(""));
+  first.textContent = value;
+  for (const node of nodes.slice(1)) node.textContent = "";
+  const range = document.createRange();
+  range.setStart(first, cursor);
+  range.collapse(true);
+  window.getSelection()?.removeAllRanges();
+  window.getSelection()?.addRange(range);
+  fireEvent.input(input);
+}
+function inputText() {
+  const input = screen.getByRole("textbox", { name: "任务输入" });
+  if (input instanceof HTMLTextAreaElement) return input.value;
+  return Array.from(input.childNodes)
+    .filter((node) => node.nodeType === Node.TEXT_NODE)
+    .map((node) => node.textContent ?? "")
+    .join("");
 }
 beforeEach(() => {
   vi.clearAllMocks();
@@ -224,9 +248,10 @@ it("adds a file with spaces at the caret, preserves surrounding text and retries
   expect(
     screen.getByRole("button", { name: "移除引用 src/中文 file.ts" }),
   ).toBeTruthy();
-  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-    "检查  后文",
-  );
+  expect(inputText()).toBe("检查  后文");
+  expect(
+    screen.getByRole("textbox").querySelector("[data-reference-path]"),
+  ).toHaveProperty("title", "src/中文 file.ts");
   fireEvent.click(screen.getByText("发送"));
   await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
   expect(referenceMessage(mocks.send.mock.calls[0][0]).references).toEqual(
@@ -251,6 +276,349 @@ it("supports plus folder browsing, folder references and removing chips", async 
   fireEvent.click(screen.getByRole("button", { name: "移除引用 src" }));
   expect(screen.queryByLabelText("已添加附件和引用")).toBeNull();
 });
+it("keeps path references in the text flow while editing, deleting and sending", async () => {
+  render(<Harness />);
+  type("在 @src/中文 file.ts 后面继续", "在 @src/中文 file.ts".length);
+  fireEvent.click(await screen.findByRole("option", { name: /中文 file.ts/ }));
+  const editor = screen.getByRole("textbox", { name: "任务输入" });
+  expect(editor.classList.contains("composer-inline-input")).toBe(true);
+  expect(
+    Array.from(editor.childNodes).map((node) =>
+      node instanceof HTMLElement && node.dataset.referencePath
+        ? node.dataset.referencePath
+        : node.textContent,
+    ),
+  ).toEqual(["在 ", "src/中文 file.ts", " 后面继续"]);
+
+  editor.firstChild!.textContent = "请在 ";
+  fireEvent.input(editor);
+  expect(inputText()).toBe("请在  后面继续");
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+  expect(referenceMessage(mocks.send.mock.calls[0][0])).toMatchObject({
+    text: "请在  后面继续",
+    references: [expect.objectContaining({ path: "src/中文 file.ts" })],
+  });
+
+  const range = document.createRange();
+  range.setStartAfter(editor.querySelector("[data-reference-path]")!);
+  range.collapse(true);
+  window.getSelection()?.removeAllRanges();
+  window.getSelection()?.addRange(range);
+  fireEvent.keyDown(editor, { key: "Backspace" });
+  expect(
+    screen.queryByRole("button", { name: "移除引用 src/中文 file.ts" }),
+  ).toBeNull();
+  expect(inputText()).toBe("请在  后面继续");
+});
+function selectComposerRange(range: Range) {
+  window.getSelection()!.removeAllRanges();
+  window.getSelection()!.addRange(range);
+}
+async function addReadme(text = "前文 @READ", cursor = text.length) {
+  type(text, cursor);
+  fireEvent.click(await screen.findByRole("option", { name: /README/ }));
+  return screen.getByRole("textbox", { name: "任务输入" });
+}
+it.each(["Backspace", "Delete", "button"])(
+  "restores the textarea caret and multiline height after removing the last chip via %s",
+  async (action) => {
+    const height = vi
+      .spyOn(Element.prototype, "scrollHeight", "get")
+      .mockReturnValue(76);
+    try {
+      render(<Harness />);
+      const editor = await addReadme(
+        "前文 @READ 后文\n下一行",
+        "前文 @READ".length,
+      );
+      editor.focus();
+      const chip = editor.querySelector("[data-reference-path]")!;
+      const range = document.createRange();
+      if (action === "Delete") range.setStartBefore(chip);
+      else range.setStartAfter(chip);
+      range.collapse(true);
+      selectComposerRange(range);
+
+      if (action === "button")
+        fireEvent.click(
+          screen.getByRole("button", { name: "移除引用 README.md" }),
+        );
+      else fireEvent.keyDown(editor, { key: action });
+
+      const input = screen.getByRole<HTMLTextAreaElement>("textbox", {
+        name: "任务输入",
+      });
+      expect(input).toBeInstanceOf(HTMLTextAreaElement);
+      expect(document.activeElement).toBe(input);
+      expect(input.selectionStart).toBe("前文 ".length);
+      expect(input.value).toBe("前文  后文\n下一行");
+      expect(input.style.height).toBe("76px");
+    } finally {
+      height.mockRestore();
+    }
+  },
+);
+it("keeps the editor mounted while IME replaces the last chip and allows sending after composition", async () => {
+  render(<Harness />);
+  const editor = await addReadme();
+  editor.focus();
+  fireEvent.compositionStart(editor);
+  editor.replaceChildren(document.createTextNode("中文"));
+  const range = document.createRange();
+  range.selectNodeContents(editor);
+  range.collapse(false);
+  selectComposerRange(range);
+  fireEvent.input(editor, {
+    inputType: "insertCompositionText",
+    isComposing: true,
+  });
+  expect(screen.getByRole("textbox", { name: "任务输入" })).toBe(editor);
+  fireEvent.keyDown(editor, { key: "Enter", isComposing: true });
+  expect(mocks.send).not.toHaveBeenCalled();
+  fireEvent.compositionEnd(editor, { data: "中文" });
+
+  const input = screen.getByRole<HTMLTextAreaElement>("textbox", {
+    name: "任务输入",
+  });
+  expect(document.activeElement).toBe(input);
+  expect(input.value).toBe("中文");
+  expect(input.selectionStart).toBe("中文".length);
+  fireEvent.keyDown(input, { key: "Enter" });
+  await waitFor(() => expect(mocks.send).toHaveBeenCalledWith("中文"));
+});
+it("renders a trailing line without adding a draft character and ignores WebKit's empty placeholder", async () => {
+  render(<Harness />);
+  const editor = await addReadme();
+  const text = document.createRange();
+  text.setStartAfter(editor.querySelector("[data-reference-path]")!);
+  text.collapse(true);
+  selectComposerRange(text);
+  fireEvent.keyDown(editor, { key: "Enter", shiftKey: true });
+  expect(editor.lastChild).toBeInstanceOf(HTMLBRElement);
+  expect(inputText()).toBe("前文 \n");
+  fireEvent.keyDown(editor, { key: "Enter", shiftKey: true });
+  expect(editor.querySelectorAll("br")).toHaveLength(1);
+  expect(inputText()).toBe("前文 \n\n");
+
+  editor.replaceChildren(document.createElement("br"));
+  const empty = document.createRange();
+  empty.setStart(editor, 0);
+  empty.collapse(true);
+  selectComposerRange(empty);
+  fireEvent.input(editor, { inputType: "deleteContentBackward" });
+  const input = screen.getByRole<HTMLTextAreaElement>("textbox", {
+    name: "任务输入",
+  });
+  expect(input.value).toBe("");
+  expect(input.placeholder).toBe("任务");
+});
+it.each([false, true])(
+  "rejects edits whose selection crosses the composer boundary (backward = %s)",
+  async (backward) => {
+    render(<Harness />);
+    const editor = await addReadme();
+    const outside = screen.getByRole("button", { name: "发送" });
+    const selection = window.getSelection()!;
+    const first = editor.firstChild!;
+    const last = outside.firstChild!;
+    selection.setBaseAndExtent(
+      ...((backward ? [last, 1, first, 0] : [first, 0, last, 1]) as [
+        Node,
+        number,
+        Node,
+        number,
+      ]),
+    );
+    fireEvent.keyDown(editor, { key: "Enter", shiftKey: true });
+    expect(fireEvent.cut(editor)).toBe(false);
+    pasteData("替换");
+    expect(pasteMocks.paths).not.toHaveBeenCalled();
+    expect(outside.textContent).toBe("发送");
+    expect(inputText()).toBe("前文 ");
+    expect(editor.querySelector("[data-reference-path]")).not.toBeNull();
+  },
+);
+it("keeps adjacent chips on the left of command completion and successive deletions", async () => {
+  render(<Harness />);
+  const editor = await addReadme();
+  const clipboard = document.createRange();
+  clipboard.setStartAfter(editor.querySelector("[data-reference-path]")!);
+  clipboard.collapse(true);
+  selectComposerRange(clipboard);
+  pasteData("@src/中文 file.ts");
+  await waitFor(() => expect(inputText()).toBe("前文 @src/中文 file.ts"));
+  fireEvent.click(editor);
+  fireEvent.click(await screen.findByRole("option", { name: /中文 file.ts/ }));
+  const second = editor.querySelector(
+    '[data-reference-path="src/中文 file.ts"]',
+  )!;
+  const suffix = second.nextSibling!;
+  suffix.textContent = "/comp";
+  const range = document.createRange();
+  range.setStart(suffix, "/comp".length);
+  range.collapse(true);
+  selectComposerRange(range);
+  fireEvent.input(editor);
+  fireEvent.click(await screen.findByRole("option", { name: /compact/ }));
+  expect(inputText()).toBe("前文 /compact ");
+  expect(editor.lastChild?.textContent).toBe("/compact ");
+
+  const afterChips = document.createRange();
+  afterChips.setStartAfter(
+    editor.querySelector('[data-reference-path="src/中文 file.ts"]')!,
+  );
+  afterChips.collapse(true);
+  selectComposerRange(afterChips);
+  fireEvent.keyDown(editor, { key: "Backspace" });
+  expect(editor.querySelectorAll("[data-reference-path]")).toHaveLength(1);
+  fireEvent.keyDown(editor, { key: "Backspace" });
+  expect(screen.queryByRole("button", { name: /移除引用/ })).toBeNull();
+  expect(inputText()).toBe("前文 /compact ");
+});
+it("restores the caret after the last pasted directory at the original position", async () => {
+  render(<Harness hostId="local" />);
+  type("前文 后文", "前文 ".length);
+  pasteMocks.paths.mockResolvedValue(["/local/one", "/local/two"]);
+  pasteMocks.importFile.mockImplementation(
+    async (_host, _project, path: string) => ({
+      path,
+      name: path.split("/").at(-1),
+      directory: true,
+    }),
+  );
+  pasteData();
+  const two = await screen.findByRole("button", {
+    name: "移除引用 /local/two",
+  });
+  const point = window.getSelection()!.getRangeAt(0);
+  const after = document.createRange();
+  after.setStartAfter(two.closest("[data-reference-path]")!);
+  after.collapse(true);
+  expect(point.compareBoundaryPoints(Range.START_TO_START, after)).toBe(0);
+});
+it("drops only plain text and blocks native formatting commands in the inline editor", async () => {
+  render(<Harness />);
+  const editor = await addReadme();
+  editor.focus();
+  const range = document.createRange();
+  range.setStartAfter(editor.querySelector("[data-reference-path]")!);
+  range.collapse(true);
+  selectComposerRange(range);
+  expect(
+    fireEvent.drop(editor, {
+      dataTransfer: {
+        types: ["text/plain", "text/html"],
+        getData: (type: string) =>
+          type === "text/plain" ? "一\r\n二" : "<b>different</b>",
+      },
+    }),
+  ).toBe(false);
+  expect(inputText()).toBe("前文 一\n二");
+  expect(editor.querySelector("b")).toBeNull();
+  expect(
+    fireEvent(
+      editor,
+      new InputEvent("beforeinput", {
+        inputType: "formatBold",
+        bubbles: true,
+        cancelable: true,
+      }),
+    ),
+  ).toBe(false);
+});
+it("keeps image reference preview and removal interactive inside the text", async () => {
+  mocks.request.mockResolvedValue({
+    kind: "files",
+    entries: [{ name: "diagram.png", path: "diagram.png", directory: false }],
+  });
+  render(<Harness />);
+  type("查看 @diagram");
+  fireEvent.click(await screen.findByRole("option", { name: /diagram.png/ }));
+  const editor = screen.getByRole("textbox", { name: "任务输入" });
+  expect(
+    editor.querySelector('[data-reference-path="diagram.png"]'),
+  ).toBeTruthy();
+  expect(
+    screen.getByRole("button", { name: "预览图片 diagram.png" }),
+  ).toBeTruthy();
+  type("查看 @diagram");
+  const list = await screen.findByRole("listbox");
+  const option = await screen.findByRole("option", { name: /diagram.png/ });
+  expect(editor.getAttribute("aria-autocomplete")).toBe("list");
+  expect(editor.getAttribute("aria-controls")).toBe(list.id);
+  expect(editor.getAttribute("aria-activedescendant")).toBe(option.id);
+  fireEvent.click(screen.getByRole("button", { name: "预览图片 diagram.png" }));
+  expect(await screen.findByRole("dialog")).toBeTruthy();
+  expect(editor.getAttribute("aria-expanded")).toBe("false");
+  expect(screen.queryByRole("listbox")).toBeNull();
+  fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+  fireEvent.click(screen.getByRole("button", { name: "移除引用 diagram.png" }));
+  expect(
+    screen.queryByRole("button", { name: "预览图片 diagram.png" }),
+  ).toBeNull();
+});
+it("pastes on the selected side of an inline reference", async () => {
+  render(<Harness />);
+  type("前文 @READ");
+  fireEvent.click(await screen.findByRole("option", { name: /README/ }));
+  const editor = screen.getByRole("textbox", { name: "任务输入" });
+  const chip = editor.querySelector("[data-reference-path]")!;
+  const range = document.createRange();
+  range.setStartAfter(chip);
+  range.collapse(true);
+  window.getSelection()?.removeAllRanges();
+  window.getSelection()?.addRange(range);
+  pasteData("后文");
+  await waitFor(() => expect(inputText()).toBe("前文 后文"));
+  expect(
+    Array.from(editor.childNodes).map((node) =>
+      node instanceof HTMLElement && node.dataset.referencePath
+        ? node.dataset.referencePath
+        : node.textContent,
+    ),
+  ).toEqual(["前文 ", "README.md", "后文"]);
+  range.setStart(editor.firstChild!, "前文 ".length);
+  range.collapse(true);
+  window.getSelection()?.removeAllRanges();
+  window.getSelection()?.addRange(range);
+  pasteData("插入");
+  await waitFor(() => expect(inputText()).toBe("前文 插入后文"));
+  expect(
+    Array.from(editor.childNodes).map((node) =>
+      node instanceof HTMLElement && node.dataset.referencePath
+        ? node.dataset.referencePath
+        : node.textContent,
+    ),
+  ).toEqual(["前文 插入", "README.md", "后文"]);
+  range.selectNodeContents(editor);
+  window.getSelection()?.removeAllRanges();
+  window.getSelection()?.addRange(range);
+  pasteData("替换");
+  await waitFor(() => expect(inputText()).toBe("替换"));
+  expect(
+    screen.queryByRole("button", { name: "移除引用 README.md" }),
+  ).toBeNull();
+});
+it("keeps the caret after pasted text following a reference", async () => {
+  vi.stubGlobal("requestAnimationFrame", (fn: FrameRequestCallback) =>
+    window.setTimeout(() => fn(0), 0),
+  );
+  render(<Harness />);
+  type("前文 @READ");
+  fireEvent.click(await screen.findByRole("option", { name: /README/ }));
+  const editor = screen.getByRole("textbox", { name: "任务输入" });
+  await waitFor(() =>
+    expect(editor.querySelector("[data-reference-path]")).toBeTruthy(),
+  );
+  pasteData("后文");
+  await waitFor(() => expect(inputText()).toBe("前文 后文"));
+  await waitFor(() =>
+    expect(window.getSelection()?.anchorOffset).toBe("后文".length),
+  );
+  pasteData("继续");
+  await waitFor(() => expect(inputText()).toBe("前文 后文继续"));
+});
 it("does not submit on IME, empty results or menu selection and closes on Escape", async () => {
   render(<Harness />);
   type("/unknown");
@@ -271,7 +639,9 @@ it("discards late file responses and references when changing project or host", 
   const view = render(<Harness />);
   type("@READ");
   fireEvent.click(await screen.findByRole("option", { name: /README/ }));
-  expect(screen.getByLabelText("已添加附件和引用")).toBeTruthy();
+  expect(
+    screen.getByRole("button", { name: "移除引用 README.md" }),
+  ).toBeTruthy();
   let finish: (value: unknown) => void = () => {};
   mocks.request.mockImplementationOnce(
     () =>
@@ -288,7 +658,9 @@ it("discards late file responses and references when changing project or host", 
       entries: [{ name: "secret", path: "secret", directory: false }],
     }),
   );
-  expect(screen.queryByLabelText("已添加附件和引用")).toBeNull();
+  expect(
+    screen.queryByRole("button", { name: "移除引用 README.md" }),
+  ).toBeNull();
   expect(screen.queryByRole("listbox")).toBeNull();
 });
 it("reports command discovery errors and retries against the agent", async () => {
@@ -322,11 +694,22 @@ it("keeps references through first-session creation while sending and clears on 
   fireEvent.click(screen.getByRole("menuitem", { name: /引用工作区文件/ }));
   fireEvent.click(await screen.findByRole("option", { name: /README/ }));
   view.rerender(<Composer {...props} sending sessionId="new-session" />);
-  expect(screen.getByLabelText("已添加附件和引用")).toBeTruthy();
+  expect(
+    screen.getByRole("button", { name: "移除引用 README.md" }),
+  ).toBeTruthy();
+  expect(
+    screen.getByRole<HTMLButtonElement>("button", {
+      name: "移除引用 README.md",
+    }).disabled,
+  ).toBe(true);
   view.rerender(<Composer {...props} sessionId="new-session" />);
-  expect(screen.getByLabelText("已添加附件和引用")).toBeTruthy();
+  expect(
+    screen.getByRole("button", { name: "移除引用 README.md" }),
+  ).toBeTruthy();
   view.rerender(<Composer {...props} sessionId="another-session" />);
-  expect(screen.queryByLabelText("已添加附件和引用")).toBeNull();
+  expect(
+    screen.queryByRole("button", { name: "移除引用 README.md" }),
+  ).toBeNull();
 });
 it("searches friendly titles but inserts the original agent command", async () => {
   render(<Harness />);

@@ -12,6 +12,8 @@ export interface ComposerReference extends FileEntry {
   attachmentKind?: AttachmentKind;
   mimeType?: string;
   size?: number;
+  /** Draft-only caret position for a path reference in the composer text. */
+  inlineOffset?: number;
 }
 export const MAX_PASTE_FILE = 64 * 1024 * 1024;
 export function isLongPaste(text: string) {

@@ -288,6 +288,10 @@ directories remain path references. No server protocol or permission change is n
 Selection/drop batches attach atomically, never send a prompt, and retain the draft
 on failure. Failed files may be retried or removed before sending. Pending panels,
 uploads and failures are invalidated on host/project/session or composer-state changes.
+Path references (files and directories) render at their draft caret offsets inside the
+composer text; attachment copies remain in the separate row. The offsets are draft-only
+presentation state: submission still sends plain text plus the existing bounded reference
+manifest, and a restored reference without an offset appears at the end of the text.
 Focused checks: Composer.test.tsx, Conversation.test.tsx and pasteAttachments.test.ts;
 native smoke should separately verify the system file panel and Finder file drops.
 
