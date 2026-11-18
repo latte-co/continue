@@ -9,17 +9,20 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { dragHasFiles } from "./fileDrag";
 import { referenceKind } from "./referenceMessage";
 import type { ComposerReference } from "./pasteAttachments";
 
+export interface InlineSelection {
+  start: number;
+  end: number;
+  afterPath?: string;
+  selectedPaths?: string[];
+}
+
 export interface InlineReferenceInputHandle {
   focus: () => void;
-  selection: () => {
-    start: number;
-    end: number;
-    afterPath?: string;
-    selectedPaths?: string[];
-  };
+  selection: () => InlineSelection | null;
   setCaret: (offset: number, afterPath?: string) => void;
 }
 
@@ -28,8 +31,17 @@ interface Props {
   references: ComposerReference[];
   label: string;
   disabled: boolean;
-  onEdit: (text: string, references: ComposerReference[]) => void;
-  onRemove: (path: string) => void;
+  autocomplete: {
+    "aria-autocomplete": "list";
+    "aria-controls"?: string;
+    "aria-expanded": boolean;
+    "aria-activedescendant"?: string;
+  };
+  onEdit: (
+    text: string,
+    references: ComposerReference[],
+    caret: InlineSelection | null,
+  ) => void;
   onPaste: (event: ClipboardEvent<HTMLDivElement>) => void;
   onKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
   onInputState: (text: string, offset: number) => void;
@@ -55,11 +67,35 @@ function signature(text: string, references: ComposerReference[]) {
   ]);
 }
 
-function textLength(node: Node): number {
-  if (node instanceof Element && node.hasAttribute("data-reference-path"))
+function chipAt(node: Node) {
+  const element = node instanceof Element ? node : node.parentElement;
+  return element?.closest<HTMLElement>("[data-reference-path]");
+}
+
+function emptyText(node: Node) {
+  return node.nodeType === Node.TEXT_NODE && !node.textContent;
+}
+
+function neighboringNode(node: Node | null, backward: boolean) {
+  while (node && emptyText(node))
+    node = backward ? node.previousSibling : node.nextSibling;
+  return node;
+}
+
+function breakLength(node: Node) {
+  if (!(node instanceof HTMLBRElement) || node.hasAttribute("data-tail-break"))
     return 0;
+  // WebKit leaves a lone BR behind when the user empties the editor.
+  return neighboringNode(node.previousSibling, true) ||
+    neighboringNode(node.nextSibling, false)
+    ? 1
+    : 0;
+}
+
+function textLength(node: Node): number {
+  if (chipAt(node)) return 0;
   if (node.nodeType === Node.TEXT_NODE) return node.textContent?.length ?? 0;
-  if (node.nodeName === "BR") return 1;
+  if (node.nodeName === "BR") return breakLength(node);
   return Array.from(node.childNodes).reduce(
     (total, child) => total + textLength(child),
     0,
@@ -76,15 +112,8 @@ function offsetAt(root: HTMLElement, target: Node, offset: number): number {
     }
     let count = 0;
     for (const child of node.childNodes) {
-      if (
-        child instanceof Element &&
-        child.hasAttribute("data-reference-path")
-      ) {
-        if (child.contains(target)) return count;
-      } else {
-        const found = visit(child);
-        if (found !== null) return count + found;
-      }
+      const found = visit(child);
+      if (found !== null) return count + found;
       count += textLength(child);
     }
     return null;
@@ -92,22 +121,39 @@ function offsetAt(root: HTMLElement, target: Node, offset: number): number {
   return visit(root) ?? textLength(root);
 }
 
-function selection(root: HTMLElement) {
+function liveRange() {
   const current = window.getSelection();
-  if (!current?.rangeCount || !root.contains(current.anchorNode)) {
-    const end = textLength(root);
-    return { start: end, end };
-  }
-  const range = current.getRangeAt(0);
-  let previous: Node | null =
-    range.startContainer === root
-      ? (root.childNodes[range.startOffset - 1] ?? null)
-      : range.startContainer.nodeType === Node.TEXT_NODE &&
-          range.startOffset === 0
-        ? range.startContainer.previousSibling
-        : null;
-  while (previous?.nodeType === Node.TEXT_NODE && !previous.textContent)
-    previous = previous.previousSibling;
+  return current?.rangeCount ? current.getRangeAt(0) : null;
+}
+
+function insideEditor(root: HTMLElement, range: Range) {
+  return (
+    root.contains(range.startContainer) &&
+    root.contains(range.endContainer) &&
+    !chipAt(range.startContainer) &&
+    !chipAt(range.endContainer)
+  );
+}
+
+function adjacentNode(root: HTMLElement, range: Range, backward: boolean) {
+  const node = range.startContainer;
+  if (node === root)
+    return neighboringNode(
+      root.childNodes[range.startOffset - (backward ? 1 : 0)] ?? null,
+      backward,
+    );
+  if (node.nodeType !== Node.TEXT_NODE) return null;
+  const edge = backward ? 0 : node.textContent?.length;
+  return range.startOffset === edge
+    ? neighboringNode(
+        backward ? node.previousSibling : node.nextSibling,
+        backward,
+      )
+    : null;
+}
+
+function selection(root: HTMLElement, range: Range): InlineSelection {
+  const previous = adjacentNode(root, range, true);
   return {
     start: offsetAt(root, range.startContainer, range.startOffset),
     end: offsetAt(root, range.endContainer, range.endOffset),
@@ -123,6 +169,12 @@ function selection(root: HTMLElement) {
   };
 }
 
+function selectRange(range: Range) {
+  const current = window.getSelection();
+  current?.removeAllRanges();
+  current?.addRange(range);
+}
+
 function setCaret(root: HTMLElement, offset: number, afterPath?: string) {
   const range = document.createRange();
   const after = afterPath
@@ -130,33 +182,76 @@ function setCaret(root: HTMLElement, offset: number, afterPath?: string) {
         root.querySelectorAll<HTMLElement>("[data-reference-path]"),
       ).find((node) => node.dataset.referencePath === afterPath)
     : undefined;
-  if (after) range.setStartAfter(after);
+  if (after && offsetAt(root, after, 0) === offset) range.setStartAfter(after);
   else {
     let remaining = offset;
-    let placed = false;
-    const walk = (node: Node): void => {
-      if (
-        placed ||
-        (node instanceof Element && node.hasAttribute("data-reference-path"))
-      )
-        return;
+    function place(node: Node): boolean {
+      if (chipAt(node)) return false;
       if (node.nodeType === Node.TEXT_NODE) {
         const length = node.textContent?.length ?? 0;
         if (remaining <= length) {
           range.setStart(node, remaining);
-          placed = true;
-        } else remaining -= length;
-        return;
+          return true;
+        }
+        remaining -= length;
+      } else if (node.nodeName === "BR") {
+        if (remaining === 0 || remaining === breakLength(node)) {
+          if (remaining === 0) range.setStartBefore(node);
+          else range.setStartAfter(node);
+          return true;
+        }
+        remaining -= breakLength(node);
       }
-      for (const child of node.childNodes) walk(child);
-    };
-    walk(root);
-    if (!placed) range.selectNodeContents(root);
+      return Array.from(node.childNodes).some(place);
+    }
+    if (!place(root)) {
+      range.selectNodeContents(root);
+      range.collapse(false);
+    }
   }
   range.collapse(true);
-  const current = window.getSelection();
-  current?.removeAllRanges();
-  current?.addRange(range);
+  selectRange(range);
+}
+
+function syncTailBreak(root: HTMLElement) {
+  const tail = root.querySelector("br[data-tail-break]");
+  let last = neighboringNode(root.lastChild, true);
+  if (last && last === tail) last = neighboringNode(last.previousSibling, true);
+  const needsBreak =
+    last?.nodeType === Node.TEXT_NODE && last.textContent?.endsWith("\n");
+  if (!needsBreak) {
+    tail?.remove();
+  } else if (!tail) {
+    const br = document.createElement("br");
+    br.dataset.tailBreak = "";
+    root.append(br);
+  } else if (tail !== root.lastChild) {
+    root.append(tail);
+  }
+}
+
+function dropRange(root: HTMLElement, x: number, y: number) {
+  let range: Range | null;
+  if (document.caretPositionFromPoint) {
+    const point = document.caretPositionFromPoint(x, y);
+    if (!point) return null;
+    range = document.createRange();
+    range.setStart(point.offsetNode, point.offset);
+    range.collapse(true);
+  } else if (document.caretRangeFromPoint) {
+    range = document.caretRangeFromPoint(x, y);
+  } else {
+    range = liveRange()?.cloneRange() ?? null;
+  }
+  if (!range || !root.contains(range.startContainer)) return null;
+  const chip = chipAt(range.startContainer);
+  if (chip) {
+    const { left, width } = chip.getBoundingClientRect();
+    if (x < left + width / 2) range.setStartBefore(chip);
+    else range.setStartAfter(chip);
+    range.collapse(true);
+  }
+  return insideEditor(root, range) ? range : null;
 }
 
 function icon(directory: boolean) {
@@ -230,6 +325,7 @@ function render(
     cursor = offset;
   }
   root.append(document.createTextNode(text.slice(cursor)));
+  syncTailBreak(root);
   return previews;
 }
 
@@ -242,7 +338,7 @@ function read(root: HTMLElement, known: ComposerReference[]) {
       const entry = byPath.get(node.dataset.referencePath);
       if (entry) references.push({ ...entry, inlineOffset: text.length });
     } else if (node.nodeType === Node.TEXT_NODE) text += node.textContent ?? "";
-    else if (node.nodeName === "BR") text += "\n";
+    else if (breakLength(node)) text += "\n";
     else for (const child of node.childNodes) visit(child);
   }
   for (const child of root.childNodes) visit(child);
@@ -255,20 +351,21 @@ export const InlineReferenceInput = forwardRef<
 >(function InlineReferenceInput(props, handle) {
   const root = useRef<HTMLDivElement>(null);
   const domSignature = useRef("");
-  const lastSelection = useRef<{
-    start: number;
-    end: number;
-    afterPath?: string;
-    selectedPaths?: string[];
-  }>({ start: props.value.length, end: props.value.length });
+  const composing = useRef(false);
+  const lastSelection = useRef<InlineSelection>({
+    start: props.value.length,
+    end: props.value.length,
+  });
   const [previews, setPreviews] = useState<
     { entry: ComposerReference; target: HTMLElement }[]
   >([]);
   function rememberSelection() {
     const element = root.current;
-    const current = window.getSelection();
-    if (element && current?.rangeCount && element.contains(current.anchorNode))
-      lastSelection.current = selection(element);
+    const range = liveRange();
+    if (element && range?.intersectsNode(element)) {
+      if (!insideEditor(element, range)) return null;
+      lastSelection.current = selection(element, range);
+    }
     return lastSelection.current;
   }
   useImperativeHandle(handle, () => ({
@@ -294,6 +391,21 @@ export const InlineReferenceInput = forwardRef<
   useLayoutEffect(() => {
     const element = root.current;
     if (!element) return;
+    // React's beforeinput event does not expose every native editing command.
+    const beforeInput = (event: InputEvent) => {
+      const range = liveRange();
+      if (
+        event.inputType?.startsWith("format") ||
+        (range?.intersectsNode(element) && !insideEditor(element, range))
+      )
+        event.preventDefault();
+    };
+    element.addEventListener("beforeinput", beforeInput);
+    return () => element.removeEventListener("beforeinput", beforeInput);
+  }, []);
+  useLayoutEffect(() => {
+    const element = root.current;
+    if (!element) return;
     const next = signature(props.value, props.references);
     if (domSignature.current === next) {
       element
@@ -307,16 +419,41 @@ export const InlineReferenceInput = forwardRef<
     const caret = focused ? rememberSelection() : lastSelection.current;
     setPreviews(render(element, props.value, props.references, props.disabled));
     domSignature.current = next;
-    if (focused) setCaret(element, caret.start, caret.afterPath);
+    if (focused && caret) setCaret(element, caret.start, caret.afterPath);
   }, [props.value, props.references, props.disabled]);
-  function edited() {
+  function edited(finishedComposition = false) {
     const element = root.current;
-    if (!element || props.disabled) return;
+    if (!element || composing.current) return;
     const next = read(element, props.references);
+    const caret = rememberSelection();
+    if (finishedComposition)
+      props.onCompositionEnd(next.text, caret?.start ?? next.text.length);
+    if (props.disabled) return;
+    syncTailBreak(element);
+    if (previews.some(({ target }) => !element.contains(target)))
+      setPreviews(previews.filter(({ target }) => element.contains(target)));
     domSignature.current = signature(next.text, next.references);
-    rememberSelection();
-    props.onEdit(next.text, next.references);
-    props.onInputState(next.text, selection(element).start);
+    props.onEdit(next.text, next.references, caret);
+    if (caret && !finishedComposition)
+      props.onInputState(next.text, caret.start);
+  }
+  function removeChip(element: HTMLElement, chip: HTMLElement) {
+    const range = document.createRange();
+    range.setStartBefore(chip);
+    range.collapse(true);
+    chip.remove();
+    element.focus();
+    selectRange(range);
+    edited();
+  }
+  function insertText(range: Range, text: string) {
+    range.deleteContents();
+    const node = document.createTextNode(text);
+    range.insertNode(node);
+    range.setStartAfter(node);
+    range.collapse(true);
+    selectRange(range);
+    edited();
   }
   return (
     <>
@@ -327,120 +464,118 @@ export const InlineReferenceInput = forwardRef<
         aria-label={props.label}
         aria-multiline="true"
         aria-disabled={props.disabled}
+        {...props.autocomplete}
         contentEditable={!props.disabled}
         suppressContentEditableWarning
-        onInput={edited}
+        onInput={(event) => {
+          if (event.currentTarget.contains(event.target as Node)) edited();
+        }}
         onClick={(event) => {
-          const target = event.target as HTMLElement;
-          const remove = target.closest<HTMLButtonElement>(
-            "button[data-remove-reference]",
-          );
-          if (remove?.dataset.removeReference) {
-            props.onRemove(remove.dataset.removeReference);
+          const element = event.currentTarget;
+          const target = event.target as Element;
+          if (!element.contains(target)) return;
+          const button = target.closest<HTMLButtonElement>("button");
+          if (button) {
+            const chip = chipAt(button);
+            if (!props.disabled && button.dataset.removeReference && chip)
+              removeChip(element, chip);
             return;
           }
-          const element = root.current;
-          if (element) {
-            rememberSelection();
-            props.onInputState(
-              read(element, props.references).text,
-              selection(element).start,
-            );
-          }
+          const caret = rememberSelection();
+          if (caret) props.onInputState(props.value, caret.start);
         }}
         onMouseUp={rememberSelection}
-        onPaste={props.onPaste}
+        onPaste={(event) => {
+          if (event.currentTarget.contains(event.target as Node))
+            props.onPaste(event);
+        }}
+        onCut={(event) => {
+          const range = liveRange();
+          if (range && !insideEditor(event.currentTarget, range))
+            event.preventDefault();
+        }}
+        onDragOver={(event) => {
+          if (!props.disabled && !dragHasFiles(event.dataTransfer))
+            event.preventDefault();
+        }}
+        onDrop={(event) => {
+          if (dragHasFiles(event.dataTransfer)) return;
+          event.preventDefault();
+          if (props.disabled || composing.current) return;
+          const text = event.dataTransfer.getData("text/plain");
+          if (!text) return;
+          const element = event.currentTarget;
+          const range = dropRange(element, event.clientX, event.clientY);
+          if (!range) return;
+          element.focus();
+          insertText(range, text.replace(/\r\n?/g, "\n"));
+        }}
         onKeyDown={(event) => {
           if (props.disabled) return;
-          if ((event.target as HTMLElement).closest("button")) return;
+          const element = event.currentTarget;
+          const target = event.target as Element;
+          if (!element.contains(target) || target.closest("button")) return;
           if (
-            (event.key === "Backspace" || event.key === "Delete") &&
-            !event.nativeEvent.isComposing
+            composing.current ||
+            event.nativeEvent.isComposing ||
+            event.keyCode === 229
+          )
+            return;
+          if (
+            (event.metaKey || event.ctrlKey) &&
+            !event.altKey &&
+            ["b", "i", "u"].includes(event.key.toLowerCase())
           ) {
-            const element = root.current;
-            const range = window.getSelection()?.rangeCount
-              ? window.getSelection()!.getRangeAt(0)
-              : null;
-            if (
-              element &&
-              range?.collapsed &&
-              element.contains(range.startContainer)
-            ) {
-              const backward = event.key === "Backspace";
-              const node = range.startContainer;
-              let neighbor: Node | null = null;
-              if (node === element)
-                neighbor =
-                  element.childNodes[range.startOffset + (backward ? -1 : 0)] ??
-                  null;
-              else if (node.nodeType === Node.TEXT_NODE) {
-                const length = node.textContent?.length ?? 0;
-                if (
-                  (backward && range.startOffset === 0) ||
-                  (!backward && range.startOffset === length)
-                )
-                  neighbor = backward ? node.previousSibling : node.nextSibling;
-              }
-              while (
-                neighbor?.nodeType === Node.TEXT_NODE &&
-                !neighbor.textContent?.length
-              )
-                neighbor = backward
-                  ? neighbor.previousSibling
-                  : neighbor.nextSibling;
+            event.preventDefault();
+            return;
+          }
+          const range = liveRange();
+          if (event.key === "Backspace" || event.key === "Delete") {
+            if (range && !insideEditor(element, range)) {
+              event.preventDefault();
+              return;
+            }
+            if (range?.collapsed) {
+              const neighbor = adjacentNode(
+                element,
+                range,
+                event.key === "Backspace",
+              );
               if (
                 neighbor instanceof HTMLElement &&
                 neighbor.dataset.referencePath
               ) {
                 event.preventDefault();
-                const offset = selection(element).start;
-                neighbor.remove();
-                edited();
-                setCaret(element, offset);
+                removeChip(element, neighbor);
                 return;
               }
             }
           }
-          if (
-            event.key === "Enter" &&
-            event.shiftKey &&
-            !event.nativeEvent.isComposing
-          ) {
+          if (event.key === "Enter" && event.shiftKey) {
             event.preventDefault();
-            const range = window.getSelection()?.getRangeAt(0);
-            if (range && root.current?.contains(range.startContainer)) {
-              range.deleteContents();
-              const newline = document.createTextNode("\n");
-              range.insertNode(newline);
-              range.setStartAfter(newline);
-              range.collapse(true);
-              window.getSelection()?.removeAllRanges();
-              window.getSelection()?.addRange(range);
-              edited();
-            }
+            if (range && insideEditor(element, range)) insertText(range, "\n");
             return;
           }
           props.onKeyDown(event);
         }}
         onKeyUp={(event) => {
-          rememberSelection();
-          if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
-            const element = root.current;
-            if (element)
-              props.onInputState(
-                read(element, props.references).text,
-                selection(element).start,
-              );
-          }
+          if (event.target !== event.currentTarget || composing.current) return;
+          const caret = rememberSelection();
+          if (
+            caret &&
+            ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)
+          )
+            props.onInputState(props.value, caret.start);
         }}
-        onCompositionStart={props.onCompositionStart}
-        onCompositionEnd={() => {
-          const element = root.current;
-          if (element)
-            props.onCompositionEnd(
-              read(element, props.references).text,
-              selection(element).start,
-            );
+        onCompositionStart={(event) => {
+          if (event.target !== event.currentTarget) return;
+          composing.current = true;
+          props.onCompositionStart();
+        }}
+        onCompositionEnd={(event) => {
+          if (event.target !== event.currentTarget) return;
+          composing.current = false;
+          edited(true);
         }}
       />
       {previews.map(({ entry, target }) =>

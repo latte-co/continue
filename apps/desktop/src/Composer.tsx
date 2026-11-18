@@ -51,6 +51,7 @@ import { annotationPrompt, type Annotation } from "./annotations";
 import {
   InlineReferenceInput,
   type InlineReferenceInputHandle,
+  type InlineSelection,
 } from "./InlineReferenceInput";
 
 interface Props {
@@ -142,6 +143,21 @@ export function Composer(props: Props) {
     )
       (inlineInput.current ?? input.current)?.focus();
   }, [concealSubmitted, hidden]);
+  const composing = useRef(false);
+  const submitting = useRef(false);
+  const scope = `${hostId}:${projectId}:${agent}`;
+  const currentScope = useRef(scope);
+  currentScope.current = scope;
+  const [localReferences, setLocalReferences] = useState<{
+    scope: string;
+    entries: ComposerReference[];
+  }>({ scope, entries: [] });
+  const references = props.referenceState ?? localReferences;
+  const setReferences = props.onReferencesChange ?? setLocalReferences;
+  const attached = references.scope === scope ? references.entries : [];
+  const inlineAttached = attached.filter((entry) => !entry.attachmentKind);
+  const separateAttached = attached.filter((entry) => !!entry.attachmentKind);
+  const inlineMode = !concealSubmitted && !!inlineAttached.length;
   useLayoutEffect(() => {
     const element = input.current;
     if (!element || hidden) return;
@@ -160,23 +176,22 @@ export function Composer(props: Props) {
     });
     observer.observe(element);
     return () => observer.disconnect();
-  }, [value, hidden, concealSubmitted]);
-  const composing = useRef(false);
-  const submitting = useRef(false);
-  const scope = `${hostId}:${projectId}:${agent}`;
-  const currentScope = useRef(scope);
-  currentScope.current = scope;
-  const [localReferences, setLocalReferences] = useState<{
-    scope: string;
-    entries: ComposerReference[];
-  }>({ scope, entries: [] });
-  const references = props.referenceState ?? localReferences;
-  const setReferences = props.onReferencesChange ?? setLocalReferences;
-  const attached = references.scope === scope ? references.entries : [];
-  const inlineAttached = attached.filter((entry) => !entry.attachmentKind);
-  const separateAttached = attached.filter((entry) => !!entry.attachmentKind);
-  const inlineMode = !concealSubmitted && !!inlineAttached.length;
-  function inputSelection() {
+  }, [value, hidden, concealSubmitted, inlineMode]);
+  // The native editor may be replaced after the last reference is removed.
+  // Restore the caret only after React has mounted the destination editor.
+  const editorContext = JSON.stringify([scope, sessionId]);
+  const pendingCaret = useRef<{
+    context: string;
+    offset: number;
+    afterPath?: string;
+  } | null>(null);
+  function restoreCaret(offset: number, afterPath?: string) {
+    pendingCaret.current = { context: editorContext, offset, afterPath };
+  }
+  useLayoutEffect(() => {
+    composing.current = false;
+  }, [editorContext, inlineMode, concealSubmitted]);
+  function inputSelection(): InlineSelection | null {
     if (inlineMode && inlineInput.current)
       return inlineInput.current.selection();
     const element = input.current;
@@ -205,6 +220,23 @@ export function Composer(props: Props) {
     }
   }
   const [pasting, setPasting] = useState(false);
+  useLayoutEffect(() => {
+    const caret = pendingCaret.current;
+    if (!caret) return;
+    if (
+      caret.context !== editorContext ||
+      hidden ||
+      disabled ||
+      sending ||
+      concealSubmitted
+    ) {
+      pendingCaret.current = null;
+      return;
+    }
+    if (pasting) return;
+    pendingCaret.current = null;
+    focusInput(caret.offset, caret.afterPath);
+  });
   const [pasteProgress, setPasteProgress] = useState("");
   const pasteOperation = useRef(0);
   const pasteBusy = useRef(false);
@@ -362,54 +394,53 @@ export function Composer(props: Props) {
   function replaceTrigger(
     replacement: string,
     entry?: FileEntry,
-    range?: {
-      start: number;
-      end: number;
-      afterPath?: string;
-      selectedPaths?: string[];
-    },
+    range?: InlineSelection,
   ) {
-    const selection = inputSelection();
-    const start = range?.start ?? trigger?.start ?? selection.start;
-    const end = range?.end ?? trigger?.end ?? selection.end;
+    const selection = range ?? inputSelection();
+    if (!selection) return false;
+    const completing = range ? null : trigger;
+    const start = completing?.start ?? selection.start;
+    const end = completing?.end ?? selection.end;
     const afterIndex = attached.findIndex(
-      (item) => item.path === (range?.afterPath ?? selection.afterPath),
+      (item) => item.path === selection.afterPath,
     );
-    const selectedPaths = new Set(
-      range?.selectedPaths ?? selection.selectedPaths,
-    );
+    const selectedPaths = new Set(selection.selectedPaths);
     const next = value.slice(0, start) + replacement + value.slice(end);
     const caret = start + replacement.length;
     const delta = replacement.length - (end - start);
-    if (entry || attached.some((item) => item.inlineOffset !== undefined)) {
-      const shifted = attached
-        .map((item, index) =>
-          item.inlineOffset === undefined
-            ? item
-            : {
-                ...item,
-                inlineOffset:
-                  item.inlineOffset < start ||
-                  (item.inlineOffset === start && index <= afterIndex)
-                    ? item.inlineOffset
-                    : item.inlineOffset >= end
-                      ? item.inlineOffset + delta
-                      : caret,
-              },
-        )
-        .filter((item) => !selectedPaths.has(item.path));
-      setReferences({
-        scope,
-        entries:
-          entry && !shifted.some((item) => item.path === entry.path)
-            ? [...shifted, { ...entry, inlineOffset: caret }]
-            : shifted,
+    let afterPath: string | undefined;
+    if (entry || inlineAttached.length) {
+      const shifted = attached.flatMap((item, index) => {
+        if (selectedPaths.has(item.path)) return [];
+        if (item.attachmentKind) return [item];
+        const offset = Math.max(
+          0,
+          Math.min(value.length, item.inlineOffset ?? value.length),
+        );
+        const staysBefore =
+          offset < start ||
+          (offset === start && (completing !== null || index <= afterIndex));
+        if (staysBefore && offset === caret) afterPath = item.path;
+        return [
+          {
+            ...item,
+            inlineOffset: staysBefore
+              ? offset
+              : offset >= end
+                ? offset + delta
+                : caret,
+          },
+        ];
       });
+      if (entry && !shifted.some((item) => item.path === entry.path)) {
+        shifted.push({ ...entry, inlineOffset: caret });
+        afterPath = entry.path;
+      }
+      setReferences({ scope, entries: shifted });
     }
+    restoreCaret(caret, afterPath);
     onChange(next);
-    requestAnimationFrame(() => {
-      focusInput(caret, entry?.path);
-    });
+    return true;
   }
   function attach(entry: FileEntry) {
     if (attached.length >= 20) {
@@ -549,6 +580,13 @@ export function Composer(props: Props) {
             : []),
         ];
   const index = Math.min(selected, Math.max(0, options.length - 1));
+  const autocomplete = {
+    "aria-autocomplete": "list" as const,
+    "aria-controls": menu && !addMenu ? listId : undefined,
+    "aria-expanded": menu && !addMenu,
+    "aria-activedescendant":
+      menu && !addMenu && options.length ? `${listId}-${index}` : undefined,
+  };
   useEffect(() => {
     if (addMenu)
       root.current
@@ -560,6 +598,7 @@ export function Composer(props: Props) {
     paths: string[],
     valid: () => boolean,
     longText = false,
+    insertionOffset = value.length,
   ) {
     if (!connected || !projectId)
       throw new Error("请先连接项目所在主机，再添加附件");
@@ -569,7 +608,6 @@ export function Composer(props: Props) {
     if (files.some((file) => file.size > MAX_PASTE_FILE))
       throw new Error("单个附件不能超过 64 MiB");
     const added: ComposerReference[] = [];
-    const insertionOffset = inputSelection().start;
     for (let i = 0; i < count; i++) {
       if (!valid()) return;
       const label = `正在保存附件 ${i + 1}/${count}`;
@@ -597,16 +635,16 @@ export function Composer(props: Props) {
           : { ...entry, inlineOffset: insertionOffset },
       );
     }
-    setReferences({
-      scope,
-      entries: [
-        ...attached,
-        ...added.filter(
-          (entry) => !attached.some((old) => old.path === entry.path),
-        ),
-      ],
+    const pathsSeen = new Set(attached.map((entry) => entry.path));
+    const unique = added.filter((entry) => {
+      if (pathsSeen.has(entry.path)) return false;
+      pathsSeen.add(entry.path);
+      return true;
     });
-    focusInput();
+    const lastInline = unique.filter((entry) => !entry.attachmentKind).at(-1);
+    if (lastInline) restoreCaret(insertionOffset, lastInline.path);
+    setReferences({ scope, entries: [...attached, ...unique] });
+    return !!lastInline;
   }
   async function addFiles(files: File[], retrying = false) {
     if (
@@ -669,10 +707,19 @@ export function Composer(props: Props) {
   }
   async function paste(event: React.ClipboardEvent<HTMLElement>) {
     event.preventDefault();
-    if (disabled || sending || pasteBusy.current || externalBusy) return;
+    if (
+      disabled ||
+      sending ||
+      pasteBusy.current ||
+      externalBusy ||
+      composing.current
+    )
+      return;
     const files = Array.from(event.clipboardData.files);
     const text = event.clipboardData.getData("text/plain");
-    const { start, end, afterPath, selectedPaths } = inputSelection();
+    const selection = inputSelection();
+    if (!selection) return;
+    let restoresCaret = false;
     const context = currentContext.current;
     const operation = ++pasteOperation.current;
     const valid = () =>
@@ -708,12 +755,11 @@ export function Composer(props: Props) {
         if (!text) throw new Error("剪贴板中没有可粘贴的文本或文件");
         if (latestValue.current !== value)
           throw new Error("输入内容已变化，请重新粘贴");
-        replaceTrigger(text, undefined, {
-          start,
-          end,
-          afterPath,
-          selectedPaths,
-        });
+        restoresCaret = replaceTrigger(
+          text.replace(/\r\n?/g, "\n"),
+          undefined,
+          selection,
+        );
         return;
       }
       const items = longText
@@ -723,7 +769,13 @@ export function Composer(props: Props) {
             }),
           ]
         : files;
-      await storeAttachments(items, paths, valid, longText);
+      restoresCaret = !!(await storeAttachments(
+        items,
+        paths,
+        valid,
+        longText,
+        selection.start,
+      ));
     } catch (cause) {
       if (valid())
         setNotice(`${message(cause)}（未添加本次附件，剪贴板内容未改变）`);
@@ -732,9 +784,10 @@ export function Composer(props: Props) {
         pasteBusy.current = false;
         setPasting(false);
         setPasteProgress("");
-        requestAnimationFrame(() => {
-          if (valid()) focusInput();
-        });
+        if (!restoresCaret)
+          requestAnimationFrame(() => {
+            if (valid()) focusInput();
+          });
       }
     }
   }
@@ -1337,13 +1390,15 @@ export function Composer(props: Props) {
         {!concealSubmitted && props.context}
         {inlineMode ? (
           <InlineReferenceInput
-            key={scope}
+            key={editorContext}
             ref={inlineInput}
             value={value}
             references={inlineAttached}
             label={props.inputLabel ?? "任务输入"}
             disabled={disabled || sending || pasting}
-            onEdit={(text, entries) => {
+            autocomplete={autocomplete}
+            onEdit={(text, entries, caret) => {
+              if (!entries.length && caret) restoreCaret(caret.start);
               if (text !== value) onChange(text);
               const paths = new Map(
                 entries.map((entry) => [entry.path, entry]),
@@ -1362,13 +1417,6 @@ export function Composer(props: Props) {
               )
                 setReferences({ scope, entries: next });
               setNotice("");
-            }}
-            onRemove={(path) => {
-              setReferences({
-                scope,
-                entries: attached.filter((entry) => entry.path !== path),
-              });
-              requestAnimationFrame(() => focusInput());
             }}
             onPaste={(event) => void paste(event)}
             onKeyDown={keys}
@@ -1409,14 +1457,7 @@ export function Composer(props: Props) {
             key={concealSubmitted ? "concealed" : "editing"}
             rows={1}
             aria-label={props.inputLabel ?? "任务输入"}
-            aria-autocomplete="list"
-            aria-controls={menu && !addMenu ? listId : undefined}
-            aria-expanded={menu && !addMenu}
-            aria-activedescendant={
-              menu && !addMenu && options.length
-                ? `${listId}-${index}`
-                : undefined
-            }
+            {...autocomplete}
             placeholder={placeholder}
             value={concealSubmitted ? "" : value}
             disabled={disabled || sending || pasting}

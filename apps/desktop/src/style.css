@@ -1479,13 +1479,15 @@ button.recent-notice {
   border-radius: var(--radius-sm);
   padding: 0 3px;
   background: transparent;
-  color: var(--color-text-secondary);
   font-size: 16px;
   line-height: 1;
+}
+.composer-inline-reference button:not(:disabled) {
+  color: var(--color-text-secondary);
   cursor: pointer;
 }
-.composer-inline-reference button:hover,
-.composer-inline-reference button:focus-visible {
+.composer-inline-reference button:not(:disabled):hover,
+.composer-inline-reference button:not(:disabled):focus-visible {
   background: var(--color-focus-background);
   color: var(--color-text);
   outline: none;
