@@ -48,16 +48,26 @@ export function ModelPicker({
   ref?: Ref<ModelPickerHandle>;
 }) {
   const selector = useRef<ModelSelectorHandle>(null);
-  const scope = JSON.stringify([hostId, projectId, agent, value]);
-  const [loaded, setCatalog] = useState<{ scope: string; catalog: Catalog }>();
-  const catalog = loaded?.scope === scope ? loaded.catalog : undefined;
+  const scope = JSON.stringify([hostId, projectId, agent]);
+  const [loaded, setCatalog] = useState<{
+    scope: string;
+    model: string | null;
+    catalog: Catalog;
+  }>();
+  const cached = loaded?.scope === scope ? loaded : undefined;
+  const catalog = cached?.catalog;
+  // The catalog covers every model, but effort levels describe the queried model.
+  const matchesSelectedModel = cached?.model === value;
+  const effortLevels = matchesSelectedModel
+    ? catalog?.effort_levels
+    : undefined;
   const [error, setError] = useState("");
   const [retry, setRetry] = useState(0);
   const [loading, setLoading] = useState(false);
   useStatusIssues([
     {
       id: `models:${hostId}:${projectId}:${agent}`,
-      title: "模型列表暂不可用",
+      title: "模型列表刷新失败",
       error: connected && !settingsOpen ? error : "",
       pending: connected && !settingsOpen && loading,
       action: { label: "重新加载模型", run: () => setRetry((v) => v + 1) },
@@ -66,7 +76,6 @@ export function ModelPicker({
   useEffect(() => {
     if (!connected || settingsOpen) return;
     let disposed = false;
-    setCatalog(undefined);
     setError("");
     setLoading(true);
     void request(hostId, {
@@ -77,10 +86,10 @@ export function ModelPicker({
     })
       .then((result) => {
         if (result.kind !== "models") throw new Error("无法加载模型列表");
-        if (!disposed) setCatalog({ scope, catalog: result });
+        if (!disposed) setCatalog({ scope, model: value, catalog: result });
       })
       .catch((e) => {
-        if (!disposed) setError(message(e));
+        if (!disposed) setError(message(e) || "无法加载模型列表");
       })
       .finally(() => {
         if (!disposed) setLoading(false);
@@ -89,15 +98,23 @@ export function ModelPicker({
       disposed = true;
     };
   }, [hostId, projectId, agent, connected, settingsOpen, retry, value]);
+  const usableCatalog =
+    !loading && !settingsOpen && connected && (error || matchesSelectedModel)
+      ? catalog
+      : undefined;
+  // Cached choices can be submitted after a failed refresh. Leave automatic
+  // model and effort changes to a successful refresh.
+  const freshCatalog = error ? undefined : usableCatalog;
   useEffect(() => {
-    if (catalog && effort && !catalog.effort_levels.includes(effort))
+    if (freshCatalog && effort && !freshCatalog.effort_levels.includes(effort))
       onEffortInvalid?.();
-  }, [catalog, effort, onEffortInvalid]);
+  }, [freshCatalog, effort, onEffortInvalid]);
   const providerFallback =
-    catalog?.provider != null && (!value || !catalog.models.includes(value))
-      ? catalog.models.includes(catalog.default_model ?? "")
-        ? catalog.default_model
-        : (catalog.models[0] ?? null)
+    freshCatalog?.provider != null &&
+    (!value || !freshCatalog.models.includes(value))
+      ? freshCatalog.models.includes(freshCatalog.default_model ?? "")
+        ? freshCatalog.default_model
+        : (freshCatalog.models[0] ?? null)
       : undefined;
   useEffect(() => {
     if (providerFallback !== undefined && providerFallback !== value)
@@ -111,12 +128,10 @@ export function ModelPicker({
     effort,
   );
   const ready =
-    !!catalog &&
+    !!usableCatalog &&
     providerFallback === undefined &&
-    (!value || catalog.models.includes(value)) &&
-    (!effort || catalog.effort_levels.includes(effort)) &&
-    connected &&
-    !settingsOpen;
+    (!value || usableCatalog.models.includes(value)) &&
+    (!effort || !!error || effortLevels?.includes(effort) === true);
   useEffect(() => {
     onReadyChange?.({ scope: readyScope, ready });
   }, [readyScope, ready, onReadyChange]);
@@ -127,12 +142,12 @@ export function ModelPicker({
         if (disabled) return "当前无法调整模型或思考强度，请在任务结束后选择。";
         if (!connected) return "主机未连接，请连接后选择模型或思考强度。";
         if (settingsOpen || !catalog) return "模型设置尚未就绪，请稍后重试。";
-        if (target === "effort" && !catalog?.effort_levels.length)
+        if (target === "effort" && !effortLevels?.length)
           return "当前 Agent 或模型不支持调整思考强度。";
         return selector.current?.openMenu(target) ? null : "无法打开模型设置。";
       },
     }),
-    [disabled, connected, settingsOpen, catalog],
+    [disabled, connected, settingsOpen, catalog, effortLevels],
   );
   const options = modelOptions(
     catalog?.models ?? [],
@@ -180,9 +195,22 @@ export function ModelPicker({
         options={groupedOptions}
         onChange={(id) => onChange(id || null)}
         effort={effort}
-        levels={catalog?.effort_levels ?? []}
+        levels={effortLevels ?? []}
         onEffortChange={onEffortChange}
-        disabled={disabled || settingsOpen || !connected || !catalog}
+        onOpen={() => {
+          if (loading) return;
+          setLoading(true);
+          setRetry((v) => v + 1);
+        }}
+        notice={usableCatalog && error ? "刷新失败，使用上次列表" : undefined}
+        status={
+          usableCatalog
+            ? undefined
+            : !loading && error
+              ? "模型刷新失败，重新打开可重试"
+              : "正在刷新模型…"
+        }
+        disabled={disabled || settingsOpen || !connected}
       />
     </div>
   );

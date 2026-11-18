@@ -1865,7 +1865,16 @@ a separate process. Closing the tab closes the child runtime and preserves its h
 Codex and Traex verify the new thread and sandbox
 before sending the turn. Claude Code uses `--resume --fork-session --session-id` and
 validates the requested child ID from the stream's init event. Later launches resume
-the saved child ID.
+the saved child ID. Provider changes apply on the next explicit send through the
+existing per-turn launch configuration. The side launch checks the native source
+and the saved Agent environment independently of Provider credentials and metadata.
+When Codex rejects a side-chat resume because the saved Provider is unavailable
+or differs from the selected one, an explicit send forks from that side chat's
+native history with the selected Provider. The branch identity and permissions
+are checked before sending the pending prompt once. The Latte side chat retains
+its history and identity, while managed policy errors still fail normally.
+Older records with only a combined digest use the native ID in the default
+environment, or require an exact launch-context match for a custom environment.
 The side chat shares the working directory, with an independent request ledger and
 transcript. Side chats do not take undo snapshots because main and side file activity can
 overlap. The host rejects main-turn undo when write-capable side work on the

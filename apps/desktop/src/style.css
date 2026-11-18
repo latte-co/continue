@@ -4093,6 +4093,11 @@ button.recent-notice {
   overflow-y: auto;
   overscroll-behavior: contain;
 }
+.model-menu-status {
+  padding: var(--space-2) var(--space-3);
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+}
 .model-menu .select-menu-title,
 .model-menu-effort {
   flex-shrink: 0;

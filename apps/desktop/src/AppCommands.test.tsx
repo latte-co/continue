@@ -90,13 +90,17 @@ it.each(["model", "effort"] as const)(
     mocks.request.mockClear();
     command(`/${target}`);
     expect(input().value).toBe("");
+    const option = await screen.findByRole("menuitemradio", {
+      name: target === "model" ? "haiku" : "low",
+    });
     const menu = screen.getByRole("menu", {
       name: target === "model" ? "Model" : "Reasoning effort",
     });
     expect(menu.contains(document.activeElement)).toBe(true);
-    const option = screen.getByRole("menuitemradio", {
-      name: target === "model" ? "haiku" : "low",
-    });
+    expect(mocks.request).toHaveBeenCalledWith(
+      "remote",
+      expect.objectContaining({ method: "models", model: "opus" }),
+    );
     // The real portal keyboard handler must not bubble into send or stop.
     option.focus();
     fireEvent.keyDown(option, { key: "Enter" });

@@ -909,7 +909,12 @@ impl TurnState {
                 })?,
                 Action::NativeSession(id) => db(database, |s| {
                     let mut current = s.session(session_id)?;
-                    s.remember_native_context(session_id, &id, config.fingerprint()?.as_deref())?;
+                    s.remember_native_context(
+                        session_id,
+                        &id,
+                        config.fingerprint()?.as_deref(),
+                        &config.environment_fingerprint()?,
+                    )?;
                     if let Some(provider) = &config.provider {
                         s.remember_title_credential(session_id, &id, &provider.credential)?;
                     }
@@ -1276,15 +1281,14 @@ impl Process {
             session.title_requested,
         );
         if let Some((parent, native)) = db(database, |s| s.side_parent(&session.id))? {
-            let fingerprint = config.fingerprint()?;
             let (owner, source) = session
                 .native_id
                 .as_ref()
                 .map_or((&parent, &native), |id| (&session.id, id));
             if !db(database, |s| {
-                s.native_rename_context_matches(owner, source, fingerprint.as_deref())
+                s.side_native_environment_matches(owner, source, &config)
             })? {
-                bail!("侧边聊天的 Provider 或环境已变化，请恢复原配置后重试");
+                bail!("侧边聊天的 Agent 环境无法与原会话匹配，请恢复原环境后重试");
             }
             adapter.set_side_parent(native)?;
         }

@@ -125,7 +125,7 @@ impl Store {
         CREATE TABLE IF NOT EXISTS side_launch_writes(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), start_seq INTEGER NOT NULL, verified_end INTEGER);
         CREATE INDEX IF NOT EXISTS side_launch_writes_session ON side_launch_writes(session_id);
         CREATE TABLE IF NOT EXISTS native_title_secrets(session_id TEXT NOT NULL REFERENCES sessions(id), native_id TEXT NOT NULL, secret_hash BLOB NOT NULL, secret_bytes INTEGER NOT NULL, PRIMARY KEY(session_id,native_id,secret_hash));
-        CREATE TABLE IF NOT EXISTS native_session_contexts(session_id TEXT NOT NULL REFERENCES sessions(id), native_id TEXT NOT NULL, fingerprint TEXT, PRIMARY KEY(session_id,native_id));
+        CREATE TABLE IF NOT EXISTS native_session_contexts(session_id TEXT NOT NULL REFERENCES sessions(id), native_id TEXT NOT NULL, fingerprint TEXT, environment_proof TEXT, PRIMARY KEY(session_id,native_id));
         CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id), at REAL NOT NULL, data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS subagents(session_id TEXT NOT NULL REFERENCES sessions(id), id TEXT NOT NULL, native_id TEXT NOT NULL, tool_use_id TEXT, active INTEGER NOT NULL, at REAL NOT NULL, data TEXT NOT NULL, PRIMARY KEY(session_id,id));
         CREATE INDEX IF NOT EXISTS subagents_session ON subagents(session_id,active,at);
@@ -145,6 +145,16 @@ impl Store {
         CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,text TEXT NOT NULL);")?;
         let migration =
             rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
+        if !migration.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('native_session_contexts') WHERE name='environment_proof')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )? {
+            migration.execute(
+                "ALTER TABLE native_session_contexts ADD COLUMN environment_proof TEXT",
+                [],
+            )?;
+        }
         let legacy_side_chat = migration.query_row(
             "SELECT pk FROM pragma_table_info('side_chats') WHERE name='parent_id'",
             [],
@@ -971,15 +981,52 @@ impl Store {
             |row| row.get(0),
         ).map_err(Into::into)
     }
-    /// Preserve only the digest of the last verified native launch, never ENV.
+    /// Preserve only digests of the last verified native launch.
     pub fn remember_native_context(
         &self,
         session_id: &str,
         native_id: &str,
         fingerprint: Option<&str>,
+        environment_fingerprint: &str,
     ) -> Result<()> {
-        self.db.execute("INSERT INTO native_session_contexts(session_id,native_id,fingerprint) VALUES (?1,?2,?3) ON CONFLICT(session_id,native_id) DO UPDATE SET fingerprint=excluded.fingerprint", params![session_id, native_id, fingerprint])?;
+        // Bind the environment proof to this launch. An older Server can update
+        // the full fingerprint without updating the environment proof.
+        let proof = fingerprint.map(|full| format!("{full}:{environment_fingerprint}"));
+        self.db.execute(
+            "INSERT INTO native_session_contexts(session_id,native_id,fingerprint,environment_proof) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(session_id,native_id) DO UPDATE SET fingerprint=excluded.fingerprint,environment_proof=excluded.environment_proof",
+            params![session_id, native_id, fingerprint, proof],
+        )?;
         Ok(())
+    }
+
+    pub fn side_native_environment_matches(
+        &self,
+        session_id: &str,
+        native_id: &str,
+        config: &crate::providers::LaunchConfig,
+    ) -> Result<bool> {
+        let saved: Option<(Option<String>, Option<String>)> = self.db.query_row(
+            "SELECT fingerprint,environment_proof FROM native_session_contexts WHERE session_id=?1 AND native_id=?2",
+            params![session_id, native_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        if let Some((Some(full), Some(proof))) = &saved
+            && let Some((source, environment)) = proof.split_once(':')
+            && source == full
+        {
+            return Ok(environment == config.environment_fingerprint()?);
+        }
+        // Old records combine the Provider and environment into one digest.
+        // An exact match still proves a custom environment. For the default
+        // environment the adapter must resolve and verify the saved native ID.
+        let fingerprint = config.fingerprint()?;
+        if self.native_rename_context_matches(session_id, native_id, fingerprint.as_deref())? {
+            return Ok(true);
+        }
+        Ok(config.environment.is_empty()
+            && (saved.is_some()
+                || self.session(session_id)?.native_id.as_deref() == Some(native_id)))
     }
     pub fn native_rename_context_matches(
         &self,
@@ -2696,7 +2743,7 @@ mod tests {
                 .unwrap()
         );
         store
-            .remember_native_context(&session.id, "native", Some("B"))
+            .remember_native_context(&session.id, "native", Some("B"), "env")
             .unwrap();
         drop(store);
         let store = super::Store::open(&path).unwrap();
@@ -2716,7 +2763,7 @@ mod tests {
                 .unwrap()
         );
         store
-            .remember_native_context(&session.id, "native", Some("C"))
+            .remember_native_context(&session.id, "native", Some("C"), "env")
             .unwrap();
         assert!(
             !store

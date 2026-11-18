@@ -80,6 +80,13 @@ impl LaunchConfig {
         };
         turn_fingerprint(Some(&snapshot))
     }
+    pub fn environment_fingerprint(&self) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&self.environment)?)
+        ))
+    }
     pub fn redactor(&self) -> crate::redaction::Redactor {
         let credentials = self.provider.iter().map(|p| p.credential.clone());
         let environment = self

@@ -340,6 +340,132 @@ async fn open_side(client: &mut Client, parent: &Session) -> Session {
     }
 }
 
+#[tokio::test]
+async fn side_chat_forks_and_resumes_after_switching_providers() {
+    use latte_work_protocol::{Provider, ProviderSnapshot};
+    use serde_json::{Value, json};
+
+    // New sessions keep their custom environment across Provider switches.
+    // Existing databases have only a combined fingerprint and must still work
+    // when using the default Agent environment.
+    for legacy in [false, true] {
+        let mut host = Host::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut client = host.client().await;
+        let project = terminal_project(&mut client, root.path()).await;
+        let parent = create_session(&mut client, project, "codex").await;
+        let environment = if legacy {
+            AgentEnvironment::default()
+        } else {
+            AgentEnvironment([("LATTE_TEST_LITERAL".into(), "same".into())].into())
+        };
+        let turn = |session: &Session, request_id: &str, version: &str| {
+            let model = if version == "old" {
+                "codex-test"
+            } else {
+                "custom-codex"
+            };
+            let provider: Provider = serde_json::from_value(json!({
+                "id": format!("fixture-{version}"), "name": "Fixture", "protocol": "openai_responses",
+                "base_url": format!("http://{version}.test/v1"),
+                "model": model, "auth": "bearer", "has_credential": true
+            }))
+            .unwrap();
+            let snapshot = Box::new(ProviderSnapshot {
+                provider,
+                credential: format!("fixture-{version}"),
+            });
+            Request::Send {
+                session_id: session.id.clone(),
+                request_id: request_id.into(),
+                text: request_id.into(),
+                model: Some(model.into()),
+                effort: None,
+                permission_mode: None,
+                provider: Some(if legacy {
+                    TurnProvider::Snapshot(snapshot)
+                } else {
+                    TurnProvider::Configured {
+                        provider: Some(snapshot),
+                        environment: environment.clone(),
+                    }
+                }),
+            }
+        };
+        assert!(matches!(
+            ask(&mut client, turn(&parent, "parent-first", "old")).await,
+            Response::Accepted { duplicate: false }
+        ));
+        wait(&mut client, &parent.id, Status::Completed).await;
+        wait_for_agent_idle(&mut client, &parent.id, Status::Completed).await;
+        let existing = open_side(&mut client, &parent).await;
+        assert!(matches!(
+            ask(&mut client, turn(&existing, "side-first", "old")).await,
+            Response::Accepted { duplicate: false }
+        ));
+        wait(&mut client, &existing.id, Status::Completed).await;
+        let before = wait_for_agent_idle(&mut client, &existing.id, Status::Completed).await;
+        let existing_native_id = before.native_id.unwrap();
+
+        if legacy {
+            drop(client);
+            kill(Pid::from_raw(host.process.id() as i32), Signal::SIGINT).unwrap();
+            assert!(host.process.wait().unwrap().success());
+            let db =
+                rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
+            db.execute(
+                "ALTER TABLE native_session_contexts DROP COLUMN environment_proof",
+                [],
+            )
+            .unwrap();
+            drop(db);
+            host.process = Host::spawn(host.directory.path(), &[]);
+            host.wait_ready().await;
+            client = host.client().await;
+        }
+
+        let fresh = open_side(&mut client, &parent).await;
+        assert!(matches!(
+            ask(&mut client, turn(&fresh, "fork-after-change", "new")).await,
+            Response::Accepted { duplicate: false }
+        ));
+        wait(&mut client, &fresh.id, Status::Completed).await;
+        let forked = wait_for_agent_idle(&mut client, &fresh.id, Status::Completed).await;
+        assert!(
+            forked
+                .native_id
+                .as_deref()
+                .is_some_and(|id| id != existing_native_id)
+        );
+
+        assert!(matches!(
+            ask(&mut client, turn(&existing, "resume-after-change", "new")).await,
+            Response::Accepted { duplicate: false }
+        ));
+        wait(&mut client, &existing.id, Status::Completed).await;
+        let resumed = wait_for_agent_idle(&mut client, &existing.id, Status::Completed).await;
+        assert_eq!(
+            resumed.native_id.as_deref(),
+            Some(existing_native_id.as_str())
+        );
+
+        let inputs = std::fs::read_to_string(root.path().join("codex-inputs")).unwrap();
+        let inputs: Vec<Value> = inputs
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(inputs.len(), 4);
+        for (input, prompt) in inputs[2..]
+            .iter()
+            .zip(["fork-after-change", "resume-after-change"])
+        {
+            assert_eq!(input["prompt"], prompt);
+            assert_eq!(input["params"]["model"], "custom-codex");
+        }
+        assert_eq!(inputs[3]["params"]["threadId"], existing_native_id);
+    }
+}
+
 async fn start_writable_side(client: &mut Client, side: &Session, prompt: &str) {
     send_writable_side(client, side, prompt, "default", TurnProvider::Cli).await;
     wait(client, &side.id, Status::Completed).await;
@@ -589,7 +715,7 @@ async fn undo_ignores_prelaunch_rejection_and_fences_unconfirmed_native_exit() {
         assert_eq!(inputs.contains(r#""prompt": "eof""#), launch);
         if !launch {
             assert!(events.iter().any(|event| matches!(&event.event,
-                EventKind::State { message: Some(message), .. } if message.contains("Provider 或环境已变化")
+                EventKind::State { message: Some(message), .. } if message.contains("Agent 环境无法与原会话匹配")
             )));
         }
         assert!(matches!(

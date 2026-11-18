@@ -40,6 +40,9 @@ export function ModelSelector({
   effort,
   levels,
   onEffortChange,
+  onOpen,
+  notice,
+  status,
   disabled,
   ref,
 }: {
@@ -49,16 +52,14 @@ export function ModelSelector({
   effort: Effort | null;
   levels: Effort[];
   onEffortChange: (value: Effort | null) => void;
+  onOpen?: () => void;
+  notice?: string;
+  status?: string;
   disabled: boolean;
   ref?: Ref<ModelSelectorHandle>;
 }) {
   useImperativeHandle(ref, () => ({
-    openMenu(target) {
-      if (disabled || (target === "effort" && !levels.length)) return false;
-      setOpen(true);
-      showSubmenu(target === "effort" ? "effort" : null, target === "effort");
-      return true;
-    },
+    openMenu,
   }));
   const [open, setOpen] = useState(false);
   const [hint, setHint] = useState<{
@@ -86,8 +87,8 @@ export function ModelSelector({
     }, 350);
   }
   useEffect(() => {
-    if (!open || disabled) hideHint();
-  }, [open, disabled]);
+    if (!open || disabled || status) hideHint();
+  }, [open, disabled, status]);
   useEffect(
     () => () => {
       if (hintTimer.current !== null) clearTimeout(hintTimer.current);
@@ -120,7 +121,8 @@ export function ModelSelector({
   const variantOptions = variantParent?.variants;
   const variantLabel = (variant: ModelOption) =>
     variantParent ? `${variantParent.label} / ${variant.label}` : variant.label;
-  const submenuOpen = reasoning || !!variantOptions?.length;
+  const submenuOpen =
+    !status && (reasoning ? !!levels.length : !!variantOptions?.length);
   const focusSubmenu = useRef(false);
   const anchor = () =>
     reasoning
@@ -160,6 +162,15 @@ export function ModelSelector({
       )
       .find((o) => o.value === value)?.label ?? value;
   const effortValue = effort && levels.includes(effort) ? effort : "跟随 Agent";
+  const visibleOptions = status ? [] : options;
+  const statusMessage = status ?? notice;
+  function openMenu(target: "model" | "effort" = "model") {
+    if (disabled || (target === "effort" && !levels.length)) return false;
+    if (!open) onOpen?.();
+    setOpen(true);
+    showSubmenu(target === "effort" ? "effort" : null, target === "effort");
+    return true;
+  }
   function close(restoreFocus = true) {
     hideHint();
     setOpen(false);
@@ -194,7 +205,10 @@ export function ModelSelector({
   useLayoutEffect(() => {
     if (!open || !trigger.current) return;
     const box = trigger.current.getBoundingClientRect();
-    const height = Math.min(320, options.length * 36 + 84);
+    const height = Math.min(
+      320,
+      (visibleOptions.length + (statusMessage ? 1 : 0)) * 36 + 84,
+    );
     const above = Math.max(0, box.top - 14);
     const below = Math.max(0, window.innerHeight - box.bottom - 14);
     const up = above >= height || above >= below;
@@ -209,10 +223,12 @@ export function ModelSelector({
       width,
       maxHeight,
     });
-    menu.current
-      ?.querySelector<HTMLButtonElement>('[aria-checked="true"]')
-      ?.focus();
-  }, [open, options.length]);
+    (
+      menu.current?.querySelector<HTMLButtonElement>('[aria-checked="true"]') ??
+      menu.current?.querySelector<HTMLButtonElement>("button:not(:disabled)") ??
+      menu.current
+    )?.focus();
+  }, [open, visibleOptions.length, statusMessage]);
   useLayoutEffect(() => {
     const source = anchor();
     if (!submenuOpen || !source || !menu.current) return;
@@ -241,7 +257,7 @@ export function ModelSelector({
       focusSubmenuItem();
       focusSubmenu.current = false;
     }
-  }, [submenuTarget, levels.length, position]);
+  }, [submenuTarget, submenuOpen, levels.length, position]);
   useEffect(() => {
     if (!open) return;
     const outside = (e: PointerEvent) => {
@@ -340,11 +356,11 @@ export function ModelSelector({
         aria-expanded={open}
         aria-controls={open ? id : undefined}
         disabled={disabled}
-        onClick={() => (open ? close() : setOpen(true))}
+        onClick={() => (open ? close() : openMenu())}
         onKeyDown={(e) => {
           if (["ArrowDown", "ArrowUp"].includes(e.key)) {
             e.preventDefault();
-            setOpen(true);
+            openMenu();
           }
         }}
       >
@@ -361,6 +377,7 @@ export function ModelSelector({
               ref={menu}
               id={id}
               role="menu"
+              tabIndex={-1}
               aria-label="Model"
               className="select-popover compact model-menu"
               style={position}
@@ -370,7 +387,12 @@ export function ModelSelector({
                 Model
               </div>
               <div className="model-menu-options" role="presentation">
-                {options.map((o) => (
+                {statusMessage && (
+                  <div className="model-menu-status" role="status">
+                    {statusMessage}
+                  </div>
+                )}
+                {visibleOptions.map((o) => (
                   <button
                     key={o.value}
                     type="button"
@@ -441,9 +463,11 @@ export function ModelSelector({
                 type="button"
                 role="menuitem"
                 aria-haspopup="menu"
-                aria-expanded={reasoning}
-                aria-controls={reasoning ? `${id}-effort` : undefined}
-                disabled={!levels.length}
+                aria-expanded={reasoning && submenuOpen}
+                aria-controls={
+                  reasoning && submenuOpen ? `${id}-effort` : undefined
+                }
+                disabled={!!status || !levels.length}
                 title={
                   levels.length
                     ? "Options supported by the current Agent and model"
