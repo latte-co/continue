@@ -1873,8 +1873,10 @@ or differs from the selected one, an explicit send forks from that side chat's
 native history with the selected Provider. The branch identity and permissions
 are checked before sending the pending prompt once. The Latte side chat retains
 its history and identity, while managed policy errors still fail normally.
-Older records with only a combined digest use the native ID in the default
-environment, or require an exact launch-context match for a custom environment.
+A verified replacement inherits the prior thread's title credential digests
+before the Server adopts its native ID.
+Older records with only a combined digest require an exact launch-context
+match once to establish independent evidence of their Agent environment.
 The side chat shares the working directory, with an independent request ledger and
 transcript. Side chats do not take undo snapshots because main and side file activity can
 overlap. The host rejects main-turn undo when write-capable side work on the

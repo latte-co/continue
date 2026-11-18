@@ -394,3 +394,33 @@ it("refreshes the catalog in the open menu and can recover from a failed refresh
     within(effortMenu).getByRole("menuitemradio", { name: "跟随 Agent" }),
   );
 });
+
+it("lets the user clear an effort override even when the model's levels could not be fetched", () => {
+  const onEffortChange = vi.fn();
+  render(
+    <ModelSelector
+      options={[{ value: "haiku", label: "Haiku" }]}
+      value="haiku"
+      onChange={vi.fn()}
+      levels={[]}
+      effort="high"
+      canResetEffort
+      onEffortChange={onEffortChange}
+      disabled={false}
+    />,
+  );
+  const trigger = screen.getByRole("button", {
+    name: "Model and reasoning effort",
+  });
+  fireEvent.click(trigger);
+  fireEvent.click(screen.getByRole("menuitem", { name: /^Effort/ }));
+  const menu = screen.getByRole("menu", { name: "Reasoning effort" });
+  const followAgent = within(menu).getByRole("menuitemradio", {
+    name: "跟随 Agent",
+  });
+  expect(within(menu).getAllByRole("menuitemradio")).toEqual([followAgent]);
+  expect(document.activeElement).toBe(followAgent);
+  fireEvent.keyDown(followAgent, { key: "Enter" });
+  expect(onEffortChange).toHaveBeenCalledWith(null);
+  expect(document.activeElement).toBe(trigger);
+});

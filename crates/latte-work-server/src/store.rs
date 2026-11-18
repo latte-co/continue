@@ -686,6 +686,26 @@ impl Store {
         }
         Ok(())
     }
+    pub fn inherit_side_chat_title_credentials(
+        &self,
+        session_id: &str,
+        source: &str,
+        target: &str,
+    ) -> Result<()> {
+        if source == target
+            || self.side_parent(session_id)?.is_none()
+            || self.session(session_id)?.native_id.as_deref() != Some(source)
+        {
+            bail!("侧边聊天的原生续接来源已变化");
+        }
+        self.db.execute(
+            "INSERT OR IGNORE INTO native_title_secrets(session_id,native_id,secret_hash,secret_bytes)
+             SELECT session_id,?3,secret_hash,secret_bytes FROM native_title_secrets
+             WHERE session_id=?1 AND native_id=?2",
+            params![session_id, source, target],
+        )?;
+        Ok(())
+    }
     fn redact_native_title(&self, session: &Session, title: &str) -> Result<Option<String>> {
         use sha2::{Digest, Sha256};
         // Bound both reads and hashing. If an unusually long-lived session has
@@ -1000,33 +1020,38 @@ impl Store {
         Ok(())
     }
 
-    pub fn side_native_environment_matches(
+    pub fn verify_side_native_environment(
         &self,
         session_id: &str,
         native_id: &str,
         config: &crate::providers::LaunchConfig,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let saved: Option<(Option<String>, Option<String>)> = self.db.query_row(
             "SELECT fingerprint,environment_proof FROM native_session_contexts WHERE session_id=?1 AND native_id=?2",
             params![session_id, native_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?;
-        if let Some((Some(full), Some(proof))) = &saved
+        let Some((Some(full), proof)) = saved else {
+            bail!("侧边聊天缺少原配置记录，请先用原配置在来源会话完成一轮");
+        };
+        let environment_fingerprint = config.environment_fingerprint()?;
+        if let Some(proof) = &proof
             && let Some((source, environment)) = proof.split_once(':')
             && source == full
         {
-            return Ok(environment == config.environment_fingerprint()?);
+            if environment != environment_fingerprint {
+                bail!("侧边聊天的 Agent 环境无法与原会话匹配，请恢复原环境后重试");
+            }
+            return Ok(());
         }
-        // Old records combine the Provider and environment into one digest.
-        // An exact match still proves a custom environment. For the default
-        // environment the adapter must resolve and verify the saved native ID.
-        let fingerprint = config.fingerprint()?;
-        if self.native_rename_context_matches(session_id, native_id, fingerprint.as_deref())? {
-            return Ok(true);
+        // A matching combined digest proves the original environment once.
+        // Save that proof for later Provider changes, including further forks
+        // from this same source. Native IDs alone do not identify the environment.
+        if config.fingerprint()?.as_deref() != Some(full.as_str()) {
+            bail!("侧边聊天的历史配置无法确认 Agent 环境，请用原 Provider 和 Agent 环境续接一次");
         }
-        Ok(config.environment.is_empty()
-            && (saved.is_some()
-                || self.session(session_id)?.native_id.as_deref() == Some(native_id)))
+        self.remember_native_context(session_id, native_id, Some(&full), &environment_fingerprint)?;
+        Ok(())
     }
     pub fn native_rename_context_matches(
         &self,

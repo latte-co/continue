@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 import { useState } from "react";
-import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Conversation } from "./Conversation";
 import { DraftStore } from "./drafts";
@@ -117,6 +123,35 @@ it.each(["model", "effort"] as const)(
     ).toBe(false);
   },
 );
+
+it("retries the initial failed model request when /model is entered", async () => {
+  let attempts = 0;
+  mocks.request.mockImplementation(async (_host, request) => {
+    if (request.method !== "models") return { kind: "ok" };
+    if (++attempts === 1) throw new Error("missing initial catalog");
+    return {
+      kind: "models",
+      models: ["opus", "haiku"],
+      provider: null,
+      default_model: null,
+      effort_levels: ["high"],
+      model_labels: {},
+    };
+  });
+  const p = setup();
+  await act(async () => {});
+  expect(attempts).toBe(1);
+  expect(screen.getByRole("button", { name: "状态提示（1）" })).toBeTruthy();
+  command("/model");
+  expect(input().value).toBe("");
+  expect(screen.getByRole("menu", { name: "Model" })).toBeTruthy();
+  expect(
+    await screen.findByRole("menuitemradio", { name: "haiku" }),
+  ).toBeTruthy();
+  expect(attempts).toBe(2);
+  expect(p.send).not.toHaveBeenCalled();
+});
+
 it("keeps /model from becoming stop during a running turn", async () => {
   const events: Event[] = [
     {

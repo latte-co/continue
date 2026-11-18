@@ -125,6 +125,7 @@ python3 scripts/smoke-providers.py --binary target/debug/latte-work-server --cla
 输入框底部的模型菜单读取 App 为该项目主机、Agent 选择的 Provider，不混用其他 Provider 的模型。
 主对话和侧边聊天每次打开模型菜单都会重新请求目录，刷新期间等待最新选项。
 刷新失败时可从同一主机、项目和 Agent 上次成功取得的列表继续选择，重新打开菜单可再次刷新。
+若缓存无法确认当前模型支持所选思考强度，可选择「跟随 Agent」清除覆盖后继续。
 发送时仍由所选主机根据本轮快照校验。
 
 模型随下一条消息提交，服务端在启动前校验列表，并只覆盖本轮启动快照；不修改 Provider 默认值或其他会话。

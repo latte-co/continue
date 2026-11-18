@@ -99,11 +99,20 @@ for line in sys.stdin:
         }[params['sandbox']]
         assert params['approvalPolicy'] == approval
         assert 'inherited messages' in params['developerInstructions']
+        provider_fork = pathlib.Path('side-provider-fork-source')
+        replacing_side = provider_fork.exists()
+        if replacing_side and method == 'thread/resume':
+            assert params['threadId'] == provider_fork.read_text()
+            emit({'id': value['id'], 'error': {'code': -32600, 'data': {'type': 'modelProviderNotConfigured'}}})
+            continue
+        parent_thread = thread
         if method == 'thread/fork':
-            assert params['threadId'] == thread and params['excludeTurns']
+            if replacing_side:
+                parent_thread = provider_fork.read_text()
+                provider_fork.unlink()
+            assert params['threadId'] == parent_thread and params['excludeTurns']
             if pathlib.Path('fail-side-initialization').exists():
                 sys.exit(0)
-        parent_thread = thread
         thread = f'side-thread-{os.getpid()}' if method == 'thread/fork' else params['threadId']
         if method == 'thread/resume' and pathlib.Path('hold-side-resume').exists():
             pathlib.Path('side-resume-entered').touch()
@@ -117,6 +126,9 @@ for line in sys.stdin:
             launch_detached_writer()
         reply(value, {'thread': {'id': thread, 'forkedFromId': parent_thread},
                       'sandbox': {'type': sandbox}, 'approvalPolicy': approval})
+        if replacing_side:
+            emit({'method': 'thread/name/updated', 'params': {'threadId': thread,
+                  'threadName': 'Provider fixture-old / fixture-new'}})
     elif method in ('thread/start', 'thread/resume'):
         if params.get('ephemeral'):
             expected_env = pathlib.Path('title-environment.json')

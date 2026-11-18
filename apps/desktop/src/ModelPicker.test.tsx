@@ -373,10 +373,20 @@ it("keeps the last model list usable after changing selection within its host, p
         expect.objectContaining({ value: "second" }),
       ]),
       levels: [],
+      canResetEffort: true,
     }),
     undefined,
   );
   expect(props.onEffortInvalid).not.toHaveBeenCalled();
+  expect(props.onReadyChange).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+  const reset = mocks.selector.mock.calls.at(-1)?.[0] as {
+    onEffortChange: (effort: null) => void;
+  };
+  act(() => reset.onEffortChange(null));
+  expect(props.onEffortChange).toHaveBeenCalledWith(null);
+  view.rerender(<ModelPicker {...props} value="second" effort={null} />);
   expect(props.onReadyChange).toHaveBeenLastCalledWith(
     expect.objectContaining({ ready: true }),
   );

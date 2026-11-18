@@ -345,21 +345,20 @@ async fn side_chat_forks_and_resumes_after_switching_providers() {
     use latte_work_protocol::{Provider, ProviderSnapshot};
     use serde_json::{Value, json};
 
-    // New sessions keep their custom environment across Provider switches.
-    // Existing databases have only a combined fingerprint and must still work
-    // when using the default Agent environment.
+    // After migration, an existing side chat must prove its original
+    // environment before accepting a Provider change.
     for legacy in [false, true] {
         let mut host = Host::start().await;
         let root = tempfile::tempdir().unwrap();
         let mut client = host.client().await;
         let project = terminal_project(&mut client, root.path()).await;
         let parent = create_session(&mut client, project, "codex").await;
-        let environment = if legacy {
-            AgentEnvironment::default()
-        } else {
-            AgentEnvironment([("LATTE_TEST_LITERAL".into(), "same".into())].into())
-        };
-        let turn = |session: &Session, request_id: &str, version: &str| {
+        let environment =
+            AgentEnvironment([("HTTPS_PROXY".into(), "http://fixture.test:8000".into())].into());
+        let turn = |session: &Session,
+                    request_id: &str,
+                    version: &str,
+                    environment: &AgentEnvironment| {
             let model = if version == "old" {
                 "codex-test"
             } else {
@@ -382,25 +381,29 @@ async fn side_chat_forks_and_resumes_after_switching_providers() {
                 model: Some(model.into()),
                 effort: None,
                 permission_mode: None,
-                provider: Some(if legacy {
-                    TurnProvider::Snapshot(snapshot)
-                } else {
-                    TurnProvider::Configured {
-                        provider: Some(snapshot),
-                        environment: environment.clone(),
-                    }
+                provider: Some(TurnProvider::Configured {
+                    provider: Some(snapshot),
+                    environment: environment.clone(),
                 }),
             }
         };
         assert!(matches!(
-            ask(&mut client, turn(&parent, "parent-first", "old")).await,
+            ask(
+                &mut client,
+                turn(&parent, "parent-first", "old", &environment)
+            )
+            .await,
             Response::Accepted { duplicate: false }
         ));
         wait(&mut client, &parent.id, Status::Completed).await;
         wait_for_agent_idle(&mut client, &parent.id, Status::Completed).await;
         let existing = open_side(&mut client, &parent).await;
         assert!(matches!(
-            ask(&mut client, turn(&existing, "side-first", "old")).await,
+            ask(
+                &mut client,
+                turn(&existing, "side-first", "old", &environment)
+            )
+            .await,
             Response::Accepted { duplicate: false }
         ));
         wait(&mut client, &existing.id, Status::Completed).await;
@@ -422,11 +425,45 @@ async fn side_chat_forks_and_resumes_after_switching_providers() {
             host.process = Host::spawn(host.directory.path(), &[]);
             host.wait_ready().await;
             client = host.client().await;
+
+            assert!(matches!(
+                ask(
+                    &mut client,
+                    turn(
+                        &existing,
+                        "cleared-environment",
+                        "old",
+                        &AgentEnvironment::default()
+                    ),
+                )
+                .await,
+                Response::Accepted { duplicate: false }
+            ));
+            let rejected = wait(&mut client, &existing.id, Status::Failed).await;
+            assert!(rejected.iter().any(|event| matches!(&event.event,
+                EventKind::State { message: Some(message), .. } if message.contains("请用原 Provider 和 Agent 环境续接一次")
+            )));
+            let confirmation = open_side(&mut client, &parent).await;
+            for (side, request) in [
+                (&existing, "confirm-child"),
+                (&confirmation, "confirm-parent"),
+            ] {
+                assert!(matches!(
+                    ask(&mut client, turn(side, request, "old", &environment)).await,
+                    Response::Accepted { duplicate: false }
+                ));
+                wait(&mut client, &side.id, Status::Completed).await;
+                wait_for_agent_idle(&mut client, &side.id, Status::Completed).await;
+            }
         }
 
         let fresh = open_side(&mut client, &parent).await;
         assert!(matches!(
-            ask(&mut client, turn(&fresh, "fork-after-change", "new")).await,
+            ask(
+                &mut client,
+                turn(&fresh, "fork-after-change", "new", &environment)
+            )
+            .await,
             Response::Accepted { duplicate: false }
         ));
         wait(&mut client, &fresh.id, Status::Completed).await;
@@ -438,31 +475,47 @@ async fn side_chat_forks_and_resumes_after_switching_providers() {
                 .is_some_and(|id| id != existing_native_id)
         );
 
+        std::fs::write(
+            root.path().join("side-provider-fork-source"),
+            &existing_native_id,
+        )
+        .unwrap();
         assert!(matches!(
-            ask(&mut client, turn(&existing, "resume-after-change", "new")).await,
+            ask(
+                &mut client,
+                turn(&existing, "resume-after-change", "new", &environment)
+            )
+            .await,
             Response::Accepted { duplicate: false }
         ));
         wait(&mut client, &existing.id, Status::Completed).await;
         let resumed = wait_for_agent_idle(&mut client, &existing.id, Status::Completed).await;
-        assert_eq!(
-            resumed.native_id.as_deref(),
-            Some(existing_native_id.as_str())
-        );
+        let resumed_native_id = resumed.native_id.unwrap();
+        assert_ne!(resumed_native_id, existing_native_id);
+        assert_eq!(resumed.title, "Provider [redacted] / [redacted]");
 
         let inputs = std::fs::read_to_string(root.path().join("codex-inputs")).unwrap();
         let inputs: Vec<Value> = inputs
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(inputs.len(), 4);
-        for (input, prompt) in inputs[2..]
+        assert_eq!(inputs.len(), if legacy { 6 } else { 4 });
+        assert!(
+            !inputs
+                .iter()
+                .any(|input| input["prompt"] == "cleared-environment")
+        );
+        for (input, prompt) in inputs[inputs.len() - 2..]
             .iter()
             .zip(["fork-after-change", "resume-after-change"])
         {
             assert_eq!(input["prompt"], prompt);
             assert_eq!(input["params"]["model"], "custom-codex");
         }
-        assert_eq!(inputs[3]["params"]["threadId"], existing_native_id);
+        assert_eq!(
+            inputs.last().unwrap()["params"]["threadId"],
+            resumed_native_id
+        );
     }
 }
 

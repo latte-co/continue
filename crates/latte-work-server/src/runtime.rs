@@ -907,6 +907,9 @@ impl TurnState {
                     }
                     Ok(())
                 })?,
+                Action::InheritSideChatTitleCredentials { source, target } => db(database, |s| {
+                    s.inherit_side_chat_title_credentials(session_id, &source, &target)
+                })?,
                 Action::NativeSession(id) => db(database, |s| {
                     let mut current = s.session(session_id)?;
                     s.remember_native_context(
@@ -1285,11 +1288,9 @@ impl Process {
                 .native_id
                 .as_ref()
                 .map_or((&parent, &native), |id| (&session.id, id));
-            if !db(database, |s| {
-                s.side_native_environment_matches(owner, source, &config)
-            })? {
-                bail!("侧边聊天的 Agent 环境无法与原会话匹配，请恢复原环境后重试");
-            }
+            db(database, |s| {
+                s.verify_side_native_environment(owner, source, &config)
+            })?;
             adapter.set_side_parent(native)?;
         }
         let prepared = adapter.command(binary, agent_cwd, session.native_id.as_deref(), &config)?;

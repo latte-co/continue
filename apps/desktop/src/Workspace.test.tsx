@@ -809,3 +809,34 @@ it("creates side chats from the plus menu and reopens them from the history butt
     before: null,
   });
 });
+
+it("keeps a single history button when the expanded side chat shares its session ID with the overview", () => {
+  const sessionId = props.workspaceId;
+  const sideId = `sideChat:${crypto.randomUUID()}` as const;
+  updateWorkspace(sessionId, {
+    tabs: [{ id: sideId, kind: "sideChat" }],
+    current: sideId,
+  });
+  const workspace = (turn: number) => (
+    <Workspace
+      {...props}
+      sessionId={sessionId}
+      canOpenSideChat
+      overview={<button key={sessionId}>任务概览 {turn}</button>}
+    />
+  );
+  const view = render(workspace(0));
+  const history = screen.getByRole("button", { name: "历史" });
+  act(() => updateWorkspace(sessionId, { expanded: true }));
+  for (let turn = 1; turn <= 5; turn++) {
+    view.rerender(workspace(turn));
+    expect(screen.getAllByRole("button", { name: "历史" })).toEqual([history]);
+    expect(
+      screen.getByRole("button", { name: `任务概览 ${turn}` }),
+    ).toBeTruthy();
+  }
+  act(() => updateWorkspace(sessionId, { conversationActive: true }));
+  expect(screen.queryByRole("button", { name: "历史" })).toBeNull();
+  fireEvent.click(screen.getByRole("tab", { name: "侧边聊天" }));
+  expect(screen.getAllByRole("button", { name: "历史" })).toHaveLength(1);
+});

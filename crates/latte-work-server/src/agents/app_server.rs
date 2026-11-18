@@ -525,6 +525,13 @@ impl AppServer {
                 }
                 let mut actions = Vec::new();
                 if method == "thread/fork" {
+                    if self.side_provider_fork {
+                        let source = self.resume.clone().context("侧边聊天的续接来源缺失")?;
+                        actions.push(Action::InheritSideChatTitleCredentials {
+                            source,
+                            target: thread.clone(),
+                        });
+                    }
                     actions.push(Action::NativeSession(thread.clone()));
                 }
                 self.thread = Some(thread);
@@ -1374,7 +1381,11 @@ mod tests {
                     "sandbox":{"type":"readOnly"}, "approvalPolicy":"never"
                 }}),
             );
-            assert!(matches!(&actions[0], Action::NativeSession(id) if id == "new-child"));
+            assert!(matches!(&actions[0],
+                Action::InheritSideChatTitleCredentials { source, target }
+                    if source == "old-child" && target == "new-child"
+            ));
+            assert!(matches!(&actions[1], Action::NativeSession(id) if id == "new-child"));
             let writes = encoded(&actions);
             assert_eq!(writes.len(), 1);
             assert_eq!(writes[0]["method"], "turn/start");

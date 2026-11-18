@@ -131,7 +131,9 @@ export function ModelPicker({
     !!usableCatalog &&
     providerFallback === undefined &&
     (!value || usableCatalog.models.includes(value)) &&
-    (!effort || !!error || effortLevels?.includes(effort) === true);
+    (!effort || effortLevels?.includes(effort) === true);
+  const canResetEffort =
+    !!usableCatalog && !!error && !!effort && !effortLevels?.includes(effort);
   useEffect(() => {
     onReadyChange?.({ scope: readyScope, ready });
   }, [readyScope, ready, onReadyChange]);
@@ -141,13 +143,15 @@ export function ModelPicker({
       openMenu(target) {
         if (disabled) return "当前无法调整模型或思考强度，请在任务结束后选择。";
         if (!connected) return "主机未连接，请连接后选择模型或思考强度。";
-        if (settingsOpen || !catalog) return "模型设置尚未就绪，请稍后重试。";
-        if (target === "effort" && !effortLevels?.length)
-          return "当前 Agent 或模型不支持调整思考强度。";
+        if (settingsOpen) return "模型设置尚未就绪，请稍后重试。";
+        if (target === "effort" && !effortLevels?.length && !canResetEffort)
+          return catalog
+            ? "当前 Agent 或模型不支持调整思考强度。"
+            : "模型设置尚未就绪，请稍后重试。";
         return selector.current?.openMenu(target) ? null : "无法打开模型设置。";
       },
     }),
-    [disabled, connected, settingsOpen, catalog, effortLevels],
+    [disabled, connected, settingsOpen, catalog, effortLevels, canResetEffort],
   );
   const options = modelOptions(
     catalog?.models ?? [],
@@ -196,6 +200,7 @@ export function ModelPicker({
         onChange={(id) => onChange(id || null)}
         effort={effort}
         levels={effortLevels ?? []}
+        canResetEffort={canResetEffort}
         onEffortChange={onEffortChange}
         onOpen={() => {
           if (loading) return;

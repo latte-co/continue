@@ -39,6 +39,7 @@ export function ModelSelector({
   onChange,
   effort,
   levels,
+  canResetEffort = false,
   onEffortChange,
   onOpen,
   notice,
@@ -51,6 +52,7 @@ export function ModelSelector({
   onChange: (value: string) => void;
   effort: Effort | null;
   levels: Effort[];
+  canResetEffort?: boolean;
   onEffortChange: (value: Effort | null) => void;
   onOpen?: () => void;
   notice?: string;
@@ -121,8 +123,9 @@ export function ModelSelector({
   const variantOptions = variantParent?.variants;
   const variantLabel = (variant: ModelOption) =>
     variantParent ? `${variantParent.label} / ${variant.label}` : variant.label;
+  const canChooseEffort = levels.length > 0 || canResetEffort;
   const submenuOpen =
-    !status && (reasoning ? !!levels.length : !!variantOptions?.length);
+    !status && (reasoning ? canChooseEffort : !!variantOptions?.length);
   const focusSubmenu = useRef(false);
   const anchor = () =>
     reasoning
@@ -161,11 +164,14 @@ export function ModelSelector({
           : [o],
       )
       .find((o) => o.value === value)?.label ?? value;
-  const effortValue = effort && levels.includes(effort) ? effort : "跟随 Agent";
+  const effortValue =
+    effort && (levels.includes(effort) || canResetEffort)
+      ? effort
+      : "跟随 Agent";
   const visibleOptions = status ? [] : options;
   const statusMessage = status ?? notice;
   function openMenu(target: "model" | "effort" = "model") {
-    if (disabled || (target === "effort" && !levels.length)) return false;
+    if (disabled || (target === "effort" && !canChooseEffort)) return false;
     if (!open) onOpen?.();
     setOpen(true);
     showSubmenu(target === "effort" ? "effort" : null, target === "effort");
@@ -194,7 +200,7 @@ export function ModelSelector({
     }
   }
   function showReasoning(moveFocus = false) {
-    if (levels.length) showSubmenu("effort", moveFocus);
+    if (canChooseEffort) showSubmenu("effort", moveFocus);
   }
   useEffect(() => {
     if (disabled) {
@@ -343,7 +349,7 @@ export function ModelSelector({
       window.removeEventListener("resize", resize);
       window.removeEventListener("blur", hideHint);
     };
-  }, [open, submenuTarget, levels.length, options]);
+  }, [open, submenuTarget, canChooseEffort, levels.length, options]);
   return (
     <>
       <button
@@ -365,7 +371,7 @@ export function ModelSelector({
         }}
       >
         <span>{selected}</span>
-        {levels.length > 0 && (
+        {canChooseEffort && (
           <span className="model-effort-value">{effortValue}</span>
         )}
         <ChevronDown size={15} />
@@ -467,11 +473,13 @@ export function ModelSelector({
                 aria-controls={
                   reasoning && submenuOpen ? `${id}-effort` : undefined
                 }
-                disabled={!!status || !levels.length}
+                disabled={!!status || !canChooseEffort}
                 title={
                   levels.length
                     ? "Options supported by the current Agent and model"
-                    : "Not supported by this Agent and model"
+                    : canResetEffort
+                      ? "清除当前思考强度，跟随 Agent"
+                      : "Not supported by this Agent and model"
                 }
                 className="model-menu-effort"
                 tabIndex={-1}
@@ -484,7 +492,7 @@ export function ModelSelector({
                 <SlidersHorizontal size={16} />
                 <span>Effort</span>
                 <span className="model-effort-value">
-                  {levels.length ? effortValue : "—"}
+                  {canChooseEffort ? effortValue : "—"}
                 </span>
                 <ChevronRight size={15} />
               </button>
