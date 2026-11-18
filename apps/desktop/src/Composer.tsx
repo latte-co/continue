@@ -48,6 +48,10 @@ import { dragHasFiles } from "./fileDrag";
 import { AttachmentImage } from "./AttachmentImage";
 import { referenceKind } from "./referenceMessage";
 import { annotationPrompt, type Annotation } from "./annotations";
+import {
+  InlineReferenceInput,
+  type InlineReferenceInputHandle,
+} from "./InlineReferenceInput";
 
 interface Props {
   skillCreator?: boolean;
@@ -113,6 +117,7 @@ export function Composer(props: Props) {
   } = props;
   const root = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
+  const inlineInput = useRef<InlineReferenceInputHandle>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const pickerContext = useRef<string | null>(null);
   const [addMenu, setAddMenu] = useState(false);
@@ -120,7 +125,8 @@ export function Composer(props: Props) {
   const dragDepth = useRef(0);
   const [retryFiles, setRetryFiles] = useState<File[]>([]);
   useEffect(() => {
-    if (props.focusRequest && !props.hidden) input.current?.focus();
+    if (props.focusRequest && !props.hidden)
+      (inlineInput.current ?? input.current)?.focus();
   }, [props.focusRequest, props.hidden]);
   // The conceal remount drops focus; restore it when the submission resolves
   // unless the user has already moved focus elsewhere.
@@ -134,7 +140,7 @@ export function Composer(props: Props) {
       !hidden &&
       document.activeElement === document.body
     )
-      input.current?.focus();
+      (inlineInput.current ?? input.current)?.focus();
   }, [concealSubmitted, hidden]);
   useLayoutEffect(() => {
     const element = input.current;
@@ -167,6 +173,37 @@ export function Composer(props: Props) {
   const references = props.referenceState ?? localReferences;
   const setReferences = props.onReferencesChange ?? setLocalReferences;
   const attached = references.scope === scope ? references.entries : [];
+  const inlineAttached = attached.filter((entry) => !entry.attachmentKind);
+  const separateAttached = attached.filter((entry) => !!entry.attachmentKind);
+  const inlineMode = !concealSubmitted && !!inlineAttached.length;
+  function inputSelection() {
+    if (inlineMode && inlineInput.current)
+      return inlineInput.current.selection();
+    const element = input.current;
+    return element
+      ? {
+          start: element.selectionStart,
+          end: element.selectionEnd,
+          afterPath: undefined,
+          selectedPaths: [],
+        }
+      : {
+          start: value.length,
+          end: value.length,
+          afterPath: undefined,
+          selectedPaths: [],
+        };
+  }
+  function focusInput(offset?: number, afterPath?: string) {
+    if (inlineInput.current) {
+      if (offset === undefined) inlineInput.current.focus();
+      else inlineInput.current.setCaret(offset, afterPath);
+    } else {
+      input.current?.focus();
+      if (offset !== undefined)
+        input.current?.setSelectionRange(offset, offset);
+    }
+  }
   const [pasting, setPasting] = useState(false);
   const [pasteProgress, setPasteProgress] = useState("");
   const pasteOperation = useRef(0);
@@ -322,18 +359,56 @@ export function Composer(props: Props) {
       ?.querySelector('[aria-selected="true"]')
       ?.scrollIntoView?.({ block: "nearest" });
   }, [selected]);
-  function replaceTrigger(replacement: string) {
-    const start =
-      trigger?.start ?? input.current?.selectionStart ?? value.length;
-    const end = trigger?.end ?? start;
+  function replaceTrigger(
+    replacement: string,
+    entry?: FileEntry,
+    range?: {
+      start: number;
+      end: number;
+      afterPath?: string;
+      selectedPaths?: string[];
+    },
+  ) {
+    const selection = inputSelection();
+    const start = range?.start ?? trigger?.start ?? selection.start;
+    const end = range?.end ?? trigger?.end ?? selection.end;
+    const afterIndex = attached.findIndex(
+      (item) => item.path === (range?.afterPath ?? selection.afterPath),
+    );
+    const selectedPaths = new Set(
+      range?.selectedPaths ?? selection.selectedPaths,
+    );
     const next = value.slice(0, start) + replacement + value.slice(end);
+    const caret = start + replacement.length;
+    const delta = replacement.length - (end - start);
+    if (entry || attached.some((item) => item.inlineOffset !== undefined)) {
+      const shifted = attached
+        .map((item, index) =>
+          item.inlineOffset === undefined
+            ? item
+            : {
+                ...item,
+                inlineOffset:
+                  item.inlineOffset < start ||
+                  (item.inlineOffset === start && index <= afterIndex)
+                    ? item.inlineOffset
+                    : item.inlineOffset >= end
+                      ? item.inlineOffset + delta
+                      : caret,
+              },
+        )
+        .filter((item) => !selectedPaths.has(item.path));
+      setReferences({
+        scope,
+        entries:
+          entry && !shifted.some((item) => item.path === entry.path)
+            ? [...shifted, { ...entry, inlineOffset: caret }]
+            : shifted,
+      });
+    }
     onChange(next);
     requestAnimationFrame(() => {
-      input.current?.focus();
-      input.current?.setSelectionRange(
-        start + replacement.length,
-        start + replacement.length,
-      );
+      focusInput(caret, entry?.path);
     });
   }
   function attach(entry: FileEntry) {
@@ -341,10 +416,7 @@ export function Composer(props: Props) {
       setNotice("最多添加 20 个文件或目录引用");
       return;
     }
-    if (!attached.some((item) => item.path === entry.path))
-      setReferences({ scope, entries: [...attached, entry] });
-    if (trigger) replaceTrigger("");
-    else input.current?.focus();
+    replaceTrigger("", entry);
     close();
     setNotice("");
   }
@@ -497,6 +569,7 @@ export function Composer(props: Props) {
     if (files.some((file) => file.size > MAX_PASTE_FILE))
       throw new Error("单个附件不能超过 64 MiB");
     const added: ComposerReference[] = [];
+    const insertionOffset = inputSelection().start;
     for (let i = 0; i < count; i++) {
       if (!valid()) return;
       const label = `正在保存附件 ${i + 1}/${count}`;
@@ -518,7 +591,11 @@ export function Composer(props: Props) {
             longText ? "text" : undefined,
           );
       if (!valid()) return;
-      added.push(entry);
+      added.push(
+        entry.attachmentKind
+          ? entry
+          : { ...entry, inlineOffset: insertionOffset },
+      );
     }
     setReferences({
       scope,
@@ -529,7 +606,7 @@ export function Composer(props: Props) {
         ),
       ],
     });
-    input.current?.focus();
+    focusInput();
   }
   async function addFiles(files: File[], retrying = false) {
     if (
@@ -567,7 +644,7 @@ export function Composer(props: Props) {
         pasteBusy.current = false;
         setPasting(false);
         setPasteProgress("");
-        input.current?.focus();
+        focusInput();
       }
     }
   }
@@ -590,13 +667,12 @@ export function Composer(props: Props) {
     }
     void addFiles(Array.from(event.dataTransfer.files));
   }
-  async function paste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
+  async function paste(event: React.ClipboardEvent<HTMLElement>) {
     event.preventDefault();
     if (disabled || sending || pasteBusy.current || externalBusy) return;
     const files = Array.from(event.clipboardData.files);
     const text = event.clipboardData.getData("text/plain");
-    const start = event.currentTarget.selectionStart;
-    const end = event.currentTarget.selectionEnd;
+    const { start, end, afterPath, selectedPaths } = inputSelection();
     const context = currentContext.current;
     const operation = ++pasteOperation.current;
     const valid = () =>
@@ -632,13 +708,11 @@ export function Composer(props: Props) {
         if (!text) throw new Error("剪贴板中没有可粘贴的文本或文件");
         if (latestValue.current !== value)
           throw new Error("输入内容已变化，请重新粘贴");
-        onChange(value.slice(0, start) + text + value.slice(end));
-        requestAnimationFrame(() => {
-          input.current?.focus();
-          input.current?.setSelectionRange(
-            start + text.length,
-            start + text.length,
-          );
+        replaceTrigger(text, undefined, {
+          start,
+          end,
+          afterPath,
+          selectedPaths,
         });
         return;
       }
@@ -659,7 +733,7 @@ export function Composer(props: Props) {
         setPasting(false);
         setPasteProgress("");
         requestAnimationFrame(() => {
-          if (valid()) input.current?.focus();
+          if (valid()) focusInput();
         });
       }
     }
@@ -821,7 +895,7 @@ export function Composer(props: Props) {
         event.preventDefault();
         event.stopPropagation();
         close();
-        input.current?.focus();
+        focusInput();
         return;
       }
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -955,7 +1029,7 @@ export function Composer(props: Props) {
             onClick={() => {
               close();
               setBrowse("");
-              input.current?.focus();
+              focusInput();
             }}
           >
             <Folder size={16} />
@@ -992,7 +1066,7 @@ export function Composer(props: Props) {
                 event.stopPropagation();
                 if (event.key === "Escape") {
                   close();
-                  input.current?.focus();
+                  focusInput();
                 }
                 if (
                   event.key === "Enter" &&
@@ -1138,7 +1212,7 @@ export function Composer(props: Props) {
                 event.stopPropagation();
                 if (event.key === "Escape") {
                   close();
-                  input.current?.focus();
+                  focusInput();
                 }
               }}
             >
@@ -1199,7 +1273,7 @@ export function Composer(props: Props) {
               aria-label="移除 Skill Creator"
               onClick={() => {
                 props.onRemoveSkillCreator?.();
-                input.current?.focus();
+                focusInput();
               }}
             >
               <X size={13} />
@@ -1207,10 +1281,10 @@ export function Composer(props: Props) {
           </span>
         </div>
       )}
-      {!!attached.length && !concealSubmitted && (
-        <ImageGallery scope={scope} active={!hidden}>
+      <ImageGallery scope={scope} active={!hidden}>
+        {!!separateAttached.length && !concealSubmitted && (
           <div className="composer-references" aria-label="已添加附件和引用">
-            {attached.map((entry) => (
+            {separateAttached.map((entry) => (
               <span key={entry.path} title={entry.path}>
                 <small className="composer-reference-kind">
                   {entry.attachmentKind ? "附件" : "引用"}
@@ -1259,70 +1333,141 @@ export function Composer(props: Props) {
               </span>
             ))}
           </div>
-        </ImageGallery>
-      )}
-      {!concealSubmitted && props.context}
-      <textarea
-        ref={input}
-        /* Remount across conceal transitions: a fresh node carries no IME
+        )}
+        {!concealSubmitted && props.context}
+        {inlineMode ? (
+          <InlineReferenceInput
+            key={scope}
+            ref={inlineInput}
+            value={value}
+            references={inlineAttached}
+            label={props.inputLabel ?? "任务输入"}
+            disabled={disabled || sending || pasting}
+            onEdit={(text, entries) => {
+              if (text !== value) onChange(text);
+              const paths = new Map(
+                entries.map((entry) => [entry.path, entry]),
+              );
+              const next = attached
+                .map((entry) =>
+                  entry.attachmentKind ? entry : paths.get(entry.path),
+                )
+                .filter((entry): entry is ComposerReference => !!entry);
+              if (
+                next.length !== attached.length ||
+                next.some(
+                  (entry, index) =>
+                    entry.inlineOffset !== attached[index].inlineOffset,
+                )
+              )
+                setReferences({ scope, entries: next });
+              setNotice("");
+            }}
+            onRemove={(path) => {
+              setReferences({
+                scope,
+                entries: attached.filter((entry) => entry.path !== path),
+              });
+              requestAnimationFrame(() => focusInput());
+            }}
+            onPaste={(event) => void paste(event)}
+            onKeyDown={keys}
+            onInputState={(text, offset) => {
+              setBrowse(null);
+              setAddMenu(false);
+              setTrigger(
+                composing.current ? null : composerTrigger(text, offset),
+              );
+            }}
+            onCompositionStart={() => {
+              composing.current = true;
+              close();
+            }}
+            onCompositionEnd={(text, offset) => {
+              composing.current = false;
+              setTrigger(composerTrigger(text, offset));
+            }}
+            renderImage={(entry) => (
+              <AttachmentImage
+                reference={entry}
+                variant="chip"
+                hostId={hostId}
+                projectId={projectId}
+                sessionId={sessionId}
+                connected={connected}
+                active={!hidden}
+                onOpen={close}
+              />
+            )}
+          />
+        ) : (
+          <textarea
+            ref={input}
+            /* Remount across conceal transitions: a fresh node carries no IME
            composition state, so an engine cannot replay the submitted text
            into the cleared field after re-enabling it. */
-        key={concealSubmitted ? "concealed" : "editing"}
-        rows={1}
-        aria-label={props.inputLabel ?? "任务输入"}
-        aria-autocomplete="list"
-        aria-controls={menu && !addMenu ? listId : undefined}
-        aria-expanded={menu && !addMenu}
-        aria-activedescendant={
-          menu && !addMenu && options.length ? `${listId}-${index}` : undefined
-        }
-        placeholder={placeholder}
-        value={concealSubmitted ? "" : value}
-        disabled={disabled || sending || pasting}
-        onPaste={(event) => void paste(event)}
-        onChange={(event) => {
-          onChange(event.target.value);
-          setNotice("");
-          setBrowse(null);
-          setAddMenu(false);
-          setTrigger(
-            composing.current
-              ? null
-              : composerTrigger(
-                  event.target.value,
-                  event.target.selectionStart,
+            key={concealSubmitted ? "concealed" : "editing"}
+            rows={1}
+            aria-label={props.inputLabel ?? "任务输入"}
+            aria-autocomplete="list"
+            aria-controls={menu && !addMenu ? listId : undefined}
+            aria-expanded={menu && !addMenu}
+            aria-activedescendant={
+              menu && !addMenu && options.length
+                ? `${listId}-${index}`
+                : undefined
+            }
+            placeholder={placeholder}
+            value={concealSubmitted ? "" : value}
+            disabled={disabled || sending || pasting}
+            onPaste={(event) => void paste(event)}
+            onChange={(event) => {
+              onChange(event.target.value);
+              setNotice("");
+              setBrowse(null);
+              setAddMenu(false);
+              setTrigger(
+                composing.current
+                  ? null
+                  : composerTrigger(
+                      event.target.value,
+                      event.target.selectionStart,
+                    ),
+              );
+            }}
+            onClick={(event) => {
+              const el = event.currentTarget;
+              setTrigger(composerTrigger(el.value, el.selectionStart));
+              setBrowse(null);
+            }}
+            onKeyUp={(event) => {
+              if (
+                ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)
+              )
+                setTrigger(
+                  composerTrigger(
+                    event.currentTarget.value,
+                    event.currentTarget.selectionStart,
+                  ),
+                );
+            }}
+            onCompositionStart={() => {
+              composing.current = true;
+              close();
+            }}
+            onCompositionEnd={(event) => {
+              composing.current = false;
+              setTrigger(
+                composerTrigger(
+                  event.currentTarget.value,
+                  event.currentTarget.selectionStart,
                 ),
-          );
-        }}
-        onClick={(event) => {
-          const el = event.currentTarget;
-          setTrigger(composerTrigger(el.value, el.selectionStart));
-          setBrowse(null);
-        }}
-        onKeyUp={(event) => {
-          if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key))
-            setTrigger(
-              composerTrigger(
-                event.currentTarget.value,
-                event.currentTarget.selectionStart,
-              ),
-            );
-        }}
-        onCompositionStart={() => {
-          composing.current = true;
-          close();
-        }}
-        onCompositionEnd={(event) => {
-          composing.current = false;
-          setTrigger(
-            composerTrigger(
-              event.currentTarget.value,
-              event.currentTarget.selectionStart,
-            ),
-          );
-        }}
-        onKeyDown={keys}
-      />
+              );
+            }}
+            onKeyDown={keys}
+          />
+        )}
+      </ImageGallery>
       {pasting && (
         <div className="composer-notice" role="status">
           {pasteProgress}

@@ -1412,6 +1412,84 @@ button.recent-notice {
   font-size: var(--text-md);
   line-height: 1.5;
 }
+.composer-inline-input {
+  min-height: 1.5em;
+  max-height: 200px;
+  overflow-y: auto;
+  outline: none;
+  font-family: var(--font-content);
+  font-size: var(--text-md);
+  font-weight: var(--weight-content);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.composer-inline-input[aria-disabled="true"] {
+  color: var(--color-text-muted);
+}
+.composer-inline-reference {
+  display: inline-flex;
+  align-items: center;
+  max-width: min(100%, 280px);
+  gap: var(--space-1);
+  margin: 0 2px;
+  padding: 1px var(--space-1) 1px var(--space-2);
+  border-radius: var(--radius-control);
+  background: var(--color-hover);
+  color: var(--color-text);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  vertical-align: baseline;
+  white-space: nowrap;
+  user-select: none;
+}
+.composer-inline-reference small {
+  color: var(--color-text-muted);
+  font-size: inherit;
+}
+.composer-inline-reference svg,
+.composer-inline-reference button {
+  flex: none;
+}
+.composer-inline-reference-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.composer-inline-image {
+  min-width: 0;
+  overflow: hidden;
+}
+.composer-inline-image .attachment-image-chip {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  background: transparent;
+}
+.composer-inline-image .attachment-image-chip > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.composer-inline-reference button {
+  border: 0;
+  border-radius: var(--radius-sm);
+  padding: 0 3px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.composer-inline-reference button:hover,
+.composer-inline-reference button:focus-visible {
+  background: var(--color-focus-background);
+  color: var(--color-text);
+  outline: none;
+}
 .composer textarea::placeholder {
   color: color-mix(
     in srgb,
@@ -6098,7 +6176,8 @@ button.task-info-row:not(:disabled):hover,
 /* Keep the input field out of drag hit-testing: WebKit's editable-area drag
    handling can consume drops over an editable field and insert the dropped
    file name as text before the composer sees them. */
-.composer-dragging textarea {
+.composer-dragging textarea,
+.composer-dragging .composer-inline-input {
   pointer-events: none;
 }
 .composer-add-menu {

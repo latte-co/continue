@@ -670,7 +670,11 @@ export function Conversation({
                         disabled={!projectName || !!session?.archived}
                         onClick={() => {
                           setText(s);
-                          root.current?.querySelector("textarea")?.focus();
+                          root.current
+                            ?.querySelector<HTMLElement>(
+                              '[aria-label="任务输入"]',
+                            )
+                            ?.focus();
                         }}
                       >
                         {s}

@@ -122,6 +122,15 @@ const props = () => ({
 });
 const input = () =>
   screen.getByRole("textbox", { name: "任务输入" }) as HTMLTextAreaElement;
+const inputText = () => {
+  const element = screen.getByRole("textbox", { name: "任务输入" });
+  return element instanceof HTMLTextAreaElement
+    ? element.value
+    : Array.from(element.childNodes)
+        .filter((node) => node.nodeType === Node.TEXT_NODE)
+        .map((node) => node.textContent ?? "")
+        .join("");
+};
 const approvalEvents = (id = "a"): Event[] => [
   {
     seq: 1,
@@ -310,7 +319,7 @@ it("keeps independent text and references across remounts, never replaces a none
   expect(input().value).toBe("");
   fireEvent.change(input(), { target: { value: "another" } });
   view.rerender(<Conversation {...p} key="a2" session={session("a")} />);
-  expect(input().value).toBe("keep this");
+  expect(inputText()).toBe("keep this");
   expect(screen.getByRole("button", { name: "移除引用 note.md" })).toBeTruthy();
   view.rerender(
     <Conversation {...p} key="remote" hostId="remote" session={session("a")} />,
@@ -1410,7 +1419,7 @@ it("restores submitted references and the skill preset after an unaccepted submi
   expect(p.drafts.get(key).references.entries).toHaveLength(1);
   expect(p.drafts.get(key).skillCreator).toBe(true);
   await act(async () => finish(false));
-  expect(input().value).toBe("创建技能");
+  expect(inputText()).toBe("创建技能");
   expect(screen.getByRole("button", { name: "移除引用 note.md" })).toBeTruthy();
   expect(screen.getByRole("group", { name: "已选择技能" })).toBeTruthy();
 });
@@ -1869,7 +1878,7 @@ it("takes a queued message into the composer, retains existing draft, annotation
   );
   fireEvent.click(screen.getByRole("menuitem", { name: "编辑消息" }));
   await waitFor(() =>
-    expect(input().value).toBe("Existing draft\n\nQueued instruction"),
+    expect(inputText()).toBe("Existing draft\n\nQueued instruction"),
   );
   expect(document.activeElement).toBe(input());
   expect(p.drafts.get(key).references.entries.map((e) => e.path)).toEqual([
