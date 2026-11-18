@@ -100,6 +100,8 @@ beforeEach(() => {
     host: { id: "local", name: "本机" },
     connected: true,
     connecting: false,
+    composerPrediction: null,
+    setPredictionVisible: vi.fn(),
     hostErrors: { remote: "SSH 连接已关闭" },
     hostConnectionStatus: (id: string) =>
       id === "local" ? "connected" : "failed",

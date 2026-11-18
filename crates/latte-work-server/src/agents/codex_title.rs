@@ -20,6 +20,7 @@ identifiers and PR/issue numbers, and prefer an action and its object. Use at mo
 Do not use tools or perform the task. Return only JSON matching the title schema.";
 
 /// Memory-only identity/config snapshot. Never log or serialize native credentials.
+#[derive(Clone)]
 pub(crate) struct NativeProvider {
     id: String,
     definition: Option<Value>,
@@ -162,12 +163,53 @@ pub(crate) async fn generate(
     description: &str,
     native_provider: Option<&NativeProvider>,
 ) -> Result<String> {
+    let result = structured(binary, cwd, config, description, native_provider, INSTRUCTIONS,
+        json!({"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false})).await?;
+    super::titles::valid(result["title"].as_str().unwrap_or_default())
+        .map(str::to_owned)
+        .context("标题摘要无效")
+}
+
+pub(crate) fn acquire_job() -> Result<tokio::sync::OwnedSemaphorePermit> {
     static JOBS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
-    let _permit = JOBS
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
+    JOBS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
         .clone()
         .try_acquire_owned()
-        .context("自动命名繁忙，保留原名称")?;
+        .context("辅助生成繁忙")
+}
+
+pub(crate) async fn predict(
+    binary: &str,
+    cwd: &str,
+    config: &LaunchConfig,
+    description: &str,
+    native_provider: Option<&NativeProvider>,
+) -> Result<Option<String>> {
+    crate::predictions::validate(
+        structured(
+            binary,
+            cwd,
+            config,
+            description,
+            native_provider,
+            crate::predictions::INSTRUCTIONS,
+            crate::predictions::schema(),
+        )
+        .await?,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn structured(
+    binary: &str,
+    cwd: &str,
+    config: &LaunchConfig,
+    description: &str,
+    native_provider: Option<&NativeProvider>,
+    instructions: &str,
+    schema: Value,
+) -> Result<Value> {
+    let _permit = acquire_job()?;
     let mut command = crate::agent_environment::command(binary);
     command.args(["app-server", "--stdio"]).current_dir(cwd);
     command.envs(&config.environment.0);
@@ -208,7 +250,7 @@ pub(crate) async fn generate(
         let custom_profile = effective["config"]["default_permissions"].as_str().filter(|s| !s.starts_with(':'));
         let mut params = json!({"cwd":cwd,"model":config.model,"modelProvider":provider,
             "ephemeral":true,"runtimeWorkspaceRoots":[],"environments":[],"dynamicTools":[],"selectedCapabilityRoots":[],
-            "config":isolated,"baseInstructions":INSTRUCTIONS,"developerInstructions":""});
+            "config":isolated,"baseInstructions":instructions,"developerInstructions":""});
         if let Some(profile) = custom_profile { params["permissions"] = json!(profile); }
         else { params["sandbox"] = json!("read-only"); }
         let opened = wire.rpc("title-open", "thread/start", params).await?;
@@ -219,7 +261,7 @@ pub(crate) async fn generate(
         let thread = opened["thread"]["id"].as_str().context("标题会话 ID 缺失")?;
         wire.send(json!({"id":"title-turn","method":"turn/start","params":{
             "threadId":thread,"input":[{"type":"text","text":description}],"effort":config.effort,
-            "outputSchema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}
+            "outputSchema":schema
         }})).await?;
         let mut turn: Option<String> = None;
         let mut response = None;
@@ -254,9 +296,7 @@ pub(crate) async fn generate(
             } else if message["method"] == "turn/completed" && turn.is_some()
                 && params["turn"]["id"].as_str() == turn.as_deref() {
                 if params["turn"]["status"] != "completed" { bail!("标题摘要未完成"); }
-                let result: Value = serde_json::from_str(response.as_deref().context("标题摘要为空")?)?;
-                return super::titles::valid(result["title"].as_str().unwrap_or_default())
-                    .map(str::to_owned).context("标题摘要无效");
+                return Ok(serde_json::from_str(response.as_deref().context("结构化摘要为空")?)?);
             } else if params["turnId"].as_str() == turn.as_deref() && turn.is_some()
                 && matches!(message["method"].as_str(), Some("item/started" | "item/completed")) {
                 match params["item"]["type"].as_str() {

@@ -1187,6 +1187,53 @@ a real ephemeral WebKit cookie store without browsing or using a user profile.
 Native UI checks and the data-store test are recorded separately in
 `docs/validation/browser-site-info-2026-10-16.md`.
 
+## Composer predictions
+
+Composer predictions are optional, host-owned model requests after a successful
+ordinary main turn. They predict one editable next user message from bounded
+visible conversation text; they do not run the proposed task. The desktop only
+queries results and never launches an Agent. New tasks with no conversation,
+legacy hosts and unsupported adapters retain their existing placeholder and
+welcome suggestions.
+
+The additive Hello capability `composer_predictions` defaults to false.
+`composer_prediction` takes a `session_id` and returns a read-only result with
+`status` (`pending`, `ready`, `none`, `unsupported` or `failed`),
+`source_request_id`, `generation_id` and nullable `suggestion`. The source is the
+completed main request, not a UI-selected model or arbitrary client transcript.
+Querying does not trigger inference. Results are bounded in-memory state, not
+user events or persisted draft contents; reconnect and daemon restart do not
+replay generation. A new turn invalidates the previous result.
+
+Each enabled adapter must provide isolated, zero-tool inference with the source
+turn's effective model and Provider. An explicitly selected effort is forwarded;
+when effort was not selected, the isolated request uses the CLI default without
+claiming to capture an unreported native effort setting. Codex reuses the supervised ephemeral
+structured-request path used for titles; Claude uses a separate non-resuming,
+non-persistent text request when an App Provider snapshot is available. Native
+Claude CLI-backed sessions retain the default prompt because the current control
+protocol cannot reliably pin their effective Provider endpoint. Traex and
+OpenCode currently report unsupported; a future adapter must verify its installed
+CLI's safe one-shot capability before enabling predictions. Do not create a
+persistent auxiliary conversation or fall back to the main Agent loop merely to
+supply a prediction. Missing isolation or changed native Provider identity fails
+closed without changing the main task.
+
+Generation treats the transcript as data and excludes hidden reasoning, tool
+output and attachment contents. It makes no additional workspace reads. One
+successful source turn gets at most one generation attempt, with bounded input,
+output, concurrency and a deadline; empty or invalid predictions never become
+user input. Optional failures are diagnosed without transcript or credential
+contents and do not add ordinary conversation notices.
+
+The shared Composer renders a non-editable, weak-grey multiline prediction only
+when the actual draft is empty and normal input is available. It is not the
+textarea value and does not enable Send. Unmodified Tab inserts it as a draft;
+Enter or the Send button remains a separate action. IME composition, completion
+menus, Shift+Tab, non-empty drafts, references, attachments, approvals and offline
+states retain their existing behavior. Escape dismisses the current prediction;
+acceptance and context changes cannot revive an old result.
+
 ## Native session titles
 
 Claude Code 2.1.302 is the tested CLI compatibility baseline. Earlier releases

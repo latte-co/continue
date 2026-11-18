@@ -38,6 +38,10 @@ import type {
 import type { Host } from "./api";
 import type { HostedProject } from "./projectCatalog";
 import { Composer } from "./Composer";
+import {
+  useComposerPrediction,
+  type ComposerPredictionResponse,
+} from "./useComposerPrediction";
 import { useAgentPreferences } from "./useAgentPreferences";
 import { PermissionPicker } from "./PermissionPicker";
 import { UsageIndicator } from "./UsageIndicator";
@@ -57,6 +61,7 @@ export const statusNames = {
   unknown: "状态待确认",
 };
 interface Props {
+  composerPrediction?: ComposerPredictionResponse | null;
   openSideChat?: (draft?: string) => boolean | Promise<boolean>;
   quoteInSideChat?: (text: string) => void;
   openSubagents?: () => void;
@@ -109,6 +114,7 @@ interface Props {
 const FOLLOW_THRESHOLD = 90;
 
 export function Conversation({
+  composerPrediction,
   openSubagents,
   openSideChat,
   quoteInSideChat,
@@ -325,6 +331,26 @@ export function Conversation({
         : [],
     [events, session, active, preparingHistory],
   );
+  const prediction = useComposerPrediction(
+    JSON.stringify([hostId, projectId, session?.id, agentId]),
+    session?.id,
+    agentId,
+    composerPrediction,
+  );
+  const predictionBlocked =
+    session?.status !== "completed" ||
+    !modelReady ||
+    !available ||
+    preparingHistory ||
+    !!openingSession ||
+    stopping ||
+    queueEditing ||
+    !!pendingQuestions.length ||
+    !!pendingApprovals.length ||
+    !!submittingApproval ||
+    ["opening", "restoring", "error", "unknown"].includes(
+      liveSessionState ?? "",
+    );
   useEffect(() => {
     stopGeneration.current++;
     setStopping(false);
@@ -1094,18 +1120,23 @@ export function Conversation({
           }}
         />
         <Composer
+          prediction={prediction.prediction}
+          onDismissPrediction={prediction.dismiss}
+          predictionBlocked={predictionBlocked}
           annotations={annotations}
           hasContext={annotations.length > 0}
           context={
-            <AnnotationSummary
-              key={draftKey}
-              entries={annotations}
-              onSave={saveAnnotation}
-              onRemove={removeAnnotation}
-              onClear={() => drafts.update(draftKey, { annotations: [] })}
-              disabled={sending || queueEditing || !!session?.archived}
-              active={!settingsOpen}
-            />
+            annotations.length > 0 ? (
+              <AnnotationSummary
+                key={draftKey}
+                entries={annotations}
+                onSave={saveAnnotation}
+                onRemove={removeAnnotation}
+                onClear={() => drafts.update(draftKey, { annotations: [] })}
+                disabled={sending || queueEditing || !!session?.archived}
+                active={!settingsOpen}
+              />
+            ) : null
           }
           focusRequest={composerFocus}
           skillCreator={draft.skillCreator}

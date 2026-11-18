@@ -150,6 +150,143 @@ const approvalEvents = (id = "a"): Event[] => [
     },
   },
 ];
+const prediction = {
+  kind: "composer_prediction" as const,
+  session_id: "s",
+  status: "ready" as const,
+  source_request_id: "source",
+  generation_id: "generation",
+  suggestion: "补充测试",
+};
+it.each(["claude", "codex", "traex"])(
+  "inserts a server %s prediction into the draft without sending",
+  (agent) => {
+    const p = props();
+    const completed = { ...session("s"), agent, status: "completed" as const };
+    const view = render(
+      <Conversation
+        {...p}
+        session={completed}
+        composerPrediction={prediction}
+      />,
+    );
+    expect(screen.getByText("Tab 插入")).toBeTruthy();
+    expect(input().value).toBe("");
+    fireEvent.keyDown(input(), { key: "Tab" });
+    expect(p.drafts.get(JSON.stringify(["local", "s"])).text).toBe("补充测试");
+    expect(p.send).not.toHaveBeenCalled();
+    fireEvent.change(input(), { target: { value: "" } });
+    view.rerender(
+      <Conversation
+        {...p}
+        session={completed}
+        composerPrediction={{ ...prediction, generation_id: "late-generation" }}
+      />,
+    );
+    expect(screen.queryByText("Tab 插入")).toBeNull();
+  },
+);
+it("keeps Escape suppression for both sources when switching conversations and returning", () => {
+  const p = props();
+  const first = { ...session("s"), status: "completed" as const };
+  const second = { ...session("other"), status: "completed" as const };
+  const view = render(
+    <Conversation {...p} session={first} composerPrediction={prediction} />,
+  );
+  fireEvent.keyDown(input(), { key: "Escape" });
+  view.rerender(
+    <Conversation
+      {...p}
+      session={second}
+      composerPrediction={{ ...prediction, session_id: "other" }}
+    />,
+  );
+  expect(screen.getByText("Tab 插入")).toBeTruthy();
+  fireEvent.keyDown(input(), { key: "Escape" });
+  view.rerender(
+    <Conversation
+      {...p}
+      session={first}
+      composerPrediction={{ ...prediction }}
+    />,
+  );
+  expect(screen.queryByText("Tab 插入")).toBeNull();
+  expect(input().value).toBe("");
+  view.rerender(
+    <Conversation
+      {...p}
+      session={first}
+      composerPrediction={{
+        ...prediction,
+        source_request_id: "new-source",
+        generation_id: "new-generation",
+      }}
+    />,
+  );
+  expect(screen.getByText("Tab 插入")).toBeTruthy();
+});
+it.each(["opencode", "legacy", "unsupported", "failed", "none", "pending"])(
+  "keeps defaults without a ready supported suggestion (%s)",
+  (kind) => {
+    const p = props();
+    render(
+      <Conversation
+        {...p}
+        session={{
+          ...session("s"),
+          agent: kind === "opencode" ? "opencode" : "claude",
+          status: "completed",
+        }}
+        composerPrediction={
+          kind === "legacy"
+            ? null
+            : {
+                ...prediction,
+                status: ["opencode", "legacy"].includes(kind)
+                  ? "ready"
+                  : (kind as typeof prediction.status),
+                suggestion: kind === "opencode" ? "不应出现" : null,
+              }
+        }
+      />,
+    );
+    expect(screen.queryByText("Tab 插入")).toBeNull();
+    expect(input().placeholder).toContain("描述任务");
+    expect(fireEvent.keyDown(input(), { key: "Tab" })).toBe(true);
+    expect(p.send).not.toHaveBeenCalled();
+  },
+);
+it.each(["running", "waiting", "failed", "stopped", "unknown"] as const)(
+  "does not predict in %s sessions",
+  (status) => {
+    render(
+      <Conversation
+        {...props()}
+        session={{ ...session("s"), status }}
+        composerPrediction={prediction}
+      />,
+    );
+    expect(screen.queryByText("Tab 插入")).toBeNull();
+  },
+);
+it("ignores a suggestion from another session and keeps a newer nonempty draft", () => {
+  const p = props();
+  const completed = { ...session("s"), status: "completed" as const };
+  const view = render(
+    <Conversation
+      {...p}
+      session={completed}
+      composerPrediction={{ ...prediction, session_id: "old" }}
+    />,
+  );
+  expect(screen.queryByText("Tab 插入")).toBeNull();
+  fireEvent.change(input(), { target: { value: "新的草稿" } });
+  view.rerender(
+    <Conversation {...p} session={completed} composerPrediction={prediction} />,
+  );
+  expect(input().value).toBe("新的草稿");
+  expect(screen.queryByText("Tab 插入")).toBeNull();
+});
 it("docks approval actions above the composer while history keeps only a record", async () => {
   const p = props();
   const waiting = { ...session("a"), status: "waiting" as const };

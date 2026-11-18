@@ -101,6 +101,304 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
+it("reads predictions on the existing poll cadence only while pending, never creates a turn", async () => {
+  mocks.connect.mockResolvedValue({
+    kind: "hello",
+    server_id: "server-local",
+    composer_predictions: true,
+    agents: [{ id: "claude", available: true }],
+  });
+  const original = mocks.request.getMockImplementation()!;
+  let predictionStatus = "pending";
+  mocks.request.mockImplementation(async (host, r) => {
+    if (r.method === "poll")
+      return {
+        kind: "events",
+        session: session(),
+        events: [
+          {
+            seq: 1,
+            at: 1,
+            session_id: "s",
+            event: { kind: "user", request_id: "source", text: "检查项目" },
+          },
+        ],
+        has_more: false,
+      };
+    if (r.method === "composer_prediction")
+      return {
+        kind: "composer_prediction",
+        session_id: "s",
+        status: predictionStatus,
+        source_request_id: "source",
+        generation_id: "generation",
+        suggestion: predictionStatus === "ready" ? "补充测试" : null,
+      };
+    return original(host, r);
+  });
+  const view = renderHook(useWorkbench);
+  await act(async () => {});
+  await act(async () =>
+    view.result.current.openSession({ ...session(), hostId: "local" }),
+  );
+  const reads = () =>
+    mocks.request.mock.calls.filter(
+      ([, r]) => r.method === "composer_prediction",
+    );
+  expect(reads()).toHaveLength(1);
+  predictionStatus = "ready";
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction).toMatchObject({
+    suggestion: "补充测试",
+    source_request_id: "source",
+  });
+  expect(reads()).toHaveLength(2);
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(reads()).toHaveLength(2);
+  expect(
+    mocks.request.mock.calls.some(([, r]) =>
+      ["send", "send_queued", "create_session"].includes(r.method),
+    ),
+  ).toBe(false);
+});
+it.each(["pending", "error", "mismatch"])(
+  "clears the previous ready prediction before a fast external turn query returns %s",
+  async (outcome) => {
+    mocks.connect.mockResolvedValue({
+      kind: "hello",
+      server_id: "server-local",
+      composer_predictions: true,
+      agents: [{ id: "claude", available: true }],
+    });
+    const original = mocks.request.getMockImplementation()!;
+    let source = "source";
+    let resolve!: (value: unknown) => void;
+    let reject!: (reason: Error) => void;
+    mocks.request.mockImplementation(async (host, r) => {
+      if (r.method === "poll")
+        return {
+          kind: "events",
+          session: session(),
+          events: [
+            {
+              seq: source === "source" ? 1 : 2,
+              at: 1,
+              session_id: "s",
+              event: { kind: "user", request_id: source, text: source },
+            },
+          ],
+          has_more: false,
+        };
+      if (r.method === "composer_prediction") {
+        if (source === "source")
+          return {
+            kind: "composer_prediction",
+            session_id: "s",
+            status: "ready",
+            source_request_id: source,
+            generation_id: "generation",
+            suggestion: "旧建议",
+          };
+        return new Promise((yes, no) => {
+          resolve = yes;
+          reject = no;
+        });
+      }
+      return original(host, r);
+    });
+    const view = renderHook(useWorkbench);
+    await act(async () => {});
+    await act(async () =>
+      view.result.current.openSession({ ...session(), hostId: "local" }),
+    );
+    expect(view.result.current.composerPrediction?.suggestion).toBe("旧建议");
+    // Another client or the queue completed a new turn between two polls; status stays completed.
+    source = "new-source";
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction).toBeNull();
+    await act(async () => {
+      if (outcome === "error") reject(new Error("unavailable"));
+      else
+        resolve({
+          kind: "composer_prediction",
+          session_id: "s",
+          status: outcome === "pending" ? "pending" : "ready",
+          source_request_id: outcome === "mismatch" ? "source" : source,
+          generation_id: "new-generation",
+          suggestion: outcome === "mismatch" ? "旧建议" : null,
+        });
+    });
+    expect(
+      view.result.current.composerPrediction?.suggestion ?? null,
+    ).toBeNull();
+  },
+);
+it.each(["none", "unsupported", "failed", "error"])(
+  "stops optional prediction reads after %s",
+  async (outcome) => {
+    mocks.connect.mockResolvedValue({
+      kind: "hello",
+      server_id: "server-local",
+      composer_predictions: true,
+      agents: [{ id: "claude", available: true }],
+    });
+    const original = mocks.request.getMockImplementation()!;
+    mocks.request.mockImplementation(async (host, r) => {
+      if (r.method === "poll")
+        return {
+          kind: "events",
+          session: session(),
+          events: [
+            {
+              seq: 1,
+              at: 1,
+              session_id: "s",
+              event: { kind: "user", request_id: "source", text: "检查项目" },
+            },
+          ],
+          has_more: false,
+        };
+      if (r.method === "composer_prediction") {
+        if (outcome === "error") throw new Error("unavailable");
+        return {
+          kind: "composer_prediction",
+          session_id: "s",
+          status: outcome,
+          source_request_id: "source",
+          generation_id: "generation",
+          suggestion: null,
+        };
+      }
+      return original(host, r);
+    });
+    const view = renderHook(useWorkbench);
+    await act(async () => {});
+    await act(async () =>
+      view.result.current.openSession({ ...session(), hostId: "local" }),
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(
+      mocks.request.mock.calls.filter(
+        ([, r]) => r.method === "composer_prediction",
+      ),
+    ).toHaveLength(1);
+  },
+);
+it("bounds pending reads and pauses them while the composer is hidden", async () => {
+  mocks.connect.mockResolvedValue({
+    kind: "hello",
+    server_id: "server-local",
+    composer_predictions: true,
+    agents: [{ id: "claude", available: true }],
+  });
+  const original = mocks.request.getMockImplementation()!;
+  mocks.request.mockImplementation(async (host, r) => {
+    if (r.method === "poll")
+      return {
+        kind: "events",
+        session: session(),
+        events: [
+          {
+            seq: 1,
+            at: 1,
+            session_id: "s",
+            event: { kind: "user", request_id: "source", text: "检查项目" },
+          },
+        ],
+        has_more: false,
+      };
+    if (r.method === "composer_prediction")
+      return {
+        kind: "composer_prediction",
+        session_id: "s",
+        status: "pending",
+        source_request_id: "source",
+        generation_id: "generation",
+        suggestion: null,
+      };
+    return original(host, r);
+  });
+  const view = renderHook(useWorkbench);
+  await act(async () => {});
+  await act(async () =>
+    view.result.current.openSession({ ...session(), hostId: "local" }),
+  );
+  const reads = () =>
+    mocks.request.mock.calls.filter(
+      ([, r]) => r.method === "composer_prediction",
+    ).length;
+  act(() => view.result.current.setPredictionVisible(false));
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(reads()).toBe(1);
+  act(() => view.result.current.setPredictionVisible(true));
+  await act(async () => vi.advanceTimersByTimeAsync(60_000));
+  const bounded = reads();
+  expect(bounded).toBeLessThanOrEqual(55);
+  await act(async () => vi.advanceTimersByTimeAsync(60_000));
+  expect(reads()).toBe(bounded);
+});
+it("discards a late prediction after navigating to a new task", async () => {
+  mocks.connect.mockResolvedValue({
+    kind: "hello",
+    server_id: "server-local",
+    composer_predictions: true,
+    agents: [{ id: "claude", available: true }],
+  });
+  const original = mocks.request.getMockImplementation()!;
+  let resolve!: (value: unknown) => void;
+  mocks.request.mockImplementation(async (host, r) => {
+    if (r.method === "poll")
+      return {
+        kind: "events",
+        session: session(),
+        events: [
+          {
+            seq: 1,
+            at: 1,
+            session_id: "s",
+            event: { kind: "user", request_id: "source", text: "检查项目" },
+          },
+        ],
+        has_more: false,
+      };
+    if (r.method === "composer_prediction")
+      return new Promise((done) => {
+        resolve = done;
+      });
+    return original(host, r);
+  });
+  const view = renderHook(useWorkbench);
+  await act(async () => {});
+  await act(async () =>
+    view.result.current.openSession({ ...session(), hostId: "local" }),
+  );
+  act(() => view.result.current.setSessionId(""));
+  await act(async () =>
+    resolve({
+      kind: "composer_prediction",
+      session_id: "s",
+      status: "ready",
+      source_request_id: "source",
+      generation_id: "generation",
+      suggestion: "旧建议",
+    }),
+  );
+  expect(view.result.current.composerPrediction).toBeNull();
+});
+it("does not query predictions on a legacy host", async () => {
+  const view = renderHook(useWorkbench);
+  await act(async () => {});
+  await act(async () =>
+    view.result.current.openSession({ ...session(), hostId: "local" }),
+  );
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(
+    mocks.request.mock.calls.some(
+      ([, r]) => r.method === "composer_prediction",
+    ),
+  ).toBe(false);
+  expect(view.result.current.composerPrediction).toBeNull();
+});
 const acknowledgements = () =>
   mocks.request.mock.calls.filter(
     ([, r]) => r.method === "mark_session_unread",

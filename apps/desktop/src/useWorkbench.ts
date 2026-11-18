@@ -73,6 +73,14 @@ import {
   type HostedSession,
 } from "./sessionNavigation";
 
+function latestUserEvent(events: Event[]) {
+  for (let index = events.length - 1; index >= 0; index--) {
+    const value = events[index].event;
+    if (value.kind === "user") return value;
+  }
+  return undefined;
+}
+
 type PasswordChallenge = {
   host: Host;
   promise: Promise<Response>;
@@ -303,6 +311,15 @@ export function useWorkbench() {
     };
   }, [pinnedHosts]);
   const [events, setEvents] = useState<Event[]>([]);
+  const [predictionVisible, setPredictionVisible] = useState(true);
+  const predictionVisibility = useRef(predictionVisible);
+  predictionVisibility.current = predictionVisible;
+  const predictionEpoch = useRef(0);
+  const [prediction, setPrediction] = useState<{
+    scope: string;
+    epoch: number;
+    value: Extract<Response, { kind: "composer_prediction" }>;
+  } | null>(null);
   const [hasEarlierHistory, setHasEarlierHistory] = useState(false);
   const [earlierHistoryLoading, setEarlierHistoryLoading] = useState(false);
   const earlierLoads = useRef(new Set<string>());
@@ -683,6 +700,78 @@ export function useWorkbench() {
     const windowed = cachedHello(host)?.history_window === true;
     let initialWindow = replaying && windowed;
     let before: number | null = null;
+    let latestSource = latestUserEvent(cached ?? []);
+    let attemptedSource: string | null = null;
+    let terminalPrediction = false;
+    let predictionStarted = 0;
+    const predictionScope = JSON.stringify([
+      hostId,
+      projectId,
+      sessionId,
+      hostConnectionVersions[hostId] ?? 0,
+    ]);
+    function observePredictionSource(incoming: Event[]) {
+      const next = latestUserEvent(incoming);
+      if (!next || next.request_id === latestSource?.request_id) return;
+      latestSource = next;
+      // A queued/external turn can start and finish between polls without a local Send epoch.
+      // Remove the previous source immediately, before awaiting any optional query.
+      setPrediction((old) => (old?.scope === predictionScope ? null : old));
+    }
+    async function refreshPrediction(current: Session, incoming: Event[]) {
+      observePredictionSource(incoming);
+      if (current.status !== "completed" || current.archived) {
+        setPrediction((old) => (old?.scope === predictionScope ? null : old));
+        return;
+      }
+      const source =
+        latestSource?.kind === "user" ? latestSource.request_id : null;
+      if (
+        !source ||
+        !cachedHello(host)?.composer_predictions ||
+        current.agent === "opencode" ||
+        !predictionVisibility.current ||
+        foregroundPage.current === "settings" ||
+        foregroundPage.current === "skills" ||
+        document.visibilityState === "hidden" ||
+        sending.current
+      )
+        return;
+      if (source !== attemptedSource) {
+        attemptedSource = source;
+        terminalPrediction = false;
+        predictionStarted = Date.now();
+      }
+      if (terminalPrediction || Date.now() - predictionStarted > 35_000) return;
+      const epoch = predictionEpoch.current;
+      try {
+        const value = await request(hostId, {
+          method: "composer_prediction",
+          session_id: sessionId,
+        });
+        if (
+          disposed ||
+          epoch !== predictionEpoch.current ||
+          !predictionVisibility.current ||
+          sending.current
+        )
+          return;
+        if (
+          value.kind !== "composer_prediction" ||
+          value.session_id !== sessionId ||
+          (value.source_request_id !== null &&
+            value.source_request_id !== source)
+        ) {
+          terminalPrediction = true;
+          return;
+        }
+        terminalPrediction = value.status !== "pending";
+        setPrediction({ scope: predictionScope, epoch, value });
+      } catch {
+        // Optional read failure keeps the default composer; never retry or generate from UI.
+        terminalPrediction = true;
+      }
+    }
     const poll = async () => {
       try {
         const r = await request(
@@ -721,6 +810,8 @@ export function useWorkbench() {
           setSessions((previous) =>
             previous.map((s) => (s.id === r.session.id ? r.session : s)),
           );
+          await refreshPrediction(r.session, replay);
+          if (disposed) return;
           replay = [];
           initialWindow = false;
           replaying = false;
@@ -728,6 +819,7 @@ export function useWorkbench() {
           return;
         }
         if (r.kind === "events") {
+          observePredictionSource(r.events);
           cursor = r.events.at(-1)?.seq ?? cursor;
           if (replaying) {
             replay = appendEvents(replay, r.events);
@@ -774,6 +866,8 @@ export function useWorkbench() {
           setSessions((previous) =>
             previous.map((s) => (s.id === r.session.id ? r.session : s)),
           );
+          if (!r.has_more) await refreshPrediction(r.session, r.events);
+          if (disposed) return;
           timer = setTimeout(() => void poll(), r.has_more ? 0 : LIVE_POLL_MS);
         }
       } catch (e) {
@@ -788,7 +882,7 @@ export function useWorkbench() {
       disposed = true;
       clearTimeout(timer);
     };
-  }, [sessionId, hostId, connected]);
+  }, [sessionId, hostId, connected, hostConnectionVersions[hostId]]);
   useEffect(() => {
     if (
       !native ||
@@ -1141,6 +1235,8 @@ export function useWorkbench() {
     }
     if (!connected || !text.trim() || sending.current) return false;
     sending.current = true;
+    predictionEpoch.current++;
+    setPrediction(null);
     try {
       const target =
         session ?? (await persistSession(navigationRevision.current));
@@ -1410,6 +1506,20 @@ export function useWorkbench() {
     window.addEventListener("pointercancel", stop);
   }
   return {
+    setPredictionVisible,
+    composerPrediction:
+      connected &&
+      session?.status === "completed" &&
+      prediction?.epoch === predictionEpoch.current &&
+      prediction.scope ===
+        JSON.stringify([
+          hostId,
+          projectId,
+          sessionId,
+          hostConnectionVersions[hostId] ?? 0,
+        ])
+        ? prediction.value
+        : null,
     hosts,
     passwordPrompt,
     admissionNotice:

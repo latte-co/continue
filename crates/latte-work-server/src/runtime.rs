@@ -1118,6 +1118,9 @@ struct Process {
     adapter: Box<dyn agents::AgentAdapter>,
     binary: String,
     title_job: Option<tokio::task::JoinHandle<()>>,
+    prediction_owner: String,
+    prediction_turn: Option<crate::predictions::TurnContext>,
+    prediction_job: Option<tokio::task::JoinHandle<()>>,
     rename_reply: Option<oneshot::Sender<Result<String, String>>>,
     approval_replies: HashMap<String, PendingApprovalReply>,
     group: Group,
@@ -1179,6 +1182,10 @@ impl Drop for Process {
     fn drop(&mut self) {
         self.session_open.store(false, Ordering::SeqCst);
         self.drain.abort();
+        crate::predictions::invalidate(&self.prediction_owner);
+        if let Some(job) = self.prediction_job.take() {
+            job.abort();
+        }
         if let Some(job) = self.title_job.take() {
             job.abort();
         }
@@ -1355,6 +1362,9 @@ impl Process {
             adapter,
             binary: binary.into(),
             title_job: None,
+            prediction_owner: session.id.clone(),
+            prediction_turn: None,
+            prediction_job: None,
             rename_reply: None,
             approval_replies: HashMap::new(),
             group,
@@ -1518,6 +1528,9 @@ impl Process {
         }
         let became_ready = actions.iter().any(|a| matches!(a, Action::Ready));
         if actions.iter().any(|a| matches!(a, Action::TurnStarted)) {
+            if !self.turn_active {
+                self.cancel_prediction().await;
+            }
             self.turn_active = true;
             self.settled_turn = None;
             self.background_at_start = self.adapter.has_background_work();
@@ -1529,6 +1542,15 @@ impl Process {
             // A CLI may emit the interrupted result before its control acknowledgement.
             self.clear_approval_replies();
             self.state.pending.clear();
+        }
+        if let Some(context) = &mut self.prediction_turn {
+            for action in &actions {
+                match action {
+                    Action::Event(event) => context.observe(event),
+                    Action::Approval { .. } | Action::Question { .. } => context.boundary(),
+                    _ => {}
+                }
+            }
         }
         let outcome = self
             .state
@@ -1570,6 +1592,26 @@ impl Process {
                 self.background_at_start || self.adapter.has_background_work(),
             )
             .await?;
+            if let Some(context) = self.prediction_turn.take()
+                && status == Status::Completed
+                && context.useful()
+            {
+                let session = db(database, |s| s.session(id))?;
+                if !session.archived && db(database, |s| Ok(s.side_parent(id)?.is_none()))? {
+                    if let Some(snapshot) = self.adapter.prediction_snapshot(&self.config) {
+                        self.prediction_job = crate::predictions::schedule(
+                            id,
+                            &session.agent,
+                            self.binary.clone(),
+                            self.path.clone(),
+                            context,
+                            snapshot,
+                        );
+                    } else {
+                        crate::predictions::unsupported(id, &context.request_id);
+                    }
+                }
+            }
             if self.state.pending.is_empty() {
                 db(database, |s| s.state(id, status.clone(), message.clone()))?;
             }
@@ -1624,6 +1666,14 @@ impl Process {
         };
         db(database, |s| s.state(id, status, message))
     }
+    async fn cancel_prediction(&mut self) {
+        crate::predictions::invalidate(&self.prediction_owner);
+        self.prediction_turn = None;
+        if let Some(job) = self.prediction_job.take() {
+            job.abort();
+            let _ = job.await;
+        }
+    }
     async fn cancel_title(&mut self) {
         if let Some(job) = self.title_job.take() {
             job.abort();
@@ -1647,6 +1697,7 @@ impl Process {
         finish_native_close(database, id, confirmed)
     }
     async fn close(&mut self) -> bool {
+        self.cancel_prediction().await;
         self.cancel_title().await;
         self.clear_approval_replies();
         if let Some(reply) = self.rename_reply.take() {
@@ -1810,6 +1861,10 @@ async fn accept_turn(
             config.permission_mode.as_deref(),
         )
     })?;
+    crate::predictions::invalidate(&session.id);
+    if let Some(p) = process.as_mut() {
+        p.cancel_prediction().await;
+    }
     // Admission is complete once the request and User/Running events are durable.
     // Filesystem snapshots and Agent startup can take longer than the sender's
     // confirmation deadline; they must not make accepted input look rejected.
@@ -1859,6 +1914,15 @@ async fn accept_turn(
         }
         let p = process.as_mut().context("Agent process missing")?;
         p.turn_active = true;
+        if !turn.text.trim_start().starts_with('/')
+            && db(database, |s| Ok(s.side_parent(&session.id)?.is_none()))?
+        {
+            p.prediction_turn = crate::predictions::TurnContext::try_new(
+                &turn.request_id,
+                &p.config.redact(&turn.text),
+                p.config.redactor(),
+            );
+        }
         p.settled_turn = None;
         p.background_at_start = p.adapter.has_background_work();
         p.turn_deadline = tokio::time::Instant::now() + TURN_LIMIT;
@@ -2170,6 +2234,9 @@ async fn actor(
                         let p=process.as_mut().context("Agent 未启动")?;
                         if !p.state.ready || p.stopping || p.interrupt_ack_pending || !same_config(&p.config,&config) {bail!("当前 Agent 尚未就绪或执行配置不一致，消息保留在队列");}
                         let (entry,_)=db(&database,|d|d.queued(&session.id))?.into_iter().find(|(e,_)|e.request_id==request_id && e.revision==revision).context("消息已执行、移除或更新，请刷新队列")?;
+                        crate::predictions::invalidate(&p.prediction_owner);
+                        p.prediction_turn = None;
+                        if let Some(job) = p.prediction_job.take() { job.abort(); }
                         let actions=p.adapter.advance(Input::Queue{request_id:&request_id,prompt:&entry.text})?;
                         Ok(actions)
                     })();

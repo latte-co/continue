@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { useState } from "react";
+import { useState, type ComponentProps } from "react";
 import {
   act,
   cleanup,
@@ -10,6 +10,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Composer } from "./Composer";
+import { Select } from "./Select";
 import { composerTrigger } from "./composerActions";
 import { referenceMessage } from "./referenceMessage";
 const pasteMocks = vi.hoisted(() => ({
@@ -40,12 +41,8 @@ function Harness({
   projectId = "p",
   agent = "claude",
   sideChat = false,
-}: {
-  hostId?: string;
-  projectId?: string;
-  agent?: string;
-  sideChat?: boolean;
-}) {
+  ...props
+}: Partial<ComponentProps<typeof Composer>>) {
   const [text, setText] = useState("");
   return (
     <Composer
@@ -63,11 +60,15 @@ function Harness({
       onOpenSubagents={mocks.openSubagents}
       onOpenModelSettings={mocks.openModelSettings}
       placeholder="任务"
-      toolbar={(submit, content) => (
-        <button disabled={!content} onClick={submit}>
-          发送
-        </button>
-      )}
+      {...props}
+      toolbar={
+        props.toolbar ??
+        ((submit, content) => (
+          <button disabled={!content} onClick={submit}>
+            发送
+          </button>
+        ))
+      }
     />
   );
 }
@@ -151,6 +152,195 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
+const prediction = { id: "round-1", text: "检查修改结果\n并补充边界测试" };
+it("shows a multiline prediction outside the empty editor and Tab inserts without sending", () => {
+  render(<Harness prediction={prediction} />);
+  const input = screen.getByRole("textbox") as HTMLTextAreaElement;
+  expect(
+    screen.getByText(prediction.text, {
+      exact: true,
+      normalizer: (text) => text,
+    }),
+  ).toBeTruthy();
+  expect(screen.getByText("Tab 插入")).toBeTruthy();
+  expect(input.value).toBe("");
+  expect(screen.getByText("发送")).toHaveProperty("disabled", true);
+  fireEvent.keyDown(input, { key: "Tab" });
+  expect(input.value).toBe(prediction.text);
+  expect(input.selectionStart).toBe(prediction.text.length);
+  expect(document.activeElement).toBe(input);
+  expect(mocks.send).not.toHaveBeenCalled();
+  expect(mocks.request).not.toHaveBeenCalled();
+  expect(screen.getByText("发送")).toHaveProperty("disabled", false);
+  type("");
+  expect(screen.queryByText("Tab 插入")).toBeNull();
+});
+it("fits the empty editor to multiline ghost height, caps at 200px and restores ordinary height", () => {
+  const height = vi
+    .spyOn(Element.prototype, "scrollHeight", "get")
+    .mockImplementation(function (this: Element) {
+      return this.classList.contains("composer-prediction") ? 280 : 20;
+    });
+  try {
+    const view = render(<Harness prediction={prediction} />);
+    expect(screen.getByRole<HTMLTextAreaElement>("textbox").style.height).toBe(
+      "200px",
+    );
+    view.rerender(<Harness />);
+    expect(screen.getByRole<HTMLTextAreaElement>("textbox").style.height).toBe(
+      "20px",
+    );
+  } finally {
+    height.mockRestore();
+  }
+});
+it("allows an explicitly empty context component without creating a draft", () => {
+  function EmptyContext() {
+    return null;
+  }
+  render(
+    <Harness
+      prediction={prediction}
+      hasContext={false}
+      context={<EmptyContext />}
+    />,
+  );
+  expect(screen.getByText("Tab 插入")).toBeTruthy();
+  expect(inputText()).toBe("");
+});
+it.each([" ", "\n", "已有草稿"])(
+  "does not predict over a nonempty value %j",
+  (value) => {
+    render(<Harness prediction={prediction} />);
+    type(value);
+    expect(screen.queryByText("Tab 插入")).toBeNull();
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Tab" });
+    expect(inputText()).toBe(value);
+  },
+);
+it.each([
+  { shiftKey: true },
+  { ctrlKey: true },
+  { metaKey: true },
+  { altKey: true },
+  { isComposing: true },
+  { keyCode: 229 },
+])("preserves modified Tab and IME %j", (modifiers) => {
+  render(<Harness prediction={prediction} />);
+  expect(
+    fireEvent.keyDown(screen.getByRole("textbox"), {
+      key: "Tab",
+      ...modifiers,
+    }),
+  ).toBe(true);
+  expect(inputText()).toBe("");
+  expect(mocks.send).not.toHaveBeenCalled();
+});
+it("hides predictions during composition and Escape dismisses only this source", () => {
+  const view = render(<Harness prediction={prediction} />);
+  const input = screen.getByRole("textbox");
+  fireEvent.compositionStart(input);
+  expect(screen.queryByText("Tab 插入")).toBeNull();
+  fireEvent.keyDown(input, { key: "Tab" });
+  expect(inputText()).toBe("");
+  fireEvent.compositionEnd(input);
+  fireEvent.keyDown(input, { key: "Escape" });
+  expect(screen.queryByText("Tab 插入")).toBeNull();
+  view.rerender(
+    <Harness prediction={{ ...prediction, text: "同轮晚到结果" }} />,
+  );
+  expect(screen.queryByText("Tab 插入")).toBeNull();
+  view.rerender(<Harness prediction={{ ...prediction, id: "round-2" }} />);
+  expect(screen.getByText("Tab 插入")).toBeTruthy();
+});
+it.each([
+  { connected: false },
+  { disabled: true },
+  { sending: true },
+  { hidden: true },
+  { concealSubmitted: true },
+  { predictionBlocked: true },
+  { skillCreator: true },
+  { hasContext: true },
+  { context: <div>引用正文</div> },
+  { annotations: [{ id: "annotation" }] },
+  {
+    referenceState: {
+      scope: "remote:p:claude",
+      entries: [{ name: "src", path: "src", directory: true }],
+    },
+  },
+  {
+    referenceState: {
+      scope: "remote:p:claude",
+      entries: [
+        {
+          name: "file",
+          path: "/tmp/file",
+          directory: false,
+          attachmentKind: "file",
+        },
+      ],
+    },
+  },
+])("does not display or accept predictions in blocked state %j", (props) => {
+  render(
+    <Harness
+      prediction={prediction}
+      {...(props as Partial<ComponentProps<typeof Composer>>)}
+    />,
+  );
+  expect(screen.queryByText("Tab 插入")).toBeNull();
+  expect(fireEvent.keyDown(screen.getByRole("textbox"), { key: "Tab" })).toBe(
+    true,
+  );
+  expect(inputText()).toBe("");
+  expect(mocks.send).not.toHaveBeenCalled();
+});
+it("hides and does not accept predictions while a toolbar Select combobox is expanded", async () => {
+  render(
+    <Harness
+      prediction={prediction}
+      toolbar={() => (
+        <Select
+          label="权限"
+          value="default"
+          options={[{ value: "default", label: "跟随 Agent" }]}
+          onChange={vi.fn()}
+        />
+      )}
+    />,
+  );
+  expect(screen.getByText("Tab 插入")).toBeTruthy();
+  fireEvent.click(screen.getByRole("combobox", { name: "权限" }));
+  await waitFor(() => expect(screen.queryByText("Tab 插入")).toBeNull());
+  expect(
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "任务输入" }), {
+      key: "Tab",
+    }),
+  ).toBe(true);
+  expect(inputText()).toBe("");
+  // Select itself closes on Tab while leaving its native navigation unprevented.
+  await waitFor(() => expect(screen.getByText("Tab 插入")).toBeTruthy());
+  fireEvent.click(screen.getByRole("combobox", { name: "权限" }));
+  await waitFor(() => expect(screen.queryByText("Tab 插入")).toBeNull());
+  fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
+  await waitFor(() => expect(screen.getByText("Tab 插入")).toBeTruthy());
+  expect(mocks.send).not.toHaveBeenCalled();
+});
+it("gives menus priority and preserves normal Tab when no prediction exists", () => {
+  const view = render(<Harness prediction={prediction} />);
+  fireEvent.click(screen.getByRole("button", { name: "添加文件" }));
+  expect(screen.queryByText("Tab 插入")).toBeNull();
+  fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+  expect(screen.getByText("Tab 插入")).toBeTruthy();
+  view.rerender(<Harness />);
+  expect(fireEvent.keyDown(screen.getByRole("textbox"), { key: "Tab" })).toBe(
+    true,
+  );
+  expect(inputText()).toBe("");
+});
+
 it("detects only standalone mention and slash triggers", () => {
   expect(composerTrigger("mail@host", 9)).toBeNull();
   expect(composerTrigger("https://host/", 13)).toBeNull();

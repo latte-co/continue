@@ -12,7 +12,31 @@ if '--help' in sys.argv:
                 print("error: unknown option '--permission-mode'",file=sys.stderr)
             sys.exit(1)
         print('Usage: claude [options]\n  -h, --help Display help for command');sys.exit(0)
-    print('--permission-mode <mode> (choices: "default", "acceptEdits", "plan", "dontAsk", "bypassPermissions")');sys.exit(0)
+    print('--permission-mode <mode> (choices: "default", "acceptEdits", "plan", "dontAsk", "bypassPermissions")')
+    print('--safe-mode --tools --strict-mcp-config --mcp-config --disable-slash-commands --no-session-persistence --no-chrome --system-prompt --setting-sources --permission-prompts --prompt-suggestions Use "" to disable all tools; sessions will not be saved')
+    sys.exit(0)
+if '--system-prompt' in sys.argv and 'Predict one short' in sys.argv[sys.argv.index('--system-prompt')+1]:
+    assert '--safe-mode' in sys.argv and '--no-session-persistence' in sys.argv
+    assert '--disable-slash-commands' in sys.argv and '--strict-mcp-config' in sys.argv
+    assert sys.argv[sys.argv.index('--tools')+1]==''
+    assert not any(arg.startswith('--resume') for arg in sys.argv)
+    assert '--append-system-prompt' not in sys.argv
+    assert sys.argv[sys.argv.index('--setting-sources')+1]==''
+    assert json.loads(pathlib.Path(sys.argv[sys.argv.index('--settings')+1]).read_text())['disableAllHooks']
+    description=sys.stdin.read()
+    root=pathlib.Path(os.environ.get('LATTE_FIXTURE_PREDICTION_ROOT',os.getcwd()))
+    with (root/'prediction-inputs').open('a') as f:
+        f.write(json.dumps({'description':description,'model':next(a.split('=',1)[1] for a in sys.argv if a.startswith('--model=')),'effort':os.environ.get('CLAUDE_CODE_EFFORT_LEVEL'),'pid':os.getpid()})+'\n')
+    print(json.dumps({'type':'system','subtype':'init','tools':[]}),flush=True)
+    if 'prediction-held' in description:
+        deadline=time.monotonic()+40
+        while not (root/'prediction-release').exists() and time.monotonic()<deadline:time.sleep(.02)
+    if 'prediction-tools' in description:
+        print(json.dumps({'type':'control_request','request':{'tool_name':'PREDICTION_UNSAFE'}}),flush=True)
+    else:
+        text=json.dumps({'suggestion':None if 'prediction-none' in description else '运行测试并检查结果'},ensure_ascii=False)
+        print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':text}),flush=True)
+    sys.exit(0)
 output_lock=threading.Lock()
 def emit(value):
     with output_lock: print(json.dumps(value),flush=True)

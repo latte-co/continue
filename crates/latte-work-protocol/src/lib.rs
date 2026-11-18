@@ -481,11 +481,25 @@ pub enum AgentCommandUiAction {
     Subagents,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerPredictionStatus {
+    Pending,
+    Ready,
+    None,
+    Unsupported,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum Request {
     Hello {
         version: u32,
+    },
+    /// Read an existing memory-only prediction; never starts inference.
+    ComposerPrediction {
+        session_id: String,
     },
     Projects,
     Terminals {
@@ -1252,9 +1266,19 @@ pub enum Response {
         providers: Vec<Provider>,
         bindings: Vec<AgentProviderBinding>,
     },
+    ComposerPrediction {
+        session_id: String,
+        status: ComposerPredictionStatus,
+        /// Durable Send identity of the successfully completed ordinary main turn.
+        source_request_id: Option<String>,
+        generation_id: Option<String>,
+        suggestion: Option<String>,
+    },
     Hello {
         version: u32,
         server_id: String,
+        #[serde(default)]
+        composer_predictions: bool,
         agents: Vec<AgentInfo>,
         #[serde(default)]
         permission_settings: bool,
@@ -1355,6 +1379,28 @@ pub enum Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn composer_prediction_is_read_only_and_legacy_hello_disables_it() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "method":"composer_prediction","session_id":"session"
+        }))
+        .unwrap();
+        assert!(
+            matches!(request, Request::ComposerPrediction { session_id } if session_id == "session")
+        );
+        let old: Response = serde_json::from_value(serde_json::json!({
+            "kind":"hello","version":1,"server_id":"old","agents":[]
+        }))
+        .unwrap();
+        assert!(matches!(
+            old,
+            Response::Hello {
+                composer_predictions: false,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn configured_agent_environment_round_trips_and_debug_hides_values() {
         let value = serde_json::json!({"kind":"configured","snapshot":{

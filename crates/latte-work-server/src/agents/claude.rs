@@ -438,6 +438,18 @@ impl AgentAdapter for Claude {
         self.title_attempted = true;
         Ok(())
     }
+    fn prediction_snapshot(&self, config: &LaunchConfig) -> Option<crate::predictions::Snapshot> {
+        if self.side_parent.is_some() || config.provider.is_none() {
+            return None;
+        }
+        let mut config = config.clone();
+        config.model = self.accounting_model.clone().or(config.model);
+        config.model.as_ref()?;
+        Some(crate::predictions::Snapshot {
+            config,
+            native_provider: None,
+        })
+    }
     fn command(
         &mut self,
         binary: &str,
@@ -528,65 +540,11 @@ impl AgentAdapter for Claude {
             command.env("CLAUDE_CODE_EFFORT_LEVEL", level.as_str());
             command.arg(format!("--effort={}", level.as_str()));
         }
-        let mut settings = if let Some(provider) = &config.provider {
-            let metadata = &provider.metadata;
-            let model = config.model.as_deref().unwrap_or(&metadata.model);
-            let mut env = json!({
-                "ANTHROPIC_BASE_URL": metadata.base_url,
-                "ANTHROPIC_MODEL": model,
-                "ANTHROPIC_DEFAULT_MODEL": model,
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
-                "ANTHROPIC_DEFAULT_FABLE_MODEL": model,
-                "ANTHROPIC_SMALL_FAST_MODEL": model,
-                "CLAUDE_CODE_SUBAGENT_MODEL": model,
-                "ANTHROPIC_AUTH_TOKEN": "",
-                "ANTHROPIC_API_KEY": "",
-                "CLAUDE_CODE_OAUTH_TOKEN": "",
-                "ANTHROPIC_CUSTOM_HEADERS": "",
-                "CLAUDE_CODE_USE_BEDROCK": "",
-                "CLAUDE_CODE_USE_VERTEX": "",
-                "CLAUDE_CODE_USE_FOUNDRY": ""
-            });
-            if metadata.protocol != latte_work_protocol::ProviderProtocol::AnthropicMessages {
-                bail!("Claude Code 只支持 Anthropic Messages Provider");
-            }
-            let base = model.strip_suffix("[1m]").unwrap_or(model);
-            if metadata.models_1m.iter().any(|id| id == base) {
-                let extended = base != model;
-                // Native 1M models also need an explicit hold for the 200K mode.
-                // Override both inherited env and settings for this child only.
-                env["CLAUDE_CODE_DISABLE_1M_CONTEXT"] = json!(if extended { "0" } else { "1" });
-                env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] =
-                    json!(if extended { "1000000" } else { "200000" });
-            }
-            let (key, credential) = match metadata.auth {
-                latte_work_protocol::ProviderAuth::Bearer => {
-                    ("ANTHROPIC_AUTH_TOKEN", provider.credential.as_str())
-                }
-                latte_work_protocol::ProviderAuth::ApiKey => {
-                    ("ANTHROPIC_API_KEY", provider.credential.as_str())
-                }
-                // Claude requires a nonempty credential even for unauthenticated gateways.
-                latte_work_protocol::ProviderAuth::None => {
-                    ("ANTHROPIC_AUTH_TOKEN", "latte-work-no-auth")
-                }
-            };
-            env[key] = json!(credential);
-            for (key, value) in env.as_object().expect("env object") {
-                command.env(key, value.as_str().expect("env string"));
-            }
-            command.arg(format!("--model={model}"));
-            json!({"env":env,"model":model,"apiKeyHelper":""})
-        } else {
-            if let Some(model) = &config.model {
-                command.arg(format!("--model={model}"));
-            } else if resume.is_some() || self.side_parent.is_some() {
-                command.arg("--model=default");
-            }
-            json!({"env":{}})
-        };
+        let mut settings = provider_settings(
+            &mut command,
+            config,
+            resume.is_some() || self.side_parent.is_some(),
+        )?;
         if let Some(level) = config.effort {
             settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"] = json!(level.as_str());
         }
@@ -4122,5 +4080,282 @@ mod tests {
                 .unwrap()[0],
             Action::Finished { failed: true, .. }
         ));
+    }
+}
+
+/// Shared Provider injection only; no platform context, session or ordinary-task launch.
+fn provider_settings(
+    command: &mut tokio::process::Command,
+    config: &LaunchConfig,
+    reset_default: bool,
+) -> Result<Value> {
+    let settings = if let Some(provider) = &config.provider {
+        let metadata = &provider.metadata;
+        let model = config.model.as_deref().unwrap_or(&metadata.model);
+        let mut env = json!({
+            "ANTHROPIC_BASE_URL": metadata.base_url,
+            "ANTHROPIC_MODEL": model,
+            "ANTHROPIC_DEFAULT_MODEL": model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+            "ANTHROPIC_DEFAULT_FABLE_MODEL": model,
+            "ANTHROPIC_SMALL_FAST_MODEL": model,
+            "CLAUDE_CODE_SUBAGENT_MODEL": model,
+            "ANTHROPIC_AUTH_TOKEN": "",
+            "ANTHROPIC_API_KEY": "",
+            "CLAUDE_CODE_OAUTH_TOKEN": "",
+            "ANTHROPIC_CUSTOM_HEADERS": "",
+            "CLAUDE_CODE_USE_BEDROCK": "",
+            "CLAUDE_CODE_USE_VERTEX": "",
+            "CLAUDE_CODE_USE_FOUNDRY": ""
+        });
+        if metadata.protocol != latte_work_protocol::ProviderProtocol::AnthropicMessages {
+            bail!("Claude Code 只支持 Anthropic Messages Provider");
+        }
+        let base = model.strip_suffix("[1m]").unwrap_or(model);
+        if metadata.models_1m.iter().any(|id| id == base) {
+            let extended = base != model;
+            // Native 1M models also need an explicit hold for the 200K mode.
+            // Override both inherited env and settings for this child only.
+            env["CLAUDE_CODE_DISABLE_1M_CONTEXT"] = json!(if extended { "0" } else { "1" });
+            env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] =
+                json!(if extended { "1000000" } else { "200000" });
+        }
+        let (key, credential) = match metadata.auth {
+            latte_work_protocol::ProviderAuth::Bearer => {
+                ("ANTHROPIC_AUTH_TOKEN", provider.credential.as_str())
+            }
+            latte_work_protocol::ProviderAuth::ApiKey => {
+                ("ANTHROPIC_API_KEY", provider.credential.as_str())
+            }
+            // Claude requires a nonempty credential even for unauthenticated gateways.
+            latte_work_protocol::ProviderAuth::None => {
+                ("ANTHROPIC_AUTH_TOKEN", "latte-work-no-auth")
+            }
+        };
+        env[key] = json!(credential);
+        for (key, value) in env.as_object().expect("env object") {
+            command.env(key, value.as_str().expect("env string"));
+        }
+        command.arg(format!("--model={model}"));
+        json!({"env":env,"model":model,"apiKeyHelper":""})
+    } else {
+        if let Some(model) = &config.model {
+            command.arg(format!("--model={model}"));
+        } else if reset_default {
+            command.arg("--model=default");
+        }
+        json!({"env":{}})
+    };
+    Ok(settings)
+}
+
+const PREDICTION_FLAGS: &[&str] = &[
+    "--safe-mode",
+    "--tools",
+    "--strict-mcp-config",
+    "--mcp-config",
+    "--disable-slash-commands",
+    "--no-session-persistence",
+    "--no-chrome",
+    "--system-prompt",
+    "--setting-sources",
+    "--permission-prompts",
+    "--prompt-suggestions",
+];
+fn prediction_help_supported(help: &str) -> bool {
+    let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    PREDICTION_FLAGS.iter().all(|flag| help.contains(flag))
+        && help.contains("disable all")
+        && help.contains("not be saved")
+}
+fn prediction_command(binary: &str, cwd: &str, config: &LaunchConfig) -> Result<AgentCommand> {
+    if config.provider.is_none() || config.model.is_none() {
+        bail!("建议缺少已确认的 Provider/model 快照");
+    }
+    let mut command = crate::agent_environment::command(binary);
+    command
+        .envs(&config.environment.0)
+        .env_remove("CLAUDECODE")
+        .current_dir(cwd);
+    command.args([
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--safe-mode",
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--mcp-config",
+        "{\"mcpServers\":{}}",
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--no-chrome",
+        "--setting-sources",
+        "",
+        "--permission-prompts",
+        "none",
+        "--prompt-suggestions",
+        "false",
+        "--system-prompt",
+        crate::predictions::INSTRUCTIONS,
+    ]);
+    let mut settings = provider_settings(&mut command, config, false)?;
+    settings["disableAllHooks"] = json!(true);
+    settings["enabledPlugins"] = json!({});
+    if let Some(effort) = config.effort {
+        command.arg(format!("--effort={}", effort.as_str()));
+        command.env("CLAUDE_CODE_EFFORT_LEVEL", effort.as_str());
+        settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"] = json!(effort.as_str());
+    }
+    let mut file = tempfile::Builder::new()
+        .prefix("claude-prediction-")
+        .suffix(".json")
+        .tempfile_in(&config.settings_dir)?;
+    file.write_all(&serde_json::to_vec(&settings)?)?;
+    file.flush()?;
+    command.arg("--settings").arg(file.path());
+    Ok(AgentCommand {
+        command,
+        _settings: Some(file),
+        sideband: None,
+    })
+}
+fn prediction_result(message: &Value) -> Result<Option<Value>> {
+    if message["type"] == "control_request" {
+        bail!("建议请求产生意外交互");
+    }
+    if message["type"] == "system"
+        && message["subtype"] == "init"
+        && message["tools"]
+            .as_array()
+            .is_none_or(|tools| !tools.is_empty())
+    {
+        bail!("建议请求未使用空工具集");
+    }
+    if message["type"] == "assistant"
+        && message["message"]["content"]
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_use"))
+    {
+        bail!("建议请求产生意外工具");
+    }
+    if message["type"] != "result" {
+        return Ok(None);
+    }
+    if message["is_error"] == true || message["subtype"] != "success" {
+        bail!("建议请求未成功完成");
+    }
+    let text = message["result"]
+        .as_str()
+        .filter(|text| text.len() <= 8192)
+        .context("建议回复无效")?;
+    Ok(Some(serde_json::from_str(text)?))
+}
+pub(crate) async fn predict(
+    binary: &str,
+    _cwd: &str,
+    config: &LaunchConfig,
+    description: &str,
+) -> Result<Option<String>> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::codec::{FramedRead, LinesCodec};
+    let _permit = super::codex_title::acquire_job()?;
+    let (success, help, _) = permission_output(binary, &["--help"]).await?;
+    if !success || !prediction_help_supported(&help) {
+        return Err(crate::predictions::Unsupported.into());
+    }
+    // No project files, instructions or attachment paths are available to this request.
+    let workspace = tempfile::Builder::new()
+        .prefix("prediction-workspace-")
+        .tempdir_in(&config.settings_dir)?;
+    let mut prepared = prediction_command(
+        binary,
+        workspace.path().to_str().context("建议工作目录无效")?,
+        config,
+    )?;
+    let child = prepared
+        .command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .process_group(0)
+        .spawn()?;
+    let pid = child.id().context("建议进程无 PID")? as i32;
+    let mut group = crate::runtime::Group { child, pid };
+    let mut input = group.child.stdin.take().context("建议 stdin 缺失")?;
+    let mut output = FramedRead::new(
+        group.child.stdout.take().context("建议 stdout 缺失")?,
+        LinesCodec::new_with_max_length(256 * 1024),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        input.write_all(description.as_bytes()).await?;
+        input.shutdown().await?;
+        drop(input);
+        let mut bytes = 0usize;
+        for _ in 0..4096 {
+            let line = output.next().await.context("建议进程提前退出")??;
+            bytes += line.len();
+            if bytes > 1024 * 1024 {
+                bail!("建议响应超出限制");
+            }
+            let message: Value = serde_json::from_str(&line)?;
+            if let Some(result) = prediction_result(&message)? {
+                return crate::predictions::validate(result);
+            }
+        }
+        bail!("建议响应消息超出限制")
+    })
+    .await
+    .context("建议生成超时")
+    .and_then(|result| result);
+    let _ = nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    let _ = group.child.wait().await;
+    result
+}
+
+#[cfg(test)]
+mod prediction_tests {
+    use super::*;
+    #[test]
+    fn prediction_help_checks_real_wrapped_semantics_not_flag_presence_alone() {
+        let help = format!(
+            "{}\nUse \"\" to disable all\n tools. Sessions will not be\n saved to disk",
+            PREDICTION_FLAGS.join(" ")
+        );
+        assert!(prediction_help_supported(&help));
+        assert!(!prediction_help_supported(
+            "--tools --no-session-persistence"
+        ));
+    }
+    #[test]
+    fn prediction_rejects_nonempty_tools_interactions_and_unconfirmed_results() {
+        for value in [
+            json!({"type":"system","subtype":"init","tools":["Read"]}),
+            json!({"type":"control_request"}),
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}),
+            json!({"type":"result","subtype":"error","result":"{}"}),
+        ] {
+            assert!(prediction_result(&value).is_err());
+        }
+        assert!(
+            prediction_result(&json!({"type":"system","subtype":"init","tools":[]}))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            prediction_result(
+                &json!({"type":"result","subtype":"success","result":"{\"suggestion\":null}"})
+            )
+            .unwrap(),
+            Some(json!({"suggestion":null}))
+        );
     }
 }

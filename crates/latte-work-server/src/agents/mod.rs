@@ -1,7 +1,7 @@
 //! Protocol adapters translate native agent messages; they do not own storage or UI.
 mod adapter;
 mod app_server;
-mod claude;
+pub(crate) mod claude;
 mod claude_models;
 mod claude_sessions;
 pub(crate) mod claude_skills;

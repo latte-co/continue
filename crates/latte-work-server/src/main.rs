@@ -6,6 +6,7 @@ mod files;
 mod git_review;
 mod image_preview;
 mod message_queue;
+mod predictions;
 mod providers;
 mod questions;
 mod redaction;
@@ -327,6 +328,7 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
                                 .iter()
                                 .map(|(_, agent)| agent.clone())
                                 .collect(),
+                            composer_predictions: true,
                             permission_settings: true,
                             custom_agent_environment: true,
                             history_window: true,
@@ -512,6 +514,15 @@ async fn dispatch_admitted(
 ) -> Result<Response> {
     let mut response = match request {
         Request::Hello { .. } => unreachable!(),
+        Request::ComposerPrediction { session_id } => {
+            let (session, is_side) = db(&s.database, |store| {
+                Ok((
+                    store.session(&session_id)?,
+                    store.side_parent(&session_id)?.is_some(),
+                ))
+            })?;
+            predictions::query(&session, is_side)?
+        }
         Request::Providers => s
             .providers
             .lock()
