@@ -435,6 +435,178 @@ async fn cursor_review_edited_queue_keeps_original_admission_reconciliation() {
     assert_eq!(inputs(root.path()).len(), 2);
 }
 
+#[tokio::test]
+async fn cursor_review_invalid_queue_edits_leave_revision_payload_and_fifo_unchanged() {
+    let host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let id = session(&mut client, root.path()).await;
+    assert!(matches!(
+        send(&mut client, &id, "edit-head", "hold").await,
+        Response::Accepted { duplicate: false }
+    ));
+    file(&root.path().join("cursor-active")).await;
+    assert!(matches!(
+        send(&mut client, &id, "edit-entry", "original").await,
+        Response::MessageQueued { duplicate: false }
+    ));
+    assert!(matches!(
+        send(&mut client, &id, "edit-tail", "tail").await,
+        Response::MessageQueued { duplicate: false }
+    ));
+    for text in [
+        "x".repeat(128 * 1024),
+        "é".repeat(64 * 1024),
+        "before\0after".into(),
+    ] {
+        assert!(
+            matches!(
+                ask(
+                    &mut client,
+                    Request::EditQueuedMessage {
+                        session_id: id.clone(),
+                        request_id: "edit-entry".into(),
+                        revision: 0,
+                        text,
+                    }
+                )
+                .await,
+                Response::Error { .. }
+            ),
+            "invalid Cursor edit must reject before saving"
+        );
+        let Response::MessageQueue {
+            entries,
+            paused: false,
+            ..
+        } = ask(
+            &mut client,
+            Request::MessageQueue {
+                session_id: id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("queue paused")
+        };
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.text.as_str(), e.revision))
+                .collect::<Vec<_>>(),
+            [("original", 0), ("tail", 0)]
+        );
+        assert_eq!(inputs(root.path()).len(), 1);
+    }
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::EditQueuedMessage {
+                session_id: id.clone(),
+                request_id: "edit-entry".into(),
+                revision: 0,
+                text: "x".repeat(128 * 1024 - 1),
+            }
+        )
+        .await,
+        Response::MessageQueue { .. }
+    ));
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::EditQueuedMessage {
+                session_id: id.clone(),
+                request_id: "edit-entry".into(),
+                revision: 1,
+                text: "edited".into(),
+            }
+        )
+        .await,
+        Response::MessageQueue { .. }
+    ));
+    std::fs::write(root.path().join("cursor-release"), "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while inputs(root.path()).len() != 3
+        || current(&mut client, &id).await.status != Status::Completed
+    {
+        assert!(Instant::now() < deadline, "valid FIFO remains dispatchable");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        inputs(root.path())
+            .iter()
+            .map(|r| r["prompt"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["hold", "edited", "tail"]
+    );
+}
+
+fn quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+}
+
+#[tokio::test]
+async fn cursor_review_configured_path_cannot_replace_the_discovered_executable() {
+    let original = tempfile::tempdir().unwrap();
+    let shadow = tempfile::tempdir().unwrap();
+    let agent = original.path().join("agent");
+    install_cursor(&agent);
+    let marker = shadow.path().join("shadow-calls");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cursor.py");
+    let shadow_agent = shadow.path().join("agent");
+    std::fs::write(
+        &shadow_agent,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexec /usr/bin/python3 {} \"$@\"\n",
+            quote_path(&marker),
+            quote_path(&source)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shadow_agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let host = discovery_host(&agent, false, false).await;
+    let mut client = host.client().await;
+    assert!(cursor_available(&mut client).await);
+    assert!(!marker.exists());
+    let root = tempfile::tempdir().unwrap();
+    let id = session(&mut client, root.path()).await;
+    let path = format!("{}:/usr/bin:/bin", shadow.path().display());
+    let environment = latte_work_protocol::AgentEnvironment(std::collections::BTreeMap::from([(
+        "PATH".into(),
+        path.clone(),
+    )]));
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::SendQueued {
+                session_id: id.clone(),
+                request_id: "pinned-executable".into(),
+                text: "private fixture prompt".into(),
+                model: Some("cursor-test".into()),
+                effort: None,
+                permission_mode: None,
+                provider: Some(TurnProvider::Configured {
+                    provider: None,
+                    environment
+                }),
+            }
+        )
+        .await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &id, Status::Completed).await;
+    assert!(
+        !marker.exists(),
+        "unverified same-name agent received metadata or prompt"
+    );
+    let record = &inputs(root.path())[0];
+    assert_eq!(record["binary"], agent.to_str().unwrap());
+    assert_eq!(
+        record["path"], path,
+        "configured PATH remains available to CLI dependencies"
+    );
+}
+
 async fn restart(host: &mut Host, environment: &[(&str, &OsStr)]) {
     host.process.kill().unwrap();
     host.process.wait().unwrap();

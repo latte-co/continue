@@ -1,5 +1,6 @@
 //! Cursor's print NDJSON transport. The Host owns per-turn spawn, drain and reap.
 mod decoder;
+mod executable;
 mod metadata;
 #[cfg(test)]
 mod tests;

@@ -25,7 +25,7 @@ Cursor JSON 保留在独立 adapter；Runtime 只消费通用 action，并拥有
 
 官方 generic `tool_call.function` 的 `name` 与字符串 `arguments` 可投影，opaque arguments 不强制当作 JSON。官方未公布其 completed result 的可靠结构，因此完成记录严格配对后只发未确认 Notice，不产生虚假的成功 ToolResult；主轮仍要求已确认的 native 终结结果。已知 `*ToolCall` 的 success/error payload 必须为结构化对象。未知字段可扩展，关键字段非法不能推断成功。
 
-元数据探测使用 Host shell snapshot、受限输出、超时和 owned process group 清理，ENV 按 OsString 合并后才转换为诊断文本，非 UTF-8 值不应使 Server panic。自动发现按安装路径/PATH 的 cursor-agent、agent 顺序核验 version/help 所需协议能力；显式 LATTE_WORK_CURSOR 失败不回退。模型 ID与 label 仅来自实际 CLI，不能从名称猜 effort/context。目录查询与历史 Open 容忍已下架的保存 ID，不自动改模型；实际发送仍严格校验当前目录。stderr 持续 drain、有界保留，按实际 child ENV 的继承/覆盖/移除与 Provider 凭据上下文脱敏；超限诊断省略原始内容。应用注入的凭据通过环境传递，不放入启动 argv；不宣称任意原生凭据来源或所有 stdout 都得到全面脱敏。prompt不经 shell，CLI参数独立传入。
+元数据探测使用 Host shell snapshot、受限输出、超时和 owned process group 清理，ENV 按 OsString 合并后才转换为诊断文本，非 UTF-8 值不应使 Server panic。自动发现按安装路径/PATH 的 cursor-agent、agent 顺序核验 version/help 所需协议能力，只有首选失败才探测后续候选。候选按发现时的 Host PATH/cwd 一次解析成绝对路径，使用该路径核验、读取元数据和发送轮次；会话 PATH 仍传给 CLI 依赖，但不能重新选择另一个同名 CLI。显式 LATTE_WORK_CURSOR 失败不回退。绝对路径绑定不等于文件内容不可替换或脚本依赖已验证。模型 ID与 label 仅来自实际 CLI，不能从名称猜 effort/context。目录查询与历史 Open 容忍已下架的保存 ID，不自动改模型；实际发送仍严格校验当前目录。stderr 持续 drain、有界保留，按实际 child ENV 的继承/覆盖/移除与 Provider 凭据上下文脱敏；超限诊断省略原始内容。应用注入的凭据通过环境传递，不放入启动 argv；不宣称任意原生凭据来源或所有 stdout 都得到全面脱敏。prompt不经 shell，CLI参数独立传入。
 
 参考接口：
 - [Cursor output format](https://cursor.com/docs/cli/reference/output-format)

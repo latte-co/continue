@@ -2439,7 +2439,13 @@ async fn actor(
                         match action {
                             QueueAction::Dispatch {..} => unreachable!(),
                             QueueAction::Take {request_id,revision} => { let result=d.take_queued(&session.id,&request_id,revision)?; queued_configs.remove(&request_id); return Ok(result); },
-                            QueueAction::Edit {request_id,revision,text} => {d.edit_queued(&session.id,&request_id,revision,text.as_deref())?;if text.is_none(){queued_configs.remove(&request_id);}},
+                            QueueAction::Edit {request_id,revision,text} => {
+                                if session.agent == "cursor" && let Some(text) = text.as_deref() {
+                                    agents::cursor::validate_prompt(text)?;
+                                }
+                                d.edit_queued(&session.id,&request_id,revision,text.as_deref())?;
+                                if text.is_none(){queued_configs.remove(&request_id);}
+                            },
                             QueueAction::Reorder {expected,order} => d.reorder_queue(&session.id,&expected,&order)?,
                             QueueAction::Clear => {d.clear_queue(&session.id)?;queued_configs.clear();},
                             QueueAction::Resume {configs} => {

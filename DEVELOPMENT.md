@@ -183,8 +183,12 @@ remain conservative. Cursor validates its single prompt argument before new admi
 (less than 128 KiB of UTF-8 bytes, no NUL), without reducing other Agents' limits.
 The frontend separates Host preparation from a live native session. Model catalog
 reads and historical Open tolerate a removed selection; actual Send still validates
-current membership. Cursor discovery probes bounded candidates concurrently and
-waits for all owned groups to retire before choosing by priority.
+current membership. Cursor resolves discovery candidates against the Host PATH/cwd
+once, verifies and retains the absolute executable path, and uses that same path for
+metadata and turns even when a session overrides PATH. Candidates are probed by
+priority with a shared read budget; a compatible cursor-agent prevents probing agent.
+Each failed probe retires its owned group before a fallback is attempted. Queue edits
+reuse Cursor input validation before saving; execution keeps its guard for old rows.
 
 Focused checks: `cargo test -p latte-work-server --test e2e cursor_ --locked -- --test-threads=1`
 and `cargo test -p latte-work-server --bin latte-work-server cursor --locked`.

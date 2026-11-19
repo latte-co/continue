@@ -86,7 +86,7 @@ def record_input(prompt: str, options: list[str], resume: str | None) -> pathlib
     record = {
         "pid": os.getpid(), "prompt": prompt, "resume": resume,
         "options": options, "env": os.environ.get("CURSOR_FIXTURE_SECRET"),
-        "binary": sys.argv[0],
+        "binary": sys.argv[0], "path": os.environ.get("PATH"),
     }
     with pathlib.Path("cursor-inputs").open("a") as log:
         log.write(json.dumps(record) + "\n")
