@@ -14,7 +14,10 @@ import { useStatusIssues } from "./statusNotices";
 
 export interface ModelPickerHandle {
   /** Null means opened; an error preserves the command draft. */
-  openMenu: (target: "model" | "effort") => string | null;
+  openMenu: (
+    target: "model" | "effort",
+    isCurrent?: () => boolean,
+  ) => string | null | Promise<string | null>;
 }
 
 type Catalog = Extract<Response, { kind: "models" }>;
@@ -64,6 +67,21 @@ export function ModelPicker({
   const [error, setError] = useState("");
   const [retry, setRetry] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [settledRetry, setSettledRetry] = useState(-1);
+  const effortCommand = useRef<{
+    scope: string;
+    model: string | null;
+    retry: number;
+    isCurrent?: () => boolean;
+    resolve: (error: string | null) => void;
+  } | null>(null);
+  useEffect(
+    () => () => {
+      effortCommand.current?.resolve("思考强度菜单已关闭，请重试。");
+      effortCommand.current = null;
+    },
+    [],
+  );
   useStatusIssues([
     {
       id: `models:${hostId}:${projectId}:${agent}`,
@@ -92,7 +110,10 @@ export function ModelPicker({
         if (!disposed) setError(message(e) || "无法加载模型列表");
       })
       .finally(() => {
-        if (!disposed) setLoading(false);
+        if (!disposed) {
+          setSettledRetry(retry);
+          setLoading(false);
+        }
       });
     return () => {
       disposed = true;
@@ -140,19 +161,73 @@ export function ModelPicker({
   useImperativeHandle(
     ref,
     () => ({
-      openMenu(target) {
+      openMenu(target, isCurrent) {
         if (disabled) return "当前无法调整模型或思考强度，请在任务结束后选择。";
         if (!connected) return "主机未连接，请连接后选择模型或思考强度。";
         if (settingsOpen) return "模型设置尚未就绪，请稍后重试。";
-        if (target === "effort" && !effortLevels?.length && !canResetEffort)
-          return catalog
-            ? "当前 Agent 或模型不支持调整思考强度。"
-            : "模型设置尚未就绪，请稍后重试。";
-        return selector.current?.openMenu(target) ? null : "无法打开模型设置。";
+        if (target === "model")
+          return selector.current?.openMenu("model")
+            ? null
+            : "无法打开模型设置。";
+        if (effortCommand.current) return "正在刷新思考强度，请稍候。";
+        return new Promise<string | null>((resolve) => {
+          effortCommand.current = {
+            scope,
+            model: value,
+            retry: retry + 1,
+            isCurrent,
+            resolve,
+          };
+          setLoading(true);
+          setRetry((v) => v + 1);
+        });
       },
     }),
-    [disabled, connected, settingsOpen, catalog, effortLevels, canResetEffort],
+    [disabled, connected, settingsOpen, scope, value, retry],
   );
+  useEffect(() => {
+    const pending = effortCommand.current;
+    if (!pending) return;
+    let outcome: string | null;
+    if (
+      pending.isCurrent?.() === false ||
+      pending.scope !== scope ||
+      pending.model !== value ||
+      disabled ||
+      !connected ||
+      settingsOpen
+    ) {
+      outcome = "模型设置已变化，请重新打开思考强度菜单。";
+    } else if (
+      loading ||
+      settledRetry < pending.retry ||
+      (providerFallback !== undefined && providerFallback !== value)
+    ) {
+      return;
+    } else if (!effortLevels?.length && !canResetEffort) {
+      outcome = error
+        ? "思考强度刷新失败，请重新打开后重试。"
+        : "当前 Agent 或模型不支持调整思考强度。";
+    } else {
+      outcome = selector.current?.openMenu("effort", false)
+        ? null
+        : "无法打开思考强度菜单。";
+    }
+    effortCommand.current = null;
+    pending.resolve(outcome);
+  }, [
+    scope,
+    value,
+    disabled,
+    connected,
+    settingsOpen,
+    loading,
+    settledRetry,
+    providerFallback,
+    effortLevels,
+    canResetEffort,
+    error,
+  ]);
   const options = modelOptions(
     catalog?.models ?? [],
     catalog?.model_labels,

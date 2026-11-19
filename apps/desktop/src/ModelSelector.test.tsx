@@ -386,9 +386,15 @@ it("refreshes the catalog in the open menu and can recover from a failed refresh
   fireEvent.click(latest);
   expect(onChange).toHaveBeenCalledWith("gpt-new");
 
-  act(() => expect(ref.current?.openMenu("effort")).toBeNull());
+  let opening: ReturnType<ModelPickerHandle["openMenu"]> | undefined;
+  act(() => {
+    opening = ref.current?.openMenu("effort");
+  });
   expect(request).toHaveBeenCalledTimes(4);
+  expect(screen.queryByRole("menu", { name: "Reasoning effort" })).toBeNull();
   await act(async () => responses[3].resolve(catalog("gpt-new")));
+  await expect(opening).resolves.toBeNull();
+  expect(request).toHaveBeenCalledTimes(4);
   const effortMenu = screen.getByRole("menu", { name: "Reasoning effort" });
   expect(document.activeElement).toBe(
     within(effortMenu).getByRole("menuitemradio", { name: "跟随 Agent" }),

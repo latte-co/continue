@@ -667,8 +667,8 @@ export function SideChat({
           value={draft.text}
           onChange={(text) => drafts.update(key, { text })}
           onSubmit={submit}
-          onOpenModelSettings={(target) =>
-            picker.current?.openMenu(target) ?? null
+          onOpenModelSettings={(target, isCurrent) =>
+            picker.current?.openMenu(target, isCurrent) ?? null
           }
           placeholder="在侧边聊天中提问…"
           toolbar={(send, hasContent, navigation) => (

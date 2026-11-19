@@ -350,6 +350,7 @@ async fn side_chat_forks_and_resumes_after_switching_providers() {
     for legacy in [false, true] {
         let mut host = Host::start().await;
         let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("check-side-provider-resume"), "").unwrap();
         let mut client = host.client().await;
         let project = terminal_project(&mut client, root.path()).await;
         let parent = create_session(&mut client, project, "codex").await;
@@ -421,6 +422,14 @@ async fn side_chat_forks_and_resumes_after_switching_providers() {
                 [],
             )
             .unwrap();
+            assert_eq!(
+                db.execute(
+                    "DELETE FROM native_session_contexts WHERE session_id=?1",
+                    [&parent.id],
+                )
+                .unwrap(),
+                1
+            );
             drop(db);
             host.process = Host::spawn(host.directory.path(), &[]);
             host.wait_ready().await;
@@ -444,6 +453,25 @@ async fn side_chat_forks_and_resumes_after_switching_providers() {
                 EventKind::State { message: Some(message), .. } if message.contains("请用原 Provider 和 Agent 环境续接一次")
             )));
             let confirmation = open_side(&mut client, &parent).await;
+            assert!(matches!(
+                ask(
+                    &mut client,
+                    turn(
+                        &confirmation,
+                        "cleared-parent-environment",
+                        "old",
+                        &AgentEnvironment::default()
+                    ),
+                )
+                .await,
+                Response::Accepted { duplicate: false }
+            ));
+            let rejected = wait(&mut client, &confirmation.id, Status::Failed).await;
+            assert!(rejected.iter().any(|event| matches!(&event.event,
+                EventKind::State { message: Some(message), .. } if message.contains("请用原 Provider 和 Agent 环境续接一次")
+            )));
+            // The historical parent can establish its environment from the
+            // matching ledger without sending a new message in the main chat.
             for (side, request) in [
                 (&existing, "confirm-child"),
                 (&confirmation, "confirm-parent"),
@@ -475,11 +503,6 @@ async fn side_chat_forks_and_resumes_after_switching_providers() {
                 .is_some_and(|id| id != existing_native_id)
         );
 
-        std::fs::write(
-            root.path().join("side-provider-fork-source"),
-            &existing_native_id,
-        )
-        .unwrap();
         assert!(matches!(
             ask(
                 &mut client,
@@ -494,21 +517,58 @@ async fn side_chat_forks_and_resumes_after_switching_providers() {
         assert_ne!(resumed_native_id, existing_native_id);
         assert_eq!(resumed.title, "Provider [redacted] / [redacted]");
 
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::CloseAgentSession {
+                    session_id: existing.id.clone(),
+                    only_if_idle: Some(true),
+                }
+            )
+            .await,
+            Response::Ok
+        ));
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::OpenSideChat {
+                    session_id: parent.id.clone(),
+                    side_id: Some(existing.id.clone()),
+                }
+            )
+            .await,
+            Response::Session { session } if session.native_id.as_deref() == Some(&resumed_native_id)
+        ));
+        assert!(matches!(
+            ask(
+                &mut client,
+                turn(&existing, "cold-resume-same-provider", "new", &environment)
+            )
+            .await,
+            Response::Accepted { duplicate: false }
+        ));
+        wait(&mut client, &existing.id, Status::Completed).await;
+        let reopened = wait_for_agent_idle(&mut client, &existing.id, Status::Completed).await;
+        assert_eq!(
+            reopened.native_id.as_deref(),
+            Some(resumed_native_id.as_str())
+        );
+
         let inputs = std::fs::read_to_string(root.path().join("codex-inputs")).unwrap();
         let inputs: Vec<Value> = inputs
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(inputs.len(), if legacy { 6 } else { 4 });
-        assert!(
-            !inputs
-                .iter()
-                .any(|input| input["prompt"] == "cleared-environment")
-        );
-        for (input, prompt) in inputs[inputs.len() - 2..]
-            .iter()
-            .zip(["fork-after-change", "resume-after-change"])
-        {
+        assert_eq!(inputs.len(), if legacy { 7 } else { 5 });
+        assert!(!inputs.iter().any(|input| matches!(
+            input["prompt"].as_str(),
+            Some("cleared-environment" | "cleared-parent-environment")
+        )));
+        for (input, prompt) in inputs[inputs.len() - 3..].iter().zip([
+            "fork-after-change",
+            "resume-after-change",
+            "cold-resume-same-provider",
+        ]) {
             assert_eq!(input["prompt"], prompt);
             assert_eq!(input["params"]["model"], "custom-codex");
         }

@@ -1088,7 +1088,17 @@ impl AgentAdapter for AppServer {
         if resolved.model.is_none() {
             resolved.model = resolved.provider.as_ref().map(|p| p.metadata.model.clone());
         }
-        self.model_provider = resolved.provider.as_ref().map(|_| provider::id());
+        self.model_provider = resolved
+            .provider
+            .as_ref()
+            .map(|provider| {
+                if self.codex && self.side_parent.is_some() {
+                    super::codex::side_provider_id(&provider.metadata)
+                } else {
+                    Ok(provider::id())
+                }
+            })
+            .transpose()?;
         self.config = Some(resolved);
         let mut command = crate::agent_environment::command(binary);
         command.envs(&config.environment.0);

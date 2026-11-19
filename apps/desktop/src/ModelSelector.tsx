@@ -18,7 +18,7 @@ import type { Effort } from "./protocol";
 import type { SelectOption } from "./Select";
 
 export interface ModelSelectorHandle {
-  openMenu: (target: "model" | "effort") => boolean;
+  openMenu: (target: "model" | "effort", refresh?: boolean) => boolean;
 }
 
 export type ModelOption = SelectOption & {
@@ -170,9 +170,9 @@ export function ModelSelector({
       : "跟随 Agent";
   const visibleOptions = status ? [] : options;
   const statusMessage = status ?? notice;
-  function openMenu(target: "model" | "effort" = "model") {
+  function openMenu(target: "model" | "effort" = "model", refresh = true) {
     if (disabled || (target === "effort" && !canChooseEffort)) return false;
-    if (!open) onOpen?.();
+    if (!open && refresh) onOpen?.();
     setOpen(true);
     showSubmenu(target === "effort" ? "effort" : null, target === "effort");
     return true;

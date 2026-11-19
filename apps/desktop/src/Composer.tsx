@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { chooseReferencePath, message, request } from "./api";
 import type { AgentSlashCommand, FileEntry } from "./protocol";
+import type { ModelPickerHandle } from "./ModelPicker";
 import {
   commandTitle,
   composerTrigger,
@@ -84,7 +85,7 @@ interface Props {
   onSubmit: (prompt: string) => Promise<boolean>;
   onOpenSideChat?: (draft?: string) => boolean | Promise<boolean>;
   onOpenSubagents?: () => void;
-  onOpenModelSettings?: (target: "model" | "effort") => string | null;
+  onOpenModelSettings?: ModelPickerHandle["openMenu"];
   toolbar: (
     submit: () => void,
     hasContent: boolean,
@@ -916,9 +917,24 @@ export function Composer(props: Props) {
       }
       props.onOpenSubagents();
     } else {
-      const error =
-        props.onOpenModelSettings?.(action) ??
-        (props.onOpenModelSettings ? null : "无法打开模型设置");
+      const owner = currentContext.current;
+      const isCurrent = () =>
+        currentContext.current === owner && latestValue.current === value;
+      const result = props.onOpenModelSettings
+        ? props.onOpenModelSettings(action, isCurrent)
+        : "无法打开模型设置";
+      let error: string | null;
+      if (result instanceof Promise) {
+        submitting.current = true;
+        try {
+          error = await result;
+        } finally {
+          submitting.current = false;
+        }
+        if (!isCurrent()) return;
+      } else {
+        error = result;
+      }
       if (error) {
         setNotice(error);
         return;

@@ -99,21 +99,26 @@ for line in sys.stdin:
         }[params['sandbox']]
         assert params['approvalPolicy'] == approval
         assert 'inherited messages' in params['developerInstructions']
-        provider_fork = pathlib.Path('side-provider-fork-source')
-        replacing_side = provider_fork.exists()
-        if replacing_side and method == 'thread/resume':
-            assert params['threadId'] == provider_fork.read_text()
-            emit({'id': value['id'], 'error': {'code': -32600, 'data': {'type': 'modelProviderNotConfigured'}}})
-            continue
+        check_provider = pathlib.Path('check-side-provider-resume').exists()
+        source = params['threadId']
+        provider = params.get('modelProvider')
+        from_side = source.startswith('side-thread-')
+        if check_provider and from_side:
+            saved_provider = json.loads(pathlib.Path(f'{source}.fixture-provider').read_text())
+            if method == 'thread/resume' and saved_provider != provider:
+                emit({'id': value['id'], 'error': {'code': -32600, 'data': {'type': 'modelProviderNotConfigured'}}})
+                continue
         parent_thread = thread
+        replacing_side = check_provider and from_side and method == 'thread/fork'
         if method == 'thread/fork':
             if replacing_side:
-                parent_thread = provider_fork.read_text()
-                provider_fork.unlink()
-            assert params['threadId'] == parent_thread and params['excludeTurns']
+                parent_thread = source
+            assert source == parent_thread and params['excludeTurns']
             if pathlib.Path('fail-side-initialization').exists():
                 sys.exit(0)
-        thread = f'side-thread-{os.getpid()}' if method == 'thread/fork' else params['threadId']
+        thread = f'side-thread-{os.getpid()}' if method == 'thread/fork' else source
+        if check_provider and method == 'thread/fork':
+            pathlib.Path(f'{thread}.fixture-provider').write_text(json.dumps(provider))
         if method == 'thread/resume' and pathlib.Path('hold-side-resume').exists():
             pathlib.Path('side-resume-entered').touch()
             deadline = time.monotonic() + 10

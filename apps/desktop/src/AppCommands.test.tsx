@@ -95,7 +95,6 @@ it.each(["model", "effort"] as const)(
     );
     mocks.request.mockClear();
     command(`/${target}`);
-    expect(input().value).toBe("");
     const option = await screen.findByRole("menuitemradio", {
       name: target === "model" ? "haiku" : "low",
     });
@@ -103,6 +102,7 @@ it.each(["model", "effort"] as const)(
       name: target === "model" ? "Model" : "Reasoning effort",
     });
     expect(menu.contains(document.activeElement)).toBe(true);
+    expect(input().value).toBe("");
     expect(mocks.request).toHaveBeenCalledWith(
       "remote",
       expect.objectContaining({ method: "models", model: "opus" }),
@@ -178,26 +178,76 @@ it("keeps /model from becoming stop during a running turn", async () => {
   expect(p.send).not.toHaveBeenCalled();
   expect(p.cancel).not.toHaveBeenCalled();
 });
-it("preserves /effort when the selected model has no effort capability", async () => {
-  mocks.request.mockResolvedValue({
+it.each([true, false])(
+  "/effort uses the refreshed levels when the selected model's capability changes (previously supported: %s)",
+  async (previouslySupported) => {
+    const catalog = {
+      kind: "models",
+      models: ["opus"],
+      provider: null,
+      default_model: null,
+      model_labels: {},
+    };
+    mocks.request.mockResolvedValueOnce({
+      ...catalog,
+      effort_levels: previouslySupported ? ["high"] : [],
+    });
+    let finishRefresh!: (result: unknown) => void;
+    mocks.request.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRefresh = resolve;
+        }),
+    );
+    const p = setup();
+    await act(async () => {});
+    command("/effort");
+    expect(mocks.request).toHaveBeenCalledTimes(2);
+    expect(input().value).toBe("/effort ");
+    expect(screen.queryByRole("menu", { name: "Reasoning effort" })).toBeNull();
+    await act(async () =>
+      finishRefresh({
+        ...catalog,
+        effort_levels: previouslySupported ? [] : ["low"],
+      }),
+    );
+    if (previouslySupported) {
+      expect(screen.getByText(/不支持调整思考强度/)).toBeTruthy();
+      expect(input().value).toBe("/effort ");
+      expect(screen.queryByRole("menu")).toBeNull();
+    } else {
+      expect(screen.getByRole("menuitemradio", { name: "low" })).toBeTruthy();
+      expect(screen.queryByRole("menuitemradio", { name: "high" })).toBeNull();
+      expect(input().value).toBe("");
+    }
+    expect(mocks.request).toHaveBeenCalledTimes(2);
+    expect(p.send).not.toHaveBeenCalled();
+  },
+);
+it("does not open /effort after the user edits the pending command", async () => {
+  const catalog = {
     kind: "models",
     models: ["opus"],
     provider: null,
     default_model: null,
-    effort_levels: [],
+    effort_levels: ["high"],
     model_labels: {},
-  });
-  const p = setup();
-  await waitFor(() =>
-    expect(
-      screen
-        .getByRole("button", { name: "Model and reasoning effort" })
-        .hasAttribute("disabled"),
-    ).toBe(false),
+  };
+  mocks.request.mockResolvedValueOnce(catalog);
+  let finishRefresh!: (result: typeof catalog) => void;
+  mocks.request.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finishRefresh = resolve;
+      }),
   );
+  const p = setup();
+  await act(async () => {});
   command("/effort");
-  expect(screen.getByText(/不支持调整思考强度/)).toBeTruthy();
-  expect(input().value).toBe("/effort ");
+  fireEvent.change(input(), { target: { value: "continue" } });
+  await act(async () => finishRefresh(catalog));
+  expect(input().value).toBe("continue");
+  expect(screen.queryByRole("menu")).toBeNull();
   expect(p.send).not.toHaveBeenCalled();
 });
 it("preserves a model command during disconnect without opening a stale menu", () => {

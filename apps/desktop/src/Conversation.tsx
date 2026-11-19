@@ -1130,8 +1130,8 @@ export function Conversation({
           onSubmit={submit}
           onOpenSubagents={openSubagents}
           onOpenSideChat={openSideChat}
-          onOpenModelSettings={(target) =>
-            modelPicker.current?.openMenu(target) ??
+          onOpenModelSettings={(target, isCurrent) =>
+            modelPicker.current?.openMenu(target, isCurrent) ??
             (modelPicker.current ? null : "无法打开模型设置。")
           }
           placeholder={
