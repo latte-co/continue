@@ -51,7 +51,7 @@ const base: Annotation = {
   comment: "建议",
   source: { message: 2, start: 0, end: 2 },
 };
-it("selects, cancels without saving, supports IME, and returns only an explicit saved comment", () => {
+it("selects, allows submitting without a comment, cancels without saving, and supports IME", () => {
   const save = vi.fn().mockReturnValue(null);
   render(
     <AnnotatedMessage
@@ -65,26 +65,48 @@ it("selects, cancels without saving, supports IME, and returns only an explicit 
   );
   select(screen.getByText("原文"));
   fireEvent.click(screen.getByRole("menuitem", { name: "添加注释" }));
-  const input = screen.getByRole("textbox", { name: "用户评论" });
+  const input = screen.getByRole("textbox", { name: "添加可选评论" });
   expect(document.activeElement).toBe(input);
   expect(
-    (screen.getByRole("button", { name: "保存" }) as HTMLButtonElement)
+    (screen.getByRole("button", { name: "提交注释" }) as HTMLButtonElement)
       .disabled,
-  ).toBe(true);
+  ).toBe(false);
   fireEvent.change(input, { target: { value: "  修改这里  " } });
   fireEvent.compositionStart(input);
+  fireEvent.keyDown(input, { key: "Enter" });
   fireEvent.keyDown(input, { key: "Enter", metaKey: true });
   expect(save).not.toHaveBeenCalled();
   fireEvent.compositionEnd(input);
   fireEvent.keyDown(input, { key: "Escape" });
   expect(screen.queryByRole("dialog")).toBeNull();
   expect(save).not.toHaveBeenCalled();
+
+  // Submitting without typing a user comment saves a quote-only annotation.
   select(screen.getByText("原文"));
   fireEvent.click(screen.getByRole("menuitem", { name: "添加注释" }));
-  fireEvent.change(screen.getByRole("textbox", { name: "用户评论" }), {
-    target: { value: "修改这里" },
+  expect(
+    document.querySelector(".annotation-marker-pending")?.textContent,
+  ).toBe("1");
+  fireEvent.click(screen.getByRole("button", { name: "提交注释" }));
+  expect(save).toHaveBeenCalledWith(
+    expect.objectContaining({
+      quote: "原文",
+      comment: "",
+      source: { message: 2, start: 4, end: 6 },
+    }),
+  );
+
+  // Submitting with a comment via Enter trims and saves it; Shift+Enter inserts a newline without submitting.
+  save.mockClear();
+  select(screen.getByText("原文"));
+  fireEvent.click(screen.getByRole("menuitem", { name: "添加注释" }));
+  const nextInput = screen.getByRole("textbox", { name: "添加可选评论" });
+  fireEvent.change(nextInput, {
+    target: { value: "  修改这里  " },
   });
-  fireEvent.click(screen.getByRole("button", { name: "保存" }));
+  fireEvent.keyDown(nextInput, { key: "Enter", shiftKey: true });
+  expect(save).not.toHaveBeenCalled();
+  fireEvent.keyDown(nextInput, { key: "Enter" });
   expect(save).toHaveBeenCalledWith(
     expect.objectContaining({
       quote: "原文",
@@ -93,10 +115,10 @@ it("selects, cancels without saving, supports IME, and returns only an explicit 
     }),
   );
 });
-it("edits, removes and clears draft comments, while history exposes no mutation actions", () => {
+it("edits, removes and clears draft comments, omits empty comment labels, and hides mutation actions in history", () => {
   function Harness() {
     const [entries, setEntries] = useState([
-      base,
+      { ...base, comment: "" },
       { ...base, id: "two", comment: "第二条" },
     ]);
     return (
@@ -113,11 +135,13 @@ it("edits, removes and clears draft comments, while history exposes no mutation 
   }
   const view = render(<Harness />);
   fireEvent.click(screen.getByRole("button", { name: "2 条注释" }));
+  expect(screen.getAllByText("所选文本：")).toHaveLength(2);
+  expect(screen.getAllByText("用户评论：")).toHaveLength(1);
   fireEvent.click(screen.getByRole("button", { name: "编辑注释 2" }));
   fireEvent.change(screen.getByRole("textbox"), {
     target: { value: "新建议" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "保存" }));
+  fireEvent.click(screen.getByRole("button", { name: "提交注释" }));
   fireEvent.click(screen.getByRole("button", { name: "2 条注释" }));
   expect(screen.getByText("新建议")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "删除注释 1" }));
@@ -128,9 +152,17 @@ it("edits, removes and clears draft comments, while history exposes no mutation 
   fireEvent.click(screen.getByRole("button", { name: "移除全部注释" }));
   expect(screen.queryByRole("button", { name: /条注释/ })).toBeNull();
   view.unmount();
-  render(<AnnotationSummary entries={[base]} />);
-  fireEvent.click(screen.getByRole("button", { name: "1 条注释" }));
+  render(
+    <AnnotationSummary
+      entries={[
+        { ...base, comment: "" },
+        { ...base, id: "two", comment: "建议" },
+      ]}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "2 条注释" }));
   expect(screen.getByText("建议")).toBeTruthy();
+  expect(screen.getAllByText("用户评论：")).toHaveLength(1);
   expect(screen.queryByRole("button", { name: /编辑|删除|移除/ })).toBeNull();
 });
 it("dismisses stale selection on scroll and hide, and reuses the side-chat callback", () => {
@@ -166,10 +198,10 @@ it("preserves comments when validation fails and traps Tab inside the editor", (
   fireEvent.click(screen.getByRole("button", { name: "编辑注释 1" }));
   const input = screen.getByRole("textbox");
   fireEvent.change(input, { target: { value: "保留编辑" } });
-  fireEvent.click(screen.getByRole("button", { name: "保存" }));
+  fireEvent.click(screen.getByRole("button", { name: "提交注释" }));
   expect(screen.getByRole("alert").textContent).toBe("内容过长");
   expect((input as HTMLTextAreaElement).value).toBe("保留编辑");
-  act(() => screen.getByRole("button", { name: "保存" }).focus());
+  act(() => screen.getByRole("button", { name: "提交注释" }).focus());
   fireEvent.keyDown(document, { key: "Tab" });
   expect(document.activeElement).toBe(input);
 });
@@ -262,7 +294,7 @@ it("does not navigate a linked caption on selection", () => {
   parent.removeEventListener("click", activation);
 });
 
-it.each(["escape", "cancel", "save"])(
+it.each(["escape", "outside", "save"])(
   "keeps copy, file and keyboard actions usable after %s",
   async (action) => {
     vi.mocked(copyText).mockClear();
@@ -283,15 +315,14 @@ it.each(["escape", "cancel", "save"])(
     if (action === "escape") fireEvent.keyDown(document, { key: "Escape" });
     else {
       fireEvent.click(screen.getByRole("menuitem", { name: "添加注释" }));
-      if (action === "save")
+      if (action === "outside") {
+        fireEvent.pointerDown(document.querySelector(".annotation-backdrop")!);
+      } else {
         fireEvent.change(screen.getByRole("textbox"), {
           target: { value: "建议" },
         });
-      fireEvent.click(
-        screen.getByRole("button", {
-          name: action === "cancel" ? "取消" : "保存",
-        }),
-      );
+        fireEvent.click(screen.getByRole("button", { name: "提交注释" }));
+      }
       expect(window.getSelection()?.toString()).toBe("");
     }
     // Recreate a retained prose selection to cover browsers that keep it across
@@ -359,7 +390,7 @@ it("suppresses only a selecting gesture's release, not a second click or keyboar
   expect(openFile).toHaveBeenCalledTimes(3);
 });
 
-it.each(["取消", "保存", "Escape"])(
+it.each(["outside", "提交注释", "Escape"])(
   "restores a surviving annotation marker after %s",
   async (action) => {
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
@@ -379,6 +410,8 @@ it.each(["取消", "保存", "Escape"])(
     fireEvent.click(marker);
     if (action === "Escape")
       fireEvent.keyDown(screen.getByRole("textbox"), { key: "Escape" });
+    else if (action === "outside")
+      fireEvent.pointerDown(document.querySelector(".annotation-backdrop")!);
     else fireEvent.click(screen.getByRole("button", { name: action }));
     await act(async () => {});
     expect(document.activeElement).toBe(marker);

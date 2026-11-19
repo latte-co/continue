@@ -1158,8 +1158,8 @@ button.recent-notice {
 .tool-images {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-3);
-  margin-block: var(--space-3);
+  gap: var(--space-2);
+  margin-block: var(--space-2);
 }
 .raster-image {
   display: flex;
@@ -1180,7 +1180,27 @@ button.recent-notice {
   object-fit: contain;
 }
 .tool-images .raster-image {
-  max-width: min(100%, 420px);
+  width: clamp(80px, 20cqw, 112px);
+  height: clamp(80px, 20cqw, 112px);
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+  border-radius: var(--radius-control);
+}
+.tool-images .raster-image > img {
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  object-fit: cover;
+}
+.tool-images .raster-image > span {
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+  padding: 0 var(--space-2);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .review-image-diff {
   display: grid;
@@ -1233,10 +1253,12 @@ button.recent-notice {
 }
 .markdown .message-image {
   display: block;
-  max-width: min(100%, 480px);
-  max-height: 360px;
+  max-width: min(100%, 360px);
+  max-height: 220px;
+  object-fit: contain;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-panel);
+  background: var(--color-input);
 }
 .markdown .message-image-placeholder {
   display: inline-flex;
@@ -1304,6 +1326,18 @@ button.recent-notice {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.attachment-image-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: none;
+}
+.attachment-image-action-error {
+  margin: 0 0 var(--space-2);
+  color: var(--color-danger);
+  font-size: var(--text-sm);
+  flex: none;
 }
 .attachment-image-stage {
   flex: 1;

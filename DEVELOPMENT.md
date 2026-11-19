@@ -162,9 +162,10 @@ protocol version increment.
 
 ## Session annotations
 
-`annotations.ts` captures exact rendered-text offsets within one assistant message;
-`AnnotationUI.tsx` provides selection actions, a shared-Modal editor, draft highlights
-and a read-only history disclosure. Main and side-chat drafts store annotations in
+`annotations.ts` captures exact rendered-text offsets within one assistant message
+with an optional user comment; `AnnotationUI.tsx` provides selection actions, a
+compact pill Modal editor, inline draft highlights with speech-bubble badges, and
+a read-only history disclosure. Main and side-chat drafts store annotations in
 the existing App-lifetime `DraftStore`; editing them advances the submission version.
 Cross-message selections and UI controls are excluded. Anchors validate the exact
 quote before highlighting, with no fuzzy relocation after history projection changes.
@@ -613,9 +614,9 @@ pending reveal work so a stale session cannot reveal the new conversation.
 
 ## Conversation lifetime and reading position
 
-Completed main and child transcripts fold earlier assistant prose, tools and
-ordinary notices together. A normal completed turn has one process disclosure;
-user handoffs, approvals, images, Skill-load notices and change results remain
+Completed main and child transcripts fold earlier assistant prose, tools, tool
+images and ordinary notices together. A normal completed turn has one process disclosure;
+user handoffs, approvals, Skill-load notices and change results remain
 visible boundaries. Empty file-change snapshots share the card's visibility rule
 and never split a process into adjacent disclosures. Projection preserves prose
 row breaks and retains the raw snapshots for change selection and undo state.
@@ -911,8 +912,10 @@ Claude tool-result images are converted in the adapter to agent-neutral
 `ToolOutputBlock` arrays (text or inline raster MIME/base64). Image bytes are bounded
 to four blocks and 384 KiB encoded per result. URL and SVG image sources are not
 loaded. Existing saved Claude results are projected on read without rewriting the
-original events. Transcript image rows remain visible outside folded tools and
-completed execution details; click opens the shared modal image view.
+original events. Tool-result image rows render as compact thumbnails outside
+folded tool groups while live and fold with the completed turn's execution
+process; click opens the shared modal image view with native clipboard copy and
+save-as download actions.
 
 The additive `preview_change` request reads the exact before/after version of a
 turn, task or Git comparison. It returns at most 64 KiB per chunk, rejects images

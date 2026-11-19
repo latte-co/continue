@@ -845,10 +845,7 @@ it("captures a rich-text selection, sends two annotations together, then reads t
   window.getSelection()!.addRange(range);
   fireEvent.mouseUp(selected);
   fireEvent.click(screen.getByRole("menuitem", { name: "添加注释" }));
-  fireEvent.change(screen.getByRole("textbox", { name: "用户评论" }), {
-    target: { value: "为什么？" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "保存" }));
+  fireEvent.click(screen.getByRole("button", { name: "提交注释" }));
   const key = JSON.stringify(["local", "a"]);
   act(() =>
     p.drafts.update(key, {
@@ -863,7 +860,7 @@ it("captures a rich-text selection, sends two annotations together, then reads t
   await waitFor(() => expect(p.send).toHaveBeenCalledTimes(1));
   const prompt = p.send.mock.calls[0][0];
   expect(userMessageContent(prompt).annotations.map((a) => a.comment)).toEqual([
-    "为什么？",
+    "",
     "请解释",
   ]);
   await waitFor(() => expect(p.drafts.get(key).annotations).toBeUndefined());
@@ -883,7 +880,8 @@ it("captures a rich-text selection, sends two annotations together, then reads t
     />,
   );
   fireEvent.click(screen.getByRole("button", { name: "2 条注释" }));
-  expect(screen.getByText("为什么？")).toBeTruthy();
+  expect(screen.getByText("请解释")).toBeTruthy();
+  expect(screen.getAllByText("用户评论：")).toHaveLength(1);
   expect(
     screen.queryByRole("button", { name: /编辑注释|删除注释/ }),
   ).toBeNull();

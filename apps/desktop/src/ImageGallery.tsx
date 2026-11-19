@@ -3,6 +3,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useId,
   useLayoutEffect,
   useMemo,
@@ -13,14 +14,29 @@ import {
   type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
-import { ChevronLeft, ChevronRight, X } from "lucide-react";
+import {
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  Download,
+  X,
+} from "lucide-react";
 import { Modal } from "./Modal";
+import { message } from "./api";
+import { copyImageBytes, saveImageBytes } from "./clipboard";
+
+export type ImagePayload = {
+  bytes: Uint8Array;
+  mime: string;
+};
 
 type Entry = {
   id: string;
   trigger: RefObject<HTMLElement | null>;
   name: string;
   title?: string;
+  payload?: ImagePayload;
   content: ReactNode;
 };
 type Gallery = {
@@ -60,6 +76,21 @@ function ImageDialog({
   const stage = useRef<HTMLDivElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
   const stageFocus = useRef<HTMLElement | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState("");
+  const currentId = useRef(entry.id);
+  currentId.current = entry.id;
+  useEffect(() => {
+    setCopied(false);
+    setBusy(false);
+    setActionError("");
+  }, [entry.id, entry.payload]);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 1800);
+    return () => clearTimeout(timer);
+  }, [copied]);
   useLayoutEffect(() => {
     // Async reads can also replace a focused retry button without navigation.
     if (stageFocus.current && !stageFocus.current.isConnected) {
@@ -77,6 +108,7 @@ function ImageDialog({
   };
   const previous = index > 0;
   const next = index < count - 1;
+  const payload = entry.payload;
   return createPortal(
     <div
       className="modal-backdrop attachment-image-backdrop"
@@ -109,16 +141,73 @@ function ImageDialog({
       >
         <header>
           <span title={entry.title}>{entry.name}</span>
-          <button
-            type="button"
-            className="icon-button"
-            aria-label="关闭图片预览"
-            ref={closeButton}
-            onClick={close}
-          >
-            <X size={18} />
-          </button>
+          <div className="attachment-image-actions">
+            <button
+              type="button"
+              className="icon-button"
+              aria-label={copied ? "已复制" : "复制图片"}
+              title={copied ? "已复制到剪贴板" : "复制图片"}
+              disabled={!payload || busy}
+              onClick={() => {
+                if (!payload || busy) return;
+                const owner = entry.id;
+                setBusy(true);
+                setActionError("");
+                void copyImageBytes(payload.bytes, payload.mime)
+                  .then(() => {
+                    if (currentId.current === owner) setCopied(true);
+                  })
+                  .catch((cause) => {
+                    if (currentId.current === owner)
+                      setActionError(`复制失败：${message(cause)}`);
+                  })
+                  .finally(() => {
+                    if (currentId.current === owner) setBusy(false);
+                  });
+              }}
+            >
+              {copied ? <Check size={16} /> : <Copy size={16} />}
+            </button>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="下载图片"
+              title="下载图片"
+              disabled={!payload || busy}
+              onClick={() => {
+                if (!payload || busy) return;
+                const owner = entry.id;
+                setBusy(true);
+                setActionError("");
+                void saveImageBytes(entry.name, payload.bytes, payload.mime)
+                  .catch((cause) => {
+                    if (currentId.current === owner)
+                      setActionError(`下载失败：${message(cause)}`);
+                  })
+                  .finally(() => {
+                    if (currentId.current === owner) setBusy(false);
+                  });
+              }}
+            >
+              <Download size={16} />
+            </button>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="关闭图片预览"
+              title="关闭图片预览（Esc）"
+              ref={closeButton}
+              onClick={close}
+            >
+              <X size={18} />
+            </button>
+          </div>
         </header>
+        {actionError && (
+          <p className="attachment-image-action-error" role="alert">
+            {actionError}
+          </p>
+        )}
         <div
           className="attachment-image-stage"
           ref={stage}
@@ -300,16 +389,25 @@ export function ImagePreview({
   preview,
   name,
   title,
+  payload,
   children,
 }: {
   preview: ReturnType<typeof useImagePreview>;
   name: string;
   title?: string;
+  payload?: ImagePayload;
   children: ReactNode;
 }) {
   const { gallery, id, identity, active, open, trigger } = preview;
-  const entry = useRef<Entry>({ id, trigger, name, title, content: children });
-  entry.current = { id, trigger, name, title, content: children };
+  const entry = useRef<Entry>({
+    id,
+    trigger,
+    name,
+    title,
+    payload,
+    content: children,
+  });
+  entry.current = { id, trigger, name, title, payload, content: children };
   const register = gallery?.register;
   const update = gallery?.update;
   useLayoutEffect(() => {
@@ -317,7 +415,7 @@ export function ImagePreview({
   }, [register, id, identity, active]);
   useLayoutEffect(() => {
     if (active) update?.();
-  }, [update, active, name, title, children]);
+  }, [update, active, name, title, payload, children]);
   return !gallery && open ? (
     <ImageDialog entry={entry.current} close={preview.close} />
   ) : null;

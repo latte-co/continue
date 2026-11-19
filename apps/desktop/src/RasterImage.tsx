@@ -70,7 +70,11 @@ export function RasterImage({
           <span>{failed ? "图片无法解码" : name}</span>
         )}
       </button>
-      <ImagePreview preview={preview} name={name}>
+      <ImagePreview
+        preview={preview}
+        name={name}
+        payload={url && !failed ? identity : undefined}
+      >
         {url && !failed ? (
           <img src={url} alt={name} onError={() => setFailed(true)} />
         ) : (

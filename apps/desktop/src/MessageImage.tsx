@@ -16,7 +16,13 @@ export function isPreviewableImage(data: SourceData): boolean {
   return IMAGE_MIME.test(data.mime) && !data.truncated;
 }
 
-type LoadState = { url?: string; error?: string; loading?: boolean };
+type LoadState = {
+  url?: string;
+  bytes?: Uint8Array;
+  mime?: string;
+  error?: string;
+  loading?: boolean;
+};
 
 /** A path that can never render as an image; explain instead of offering a grant. */
 function UnavailableImage({ path, hint }: { path: string; hint: string }) {
@@ -120,7 +126,7 @@ function MessageLocalImage({
         // Latch activation before replacing its observed placeholder, so
         // decode retries remain enabled after the dialog closes.
         setVisible(true);
-        setState({ url });
+        setState({ url, bytes: data.bytes, mime: data.mime });
       })
       .catch((error) => {
         if (!disposed) {
@@ -209,7 +215,16 @@ function MessageLocalImage({
       {/* Keep the selected logical owner registered during async reloads;
           unviewed lazy images still join only after loading. */}
       {(state.url || preview.open) && (
-        <ImagePreview preview={preview} name={name} title={path}>
+        <ImagePreview
+          preview={preview}
+          name={name}
+          title={path}
+          payload={
+            state.url && state.bytes && state.mime
+              ? { bytes: state.bytes, mime: state.mime }
+              : undefined
+          }
+        >
           {state.url ? (
             <img src={state.url} alt={name} onError={onError} />
           ) : (

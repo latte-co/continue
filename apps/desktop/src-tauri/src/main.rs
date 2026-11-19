@@ -1346,6 +1346,7 @@ fn main() {
             source_preview::system_preview,
             source_preview::preview_pdf,
             paste::clipboard_file_paths,
+            paste::copy_image,
             paste::paste_stage,
             paste::finish_paste_upload,
             paste::import_clipboard_file,

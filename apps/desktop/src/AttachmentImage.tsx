@@ -106,6 +106,8 @@ export function AttachmentImage({
   const [state, setState] = useState<{
     scope: string;
     url?: string;
+    bytes?: Uint8Array;
+    mime?: string;
     error?: string;
     loading?: boolean;
   }>({ scope });
@@ -152,7 +154,7 @@ export function AttachmentImage({
           new Blob([data.bytes as BlobPart], { type: data.mime }),
         );
         resource.current = { scope, url };
-        setState({ scope, url });
+        setState({ scope, url, bytes: data.bytes, mime: data.mime });
       })
       .catch((error) => {
         if (!disposed) setState({ scope, error: message(error) });
@@ -200,6 +202,11 @@ export function AttachmentImage({
         preview={previewDialog}
         name={reference.name}
         title={reference.path}
+        payload={
+          preview.url && preview.bytes && preview.mime
+            ? { bytes: preview.bytes, mime: preview.mime }
+            : undefined
+        }
       >
         {preview.url ? (
           <img src={preview.url} alt={reference.name} onError={failedImage} />
