@@ -187,6 +187,10 @@ current membership. Cursor resolves discovery candidates against the Host PATH/c
 once, verifies and retains the absolute executable path, and uses that same path for
 metadata and turns even when a session overrides PATH. Candidates are probed by
 priority with a shared read budget; a compatible cursor-agent prevents probing agent.
+PATH lookup uses the actual initial version spawn as the permission authority, not
+any executable mode bit. Only a precise pre-start EACCES advances to the next
+same-name PATH entry; an already-started CLI is not replaced after an incompatible
+version/help response or a later help spawn failure. An explicit path never changes.
 Each failed probe retires its owned group before a fallback is attempted. Queue edits
 reuse Cursor input validation before saving; execution keeps its guard for old rows.
 

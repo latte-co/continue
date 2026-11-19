@@ -1,4 +1,7 @@
 //! Prompt-free Cursor metadata; no status/login/empty-chat/model turns.
+#[cfg(test)]
+#[path = "metadata_permission_tests.rs"]
+mod permission_tests;
 use anyhow::{Context, Result, bail};
 use latte_work_protocol::{AgentEnvironment, AgentInfo, AgentPermissionMode, Effort, Response};
 use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
@@ -16,6 +19,28 @@ impl std::fmt::Display for CleanupUnconfirmed {
     }
 }
 impl std::error::Error for CleanupUnconfirmed {}
+
+#[derive(Debug)]
+struct SpawnFailure(std::io::Error);
+impl std::fmt::Display for SpawnFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Cursor 元数据进程无法启动：{}", self.0)
+    }
+}
+impl std::error::Error for SpawnFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[derive(Debug)]
+struct RetryPathCandidate;
+impl std::fmt::Display for RetryPathCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Cursor 初次启动权限不足")
+    }
+}
+impl std::error::Error for RetryPathCandidate {}
 
 async fn output(
     binary: &str,
@@ -61,7 +86,7 @@ async fn spawn_output(
         if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             bail!("Cursor 元数据读取超时");
         }
-        let child = command.spawn().context("Cursor 元数据进程无法启动")?;
+        let child = command.spawn().map_err(SpawnFailure)?;
         let pid = i32::try_from(child.id().context("Cursor 元数据 PID 缺失")?)
             .context("Cursor PID 无效")?;
         Ok((crate::runtime::Group { child, pid }, redactor))
@@ -162,55 +187,81 @@ pub(crate) async fn discover() -> (String, AgentInfo) {
     ))
     .await
 }
-async fn bind_candidates(candidates: Vec<String>) -> Result<(Vec<String>, String)> {
+async fn discovery_context() -> Result<(String, Option<std::ffi::OsString>)> {
     let effective_path = crate::agent_environment::variable("PATH");
-    // Bind against the actual discovery cwd, never a later request's cwd/PATH.
-    // Filesystem checks can block too; await them without dropping owned work.
     tokio::task::spawn_blocking(move || {
         let cwd = std::env::current_dir().context("Cursor discovery cwd 无法读取")?;
-        let cwd_string = cwd
+        let cwd = cwd
             .to_str()
             .context("Cursor discovery cwd 不是 UTF-8")?
             .to_owned();
-        let binaries = candidates
-            .into_iter()
-            .filter_map(|candidate| {
-                super::executable::resolve(candidate.as_ref(), effective_path.as_deref(), &cwd)
-            })
-            .collect();
-        Ok((binaries, cwd_string))
+        Ok((cwd, effective_path))
     })
     .await
     .context("Cursor CLI 路径绑定任务失败")?
 }
+
+async fn probe_candidate(
+    candidate: String,
+    cwd: &str,
+    path: Option<std::ffi::OsString>,
+    deadline: tokio::time::Instant,
+) -> Result<Option<(String, String)>> {
+    let bound_cwd = PathBuf::from(cwd);
+    // Enumerate only this logical command. Generic fallback stays lazy, and
+    // filesystem I/O remains off the async executor.
+    let binaries = tokio::task::spawn_blocking(move || {
+        super::executable::resolve(candidate.as_ref(), path.as_deref(), &bound_cwd)
+    })
+    .await
+    .context("Cursor CLI 路径绑定任务失败")?;
+    for binary in binaries {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        // Never skip an unrepresentable first path to select another CLI.
+        let Some(binary) = binary.to_str() else {
+            break;
+        };
+        match probe_binary(binary, cwd, deadline).await {
+            Ok(version) => return Ok(Some((binary.to_owned(), version))),
+            Err(error) if error.is::<RetryPathCandidate>() => continue,
+            Err(error) if error.is::<CleanupUnconfirmed>() => return Err(error),
+            // Initial exec success fixes lookup even if version/help is wrong
+            // or help later fails to spawn. Only pre-spawn EACCES can retry PATH.
+            Err(_) => break,
+        }
+    }
+    Ok(None)
+}
+
 async fn discover_candidates(candidates: Vec<String>) -> (String, AgentInfo) {
     let mut binary = candidates.first().cloned().unwrap_or_default();
     let mut available = false;
     let mut detail = "未找到兼容的 Cursor Agent；在此 Host 安装并登录后重启 Server。".into();
     let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
-    let binding = bind_candidates(candidates).await;
-    if let Ok((candidates, cwd)) = binding {
-        for candidate in candidates {
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            // Each failed probe confirms group cleanup before actual fallback.
-            match probe_binary(&candidate, &cwd, deadline).await {
-                Ok(version) => {
-                    binary = candidate;
-                    available = true;
-                    detail = version;
+    match discovery_context().await {
+        Ok((cwd, path)) => {
+            for candidate in candidates {
+                if tokio::time::Instant::now() >= deadline {
                     break;
                 }
-                Err(error) if error.is::<CleanupUnconfirmed>() => {
-                    detail = error.to_string();
-                    break;
+                match probe_candidate(candidate, &cwd, path.clone(), deadline).await {
+                    Ok(Some((selected, version))) => {
+                        binary = selected;
+                        available = true;
+                        detail = version;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        detail = error.to_string();
+                        break;
+                    }
                 }
-                Err(_) => {}
             }
         }
-    } else if let Err(error) = binding {
-        detail = error.to_string();
+        Err(error) => detail = error.to_string(),
     }
     (
         binary,
@@ -232,7 +283,16 @@ async fn probe_binary(binary: &str, cwd: &str, deadline: tokio::time::Instant) -
         &environment,
         Some(deadline),
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        if error.downcast_ref::<SpawnFailure>().is_some_and(|failure| {
+            failure.0.raw_os_error() == Some(nix::errno::Errno::EACCES as i32)
+        }) {
+            error.context(RetryPathCandidate)
+        } else {
+            error
+        }
+    })?;
     if version.trim().is_empty() {
         bail!("Cursor 未返回有效版本");
     }
@@ -460,306 +520,5 @@ pub(super) fn catalog(output: &str, _selected: Option<&str>) -> Result<Response>
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-    fn fixture(script: &str) -> (tempfile::TempDir, String) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cursor");
-        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        (dir, path.to_string_lossy().into_owned())
-    }
-    const COMPATIBLE_HELP: &str = "  -p, --print Print responses\n  --output-format <format> Output (choices: \"text\", \"json\", \"stream-json\")\n  --resume [chatId] Resume a chat\n  --model <model> Choose a model\n";
-
-    fn probe_fixture(help: &str) -> (tempfile::TempDir, String) {
-        fixture(&format!(
-            "printf '%s\\n' \"$1\" >> \"$0.args\"\ncase \"$1\" in\n--version) printf 'fixture-version\\n';;\n--help) printf '%s' '{help}';;\n*) exit 4;;\nesac"
-        ))
-    }
-
-    #[test]
-    fn cursor_capabilities_require_real_option_declarations_and_scoped_format_choices() {
-        validate_capabilities(COMPATIBLE_HELP).unwrap();
-        let native = "  --print Print\n  --output-format <format> Output (only with --print): text, json, stream-json (default: \"text\")\n  --resume [chatId] Resume\n  --model <model> Model";
-        validate_capabilities(native).unwrap();
-        let wrapped = "  --print Print\n  --output-format <format> Output\n      (choices: \"text\", \"json\", \"stream-json\")\n  --resume <chatId> Resume\n  --model <model> Model";
-        validate_capabilities(wrapped).unwrap();
-        for flag in ["--print", "--output-format", "--resume", "--model"] {
-            // Mentions of the missing option in unrelated descriptions do not count.
-            let help = COMPATIBLE_HELP
-                .lines()
-                .filter(|line| !line.contains(flag))
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(validate_capabilities(&format!("{help}\n  --notes mentions {flag}")).is_err());
-        }
-        for unsupported in [
-            COMPATIBLE_HELP.replace("\"stream-json\"", "\"stream-json-v2\""),
-            COMPATIBLE_HELP.replace("\"stream-json\"", "\"not-stream-json\""),
-            COMPATIBLE_HELP.replace("<format>", "format"),
-            COMPATIBLE_HELP.replace("[chatId]", "chatId"),
-            COMPATIBLE_HELP.replace("<model>", "model"),
-            COMPATIBLE_HELP.replace("--print Print", "--print <value> Print"),
-        ] {
-            assert!(validate_capabilities(&unsupported).is_err());
-        }
-        for description in [
-            "Use another program for stream-json",
-            "Example: stream-json",
-            "Output (choices: \"text\", \"json\")",
-        ] {
-            let help = format!(
-                "  --print Print\n  --output-format <format> {description}\n  --resume [chatId] Resume\n  --model <model> Model (choices: \"stream-json\")"
-            );
-            assert!(validate_capabilities(&help).is_err());
-        }
-    }
-
-    #[test]
-    fn cursor_candidates_prioritize_cursor_agent_and_never_fallback_from_override() {
-        use std::os::unix::ffi::OsStringExt;
-        let home = tempfile::tempdir().unwrap();
-        let installed = home.path().join(".local/bin");
-        std::fs::create_dir_all(&installed).unwrap();
-        for name in ["cursor-agent", "agent"] {
-            std::fs::write(installed.join(name), "fixture").unwrap();
-        }
-        assert_eq!(
-            binary_candidates(None, Some(home.path().into())),
-            [
-                installed.join("cursor-agent").to_str().unwrap(),
-                "cursor-agent",
-                installed.join("agent").to_str().unwrap(),
-                "agent",
-            ]
-        );
-        assert_eq!(
-            binary_candidates(Some("/explicit/cursor".into()), Some(home.path().into())),
-            ["/explicit/cursor"]
-        );
-        assert_eq!(
-            binary_candidates(
-                Some(std::ffi::OsString::from_vec(b"/invalid/\xff".to_vec())),
-                Some(home.path().into()),
-            ),
-            [""]
-        );
-    }
-
-    #[tokio::test]
-    async fn cursor_discovery_checks_help_and_advances_to_compatible_generic_agent() {
-        let (wrong_dir, wrong) = probe_fixture(
-            "  --notes Mentions --print --output-format stream-json --resume --model",
-        );
-        let (dir, binary) = probe_fixture(COMPATIBLE_HELP);
-        let agent = dir.path().join("agent");
-        std::fs::rename(&binary, &agent).unwrap();
-        let agent = agent.to_str().unwrap().to_owned();
-        let (selected, info) = discover_candidates(vec![wrong, agent.clone()]).await;
-        assert_eq!(selected, agent);
-        assert!(info.available);
-        assert_eq!(info.detail, "fixture-version");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("agent.args")).unwrap(),
-            "--version\n--help\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(wrong_dir.path().join("cursor.args")).unwrap(),
-            "--version\n--help\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn cursor_discovery_skips_failed_or_empty_versions_without_more_commands() {
-        for script in [
-            "printf '%s\\n' \"$1\" >> \"$0.args\"; exit 3",
-            "printf '%s\\n' \"$1\" >> \"$0.args\"; printf '  \\n'",
-        ] {
-            let (bad_dir, bad) = fixture(script);
-            let (_dir, good) = probe_fixture(COMPATIBLE_HELP);
-            let (selected, info) = discover_candidates(vec![bad, good.clone()]).await;
-            assert!(info.available);
-            assert_eq!(selected, good);
-            assert_eq!(
-                std::fs::read_to_string(bad_dir.path().join("cursor.args")).unwrap(),
-                "--version\n"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn cursor_discovery_reaps_timeout_without_starting_over_budget_fallback() {
-        let (_dir, binary) = fixture(
-            "case \"$1\" in\n--version) printf 'fixture-version\\n';;\n--help) printf '%s\\n' \"$$\" >> \"$0.pids\"; sleep 30;;\n*) exit 4;;\nesac",
-        );
-        let (_fallback_dir, fallback) = fixture("printf 'executed' > \"$0.marker\"; exit 4");
-        let start = std::time::Instant::now();
-        let (_, info) = discover_candidates(vec![binary.clone(), fallback.clone()]).await;
-        let elapsed = start.elapsed();
-        assert!(!info.available);
-        let pids = std::fs::read_to_string(format!("{binary}.pids")).unwrap();
-        let pids: Vec<i32> = pids.lines().map(|pid| pid.parse().unwrap()).collect();
-        assert_eq!(pids.len(), 1);
-        assert!(!std::path::Path::new(&format!("{fallback}.marker")).exists());
-        for pid in pids {
-            assert_eq!(
-                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-                Err(nix::errno::Errno::ESRCH),
-            );
-        }
-        assert!(
-            elapsed < Duration::from_secs(9),
-            "discovery exceeded the connection startup budget: {elapsed:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn cursor_discovery_version_and_help_share_one_read_deadline() {
-        let (_dir, binary) = fixture(
-            "printf '%s\\n' \"$$\" >> \"$0.pids\"\ncase \"$1\" in\n--version) sleep 3; printf 'fixture-version\\n';;\n--help) sleep 30;;\n*) exit 4;;\nesac",
-        );
-        let start = std::time::Instant::now();
-        let (_, info) = discover_candidates(vec![binary.clone()]).await;
-        assert!(!info.available);
-        let elapsed = start.elapsed();
-        let pids = std::fs::read_to_string(format!("{binary}.pids")).unwrap();
-        assert_eq!(pids.lines().count(), 2);
-        for pid in pids.lines().map(|pid| pid.parse::<i32>().unwrap()) {
-            assert_eq!(
-                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-                Err(nix::errno::Errno::ESRCH),
-            );
-        }
-        assert!(
-            elapsed < Duration::from_secs(7),
-            "version/help did not share the candidate deadline: {elapsed:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn cursor_discovery_fallback_reuses_remaining_read_budget() {
-        let (_first_dir, first) = fixture("sleep 3; exit 4");
-        let (_second_dir, second) = fixture(
-            "printf '%s\\n' \"$$\" >> \"$0.pids\"\ncase \"$1\" in\n--version) printf 'fixture-version\\n';;\n--help) sleep 30;;\n*) exit 4;;\nesac",
-        );
-        let start = std::time::Instant::now();
-        let (_, info) = discover_candidates(vec![first, second.clone()]).await;
-        assert!(!info.available);
-        let elapsed = start.elapsed();
-        let pids = std::fs::read_to_string(format!("{second}.pids")).unwrap();
-        assert_eq!(pids.lines().count(), 2);
-        for pid in pids.lines().map(|pid| pid.parse::<i32>().unwrap()) {
-            assert_eq!(
-                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-                Err(nix::errno::Errno::ESRCH),
-            );
-        }
-        assert!(
-            elapsed < Duration::from_secs(7),
-            "fallback reset the shared discovery deadline: {elapsed:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn cursor_discovery_stops_before_executing_lower_priority_agent() {
-        let (_first_dir, first) = probe_fixture(COMPATIBLE_HELP);
-        let (_second_dir, second) = fixture("printf 'executed' > \"$0.marker\"; exit 4");
-        let (selected, info) = discover_candidates(vec![first.clone(), second.clone()]).await;
-        assert_eq!(selected, first);
-        assert!(info.available);
-        assert!(
-            !std::path::Path::new(&format!("{second}.marker")).exists(),
-            "a compatible preferred CLI must prevent executing the generic fallback"
-        );
-    }
-
-    #[tokio::test]
-    async fn cursor_discovery_cleans_failed_candidate_before_fallback() {
-        let (dir, first) = fixture(
-            "case \"$1\" in\n--version) printf 'fixture-version\\n';;\n--help) printf '%s' \"$$\" > \"$0.pid\"; sleep 0.1; printf 'incompatible\\n';;\n*) exit 4;;\nesac",
-        );
-        let pid_path = dir.path().join("cursor.pid");
-        let (_second_dir, second) = fixture(&format!(
-            "pid=$(cat '{}') || {{ printf 'premature' > \"$0.marker\"; exit 4; }}\nif kill -0 \"$pid\" 2>/dev/null; then printf 'unclean' > \"$0.marker\"; exit 4; fi\ncase \"$1\" in\n--version) printf 'fixture-version\\n';;\n--help) printf '%s' '{COMPATIBLE_HELP}';;\n*) exit 4;;\nesac",
-            pid_path.display()
-        ));
-        let (selected, info) = discover_candidates(vec![first, second.clone()]).await;
-        assert_eq!(selected, second);
-        assert!(info.available);
-        assert!(!std::path::Path::new(&format!("{second}.marker")).exists());
-    }
-
-    #[tokio::test]
-    async fn cursor_incompatible_explicit_override_remains_unavailable() {
-        let (_dir, wrong) = probe_fixture("  --notes stream-json --print --resume --model");
-        let (selected, info) =
-            discover_candidates(binary_candidates(Some(wrong.clone().into()), None)).await;
-        assert_eq!(selected, wrong);
-        assert!(!info.available);
-    }
-
-    #[tokio::test]
-    async fn cursor_metadata_is_prompt_free_environment_aware_and_redacted() {
-        let (_dir, binary) = fixture(
-            "[ \"$#\" = 1 ] && [ \"$1\" = models ] || exit 3\nprintf 'Available models\\nchosen - %s (default)\\n' \"$TEST_TOKEN\"",
-        );
-        let environment = AgentEnvironment(BTreeMap::from([(
-            "TEST_TOKEN".into(),
-            "private-token".into(),
-        )]));
-        let Response::Models { model_labels, .. } =
-            models(&binary, None, None, &environment).await.unwrap()
-        else {
-            panic!()
-        };
-        assert_eq!(model_labels["chosen"], "[redacted]");
-        let (_dir, binary) = fixture("printf '%s' \"$TEST_TOKEN\" >&2; exit 4");
-        let error = output(&binary, &["--help"], None, &environment)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("[redacted]") && !error.contains("private-token"));
-    }
-    #[tokio::test]
-    async fn cursor_selection_still_requires_current_membership_and_no_effort() {
-        let (_dir, binary) = fixture("printf 'Available models\\ncurrent - Current (default)\\n'");
-        let environment = AgentEnvironment::default();
-        validate_selection(&binary, None, Some("current"), None, &environment)
-            .await
-            .unwrap();
-        assert!(
-            validate_selection(&binary, None, Some("removed-model"), None, &environment)
-                .await
-                .is_err()
-        );
-        assert!(
-            validate_selection(&binary, None, None, Some(Effort::High), &environment)
-                .await
-                .is_err()
-        );
-    }
-    #[tokio::test]
-    async fn cursor_metadata_bounds_output_and_reaps_timeout() {
-        let (_dir, binary) = fixture("/usr/bin/yes metadata | /usr/bin/head -c 131073");
-        assert!(
-            output(&binary, &["--version"], None, &AgentEnvironment::default())
-                .await
-                .is_err()
-        );
-        let (dir, binary) = fixture("printf '%s' \"$$\" > \"$0.pid\"; sleep 30");
-        assert!(
-            output(&binary, &["--help"], None, &AgentEnvironment::default())
-                .await
-                .is_err()
-        );
-        let pid: i32 = std::fs::read_to_string(dir.path().join("cursor.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-            Err(nix::errno::Errno::ESRCH)
-        );
-    }
-}
+#[path = "metadata_tests.rs"]
+mod tests;

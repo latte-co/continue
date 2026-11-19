@@ -541,6 +541,69 @@ async fn cursor_review_invalid_queue_edits_leave_revision_payload_and_fifo_uncha
     );
 }
 
+#[tokio::test]
+async fn cursor_review_permission_denied_path_entry_does_not_hide_later_cli() {
+    let denied = tempfile::tempdir().unwrap();
+    let usable = tempfile::tempdir().unwrap();
+    let interpreter = denied.path().join("interpreter");
+    std::fs::write(&interpreter, "not executable").unwrap();
+    std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let first = denied.path().join("cursor-agent");
+    std::fs::write(&first, format!("#!{}\n", interpreter.display())).unwrap();
+    // Owner execution is denied although a different permission class has X.
+    // The denied interpreter also makes the spawn fail under a root test runner.
+    std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o610)).unwrap();
+    assert_eq!(
+        std::process::Command::new(&first)
+            .arg("--version")
+            .spawn()
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let second = usable.path().join("cursor-agent");
+    install_cursor(&second);
+    let directory = tempfile::Builder::new()
+        .prefix("lw-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let home = directory.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let path = std::env::join_paths([
+        denied.path(),
+        usable.path(),
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+    ])
+    .unwrap();
+    let environment = [("HOME", home.as_os_str()), ("PATH", path.as_os_str())];
+    fixture_bridge::prepare(
+        directory.path(),
+        &environment,
+        Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+    );
+    let process = Host::spawn_with_removed_environment(
+        directory.path(),
+        &environment,
+        &["LATTE_WORK_CURSOR"],
+    );
+    let host = Host { directory, process };
+    host.wait_ready().await;
+    let mut client = host.client().await;
+    assert!(
+        cursor_available(&mut client).await,
+        "EACCES on the first PATH entry must not hide the usable same-name CLI"
+    );
+    let root = tempfile::tempdir().unwrap();
+    let id = session(&mut client, root.path()).await;
+    assert!(matches!(
+        send(&mut client, &id, "permission-fallback", "hello").await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &id, Status::Completed).await;
+    assert_eq!(inputs(root.path())[0]["binary"], second.to_str().unwrap());
+}
+
 fn quote_path(path: &Path) -> String {
     format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
 }
