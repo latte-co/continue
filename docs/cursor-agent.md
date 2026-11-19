@@ -11,11 +11,11 @@ Latte Work 在执行主机上发现 Cursor Agent CLI，并通过现有本机/SSH
 现有 Agent 保持常驻双向传输。Cursor 使用持久 Host actor 和按轮子进程，native `session_id` 独立于 Latte session ID。
 
 - Open：只准备 Host 上下文，不调用模型、不创建空 chat、不伪造 native Ready。`agent_session_open=false`。
-- Start：请求事务落库 → baseline → spawn `--print --output-format stream-json` → native init → 立即保存 ID → 事件投影。prompt 通过独立 argv 传入；单轮 stdin 使用 null，立即 EOF，不保留假的机器输入通道。
+- Start：精确请求去重 → Cursor argv 输入校验 → 请求事务落库 → baseline → spawn `--print --output-format stream-json` → native init → 立即保存 ID → 事件投影。prompt 通过独立 argv 传入，正文必须小于 128 KiB 且不能含 NUL；这是保守的单参数预算，不保证完整 argv/ENV 永远不会超限。单轮 stdin 使用 null，立即 EOF，不保留假的机器输入通道。
 - Completion：明确 native result → stdout drain → exit status → owned process group 确认收尾 → 最终状态与快照 → 下一 FIFO 轮。
 - Continue：下一轮使用已保存 ID 的 `--resume`，不重发历史 prompt。返回 ID 不一致即失败，不 fallback 新建。
 - Stop/Close：由 Runtime 关闭 owned process group；confirmed reap 后标记本轮停止，不宣称文件操作已撤销。未知收尾阻止 replacement。
-- Interruption：daemon 重启保留 Unknown，已交付输入不自动重放。首次 admitted 执行后仍无 native ID时，保守禁止把新 chat当作 continuation。
+- Interruption：daemon 重启保留 Unknown，已交付输入不自动重放。首次 admitted 执行后仍无 native ID时，保守禁止把新 chat当作 continuation。只有精确 spawn 阶段的 ENOENT/E2BIG 已持久化为请求绑定的「确定未执行」证据时，该记录才不再阻止用户以新 request ID 重试；旧请求仍只去重、不重放。已启动未 init、未知错误、旧数据库记录及证据写入失败均不满足例外。
 
 前端分别保存 Host-prepared 和 native-open 证据；其他 Agent 的存活要求不变。断线、重连、关闭和迟到响应沿用 host/session/version fencing。
 
@@ -25,7 +25,7 @@ Cursor JSON 保留在独立 adapter；Runtime 只消费通用 action，并拥有
 
 官方 generic `tool_call.function` 的 `name` 与字符串 `arguments` 可投影，opaque arguments 不强制当作 JSON。官方未公布其 completed result 的可靠结构，因此完成记录严格配对后只发未确认 Notice，不产生虚假的成功 ToolResult；主轮仍要求已确认的 native 终结结果。已知 `*ToolCall` 的 success/error payload 必须为结构化对象。未知字段可扩展，关键字段非法不能推断成功。
 
-元数据探测使用 Host shell snapshot、受限输出、超时和 owned process group 清理。模型 ID与 label 仅来自实际 CLI，不能从名称猜 effort/context。stderr 持续 drain、有界保留，按实际 child ENV 的继承/覆盖/移除与 Provider 凭据上下文脱敏；超限诊断省略原始内容。应用注入的凭据通过环境传递，不放入启动 argv；不宣称任意原生凭据来源或所有 stdout 都得到全面脱敏。prompt不经 shell，CLI参数独立传入。
+元数据探测使用 Host shell snapshot、受限输出、超时和 owned process group 清理，ENV 按 OsString 合并后才转换为诊断文本，非 UTF-8 值不应使 Server panic。自动发现按安装路径/PATH 的 cursor-agent、agent 顺序核验 version/help 所需协议能力；显式 LATTE_WORK_CURSOR 失败不回退。模型 ID与 label 仅来自实际 CLI，不能从名称猜 effort/context。目录查询与历史 Open 容忍已下架的保存 ID，不自动改模型；实际发送仍严格校验当前目录。stderr 持续 drain、有界保留，按实际 child ENV 的继承/覆盖/移除与 Provider 凭据上下文脱敏；超限诊断省略原始内容。应用注入的凭据通过环境传递，不放入启动 argv；不宣称任意原生凭据来源或所有 stdout 都得到全面脱敏。prompt不经 shell，CLI参数独立传入。
 
 参考接口：
 - [Cursor output format](https://cursor.com/docs/cli/reference/output-format)

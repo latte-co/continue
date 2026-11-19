@@ -1,4 +1,6 @@
 //! Redact external content before storage without changing protocol identities.
+mod environment;
+pub(crate) use environment::for_command;
 use latte_work_protocol::EventKind;
 use serde_json::Value;
 use std::collections::BTreeSet;

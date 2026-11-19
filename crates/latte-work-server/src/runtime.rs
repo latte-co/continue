@@ -1132,6 +1132,7 @@ struct Process {
     /// into its recorded directory while `path` stays at the project root.
     agent_cwd: String,
     turn_active: bool,
+    active_request_id: Option<String>,
     /// The main turn can settle while a child still needs input.
     settled_turn: Option<Outcome>,
     /// Background work already alive when this turn started. Its writes may
@@ -1357,6 +1358,7 @@ impl Process {
                 &config,
                 request_id,
                 agents::TransportLifetime::Persistent,
+                None,
             )?)
         } else {
             None
@@ -1379,6 +1381,7 @@ impl Process {
             path: path.into(),
             agent_cwd: agent_cwd.into(),
             turn_active: false,
+            active_request_id: None,
             settled_turn: None,
             background_at_start: false,
             stopping: false,
@@ -1399,6 +1402,7 @@ impl Process {
         config: &LaunchConfig,
         request_id: Option<&str>,
         lifetime: agents::TransportLifetime,
+        main_request_id: Option<&str>,
     ) -> Result<Transport> {
         let write_id = db(database, |s| {
             if let Some(reason) = s.unconfirmed_agent_close(id)? {
@@ -1413,16 +1417,22 @@ impl Process {
                 Ok(None)
             }
         })?;
-        Transport::spawn(prepared, frame_limit, config, lifetime)
-            .inspect_err(|error| {
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.raw_os_error() == Some(Errno::ENOENT as i32))
-                    && let Some(write_id) = &write_id
-                {
-                    let _ = db(database, |s| s.mark_side_write_not_started(write_id));
-                }
-            })
+        let spawned = Transport::spawn(prepared, frame_limit, config, lifetime);
+        if let Err(error) = &spawned
+            && let Some(failure) = error.downcast_ref::<transport::SpawnNotStarted>()
+        {
+            if let Some(request_id) = main_request_id {
+                db(database, |s| {
+                    s.record_confirmed_not_started(id, request_id, failure.evidence)
+                })?;
+            }
+            if failure.evidence == crate::store::ConfirmedNotStarted::Enoent
+                && let Some(write_id) = &write_id
+            {
+                db(database, |s| s.mark_side_write_not_started(write_id))?;
+            }
+        }
+        spawned
             .with_context(|| format!("无法启动 Agent {agent}，请检查此 Host 的 CLI 安装和登录状态"))
     }
     async fn apply(&mut self, actions: Vec<Action>, database: &Database, id: &str) -> Result<()> {
@@ -1449,6 +1459,7 @@ impl Process {
                     &self.config,
                     None,
                     agents::TransportLifetime::PerTurn,
+                    self.active_request_id.as_deref(),
                 )?);
                 self.result_deadline = None;
                 self.native_initialized = false;
@@ -1642,6 +1653,7 @@ impl Process {
                 bail!("Agent 在审批完成前结束了本轮任务");
             }
             self.turn_active = false;
+            self.active_request_id = None;
             let (status, message) = if self.stopping {
                 (
                     Status::Stopped,
@@ -1706,14 +1718,20 @@ impl Process {
         }
     }
     async fn finish_per_turn(&mut self, database: &Database, id: &str) -> Result<()> {
-        if self.pending_result.is_none() {
-            bail!("Agent stdout EOF但没有native result；任务不能确认完成");
-        }
-        self.transport
+        let exit = self
+            .transport
             .as_mut()
             .context("Agent transport missing")?
             .exited_successfully()
-            .await?;
+            .await;
+        if self.pending_result.is_none() {
+            let diagnostic = match exit {
+                Ok(diagnostic) => diagnostic,
+                Err(error) => format!("{error:#}"),
+            };
+            bail!("Agent stdout EOF但没有native result；任务不能确认完成：{diagnostic}");
+        }
+        exit?;
         self.close_confirmed(database, id).await?;
         let (failed, message) = self.pending_result.take().context("Agent result missing")?;
         self.result_deadline = None;
@@ -1925,6 +1943,9 @@ async fn accept_turn(
     })? {
         return Ok(false);
     }
+    if session.agent == "cursor" {
+        agents::cursor::validate_prompt(&turn.text)?;
+    }
     if db(database, |s| Ok(s.session(&session.id)?.status.active()))? {
         bail!("会话已有运行中的任务");
     }
@@ -1938,7 +1959,7 @@ async fn accept_turn(
     if per_turn
         && db(database, |s| {
             Ok(s.session(&session.id)?.native_id.is_none()
-                && s.has_admitted_request(&session.id)?)
+                && s.has_possibly_started_request(&session.id)?)
         })?
     {
         bail!(
@@ -2023,6 +2044,7 @@ async fn accept_turn(
         }
         let p = process.as_mut().context("Agent process missing")?;
         p.turn_active = true;
+        p.active_request_id = Some(turn.request_id.clone());
         p.settled_turn = None;
         p.background_at_start = p.adapter.has_background_work();
         p.turn_deadline = tokio::time::Instant::now() + TURN_LIMIT;
@@ -2101,6 +2123,9 @@ async fn receive_turn(
         )
     })? {
         return Ok(Response::Accepted { duplicate: true });
+    }
+    if session.agent == "cursor" {
+        agents::cursor::validate_prompt(&turn.text)?;
     }
     if pending_inputs && !allow_queue {
         bail!("Agent 尚有已交付的消息待处理");

@@ -4,6 +4,7 @@ use crate::agents::{AgentCommand, TransportLifetime};
 struct OneShot {
     script: String,
     resume: Option<String>,
+    environment: std::collections::BTreeMap<String, String>,
 }
 impl agents::AgentAdapter for OneShot {
     fn transport_lifetime(&self) -> TransportLifetime {
@@ -38,7 +39,7 @@ impl agents::AgentAdapter for OneShot {
             Input::Open => Ok(vec![]),
             Input::Start { .. } => {
                 let mut command = tokio::process::Command::new("/bin/sh");
-                command.arg("-c").arg(&self.script);
+                command.arg("-c").arg(&self.script).envs(&self.environment);
                 Ok(vec![Action::SpawnTurn(AgentCommand {
                     command,
                     _settings: None,
@@ -76,6 +77,7 @@ fn prepared(
     config: LaunchConfig,
     script: &str,
 ) -> Process {
+    let environment = config.environment.0.clone();
     Process::prepare_adapter(
         database,
         "/must-not-spawn",
@@ -88,6 +90,7 @@ fn prepared(
         Box::new(OneShot {
             script: script.into(),
             resume: None,
+            environment,
         }),
     )
     .unwrap()
@@ -456,6 +459,9 @@ async fn per_turn_nonzero_after_result_is_not_success_and_stderr_is_bounded() {
     );
     p.close_confirmed(&database, &session.id).await.unwrap();
 }
+#[path = "per_turn_review_tests.rs"]
+mod review;
+
 #[tokio::test]
 async fn per_turn_stop_preserves_actor_and_native_id() {
     let (dir, database, session, config) = context();

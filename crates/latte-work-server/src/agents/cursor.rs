@@ -11,6 +11,15 @@ use anyhow::{Context, Result, bail};
 pub(crate) use metadata::{discover, models, permission_modes, validate_selection};
 
 const NATIVE_FRAME_LIMIT: usize = 1024 * 1024;
+const PROMPT_ARG_LIMIT: usize = 128 * 1024;
+
+pub(crate) fn validate_prompt(prompt: &str) -> Result<()> {
+    // Reserve the terminating argv NUL; Linux's single-argument bound includes it.
+    if prompt.len() >= PROMPT_ARG_LIMIT || prompt.contains('\0') {
+        bail!("Cursor prompt 必须小于 128 KiB 且不能包含 NUL；消息未发送");
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 pub(crate) struct Cursor {
@@ -124,6 +133,7 @@ impl AgentAdapter for Cursor {
         match input {
             Input::Open => Ok(vec![]),
             Input::Start { prompt } => {
+                validate_prompt(prompt)?;
                 let launch = self.launch.as_ref().context("Cursor launch 尚未准备")?;
                 self.decoder.start()?;
                 Ok(vec![Action::SpawnTurn(native_command(

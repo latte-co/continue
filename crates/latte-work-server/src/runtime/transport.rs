@@ -9,30 +9,29 @@ fn stderr_redactor(
     inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     config: &LaunchConfig,
 ) -> crate::redaction::Redactor {
-    let mut values: std::collections::BTreeMap<_, _> = inherited.into_iter().collect();
-    for (name, value) in command.as_std().get_envs() {
-        if let Some(value) = value {
-            values.insert(name.to_owned(), value.to_owned());
-        } else {
-            values.remove(name);
-        }
-    }
-    let secrets = values
-        .into_iter()
-        .filter(|(name, value)| {
-            let name = name.to_string_lossy().to_ascii_uppercase();
-            let value = value.to_string_lossy();
-            ["TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH"]
-                .iter()
-                .any(|part| name.contains(part))
-                || (value.contains("://") && value.contains('@'))
-        })
-        .map(|(_, value)| value.to_string_lossy().into_owned());
-    // Provider credentials can live in private settings instead of the child's
-    // environment. Merge all patterns before matching so overlaps stay masked.
-    crate::redaction::Redactor::new(
-        secrets.chain(config.provider.iter().map(|p| p.credential.clone())),
+    // Provider credentials may live in private settings instead of child ENV.
+    crate::redaction::for_command(
+        command,
+        inherited,
+        config.provider.iter().map(|p| p.credential.clone()),
     )
+}
+
+/// Constructed only at the exact Command::spawn failure boundary.
+#[derive(Debug)]
+pub(super) struct SpawnNotStarted {
+    pub evidence: crate::store::ConfirmedNotStarted,
+    source: std::io::Error,
+}
+impl std::fmt::Display for SpawnNotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, f)
+    }
+}
+impl std::error::Error for SpawnNotStarted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 pub(super) struct Transport {
@@ -91,7 +90,19 @@ impl Transport {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .process_group(0)
-            .spawn()?;
+            .spawn()
+            .map_err(|source| {
+                let evidence = match source.raw_os_error() {
+                    Some(code) if code == Errno::ENOENT as i32 => {
+                        crate::store::ConfirmedNotStarted::Enoent
+                    }
+                    Some(code) if code == Errno::E2BIG as i32 => {
+                        crate::store::ConfirmedNotStarted::E2big
+                    }
+                    _ => return anyhow::Error::from(source),
+                };
+                anyhow::Error::new(SpawnNotStarted { evidence, source })
+            })?;
         let pid = child.id().context("Agent PID missing")? as i32;
         let mut group = Group { child, pid };
         let input = if bidirectional {
@@ -133,7 +144,7 @@ impl Transport {
         })
     }
     /// stdout EOF is handled by Runtime before this call. Exit alone never finishes a turn.
-    pub async fn exited_successfully(&mut self) -> Result<()> {
+    pub async fn exited_successfully(&mut self) -> Result<String> {
         let status = tokio::time::timeout(Duration::from_secs(5), self.group.child.wait())
             .await
             .context("Agent stdout已结束，但进程退出未确认")??;
@@ -144,7 +155,7 @@ impl Transport {
         if !status.success() {
             bail!("Agent进程非零退出 ({status})：{stderr}");
         }
-        Ok(())
+        Ok(format!("Agent进程退出 ({status})：{stderr}"))
     }
     /// A parent wait is not proof that inherited descendants have stopped writing.
     pub async fn terminate(&mut self, confirm_group: bool) -> bool {
@@ -182,6 +193,49 @@ impl Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn only_exact_spawn_enoent_and_e2big_produce_not_started_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::providers::ProviderStore::open(dir.path())
+            .unwrap()
+            .turn_config("cursor", None, None)
+            .unwrap();
+        for (binary, oversized, expected) in [
+            (
+                dir.path().join("missing-agent"),
+                false,
+                Some(crate::store::ConfirmedNotStarted::Enoent),
+            ),
+            (
+                std::path::PathBuf::from("/bin/sh"),
+                true,
+                Some(crate::store::ConfirmedNotStarted::E2big),
+            ),
+            (dir.path().to_owned(), false, None),
+        ] {
+            let mut command = tokio::process::Command::new(binary);
+            if oversized {
+                command.arg("x".repeat(8 * 1024 * 1024));
+            }
+            let error = match Transport::spawn(
+                agents::AgentCommand {
+                    command,
+                    _settings: None,
+                    sideband: None,
+                },
+                Some(1024),
+                &config,
+                agents::TransportLifetime::PerTurn,
+            ) {
+                Ok(_) => panic!("invalid executable/argv must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.downcast_ref::<SpawnNotStarted>().map(|e| e.evidence),
+                expected
+            );
+        }
+    }
     #[tokio::test]
     async fn persistent_transport_retains_bidirectional_stdin() {
         let dir = tempfile::tempdir().unwrap();

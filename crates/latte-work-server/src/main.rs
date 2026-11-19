@@ -924,8 +924,21 @@ async fn dispatch_admitted(
                         .contains(level)
             });
             config.permission_mode = session.permission_mode.clone();
-            s.resolve_native_model(&session.agent, &path, &mut config)
+            if session.agent == "cursor" {
+                // Open preserves historical model/native ID even after catalog removal.
+                // Send still validates current membership before accepting a new turn.
+                agents::cursor::validate_selection(
+                    binary,
+                    Some(&path),
+                    None,
+                    config.effort,
+                    &config.environment,
+                )
                 .await?;
+            } else {
+                s.resolve_native_model(&session.agent, &path, &mut config)
+                    .await?;
+            }
             runtime::open(
                 s.database.clone(),
                 s.runs.clone(),
@@ -1022,6 +1035,46 @@ async fn dispatch_admitted(
                 return Ok(Response::Accepted { duplicate: true });
             }
             let agent_id = db(&s.database, |d| Ok(d.session(&session_id)?.agent))?;
+            if agent_id == "cursor" && allow_queue {
+                // Edited queue data may differ from the original accepted payload.
+                // Reconcile that admission before the executed requests ledger or
+                // current model catalog; neither identity check sends native input.
+                let original = runtime::SendTurn {
+                    request_id: request_id.clone(),
+                    text: text.clone(),
+                    model: model.clone(),
+                    fingerprint: fingerprint.clone(),
+                    // This value is identity-only and is never submitted to Runtime.
+                    // Queue comparison consumes only effort and permission_mode.
+                    config: providers::LaunchConfig {
+                        environment: latte_work_protocol::AgentEnvironment::default(),
+                        provider: None,
+                        settings_dir: std::path::PathBuf::new(),
+                        model: None,
+                        traex_model: None,
+                        effort,
+                        permission_mode: permission_mode.clone(),
+                    },
+                };
+                if let Some(response) =
+                    db(&s.database, |d| d.queued_duplicate(&session_id, &original))?
+                {
+                    return Ok(response);
+                }
+                if db(&s.database, |d| {
+                    d.already_accepted(
+                        &session_id,
+                        &request_id,
+                        &text,
+                        model.as_deref(),
+                        effort,
+                        fingerprint.as_deref(),
+                        permission_mode.as_deref(),
+                    )
+                })? {
+                    return Ok(Response::Accepted { duplicate: true });
+                }
+            }
             let binary = s.agent_binary(&agent_id)?;
             let mut launch_config = s
                 .providers

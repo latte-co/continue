@@ -39,14 +39,21 @@ def metadata(args: list[str]) -> bool:
         print("2026.11.13-eacade1")
     elif args == ["--help"]:
         print(
-            "--print --output-format <format> text | json | stream-json\n"
-            '--resume [chatId] --model <model> --mode <mode> '
-            '(choices: "plan", "ask")\n'
-            "--sandbox <mode> enabled | disabled"
+            "  --print  Print a headless response\n"
+            '  --output-format <format>  Output format (choices: "text", "json", "stream-json")\n'
+            "  --resume [chatId]  Resume a chat\n"
+            "  --model <model>  Select a model\n"
+            '  --mode <mode>  Read-only mode (choices: "plan", "ask")\n'
+            "  --sandbox <mode>  enabled | disabled"
         )
     elif args in (["models"], ["--list-models"]):
+        model = (
+            "cursor-next - Cursor Next"
+            if pathlib.Path("cursor-models-next").exists()
+            else "cursor-test - Cursor Test"
+        )
         print(
-            "Available models\n\ncursor-test - Cursor Test (default)\n\n"
+            f"Available models\n\n{model} (default)\n\n"
             "Tip: use --model <id> to select a model."
         )
     else:
@@ -68,7 +75,7 @@ def parse(args: list[str]) -> tuple[str, list[str], str | None]:
     assert not any(flag in options for flag in forbidden), options
     allowed = frozenset({
         "--print", "--output-format", "stream-json", "--resume", NATIVE_ID,
-        "--model", "cursor-test", "--mode", "ask", "plan",
+        "--model", "cursor-test", "cursor-next", "--mode", "ask", "plan",
     })
     assert all(value in allowed for value in options), options
     resume = options[options.index("--resume") + 1] if "--resume" in options else None
@@ -79,6 +86,7 @@ def record_input(prompt: str, options: list[str], resume: str | None) -> pathlib
     record = {
         "pid": os.getpid(), "prompt": prompt, "resume": resume,
         "options": options, "env": os.environ.get("CURSOR_FIXTURE_SECRET"),
+        "binary": sys.argv[0],
     }
     with pathlib.Path("cursor-inputs").open("a") as log:
         log.write(json.dumps(record) + "\n")
@@ -88,8 +96,27 @@ def record_input(prompt: str, options: list[str], resume: str | None) -> pathlib
     return active
 
 
+def diagnostic() -> None:
+    print(
+        "fixture diagnostic " + os.environ.get("CURSOR_FIXTURE_SECRET", ""),
+        file=sys.stderr, flush=True,
+    )
+
+
 def special_output(prompt: str) -> bool:
-    if prompt == "eof":
+    if prompt == "stderr-after-init":
+        diagnostic()
+        sys.exit(7)
+    elif prompt == "stderr-exit-zero":
+        diagnostic()
+    elif prompt == "stderr-oversize":
+        print("x" * (32 * 1024), file=sys.stderr, flush=True)
+        diagnostic()
+        sys.exit(7)
+    elif prompt == "eof-hold":
+        os.close(sys.stdout.fileno())
+        await_file("cursor-release")
+    elif prompt == "eof":
         text("CURSOR:unfinished")
     elif prompt == "unframed":
         sys.stdout.write("x" * (2 * 1024 * 1024))
@@ -137,21 +164,21 @@ def complete(prompt: str) -> None:
         pathlib.Path("cursor-result-emitted").touch()
         await_file("cursor-release")
     if prompt == "nonzero":
-        print(
-            "fixture diagnostic " + os.environ.get("CURSOR_FIXTURE_SECRET", ""),
-            file=sys.stderr, flush=True,
-        )
+        diagnostic()
         sys.exit(7)
 
 
-def run_turn(prompt: str) -> None:
+def run_turn(prompt: str, model: str) -> None:
     assert sys.stdin.read() == "", "Per-turn stdin must be closed"
+    if prompt == "stderr-no-result":
+        diagnostic()
+        sys.exit(7)
     if prompt == "before-init":
         await_file("cursor-release")
         return
     emit({
         "type": "system", "subtype": "init", "cwd": os.getcwd(),
-        "model": "cursor-test", "permissionMode": "default",
+        "model": model, "permissionMode": "default",
     })
     if prompt == "hold":
         await_file("cursor-release")
@@ -173,7 +200,8 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, stop)
     try:
-        run_turn(prompt)
+        model = options[options.index("--model") + 1] if "--model" in options else "cursor-test"
+        run_turn(prompt, model)
     finally:
         active.unlink(missing_ok=True)
 

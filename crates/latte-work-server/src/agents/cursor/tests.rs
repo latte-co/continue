@@ -402,7 +402,27 @@ fn cursor_model_parser_uses_native_ids_without_inventing_effort_or_context() {
     ] {
         assert!(metadata::catalog(invalid, None).is_err());
     }
-    assert!(metadata::catalog("Available models\na - A", Some("unknown")).is_err());
+}
+
+#[test]
+fn cursor_catalog_returns_current_models_when_saved_selection_is_unavailable() {
+    let catalog = metadata::catalog(
+        "Available models\ncurrent - Current (default)",
+        Some("removed-model"),
+    )
+    .unwrap();
+    let latte_work_protocol::Response::Models {
+        models,
+        model_labels,
+        default_model,
+        ..
+    } = catalog
+    else {
+        panic!("expected current Cursor catalog")
+    };
+    assert_eq!(models, ["current"]);
+    assert_eq!(default_model.as_deref(), Some("current"));
+    assert!(!model_labels.contains_key("removed-model"));
 }
 
 #[test]

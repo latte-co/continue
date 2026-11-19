@@ -176,7 +176,15 @@ A result alone is not sufficient: settlement and queue advancement wait for the
 owned transport to finish. Missing result, conflicting native IDs, malformed output
 or nonzero exit fail explicitly. If an admitted first turn ends before its native
 ID is known, a subsequent prompt cannot silently create a replacement session.
-The frontend separates Host preparation from a live native session.
+Only request-bound, durable evidence from an exact `Command::spawn` ENOENT/E2BIG
+failure permits an independent new request; old IDs still only reconcile, never replay.
+Missing/legacy evidence, a started process without init, and failed evidence writes
+remain conservative. Cursor validates its single prompt argument before new admission
+(less than 128 KiB of UTF-8 bytes, no NUL), without reducing other Agents' limits.
+The frontend separates Host preparation from a live native session. Model catalog
+reads and historical Open tolerate a removed selection; actual Send still validates
+current membership. Cursor discovery probes bounded candidates concurrently and
+waits for all owned groups to retire before choosing by priority.
 
 Focused checks: `cargo test -p latte-work-server --test e2e cursor_ --locked -- --test-threads=1`
 and `cargo test -p latte-work-server --bin latte-work-server cursor --locked`.

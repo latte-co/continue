@@ -1,6 +1,9 @@
 use super::*;
 use latte_work_protocol::TurnProvider;
 
+#[path = "cursor_review.rs"]
+mod review;
+
 async fn session(client: &mut Client, path: &Path) -> String {
     let Response::Project { project } = ask(
         client,

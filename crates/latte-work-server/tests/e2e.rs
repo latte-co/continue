@@ -52,8 +52,16 @@ impl Host {
         host
     }
     fn spawn(directory: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Child {
+        Self::spawn_with_removed_environment(directory, env, &[])
+    }
+    fn spawn_with_removed_environment(
+        directory: &Path,
+        env: &[(&str, &std::ffi::OsStr)],
+        removed: &[&str],
+    ) -> Child {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude.py");
-        Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_latte-work-server"));
+        command
             .env("LATTE_WORK_AGENT_ENV", "inherit")
             .arg("serve")
             .arg("--state-dir")
@@ -76,7 +84,11 @@ impl Host {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cursor.py"),
             )
             .env("CLAUDE_CONFIG_DIR", directory.join("claude-config"))
-            .envs(env.iter().copied())
+            .envs(env.iter().copied());
+        for name in removed {
+            command.env_remove(name);
+        }
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
