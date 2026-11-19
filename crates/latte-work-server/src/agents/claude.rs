@@ -417,6 +417,32 @@ impl AgentAdapter for Claude {
     fn has_background_work(&self) -> bool {
         !self.tasks.is_empty() || !self.foreground_agents.is_empty()
     }
+    fn background_task_ids(&self) -> Vec<String> {
+        self.tasks.iter().cloned().collect()
+    }
+    fn stop_background_task(&self, task_id: &str) -> Result<Vec<u8>> {
+        let mut request = serde_json::to_vec(&json!({
+            "type": "control_request",
+            "request_id": format!("latte-stop-task-{task_id}"),
+            "request": { "subtype": "stop_task", "task_id": task_id },
+        }))?;
+        request.push(b'\n');
+        Ok(request)
+    }
+    fn observe_background_shutdown(&mut self, line: &str) -> Result<()> {
+        let message: Value = serde_json::from_str(line)?;
+        // Only task lifecycle frames can settle a task. A control receipt
+        // acknowledges the request, and unrelated output cannot restart a turn.
+        if message["type"] == "system"
+            && matches!(
+                message["subtype"].as_str(),
+                Some("task_started" | "task_updated" | "task_notification")
+            )
+        {
+            self.decode(message)?;
+        }
+        Ok(())
+    }
     fn knows_subagent(&self, native_id: &str) -> bool {
         self.agent_tasks.contains_key(native_id)
     }

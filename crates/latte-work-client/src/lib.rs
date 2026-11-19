@@ -93,7 +93,7 @@ impl Client {
                 Ok(client)
             }
             Response::Error { code, message } if code == "version_mismatch" => bail!(
-                "远程 Server 与客户端不兼容，请等待远程任务结束并关闭终端后，更新并重启远程 Server：{message}"
+                "Server 与客户端不兼容，请等待任务结束并关闭终端后，更新并重启 Server：{message}"
             ),
             Response::Error { message, .. } => bail!("{message}"),
             other => bail!("不兼容的 Server: {other:?}"),

@@ -150,12 +150,17 @@ async fn connect_host(
         .lock()
         .await
         .insert(host.id.clone(), host.clone());
-    let adopted = pending_close::drain(&app, &state, &host, &mut client).await?;
+    let adopted = if host.ssh.is_some() {
+        pending_close::drain(&app, &state, &host, &mut client).await?
+    } else {
+        Vec::new()
+    };
+    let server_id = client.server_id().to_owned();
     state
         .server_ids
         .lock()
         .await
-        .insert(host.id.clone(), client.server_id().to_owned());
+        .insert(host.id.clone(), server_id.clone());
     let response = client
         .request(Request::Hello {
             version: latte_work_protocol::VERSION,
@@ -174,6 +179,28 @@ async fn connect_host(
         .lock()
         .await
         .insert(host.id.clone(), client.clone());
+    if host.ssh.is_none() {
+        let app = app.clone();
+        let host = host.clone();
+        // Old quit records can contain a slow or uncertain close. Use a
+        // separate bridge so it cannot block the new local connection.
+        tauri::async_runtime::spawn(async move {
+            let state = app.state::<Connections>();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+                let mut cleanup = reconnect_for_cleanup(&app, &state, &host.id).await?;
+                if cleanup.server_id() == server_id && !state.quitting.load(Ordering::SeqCst) {
+                    pending_close::drain(&app, &state, &host, &mut cleanup).await?;
+                }
+                Ok::<_, String>(())
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("恢复本机关闭记录失败：{error}"),
+                Err(_) => eprintln!("恢复本机关闭记录超时，待下次连接处理"),
+            }
+        });
+    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<Connections>();
@@ -242,6 +269,9 @@ async fn connect_host(
             .is_err()
             {
                 continue;
+            }
+            if state.quitting.load(Ordering::SeqCst) {
+                break;
             }
             let target = host.id.clone();
             // Open is idempotent and contains no prompt. A surviving daemon keeps

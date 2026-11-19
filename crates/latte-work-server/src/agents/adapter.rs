@@ -174,6 +174,16 @@ pub trait AgentAdapter: Send {
     fn metadata_ready(&self) -> bool {
         true
     }
+    /// Native background tasks may own processes outside the Agent process group.
+    fn background_task_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn stop_background_task(&self, _task_id: &str) -> Result<Vec<u8>> {
+        anyhow::bail!("此 Agent 不支持按标识停止后台任务")
+    }
+    fn observe_background_shutdown(&mut self, _line: &str) -> Result<()> {
+        Ok(())
+    }
     /// Optional JSON-RPC detach request for an owned process. Shutdown stays bounded.
     fn close_request(&self) -> Result<Option<Vec<u8>>> {
         Ok(None)

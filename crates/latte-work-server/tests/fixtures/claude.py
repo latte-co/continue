@@ -44,6 +44,7 @@ def metadata(value):
 turns=0
 child=None
 background=None
+background_mode=None
 native_lock=threading.Lock()
 native_pending=[]
 native_head=False
@@ -53,6 +54,21 @@ resumed=any(arg.startswith('--resume=') for arg in sys.argv)
 for line in sys.stdin:
     value=json.loads(line)
     if value['type']=='control_request':
+        if value['request']['subtype']=='stop_task':
+            task_id=value['request']['task_id']
+            if task_id=='bg-task' and background is not None:
+                if background_mode=='background-detached':
+                    pathlib.Path('fixture-stop-started').touch()
+                    deadline=time.monotonic()+0.8
+                    while not pathlib.Path('fixture-stop-release').exists() and time.monotonic()<deadline:
+                        time.sleep(.01)
+                if background.poll() is None:
+                    background.terminate()
+                    background.wait()
+            emit({'type':'control_response','response':{'subtype':'success','request_id':value['request_id']}})
+            if background_mode!='background-stop-uncertain':
+                emit({'type':'system','subtype':'task_notification','task_id':task_id,'status':'stopped'})
+            continue
         if value['request']['subtype']=='generate_session_title':
             description=value['request']['description'].split('\n\nAssistant reply:', 1)[0]
             if description.startswith('native-auto-title'):
@@ -399,9 +415,11 @@ for line in sys.stdin:
         elif text=='identity':
             emit({'type':'assistant','message':{'content':[{'type':'text','text':json.dumps({'pid':os.getpid(),'turns':turns,'background_pid':background.pid if background else None})}]}})
             emit({'type':'result','subtype':'success','is_error':False})
-        elif text in ('background','background-report','background-held'):
-            background=subprocess.Popen(['sleep','120' if text in ('background','background-held') else '0.5'])
-            emit({'type':'system','subtype':'task_started','task_id':'bg-task','task_type':'local_agent'})
+        elif text in ('background','background-report','background-held','background-detached','background-stop-uncertain'):
+            background_mode=text
+            detached=text=='background-detached'
+            background=subprocess.Popen(['sleep','0.5' if text=='background-report' else '120'],start_new_session=detached)
+            emit({'type':'system','subtype':'task_started','task_id':'bg-task','task_type':'local_bash' if detached else 'local_agent'})
             emit({'type':'assistant','message':{'content':[{'type':'text','text':f'background:{background.pid}'}]}})
             if text=='background-held':
                 pathlib.Path('background-main-waiting').touch()

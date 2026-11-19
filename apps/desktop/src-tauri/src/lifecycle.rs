@@ -1,5 +1,6 @@
 //! Graceful App exit: close every owned Agent session/terminal, then drain an idle local daemon.
 use crate::Connections;
+use latte_work_protocol::lifecycle::{RESOURCE_BATCH_LIMIT, Resource};
 use latte_work_protocol::{Request, Response};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -94,59 +95,71 @@ where
         .ok();
     let mut failed_hosts = HashSet::new();
     let mut errors = Vec::new();
-    let mut batches =
-        BTreeMap::<(String, String), Vec<latte_work_protocol::lifecycle::Resource>>::new();
+    let mut batches = BTreeMap::<(String, String), Vec<Resource>>::new();
     for ((host, resource), server) in state.owned_instances.lock().await.clone() {
         batches.entry((host, server)).or_default().push(resource);
     }
-    let mut batches: Vec<_> = batches.into_iter().collect();
-    batches.sort_by_key(|((host, server), _)| (host != "local", host.clone(), server.clone()));
-    for ((host, server), resources) in batches {
-        let result = async {
-            // Use a dedicated bridge: an in-flight reply or UI polling cannot
-            // prevent the server from receiving the whole cleanup batch.
-            let mut client = reconnect(host.clone()).await?;
-            for batch in resources.chunks(latte_work_protocol::lifecycle::RESOURCE_BATCH_LIMIT) {
-                client
-                    .close_owned_resources(
-                        server.clone(),
-                        state.owner_id().to_owned(),
-                        batch.to_vec(),
-                    )
-                    .await
-                    .map_err(|e| format!("{e:#}"))?;
-                // A later batch can fail or exceed the overall quit deadline.
-                // Remove only resources whose batch has already acknowledged.
-                for resource in batch {
-                    state
-                        .owned_instances
-                        .lock()
+    let (local, remote): (Vec<_>, Vec<_>) = batches
+        .into_iter()
+        .partition(|((host, _), _)| host == "local");
+    let close_batches = |batches: Vec<((String, String), Vec<Resource>)>| async move {
+        let mut failures = Vec::new();
+        for ((host, server), resources) in batches {
+            let result = async {
+                // Use a dedicated bridge: an in-flight reply or UI polling cannot
+                // prevent the server from receiving the whole cleanup batch.
+                let mut client = reconnect(host.clone()).await?;
+                let mut error = None;
+                for batch in resources.chunks(RESOURCE_BATCH_LIMIT) {
+                    if let Err(failure) = client
+                        .close_owned_resources(
+                            server.clone(),
+                            state.owner_id().to_owned(),
+                            batch.to_vec(),
+                        )
                         .await
-                        .remove(&(host.clone(), resource.clone()));
-                    match resource {
-                        latte_work_protocol::lifecycle::Resource::AgentSession(id) => {
-                            state.turns.lock().await.remove(&(host.clone(), id.clone()));
+                    {
+                        error.get_or_insert_with(|| format!("{failure:#}"));
+                        if client.is_broken() {
+                            break;
                         }
-                        latte_work_protocol::lifecycle::Resource::Terminal(id) => {
-                            state
-                                .terminals
-                                .lock()
-                                .await
-                                .remove(&(host.clone(), id.clone()));
+                        continue;
+                    }
+                    // A later batch can fail or exceed the overall quit deadline.
+                    // Remove only resources whose batch has already acknowledged.
+                    for resource in batch {
+                        state
+                            .owned_instances
+                            .lock()
+                            .await
+                            .remove(&(host.clone(), resource.clone()));
+                        match resource {
+                            Resource::AgentSession(id) => {
+                                state.turns.lock().await.remove(&(host.clone(), id.clone()));
+                            }
+                            Resource::Terminal(id) => {
+                                state
+                                    .terminals
+                                    .lock()
+                                    .await
+                                    .remove(&(host.clone(), id.clone()));
+                            }
                         }
                     }
                 }
+                error.map_or(Ok(()), Err)
             }
-            Ok::<_, String>(())
-        }
-        .await;
-        match result {
-            Ok(()) => {}
-            Err(error) => {
-                errors.push(format!("{host}：{error}"));
-                failed_hosts.insert(host);
+            .await;
+            if let Err(error) = result {
+                failures.push((host, error));
             }
         }
+        failures
+    };
+    let (local, remote) = tokio::join!(close_batches(local), close_batches(remote));
+    for (host, error) in local.into_iter().chain(remote) {
+        errors.push(format!("{host}：{error}"));
+        failed_hosts.insert(host);
     }
     let mut turns: Vec<_> = state.turns.lock().await.keys().cloned().collect();
     // Settle local resources before potentially unavailable remote hosts.

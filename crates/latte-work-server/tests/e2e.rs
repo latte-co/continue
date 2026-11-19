@@ -3085,6 +3085,207 @@ async fn upgrade_legacy_daemon_returns_actionable_error_without_stopping_it() {
 }
 
 #[tokio::test]
+async fn upgrade_busy_daemon_defers_replacement_and_still_requires_compatible_hello() {
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    for compatible in [true, false] {
+        let directory = tempfile::Builder::new()
+            .prefix("lw-defer-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let listener =
+            tokio::net::UnixListener::bind(directory.path().join("control.sock")).unwrap();
+        let old = tokio::spawn(async move {
+            let status = json!({
+                "kind":"server_status", "server_id":"busy-instance",
+                "build_id":"old-build", "draining":false,
+            });
+            for requests in [
+                vec!["server_status"],
+                vec!["prepare_upgrade"],
+                vec!["server_status", "hello"],
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                for method in requests {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(request["method"], method);
+                    let response = match method {
+                        "server_status" => status.clone(),
+                        "prepare_upgrade" => {
+                            assert_eq!(request["server_id"], "busy-instance");
+                            json!({"kind":"error","code":"upgrade_blocked","message":"conversation busy"})
+                        }
+                        "hello" if compatible => json!({
+                            "kind":"hello","version":VERSION,"server_id":"busy-instance","agents":[],
+                        }),
+                        _ => {
+                            json!({"kind":"error","code":"version_mismatch","message":"fixture protocol mismatch"})
+                        }
+                    };
+                    reader
+                        .get_mut()
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let result = Client::local(
+            Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+            Some(directory.path()),
+        )
+        .await;
+        if compatible {
+            assert_eq!(result.unwrap().server_id(), "busy-instance");
+        } else {
+            let Err(error) = result else {
+                panic!("an incompatible daemon must not serve application requests");
+            };
+            assert!(error.to_string().contains("fixture protocol mismatch"));
+        }
+        old.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn quit_and_reconnect_keep_live_conversations_isolated_from_slow_or_unknown_closes() {
+    use latte_work_protocol::lifecycle::Resource;
+    let host = Host::start().await;
+    let mut app = host.client().await;
+    let server_id = app.server_id().to_owned();
+    let good = tempfile::tempdir().unwrap();
+    let uncertain = tempfile::tempdir().unwrap();
+    let good_id = session(&mut app, good.path()).await;
+    let uncertain_id = session(&mut app, uncertain.path()).await;
+    let resources = vec![
+        Resource::AgentSession(uncertain_id.clone()),
+        Resource::AgentSession(good_id.clone()),
+    ];
+    app.claim_resources("first-app".into(), resources.clone())
+        .await
+        .unwrap();
+    let mut processes = Vec::new();
+    for (id, root, input) in [
+        (&good_id, good.path(), "background-detached"),
+        (&uncertain_id, uncertain.path(), "background-stop-uncertain"),
+    ] {
+        send(&mut app, id, input, input).await;
+        let events = wait(&mut app, id, Status::Completed).await;
+        let pid = events
+            .iter()
+            .find_map(|entry| match &entry.event {
+                EventKind::Text { text } => text.strip_prefix("background:")?.parse::<i32>().ok(),
+                _ => None,
+            })
+            .unwrap();
+        processes.push((agent_pid(root), pid));
+    }
+    drop(app);
+
+    // Reopening from a new client takes over the existing actor with no prompt.
+    let mut reopened = host.client().await;
+    assert_eq!(reopened.server_id(), server_id);
+    assert!(
+        matches!(ask(&mut reopened, Request::Projects).await, Response::Projects { projects } if projects.len() == 2)
+    );
+    reopened
+        .claim_resources("reopened-app".into(), resources.clone())
+        .await
+        .unwrap();
+    for (id, root, (pid, background)) in [
+        (&good_id, good.path(), processes[0]),
+        (&uncertain_id, uncertain.path(), processes[1]),
+    ] {
+        assert!(matches!(
+            ask(
+                &mut reopened,
+                Request::OpenAgentSession {
+                    session_id: id.clone(),
+                    provider: None,
+                }
+            )
+            .await,
+            Response::Ok
+        ));
+        assert_eq!(agent_pid(root), pid);
+        assert!(kill(Pid::from_raw(background), None).is_ok());
+        assert!(matches!(ask(&mut reopened, Request::Poll {
+            session_id: id.clone(), after: 0.0,
+        }).await, Response::Events { session, events, .. }
+            if session.agent_session_busy == Some(true)
+                && events.iter().filter(|e| matches!(e.event, EventKind::User { .. })).count() == 1));
+    }
+
+    let mut cleanup = Client::local_cleanup(
+        Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+        Some(host.directory.path()),
+    )
+    .await
+    .unwrap();
+    let close = tokio::spawn(async move {
+        cleanup
+            .close_owned_resources(server_id, "reopened-app".into(), resources)
+            .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while !good.path().join("fixture-stop-started").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "quit skipped the other conversation"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut another = tokio::time::timeout(Duration::from_millis(600), async {
+        let mut client = Client::local_cleanup(
+            Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+            Some(host.directory.path()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            ask(&mut client, Request::Projects).await,
+            Response::Projects { .. }
+        ));
+        client
+    })
+    .await
+    .expect("one closing conversation blocked access to the daemon");
+    assert!(!close.is_finished());
+    std::fs::write(good.path().join("fixture-stop-release"), "").unwrap();
+    assert!(
+        close
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("待确认")
+    );
+    for &(agent, child) in &processes {
+        assert_gone(agent).await;
+        assert_gone(child).await;
+    }
+    assert!(
+        matches!(ask(&mut another, Request::Session { session_id: uncertain_id }).await,
+        Response::Session { session } if session.agent_close_pending.is_some())
+    );
+    assert!(matches!(
+        ask(
+            &mut another,
+            Request::OpenAgentSession {
+                session_id: good_id,
+                provider: None,
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    assert_ne!(agent_pid(good.path()), processes[0].0);
+}
+
+#[tokio::test]
 async fn upgrade_racing_send_either_preserves_task_or_rejects_before_launch() {
     use serde_json::json;
     let host = Host::start().await;

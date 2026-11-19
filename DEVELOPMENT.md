@@ -68,6 +68,11 @@ starting the new build. This identity is separate from wire protocol v1. The
 private `server_status` / `prepare_upgrade` lifecycle handshake is available before
 Hello and is not a WebView API. The latter binds to a server instance and closes
 request admission atomically; running/waiting tasks and any open terminal veto it.
+When the running instance declines to drain, the bridge verifies that it is
+still connecting to that same instance and leaves the upgrade for the next
+connection attempt. The normal wire-version handshake and capability checks
+still apply. The App can load projects, open another chat, and reattach to a
+live conversation on the compatible daemon while it is busy.
 Local coordinators serialize via `upgrade.lock` and time out after 20 seconds.
 SSH still uses `connect`, with no automatic remote replacement. Legacy daemons
 without the lifecycle handshake require a one-time manual restart after tasks
@@ -360,9 +365,12 @@ the event-backed Quit menu because Tao 0.35 does not expose a cancellable
 applicationShouldTerminate callback. It adds only that missing method and leaves
 Tao window/reopen handling intact; Rust contains no unsafe code.
 
-Dock Quit and Command-Q silently close resources opened or sent by this App
-instance. A dedicated transport bypasses local upgrade checks and UI polling;
-cleanup batches are idempotent and bound to both the daemon ID and App owner ID.
+Dock Quit and Command-Q close all native conversations and terminals owned by
+the App instance, including ones with completed turns and live background work.
+Dedicated cleanup transports bypass local upgrade checks and UI polling. Each
+batch is idempotent and bound to both the daemon ID and App owner ID. The server
+reserves the owned resources before closing them independently. A slow or
+unconfirmed close leaves other conversations and the host handshake available.
 Quit and reconnect split resource inventories into at most 128 IDs per lifecycle
 RPC. Successful quit batches retire their local records immediately; failures
 retain only the remaining work. The size-bounded quit journal accepts larger
@@ -380,7 +388,10 @@ Handoff reuses an existing source file and preserves its other hosts, so recover
 at the 128-record limit never creates an unreadable 129th record. A reachable
 local daemon's durable unknown-close state retains the quit journal while allowing
 the connection to open for manual verification; transport failures remain errors.
-The host closes and reaps the Agent process group before acknowledging. An App
+Before reaping Claude, the host requests native stops for tracked background
+tasks, including shells that have their own process group. A task's terminal
+lifecycle event is required to confirm its stop. The host then terminates the
+Agent process group and reaps the Agent. An App
 reclaim fences stale closes from an earlier App instance. New requests are blocked
 while quitting; admitted requests cannot send new work after claiming a resource
 if Quit has begun. Prompt input is never replayed.
@@ -388,8 +399,9 @@ if Quit has begun. Prompt input is never replayed.
 Quit persists a private, atomic resource record before closing. The UI is never
 blocked by a quit-failure dialog: cleanup has an 8-second overall deadline, then
 the App exits. Unconfirmed work is not reported as stopped. Tab cleanup is advisory,
-with a one-second budget; native resource ownership remains authoritative. Local
-unconfirmed closes are resolved before the next local connection is exposed.
+with a one-second budget; native resource ownership remains authoritative. The
+next local connection reconciles unconfirmed closes over a separate transport
+so the App can load projects and history while cleanup continues.
 A disconnected remote server keeps executing and retains its Agent sessions:
 it cannot infer App Quit from SSH EOF. On the next connection, the App reattaches
 to surviving remote resources and fetches their actual state; it never replays an
@@ -644,9 +656,10 @@ conversation to a draft; history remains on the host. Stop interrupts one turn
 and keeps the native session open. Native reconnect restores every App-owned
 session, including conversations not currently selected, without replaying prompts.
 An actual process/daemon restart cannot recover in-flight subagents; interrupted
-execution stays failed/unknown while native history is reopened. Busy/background
-sessions veto an automatic local daemon upgrade. Both desktop and remote Server
-need this revision for the additive lifecycle requests.
+execution stays failed/unknown while native history is reopened. If the daemon
+survives a desktop restart, reopening a conversation with background work
+reattaches to the existing process and continues reading its events. A busy
+compatible daemon can continue serving the App while the upgrade is deferred.
 
 The transcript stores its scroll offset and follow-latest preference in App memory
 per host/session. Switching back restores that position after concealed layout;

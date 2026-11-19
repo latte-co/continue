@@ -14,7 +14,7 @@ use nix::{
 };
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     process::Stdio,
     sync::{
         Arc, Mutex,
@@ -1653,6 +1653,10 @@ impl Process {
             let _ = reply.send(Err("原生会话已关闭，标题修改结果待确认".into()));
         }
         self.session_open.store(false, Ordering::SeqCst);
+        let background_confirmed = matches!(
+            tokio::time::timeout(Duration::from_secs(1), self.stop_native_background()).await,
+            Ok(Ok(()))
+        );
         if let Ok(Some(bytes)) = self.adapter.close_request() {
             let (adapter, input, output) = (&mut self.adapter, &mut self.input, &mut self.output);
             let _ = tokio::time::timeout(Duration::from_millis(750), async move {
@@ -1678,16 +1682,43 @@ impl Process {
         );
         // The parent may have exited before its descendants. A signal alone
         // does not prove that they have stopped writing.
-        let _ = killpg(group, Signal::SIGKILL);
+        let group_signaled = matches!(killpg(group, Signal::SIGKILL), Ok(()) | Err(Errno::ESRCH));
         self.drain.abort();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let parent_reaped = tokio::time::timeout(Duration::from_millis(750), async {
             if !reaped {
                 reaped = self.group.child.wait().await.is_ok();
             }
             reaped
         })
         .await
-        .unwrap_or(false)
+        .unwrap_or(false);
+        background_confirmed && group_signaled && parent_reaped
+    }
+    async fn stop_native_background(&mut self) -> Result<()> {
+        let mut requested = HashSet::new();
+        for _ in 0..512 {
+            let mut tasks = self.adapter.background_task_ids();
+            if tasks.is_empty() {
+                return Ok(());
+            }
+            tasks.sort_unstable();
+            for task in tasks {
+                if requested.insert(task.clone()) {
+                    if requested.len() > 256 {
+                        bail!("原生后台任务数量超出关闭限制");
+                    }
+                    let command = self.adapter.stop_background_task(&task)?;
+                    write(&mut self.input, &command).await?;
+                }
+            }
+            let line = self
+                .output
+                .next()
+                .await
+                .context("原生后台任务停止待确认")??;
+            self.adapter.observe_background_shutdown(&line)?;
+        }
+        bail!("原生后台任务停止待确认")
     }
 }
 fn finish_native_close(database: &Database, id: &str, confirmed: bool) -> Result<()> {
