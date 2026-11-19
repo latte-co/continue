@@ -122,6 +122,67 @@ it("ignores malformed or unbounded stored preferences", () => {
     hook.unmount();
   }
 });
+it("isolates Cursor model and permission preferences from other hosts and Agents without inventing effort", () => {
+  const hook = renderHook(
+    ({ host, agent, project, session }) =>
+      useAgentPreferences(host, agent, project, session, false),
+    {
+      initialProps: {
+        host: "local",
+        agent: "cursor",
+        project: "a",
+        session: undefined as Session | undefined,
+      },
+    },
+  );
+  act(() => {
+    hook.result.current.chooseModel("native-cursor-model");
+    hook.result.current.choosePermissionMode("plan");
+  });
+  expect(hook.result.current.effort).toBeNull();
+  hook.rerender({
+    host: "remote",
+    agent: "cursor",
+    project: "b",
+    session: undefined,
+  });
+  expect(hook.result.current.model).toBeNull();
+  expect(hook.result.current.permissionMode).toBeNull();
+  act(() => hook.result.current.chooseModel("remote-cursor-model"));
+  hook.rerender({
+    host: "local",
+    agent: "claude",
+    project: "b",
+    session: undefined,
+  });
+  expect(hook.result.current.model).toBeNull();
+  act(() => hook.result.current.chooseEffort("high"));
+  hook.rerender({
+    host: "local",
+    agent: "cursor",
+    project: "c",
+    session: undefined,
+  });
+  expect(hook.result.current.model).toBe("native-cursor-model");
+  expect(hook.result.current.permissionMode).toBe("plan");
+  expect(hook.result.current.effort).toBeNull();
+  hook.rerender({
+    host: "local",
+    agent: "cursor",
+    project: "c",
+    session: savedSession("session-cursor-model", null),
+  });
+  expect(hook.result.current.model).toBe("session-cursor-model");
+  expect(hook.result.current.permissionMode).toBeNull();
+  hook.unmount();
+  const restored = renderHook(() =>
+    useAgentPreferences("local", "cursor", "d", undefined, false),
+  );
+  expect(restored.result.current.model).toBe("native-cursor-model");
+  expect(restored.result.current.permissionMode).toBe("plan");
+  expect(restored.result.current.effort).toBeNull();
+});
+
 it("remembers native permission ids per host/agent and restores session inheritance", () => {
   const hook = renderHook(
     ({ host, agent, session }) =>

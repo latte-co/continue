@@ -140,11 +140,14 @@ and `agents/app_server.rs` implements the shared Codex/Traex app-server v2 state
 machine. `agents/codex.rs` and `agents/traex.rs` own their native capabilities.
 Keep protocol order and wire messages in the implementation.
 Runtime consumes common actions and retains approval authorization, process
-supervision and persistence. Each opened conversation has a persistent actor and
-native process. The additive `open_agent_session` and `close_agent_session`
+supervision and persistence. Each opened conversation has a persistent actor;
+Claude, Codex, Traex and OpenCode also retain a native process. Cursor uses an
+explicit per-turn transport: Open only prepares host context and does not claim a
+live native session. The additive `open_agent_session` and `close_agent_session`
 requests do not send prompts; they share the local/SSH implementation. Runtime
-serializes native output, durable turn admission, interruption and close. Native
-results finish turns without closing stdin. Task lifecycle and session-state
+serializes native output, durable turn admission, interruption and close. Persistent
+native results finish turns without closing stdin. Cursor results remain pending
+until stdout drains, the child exits successfully and its owned group is reaped. Task lifecycle and session-state
 messages stay in the Claude adapter. Configuration changes are rejected before
 admission when background work cannot safely be released. `Ready` must never implicitly send a prompt.
 
@@ -159,6 +162,29 @@ for contract/adapter/runtime UT, followed by `make test-e2e` for real server/bri
 behavior with the deterministic CLI fixture. These do not measure coverage or
 validate a live model service. Internal interface changes do not require a wire
 protocol version increment.
+
+### Cursor Agent per-turn transport
+
+Cursor uses `--print --output-format stream-json` and resumes only the persisted
+native ID. `LATTE_WORK_CURSOR` selects the Host executable. Its metadata and JSON
+remain adapter-owned; Runtime owns spawning, output bounds, stderr redaction,
+cancellation and process-group retirement. No force/trust/MCP-approval defaults
+are injected. Model discovery is prompt-free; native-default permissions are not
+an App sandbox. Ask/plan use only CLI-declared native modes.
+
+A result alone is not sufficient: settlement and queue advancement wait for the
+owned transport to finish. Missing result, conflicting native IDs, malformed output
+or nonzero exit fail explicitly. If an admitted first turn ends before its native
+ID is known, a subsequent prompt cannot silently create a replacement session.
+The frontend separates Host preparation from a live native session.
+
+Focused checks: `cargo test -p latte-work-server --test e2e cursor_ --locked -- --test-threads=1`
+and `cargo test -p latte-work-server --bin latte-work-server cursor --locked`.
+Installed `cargo-llvm-cov` can measure the new modules with
+`cargo llvm-cov -p latte-work-server --bin latte-work-server --locked --json --output-path target/cursor-coverage.json`;
+report whole-project and Cursor-module coverage separately. Coverage output is local
+build data, never product source. Real account/model turns need separate confirmation
+and are not performed by deterministic fixtures. See [Cursor design](docs/cursor-agent.md).
 
 ## Session annotations
 

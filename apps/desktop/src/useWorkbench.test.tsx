@@ -607,6 +607,462 @@ it("opens selected Agent sessions and closes explicitly without reopening on ref
   ).toHaveLength(opens + 1);
 });
 
+const cursorSession = (id = "s"): Session => ({
+  ...session(),
+  id,
+  agent: "cursor",
+  unread: false,
+  agent_session_open: false,
+});
+function cursorHost() {
+  const base = mocks.request.getMockImplementation()!;
+  mocks.request.mockImplementation(async (host: string, r: Request) => {
+    if (r.method === "sessions")
+      return {
+        kind: "sessions",
+        sessions: [cursorSession(), cursorSession("t")],
+      };
+    if (r.method === "poll")
+      return {
+        kind: "events",
+        session: cursorSession(r.session_id),
+        events: [],
+        has_more: false,
+      };
+    return base(host, r);
+  });
+}
+const agentOpens = () =>
+  mocks.request.mock.calls.filter(([, r]) => r.method === "open_agent_session");
+it("prepares Cursor on the Host without native-open evidence and reuses preparation across conversation switches", async () => {
+  cursorHost();
+  const { result } = renderHook(useWorkbench);
+  await act(async () => {});
+  await act(async () =>
+    result.current.openSession({ ...cursorSession(), hostId: "local" }),
+  );
+  expect(
+    result.current.agentSessionTransitions[JSON.stringify(["local", "s"])],
+  ).toBeUndefined();
+  expect(result.current.session).toMatchObject({
+    agent_session_open: false,
+    native_id: null,
+  });
+  expect(
+    result.current.agentSessionState({ ...cursorSession(), hostId: "local" }),
+  ).toBe("closed");
+  await act(async () =>
+    result.current.openSession({ ...cursorSession("t"), hostId: "local" }),
+  );
+  await act(async () =>
+    result.current.openSession({ ...cursorSession(), hostId: "local" }),
+  );
+  expect(agentOpens()).toHaveLength(2);
+  expect(
+    mocks.request.mock.calls.some(([, r]) =>
+      ["create_session", "send_queued"].includes(r.method),
+    ),
+  ).toBe(false);
+});
+it.each(["claude", "codex", "traex", "opencode"])(
+  "still requires native-open evidence for %s",
+  async (agent) => {
+    const base = mocks.request.getMockImplementation()!;
+    const row = { ...cursorSession(), agent };
+    mocks.request.mockImplementation(async (host: string, r: Request) => {
+      if (r.method === "sessions") return { kind: "sessions", sessions: [row] };
+      if (r.method === "poll")
+        return { kind: "events", session: row, events: [], has_more: false };
+      return base(host, r);
+    });
+    const { result } = renderHook(useWorkbench);
+    await act(async () => {});
+    await act(async () =>
+      result.current.openSession({ ...row, hostId: "local" }),
+    );
+    expect(
+      result.current.agentSessionTransitions[JSON.stringify(["local", "s"])],
+    ).toMatchObject({ phase: "error" });
+  },
+);
+it("automatically selects an available Cursor directory entry and isolates Host preparation and draft Agent choices", async () => {
+  cursorHost();
+  mocks.loadHosts.mockResolvedValue([
+    { id: "local", name: "Local" },
+    { id: "remote", name: "Remote", ssh: "fixture" },
+  ]);
+  mocks.connect.mockImplementation(async (host: { id: string }) => ({
+    kind: "hello",
+    server_id: `server-${host.id}`,
+    agents: [
+      {
+        id: "claude",
+        name: "Claude Code",
+        available: host.id === "remote",
+        detail: "fixture",
+        provider_protocols: [],
+      },
+      {
+        id: "cursor",
+        name: "Cursor Agent",
+        available: true,
+        detail: "fixture",
+        provider_protocols: [],
+      },
+    ],
+  }));
+  const { result } = renderHook(useWorkbench);
+  await act(async () => {});
+  expect(result.current.agent?.id).toBe("cursor");
+  await act(async () =>
+    result.current.openSession({ ...cursorSession(), hostId: "local" }),
+  );
+  await act(async () =>
+    result.current.openSession({ ...cursorSession(), hostId: "remote" }),
+  );
+  expect(agentOpens().map(([host]) => host)).toEqual(["local", "remote"]);
+  await act(async () =>
+    result.current.openSession({ ...cursorSession(), hostId: "local" }),
+  );
+  expect(agentOpens()).toHaveLength(2);
+});
+it.each(["error", "missing-state", "wrong-session", "wrong-agent"])(
+  "does not accept Cursor preparation with %s evidence",
+  async (invalid) => {
+    cursorHost();
+    const base = mocks.request.getMockImplementation()!;
+    mocks.request.mockImplementation(async (host: string, r: Request) => {
+      if (r.method === "open_agent_session" && invalid === "error")
+        return { kind: "error", message: "Host preparation failed" };
+      if (r.method === "poll" && r.after === Number.MAX_SAFE_INTEGER)
+        return {
+          kind: "events",
+          events: [],
+          has_more: false,
+          session: {
+            ...cursorSession(invalid === "wrong-session" ? "other" : "s"),
+            agent: invalid === "wrong-agent" ? "claude" : "cursor",
+            agent_session_open: invalid === "missing-state" ? undefined : false,
+          },
+        };
+      return base(host, r);
+    });
+    const { result } = renderHook(useWorkbench);
+    await act(async () => {});
+    await act(async () =>
+      result.current.openSession({ ...cursorSession(), hostId: "local" }),
+    );
+    expect(
+      result.current.agentSessionTransitions[JSON.stringify(["local", "s"])]
+        ?.phase,
+    ).toBe("error");
+    expect(result.current.session).toMatchObject({
+      id: "s",
+      native_id: null,
+      agent_session_open: false,
+    });
+  },
+);
+it("does not publish a late Cursor preparation poll across close or a replacement connection", async () => {
+  cursorHost();
+  const base = mocks.request.getMockImplementation()!;
+  const finishes: ((value: unknown) => void)[] = [];
+  mocks.request.mockImplementation(async (host: string, r: Request) => {
+    if (r.method === "poll" && r.after === Number.MAX_SAFE_INTEGER)
+      return new Promise((resolve) => finishes.push(resolve));
+    return base(host, r);
+  });
+  const { result } = renderHook(useWorkbench);
+  await act(async () => {});
+  await act(async () =>
+    result.current.openSession({ ...cursorSession(), hostId: "local" }),
+  );
+  act(() =>
+    window.dispatchEvent(
+      new CustomEvent(HOST_DISCONNECTED_EVENT, {
+        detail: new HostConnectionError("local", "offline"),
+      }),
+    ),
+  );
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(finishes).toHaveLength(2);
+  await act(async () =>
+    finishes[0]({
+      kind: "events",
+      session: {
+        ...cursorSession(),
+        native_id: "stale-native",
+        agent_session_open: true,
+      },
+      events: [],
+      has_more: false,
+    }),
+  );
+  expect(result.current.session?.native_id).toBeNull();
+  expect(
+    result.current.agentSessionTransitions[JSON.stringify(["local", "s"])]
+      ?.phase,
+  ).toBe("opening");
+  await act(async () =>
+    result.current.sessionAction("local", {
+      method: "close_agent_session",
+      session_id: "s",
+    }),
+  );
+  await act(async () =>
+    finishes[1]({
+      kind: "events",
+      session: cursorSession(),
+      events: [],
+      has_more: false,
+    }),
+  );
+  expect(result.current.sessionId).toBe("");
+  expect(
+    result.current.agentSessionTransitions[JSON.stringify(["local", "s"])],
+  ).toBeUndefined();
+});
+
+it.each(["success", "failure"])(
+  "reprepares Cursor after a same-server connection replacement and fences the old Poll %s",
+  async (outcome) => {
+    cursorHost();
+    const base = mocks.request.getMockImplementation()!;
+    let finish!: (value: unknown) => void;
+    let reject!: (reason: Error) => void;
+    let delayed = false;
+    mocks.request.mockImplementation(async (host: string, r: Request) => {
+      if (
+        r.method === "poll" &&
+        r.after === Number.MAX_SAFE_INTEGER &&
+        !delayed
+      ) {
+        delayed = true;
+        return new Promise((resolve, fail) => {
+          finish = resolve;
+          reject = fail;
+        });
+      }
+      return base(host, r);
+    });
+    const { result } = renderHook(useWorkbench);
+    await act(async () => {});
+    await act(async () =>
+      result.current.openSession({ ...cursorSession(), hostId: "local" }),
+    );
+    const previousVersion = result.current.hostConnectionVersions.local;
+    await act(async () =>
+      result.current.refreshHost(result.current.host, true),
+    );
+    expect(result.current.serverId).toBe("server-local");
+    expect(result.current.connected).toBe(true);
+    expect(result.current.hostConnectionVersions.local).toBeGreaterThan(
+      previousVersion,
+    );
+    await act(async () => {
+      if (outcome === "failure")
+        reject(new HostConnectionError("local", "old connection replaced"));
+      else
+        finish({
+          kind: "events",
+          session: {
+            ...cursorSession(),
+            native_id: "old-native",
+            agent_session_open: true,
+          },
+          events: [],
+          has_more: false,
+        });
+    });
+    expect(agentOpens()).toHaveLength(2);
+    expect(
+      result.current.agentSessionTransitions[JSON.stringify(["local", "s"])],
+    ).toBeUndefined();
+    expect(result.current.session).toMatchObject({
+      native_id: null,
+      agent_session_open: false,
+    });
+    expect(result.current.connected).toBe(true);
+  },
+);
+it("fences an old Cursor Poll rejection while the replacement handshake is still pending", async () => {
+  cursorHost();
+  const base = mocks.request.getMockImplementation()!;
+  let reject!: (error: Error) => void;
+  let delayed = false;
+  mocks.request.mockImplementation(async (host: string, r: Request) => {
+    if (
+      r.method === "poll" &&
+      r.after === Number.MAX_SAFE_INTEGER &&
+      !delayed
+    ) {
+      delayed = true;
+      return new Promise((_resolve, fail) => {
+        reject = fail;
+      });
+    }
+    return base(host, r);
+  });
+  const { result } = renderHook(useWorkbench);
+  await act(async () => {});
+  await act(async () =>
+    result.current.openSession({ ...cursorSession(), hostId: "local" }),
+  );
+  const connectBase = mocks.connect.getMockImplementation()!;
+  const hello = await connectBase(result.current.host);
+  let replace!: (value: unknown) => void;
+  mocks.connect.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        replace = resolve;
+      }),
+  );
+  let refreshed!: Promise<void>;
+  act(() => {
+    refreshed = result.current.refreshHost(result.current.host, true);
+  });
+  await act(async () =>
+    reject(new HostConnectionError("local", "old transport closed")),
+  );
+  expect(
+    result.current.agentSessionTransitions[JSON.stringify(["local", "s"])]
+      ?.phase,
+  ).toBe("opening");
+  await act(async () => {
+    replace(hello);
+    await refreshed;
+  });
+  expect(agentOpens()).toHaveLength(2);
+  expect(
+    result.current.agentSessionTransitions[JSON.stringify(["local", "s"])],
+  ).toBeUndefined();
+  expect(result.current.connected).toBe(true);
+});
+
+it("invalidates completed Cursor preparation on same-server replacement instead of reusing the old connection evidence", async () => {
+  cursorHost();
+  const { result } = renderHook(useWorkbench);
+  await act(async () => {});
+  await act(async () =>
+    result.current.openSession({ ...cursorSession(), hostId: "local" }),
+  );
+  expect(agentOpens()).toHaveLength(1);
+  await act(async () => result.current.refreshHost(result.current.host, true));
+  expect(agentOpens()).toHaveLength(2);
+  expect(
+    result.current.agentSessionTransitions[JSON.stringify(["local", "s"])],
+  ).toBeUndefined();
+  expect(result.current.session?.agent_session_open).toBe(false);
+});
+
+it("restores Cursor preparation after reconnect without marking a native session open", async () => {
+  cursorHost();
+  const { result } = renderHook(useWorkbench);
+  await act(async () => {});
+  await act(async () =>
+    result.current.openSession({ ...cursorSession(), hostId: "local" }),
+  );
+  act(() =>
+    window.dispatchEvent(
+      new CustomEvent(HOST_DISCONNECTED_EVENT, {
+        detail: new HostConnectionError("local", "offline"),
+      }),
+    ),
+  );
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(agentOpens()).toHaveLength(2);
+  expect(
+    result.current.agentSessionTransitions[JSON.stringify(["local", "s"])],
+  ).toBeUndefined();
+  expect(result.current.session?.agent_session_open).toBe(false);
+});
+it.each(["close_agent_session", "archive_session"] as const)(
+  "discards late Cursor preparation after %s",
+  async (method) => {
+    cursorHost();
+    const base = mocks.request.getMockImplementation()!;
+    let finish!: (value: unknown) => void;
+    mocks.request.mockImplementation(async (host: string, r: Request) => {
+      if (r.method === "open_agent_session")
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      if (r.method === "archive_session")
+        return {
+          kind: "session",
+          session: { ...cursorSession(), archived: true },
+        };
+      return base(host, r);
+    });
+    const { result } = renderHook(useWorkbench);
+    await act(async () => {});
+    await act(async () =>
+      result.current.openSession({ ...cursorSession(), hostId: "local" }),
+    );
+    await act(async () =>
+      result.current.sessionAction(
+        "local",
+        method === "archive_session"
+          ? { method, session_id: "s", archived: true }
+          : { method, session_id: "s" },
+      ),
+    );
+    await act(async () => finish({ kind: "ok" }));
+    expect(result.current.sessionId).toBe("");
+    expect(
+      result.current.agentSessionTransitions[JSON.stringify(["local", "s"])],
+    ).toBeUndefined();
+    expect(
+      mocks.request.mock.calls.some(
+        ([, r]) => r.method === "poll" && r.after === Number.MAX_SAFE_INTEGER,
+      ),
+    ).toBe(false);
+    if (method === "close_agent_session") {
+      await act(async () =>
+        result.current.openSession({ ...cursorSession(), hostId: "local" }),
+      );
+      expect(agentOpens()).toHaveLength(2);
+    }
+  },
+);
+it("ignores an old Cursor Open acknowledgement after a replacement connection and on unmount", async () => {
+  cursorHost();
+  const base = mocks.request.getMockImplementation()!;
+  const finishes: ((value: unknown) => void)[] = [];
+  mocks.request.mockImplementation(async (host: string, r: Request) => {
+    if (r.method === "open_agent_session")
+      return new Promise((resolve) => finishes.push(resolve));
+    return base(host, r);
+  });
+  const hook = renderHook(useWorkbench);
+  await act(async () => {});
+  await act(async () =>
+    hook.result.current.openSession({ ...cursorSession(), hostId: "local" }),
+  );
+  act(() =>
+    window.dispatchEvent(
+      new CustomEvent(HOST_DISCONNECTED_EVENT, {
+        detail: new HostConnectionError("local", "offline"),
+      }),
+    ),
+  );
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(finishes).toHaveLength(2);
+  await act(async () => finishes[0]({ kind: "ok" }));
+  expect(
+    mocks.request.mock.calls.some(
+      ([, r]) => r.method === "poll" && r.after === Number.MAX_SAFE_INTEGER,
+    ),
+  ).toBe(false);
+  hook.unmount();
+  await act(async () => finishes[1]({ kind: "ok" }));
+  expect(
+    mocks.request.mock.calls.some(
+      ([, r]) => r.method === "poll" && r.after === Number.MAX_SAFE_INTEGER,
+    ),
+  ).toBe(false);
+});
+
 it("distinguishes first open, recovery, and switching to a live session", async () => {
   unread = false;
   const opened = new Set<string>();
@@ -1318,56 +1774,72 @@ it.each([false, true])(
   },
 );
 
-it("creates the selected native Agent and keeps the saved session Agent fixed", async () => {
-  const agents = [
-    {
-      id: "claude",
-      name: "Claude Code",
-      available: true,
-      detail: "",
-      provider_protocols: [],
-    },
-    {
-      id: "traex",
-      name: "Traex",
-      available: true,
-      detail: "",
-      provider_protocols: [],
-    },
-  ];
-  mocks.connect.mockResolvedValue({
-    kind: "hello",
-    server_id: "server-local",
-    agents,
-  });
-  const base = mocks.request.getMockImplementation()!;
-  const created = { ...session(), id: "native", agent: "traex" };
-  mocks.request.mockImplementation(async (host: string, r: Request) => {
-    if (r.method === "create_session")
-      return { kind: "session", session: created };
-    if (r.method === "send_queued")
-      return { kind: "accepted", duplicate: false };
-    if (r.method === "poll" && r.session_id === created.id)
-      return { kind: "events", session: created, events: [], has_more: false };
-    return base(host, r);
-  });
-  const { result } = renderHook(useWorkbench);
-  await act(async () => {});
-  act(() => result.current.selectAgent("traex"));
-  expect(result.current.agent?.id).toBe("traex");
-  await act(async () => {
-    expect(await result.current.send("native turn", null, null, null)).toBe(
-      true,
-    );
-  });
-  expect(
-    mocks.request.mock.calls.find(
-      ([, r]) => r.method === "create_session",
-    )?.[1],
-  ).toMatchObject({ agent: "traex" });
-  act(() => result.current.selectAgent("claude"));
-  expect(result.current.agent?.id).toBe("traex");
-});
+it.each([
+  { id: "traex", name: "Traex" },
+  { id: "cursor", name: "Cursor Agent" },
+])(
+  "creates the selected $name and keeps the saved session Agent fixed",
+  async ({ id, name }) => {
+    const agents = [
+      {
+        id: "claude",
+        name: "Claude Code",
+        available: true,
+        detail: "",
+        provider_protocols: [],
+      },
+      {
+        id,
+        name,
+        available: true,
+        detail: "",
+        provider_protocols: [],
+      },
+    ];
+    mocks.connect.mockResolvedValue({
+      kind: "hello",
+      server_id: "server-local",
+      agents,
+    });
+    const base = mocks.request.getMockImplementation()!;
+    const created = {
+      ...session(),
+      id: "native",
+      agent: id,
+      agent_session_open: id !== "cursor",
+    };
+    mocks.request.mockImplementation(async (host: string, r: Request) => {
+      if (r.method === "create_session")
+        return { kind: "session", session: created };
+      if (r.method === "send_queued")
+        return { kind: "accepted", duplicate: false };
+      if (r.method === "poll" && r.session_id === created.id)
+        return {
+          kind: "events",
+          session: created,
+          events: [],
+          has_more: false,
+        };
+      return base(host, r);
+    });
+    const { result } = renderHook(useWorkbench);
+    await act(async () => {});
+    act(() => result.current.selectAgent(id));
+    expect(result.current.agent?.id).toBe(id);
+    await act(async () => {
+      expect(await result.current.send("native turn", null, null, null)).toBe(
+        true,
+      );
+    });
+    expect(
+      mocks.request.mock.calls.find(
+        ([, r]) => r.method === "create_session",
+      )?.[1],
+    ).toMatchObject({ agent: id });
+    act(() => result.current.selectAgent("claude"));
+    expect(result.current.agent?.id).toBe(id);
+  },
+);
 
 it("persists pinned ordering through native refresh, disconnect/reconnect and remount without sending a request to reorder", async () => {
   const rows = [

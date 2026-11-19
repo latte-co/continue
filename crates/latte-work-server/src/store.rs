@@ -1658,6 +1658,14 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    /// Durable admission evidence survives stop, close and daemon restart.
+    pub fn has_admitted_request(&self, id: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM requests WHERE session_id=?1)",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
     pub fn first_request(&self, id: &str) -> Result<bool> {
         Ok(self.db.query_row(
             "SELECT COUNT(*) FROM requests WHERE session_id=?1",

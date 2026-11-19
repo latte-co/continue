@@ -6,6 +6,14 @@ use latte_work_protocol::EventKind;
 use serde_json::Value;
 use tokio::process::Command;
 
+/// Physical process lifetime, independent of the durable Host session actor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransportLifetime {
+    #[default]
+    Persistent,
+    PerTurn,
+}
+
 pub struct AgentCommand {
     pub command: Command,
     /// Keep private launch files alive until the agent exits, including spawn errors.
@@ -56,6 +64,9 @@ pub enum Input<'a> {
 }
 
 pub enum Action {
+    /// A PerTurn adapter starts physical I/O only after durable admission and baseline.
+    /// Runtime owns spawn, stderr, termination and confirmation of the owned group.
+    SpawnTurn(AgentCommand),
     /// Authoritative native session name, including external manual renames.
     NativeName(String),
     /// Optional generated metadata; never supersedes an explicit user name.
@@ -128,6 +139,12 @@ pub enum Action {
 }
 
 pub trait AgentAdapter: Send {
+    fn transport_lifetime(&self) -> TransportLifetime {
+        TransportLifetime::Persistent
+    }
+    /// Runtime invokes this only after confirming the physical process group is gone.
+    /// PerTurn adapters retire active decoder state without losing native identity.
+    fn transport_closed(&mut self) {}
     /// Only true between turns when replacing the process cannot discard live work.
     fn can_reconfigure(&self) -> bool;
     /// A new turn may reuse a process that still owns background work. This
