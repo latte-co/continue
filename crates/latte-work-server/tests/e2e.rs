@@ -546,15 +546,27 @@ async fn denies_permissions_and_bounds_paths_and_failures() {
             .await,
             Response::Ok
         ));
+        let pid = agent_pid(project.path());
         send(&mut c, &id, text, text).await;
-        let events = wait(&mut c, &id, Status::Failed).await;
-        assert!(events.iter().any(|e| matches!(
-            e.event,
-            EventKind::State {
-                status: Status::Failed,
-                ..
-            }
-        )));
+        wait(&mut c, &id, Status::Unknown).await;
+        assert_gone(pid).await;
+        let Response::Session { session } = ask(
+            &mut c,
+            Request::Session {
+                session_id: id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("session");
+        };
+        let close_id = session
+            .agent_close_pending
+            .expect("native close evidence is missing");
+        assert!(
+            matches!(ask(&mut c, Request::ConfirmAgentClosed { session_id: id.clone(), close_id }).await,
+            Response::Session { session } if session.agent_close_pending.is_none())
+        );
     }
 }
 #[tokio::test]
@@ -3286,6 +3298,133 @@ async fn quit_and_reconnect_keep_live_conversations_isolated_from_slow_or_unknow
 }
 
 #[tokio::test]
+async fn quit_drains_late_task_starts_and_preserves_unconfirmed_shutdown() {
+    use latte_work_protocol::lifecycle::Resource;
+    let host = Host::start().await;
+    let mut client = host.client().await;
+    let server = client.server_id().to_owned();
+    for confirmed in [true, false] {
+        let project = tempfile::tempdir().unwrap();
+        let id = session(&mut client, project.path()).await;
+        let resources = vec![Resource::AgentSession(id.clone())];
+        client
+            .claim_resources("app".into(), resources.clone())
+            .await
+            .unwrap();
+        let input = if confirmed {
+            "background-detached-late"
+        } else {
+            "background-detached-late-unconfirmed"
+        };
+        send(&mut client, &id, input, input).await;
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(project.path().join("late-background-pid"))
+                && let Ok(pid) = text.parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "detached task did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let claude = agent_pid(project.path());
+        assert!(kill(Pid::from_raw(pid), None).is_ok());
+        let mut cleanup = host.client().await;
+        let closed = cleanup
+            .close_owned_resources(server.clone(), "app".into(), resources)
+            .await;
+        assert_gone(claude).await;
+        assert_gone(pid).await;
+        assert_eq!(closed.is_ok(), confirmed);
+        assert!(
+            matches!(ask(&mut cleanup, Request::Session { session_id: id }).await,
+            Response::Session { session } if session.agent_session_open == Some(false)
+                && session.agent_close_pending.is_none() == confirmed)
+        );
+    }
+}
+
+#[tokio::test]
+async fn claude_crash_before_task_started_leaves_detached_process_and_fences_reopen() {
+    use latte_work_protocol::lifecycle::Resource;
+    let host = Host::start().await;
+    let project = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let id = session(&mut client, project.path()).await;
+    let server_id = client.server_id().to_owned();
+    let resources = vec![Resource::AgentSession(id.clone())];
+    client
+        .claim_resources("app".into(), resources.clone())
+        .await
+        .unwrap();
+    send(
+        &mut client,
+        &id,
+        "crash-with-detached-shell",
+        "background-detached-crash",
+    )
+    .await;
+    wait(&mut client, &id, Status::Unknown).await;
+    let pid = Pid::from_raw(
+        std::fs::read_to_string(project.path().join("crashed-background-pid"))
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    assert!(
+        process_is_running(pid),
+        "detached fixture must survive the native crash"
+    );
+
+    let Response::Session { session } = ask(
+        &mut client,
+        Request::Session {
+            session_id: id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("session");
+    };
+    let close_id = session
+        .agent_close_pending
+        .expect("crash has no closing receipt");
+    assert!(matches!(ask(&mut client, Request::OpenAgentSession {
+        session_id: id.clone(), provider: None,
+    }).await, Response::Error { message, .. } if message.contains("待确认")));
+    assert!(
+        client
+            .close_owned_resources(server_id, "app".into(), resources)
+            .await
+            .is_err()
+    );
+    assert!(process_is_running(pid));
+
+    // Only the test owns this PID. Model the user's explicit verification
+    // before releasing the durable fence.
+    kill(pid, Signal::SIGTERM).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while process_is_running(pid) {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(matches!(ask(&mut client, Request::ConfirmAgentClosed {
+        session_id: id.clone(), close_id,
+    }).await, Response::Session { session } if session.agent_close_pending.is_none()));
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::OpenAgentSession {
+                session_id: id,
+                provider: None,
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+}
+
+#[tokio::test]
 async fn upgrade_racing_send_either_preserves_task_or_rejects_before_launch() {
     use serde_json::json;
     let host = Host::start().await;
@@ -4695,6 +4834,7 @@ for line in sys.stdin:
     if os.path.exists('fail-init'): sys.exit(1)
     time.sleep(0.4)
     print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':value['request_id'],'response':{}}}),flush=True)
+    if value['request']['subtype']=='end_session': break
 "#).unwrap();
     std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
     let host = Host::start_with_environment(&[("LATTE_WORK_CLAUDE", fixture.as_os_str())]).await;

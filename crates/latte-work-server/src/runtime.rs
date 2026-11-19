@@ -14,7 +14,7 @@ use nix::{
 };
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     process::Stdio,
     sync::{
         Arc, Mutex,
@@ -1653,31 +1653,42 @@ impl Process {
             let _ = reply.send(Err("原生会话已关闭，标题修改结果待确认".into()));
         }
         self.session_open.store(false, Ordering::SeqCst);
-        let background_confirmed = matches!(
-            tokio::time::timeout(Duration::from_secs(1), self.stop_native_background()).await,
-            Ok(Ok(()))
-        );
-        if let Ok(Some(bytes)) = self.adapter.close_request() {
-            let (adapter, input, output) = (&mut self.adapter, &mut self.input, &mut self.output);
-            let _ = tokio::time::timeout(Duration::from_millis(750), async move {
-                write(input, &bytes).await?;
-                for _ in 0..64 {
-                    let Some(Ok(line)) = output.next().await else {
-                        break;
-                    };
-                    if adapter.close_ack(&line) {
-                        break;
+        let requires_drain = self.adapter.requires_close_drain();
+        let background_confirmed = if requires_drain {
+            matches!(
+                tokio::time::timeout(Duration::from_secs(2), self.drain_native_close()).await,
+                Ok(Ok(true))
+            )
+        } else {
+            if let Ok(Some(bytes)) = self.adapter.close_request() {
+                let (adapter, input, output) =
+                    (&mut self.adapter, &mut self.input, &mut self.output);
+                let _ = tokio::time::timeout(Duration::from_millis(750), async move {
+                    write(input, &bytes).await?;
+                    for _ in 0..64 {
+                        let Some(Ok(line)) = output.next().await else {
+                            break;
+                        };
+                        if adapter.close_ack(&line) {
+                            break;
+                        }
                     }
-                }
-                Ok::<_, anyhow::Error>(())
-            })
-            .await;
-        }
-        // Closing stdin alone lets some CLI versions wait indefinitely for background work.
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+            }
+            true
+        };
+        // Graceful shutdown has a deadline. Reap the process group even when
+        // the native exchange failed, and preserve uncertainty in that case.
         let group = Pid::from_raw(self.group.pid);
         let _ = killpg(group, Signal::SIGTERM);
         let mut reaped = matches!(
-            tokio::time::timeout(Duration::from_secs(2), self.group.child.wait()).await,
+            tokio::time::timeout(
+                Duration::from_secs(if requires_drain { 1 } else { 2 }),
+                self.group.child.wait(),
+            )
+            .await,
             Ok(Ok(_))
         );
         // The parent may have exited before its descendants. A signal alone
@@ -1694,31 +1705,23 @@ impl Process {
         .unwrap_or(false);
         background_confirmed && group_signaled && parent_reaped
     }
-    async fn stop_native_background(&mut self) -> Result<()> {
-        let mut requested = HashSet::new();
-        for _ in 0..512 {
-            let mut tasks = self.adapter.background_task_ids();
-            if tasks.is_empty() {
-                return Ok(());
-            }
-            tasks.sort_unstable();
-            for task in tasks {
-                if requested.insert(task.clone()) {
-                    if requested.len() > 256 {
-                        bail!("原生后台任务数量超出关闭限制");
-                    }
-                    let command = self.adapter.stop_background_task(&task)?;
-                    write(&mut self.input, &command).await?;
-                }
-            }
-            let line = self
-                .output
-                .next()
-                .await
-                .context("原生后台任务停止待确认")??;
-            self.adapter.observe_background_shutdown(&line)?;
+    async fn drain_native_close(&mut self) -> Result<bool> {
+        let request = self.adapter.close_request()?.context("缺少原生关闭请求")?;
+        write(&mut self.input, &request).await?;
+        let mut acknowledged = false;
+        for _ in 0..1024 {
+            let Some(line) = self.output.next().await else {
+                let exit = self.group.child.wait().await?;
+                // The child may have detached a shell before reporting it.
+                return Ok(acknowledged
+                    && exit.success()
+                    && self.adapter.background_close_complete());
+            };
+            let line = line?;
+            acknowledged |= self.adapter.close_ack(&line);
+            self.adapter.observe_close_output(&line)?;
         }
-        bail!("原生后台任务停止待确认")
+        bail!("原生会话关闭输出超出限制")
     }
 }
 fn finish_native_close(database: &Database, id: &str, confirmed: bool) -> Result<()> {

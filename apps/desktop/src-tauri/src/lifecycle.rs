@@ -272,7 +272,8 @@ pub fn quit(app: tauri::AppHandle) {
         let state = app.state::<Connections>();
         // Persist explicit closing intent before any RPC. Disconnect/lock/sleep
         // never enters this path. Exit remains bounded and never opens a dialog.
-        if let Err(error) = crate::pending_close::persist(&app, &state).await {
+        let journal = crate::pending_close::QuitJournal::begin(&app, &state).await;
+        if let Err(error) = &journal {
             eprintln!("保存退出关闭记录失败：{error}");
         }
         let result = tokio::time::timeout(Duration::from_secs(8), async {
@@ -288,13 +289,19 @@ pub fn quit(app: tauri::AppHandle) {
             Ok::<_, String>(())
         })
         .await;
-        if !matches!(result, Ok(Ok(()))) {
-            // Keep only unconfirmed instances; no 'stopped' state is invented.
-            if let Err(error) = crate::pending_close::persist(&app, &state).await {
-                eprintln!("保留待关闭记录失败：{error}");
-            }
-        } else {
-            let _ = crate::pending_close::persist(&app, &state).await;
+        if let Ok(Err(error)) = result {
+            eprintln!("退出清理有待确认资源：{error}");
+        }
+        // Compaction is optional once the full record is durable. If another
+        // recovery is holding the lock, leave the original record for retry.
+        let saved = match journal {
+            Ok(journal) => journal.compact(&state).await,
+            Err(_) => crate::pending_close::QuitJournal::begin(&app, &state)
+                .await
+                .map(|_| ()),
+        };
+        if let Err(error) = saved {
+            eprintln!("退出关闭记录未更新：{error}");
         }
         state.close_ack.lock().await.take();
         crate::source_preview::close().await;

@@ -5,6 +5,7 @@ use latte_work_client::Client;
 use latte_work_protocol::lifecycle::Resource;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeSet, HashSet},
     fs::{File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -12,12 +13,12 @@ use std::{
 };
 use tauri::Manager;
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 struct Intent {
     owner_id: String,
     hosts: Vec<HostIntent>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 struct HostIntent {
     host: Host,
     server_id: String,
@@ -30,12 +31,13 @@ struct HostIntent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_adoption: Option<Adoption>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct Adoption {
     previous_owner_id: String,
     owner_id: String,
 }
 const LIMIT: u64 = 1024 * 1024;
+const RECOVERY_PAGE_LIMIT: usize = 128;
 fn directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(app
         .path()
@@ -43,7 +45,7 @@ fn directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())?
         .join("pending-resources"))
 }
-fn lock(directory: &Path) -> Result<File, String> {
+fn prepare_directory(directory: &Path) -> Result<(), String> {
     if directory
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink())
@@ -52,7 +54,10 @@ fn lock(directory: &Path) -> Result<File, String> {
     }
     std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())
+}
+fn lock(directory: &Path) -> Result<File, String> {
+    prepare_directory(directory)?;
     let path = directory.join("pending.lock");
     regular(&path)?;
     let file = OpenOptions::new()
@@ -146,7 +151,7 @@ fn same_target(a: &Host, b: &Host) -> bool {
         && a.identity_file == b.identity_file
         && a.auth == b.auth
 }
-pub(crate) async fn persist(app: &tauri::AppHandle, state: &Connections) -> Result<(), String> {
+async fn capture(state: &Connections) -> Result<Intent, String> {
     let instances = state.owned_instances.lock().await.clone();
     let hosts = state.host_targets.lock().await;
     let mut grouped = std::collections::BTreeMap::<(String, String), Vec<Resource>>::new();
@@ -164,15 +169,59 @@ pub(crate) async fn persist(app: &tauri::AppHandle, state: &Connections) -> Resu
             pending_adoption: None,
         });
     }
-    let intent = Intent {
+    Ok(Intent {
         owner_id: state.owner_id().to_owned(),
         hosts: intents,
-    };
-    let directory = directory(app)?;
-    let _lock = lock(&directory)?;
-    write(&directory, &intent)
+    })
 }
-/// Resolve local cleanup or remote reattachment before exposing a connection.
+pub(crate) struct QuitJournal {
+    directory: PathBuf,
+    initial: Intent,
+}
+impl QuitJournal {
+    pub(crate) async fn begin(app: &tauri::AppHandle, state: &Connections) -> Result<Self, String> {
+        Self::begin_in(directory(app)?, state).await
+    }
+
+    async fn begin_in(directory: PathBuf, state: &Connections) -> Result<Self, String> {
+        let initial = capture(state).await?;
+        if !initial.hosts.is_empty() {
+            prepare_directory(&directory)?;
+            let path = directory.join(format!("{}.json", initial.owner_id));
+            regular(&path)?;
+            if path.try_exists().map_err(|error| error.to_string())? {
+                return Err("本次退出的关闭记录已存在".into());
+            }
+            // Each App publishes to its own UUID exactly once. Recovery only
+            // sees whole records, so an earlier owner's RPC cannot delay this
+            // first durable write.
+            write(&directory, &initial)?;
+        }
+        Ok(Self { directory, initial })
+    }
+
+    pub(crate) async fn compact(self, state: &Connections) -> Result<(), String> {
+        let remaining = capture(state).await?;
+        if remaining == self.initial {
+            return Ok(());
+        }
+        let _lock = lock(&self.directory)?;
+        let path = self
+            .directory
+            .join(format!("{}.json", self.initial.owner_id));
+        regular(&path)?;
+        if path.try_exists().map_err(|error| error.to_string())? {
+            if read(&path)? != self.initial {
+                // Another App recovered this record. Preserve its handoff.
+                return Ok(());
+            }
+        } else if !self.initial.hosts.is_empty() {
+            return Ok(());
+        }
+        write(&self.directory, &remaining)
+    }
+}
+/// Reconcile old local quit records or reattach to surviving remote resources.
 pub(crate) async fn drain(
     app: &tauri::AppHandle,
     state: &Connections,
@@ -221,19 +270,55 @@ async fn drain_directory_with_cleanup(
     mut cleanup: impl FnMut(&Path, &Intent) -> Result<(), String>,
 ) -> Result<Vec<Resource>, String> {
     let _lock = lock(directory)?;
-    let mut paths = Vec::new();
+    let mut adopted = Vec::new();
+    let mut seen = HashSet::new();
+    let mut after = None;
+    loop {
+        let paths = recovery_page(directory, after.as_deref())?;
+        if paths.is_empty() {
+            break;
+        }
+        let page = drain_page(directory, &paths, host, client, owner_id, &mut cleanup).await?;
+        adopted.extend(
+            page.into_iter()
+                .filter(|resource| seen.insert(resource.clone())),
+        );
+        if paths.len() < RECOVERY_PAGE_LIMIT {
+            break;
+        }
+        // Advance by the original name even if this page deleted that file.
+        // Records for other hosts and pending closes cannot pin the cursor.
+        after = paths.into_iter().last();
+    }
+    Ok(adopted)
+}
+
+fn recovery_page(directory: &Path, after: Option<&Path>) -> Result<Vec<PathBuf>, String> {
+    let mut paths = BTreeSet::new();
     for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            if paths.len() >= 128 {
-                return Err("待关闭记录数量超过限制".into());
+        if path.extension().is_some_and(|e| e == "json")
+            && after.is_none_or(|after| path.as_path() > after)
+        {
+            paths.insert(path);
+            if paths.len() > RECOVERY_PAGE_LIMIT {
+                paths.pop_last();
             }
-            paths.push(path);
         }
     }
-    paths.sort();
+    Ok(paths.into_iter().collect())
+}
+
+async fn drain_page(
+    directory: &Path,
+    paths: &[PathBuf],
+    host: &Host,
+    client: &mut Client,
+    owner_id: &str,
+    cleanup: &mut impl FnMut(&Path, &Intent) -> Result<(), String>,
+) -> Result<Vec<Resource>, String> {
     let mut adopted = Vec::new();
-    for path in &paths {
+    for path in paths {
         let mut intent = read(path)?;
         let mut index = 0;
         while index < intent.hosts.len() {
@@ -298,7 +383,7 @@ async fn drain_directory_with_cleanup(
             write(directory, &intent)?;
         }
     }
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     adopted.retain(|resource| seen.insert(resource.clone()));
     // Durable handoff precedes any old-record deletion. Keep it after returning:
     // a crash can occur before the caller registers resources in App memory too.
@@ -306,9 +391,9 @@ async fn drain_directory_with_cleanup(
     // records; closed or foreign-owned resources simply do not get re-adopted.
     let mut handoff_path = None;
     if host.ssh.is_some() && !adopted.is_empty() {
-        // Reuse a source file as the durable handoff. Adding a UUID file could
-        // exceed the 128-file reader bound when every old file has other hosts.
-        for path in &paths {
+        // Store this page's handoff in a source record before retiring its
+        // duplicates. Its other hosts remain available for their own recovery.
+        for path in paths {
             if !path.exists() {
                 continue;
             }
@@ -332,7 +417,7 @@ async fn drain_directory_with_cleanup(
             return Err("接管交接缺少原始记录".into());
         }
     }
-    for path in &paths {
+    for path in paths {
         if !path.exists() || handoff_path == Some(path) || host.ssh.is_none() {
             continue;
         }
@@ -434,6 +519,107 @@ mod tests {
     fn host() -> Host {
         serde_json::from_value(serde_json::json!({"id":"local", "name":"本机", "ssh":null}))
             .unwrap()
+    }
+    #[tokio::test]
+    async fn quit_publishes_new_owner_while_recovery_holds_the_journal_lock() {
+        let directory = std::env::temp_dir().join(format!("lw-quit-{}", uuid::Uuid::new_v4()));
+        let local = host();
+        let old_owner = uuid::Uuid::new_v4().to_string();
+        let setup = lock(&directory).unwrap();
+        write(
+            &directory,
+            &Intent {
+                owner_id: old_owner.clone(),
+                hosts: vec![HostIntent {
+                    host: local.clone(),
+                    server_id: "fixture".into(),
+                    resources: vec![Resource::AgentSession("old-session".into())],
+                    adopted_owner_id: None,
+                    pending_adoption: None,
+                }],
+            },
+        )
+        .unwrap();
+        drop(setup);
+        let binary = directory.join("bridge");
+        std::fs::write(
+            &binary,
+            r#"#!/usr/bin/env python3
+import json,pathlib,sys,time
+base=pathlib.Path(sys.argv[sys.argv.index('--state-dir')+1])
+for line in sys.stdin:
+    request=json.loads(line)
+    if request['method']=='hello':
+        response={'kind':'hello','version':1,'server_id':'fixture','agents':[]}
+    elif request['method']=='close_owned_resources':
+        session=request['resources'][0]['id']
+        if session=='old-session':
+            (base/'recovery-started').touch()
+            deadline=time.monotonic()+20
+            while not (base/'release').exists() and time.monotonic()<deadline:
+                time.sleep(.01)
+        elif not (base/'release').exists():
+            sys.exit(1)
+        response={'kind':'resources_closed'}
+    else:
+        raise AssertionError(request['method'])
+    print(json.dumps(response),flush=True)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = Connections::default();
+        let owner = state.owner_id().to_owned();
+        let mut recovery_client = Client::local(&binary, Some(&directory)).await.unwrap();
+        let recovering = {
+            let (directory, local, owner) = (directory.clone(), local.clone(), owner.clone());
+            tokio::spawn(async move {
+                drain_directory(&directory, &local, &mut recovery_client, &owner)
+                    .await
+                    .unwrap();
+            })
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !directory.join("recovery-started").is_file() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(lock(&directory).is_err());
+        let resource = Resource::AgentSession("new-session".into());
+        state
+            .host_targets
+            .lock()
+            .await
+            .insert(local.id.clone(), local.clone());
+        state
+            .owned_instances
+            .lock()
+            .await
+            .insert((local.id.clone(), resource.clone()), "fixture".into());
+        let journal = QuitJournal::begin_in(directory.clone(), &state)
+            .await
+            .unwrap();
+        let mut cleanup = Client::local(&binary, Some(&directory)).await.unwrap();
+        assert!(
+            cleanup
+                .close_owned_resources("fixture".into(), owner.clone(), vec![resource.clone()])
+                .await
+                .is_err()
+        );
+        journal.compact(&state).await.unwrap();
+        let new_path = directory.join(format!("{owner}.json"));
+        assert_eq!(read(&new_path).unwrap().hosts[0].resources, vec![resource]);
+        assert!(!recovering.is_finished());
+        std::fs::write(directory.join("release"), "").unwrap();
+        recovering.await.unwrap();
+        assert!(new_path.is_file());
+        let mut next = Client::local(&binary, Some(&directory)).await.unwrap();
+        drain_directory(&directory, &local, &mut next, "next-app")
+            .await
+            .unwrap();
+        assert!(!new_path.exists());
+        drop(next);
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn quit_intent_is_private_atomic_and_contains_no_authentication_secret() {
@@ -928,7 +1114,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn handoff_reuses_a_source_file_at_the_128_record_boundary() {
+    async fn recovery_advances_past_128_after_new_quit_cleanup_fails() {
         let directory =
             std::env::temp_dir().join(format!("lw-handoff-cap-{}", uuid::Uuid::new_v4()));
         let guard = lock(&directory).unwrap();
@@ -938,7 +1124,7 @@ for line in sys.stdin:
         let mut other = remote.clone();
         other.id = "other".into();
         other.ssh = Some("other".into());
-        for n in 0..128 {
+        for n in 0..RECOVERY_PAGE_LIMIT {
             let mut hosts = vec![HostIntent {
                 host: other.clone(),
                 server_id: "fixture".into(),
@@ -958,7 +1144,7 @@ for line in sys.stdin:
             write(
                 &directory,
                 &Intent {
-                    owner_id: uuid::Uuid::new_v4().to_string(),
+                    owner_id: uuid::Uuid::from_u128(n as u128 + 1).to_string(),
                     hosts,
                 },
             )
@@ -973,6 +1159,7 @@ for line in sys.stdin:
     r=json.loads(line)
     if r['method']=='hello': out={'kind':'hello','version':1,'server_id':'fixture','agents':[]}
     elif r['method']=='adopt_resources': out={'kind':'resources_adopted','resources':r['resources']}
+    elif r['method']=='close_owned_resources': sys.exit(1)
     else: raise AssertionError(r)
     print(json.dumps(out),flush=True)
 "#,
@@ -980,20 +1167,62 @@ for line in sys.stdin:
         .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         drop(guard);
+        let state = Connections::default();
+        let owner = uuid::Uuid::from_u128(RECOVERY_PAGE_LIMIT as u128 + 1).to_string();
+        state.owner.set(owner.clone()).unwrap();
+        let overflow = Resource::AgentSession("failed-quit-on-second-page".into());
+        state
+            .host_targets
+            .lock()
+            .await
+            .insert(remote.id.clone(), remote.clone());
+        state
+            .owned_instances
+            .lock()
+            .await
+            .insert((remote.id.clone(), overflow.clone()), "fixture".into());
+        let journal = QuitJournal::begin_in(directory.clone(), &state)
+            .await
+            .unwrap();
+        let mut quitter = Client::local(&binary, Some(&directory)).await.unwrap();
+        assert!(
+            quitter
+                .close_owned_resources("fixture".into(), owner.clone(), vec![overflow.clone()])
+                .await
+                .is_err()
+        );
+        journal.compact(&state).await.unwrap();
+        let overflow_path = directory.join(format!("{owner}.json"));
+        assert_eq!(
+            read(&overflow_path).unwrap().hosts[0].resources,
+            vec![overflow.clone()]
+        );
+        assert!(
+            !recovery_page(&directory, None)
+                .unwrap()
+                .contains(&overflow_path)
+        );
+
         let mut client = Client::local(&binary, Some(&directory)).await.unwrap();
         for app in ["app-b", "app-c"] {
             assert_eq!(
                 drain_directory(&directory, &remote, &mut client, app)
                     .await
                     .unwrap(),
-                vec![Resource::AgentSession("target".into())]
+                vec![Resource::AgentSession("target".into()), overflow.clone()]
+            );
+            assert_eq!(
+                read(&overflow_path).unwrap().hosts[0]
+                    .adopted_owner_id
+                    .as_deref(),
+                Some(app)
             );
             let paths: Vec<_> = std::fs::read_dir(&directory)
                 .unwrap()
                 .map(|e| e.unwrap().path())
                 .filter(|p| p.extension().is_some_and(|e| e == "json"))
                 .collect();
-            assert_eq!(paths.len(), 128);
+            assert_eq!(paths.len(), RECOVERY_PAGE_LIMIT + 1);
             assert_eq!(
                 paths
                     .iter()
@@ -1004,7 +1233,7 @@ for line in sys.stdin:
                         .filter(|h| same_target(&h.host, &other))
                         .count())
                     .sum::<usize>(),
-                128
+                RECOVERY_PAGE_LIMIT
             );
         }
         assert_eq!(
@@ -1012,7 +1241,7 @@ for line in sys.stdin:
                 .await
                 .unwrap()
                 .len(),
-            128
+            RECOVERY_PAGE_LIMIT
         );
         drop(client);
         std::fs::remove_dir_all(directory).unwrap();

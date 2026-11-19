@@ -119,7 +119,7 @@ enum SshAuthMode {
     IdentityFile,
     Password,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct Host {
     id: String,
     name: String,
@@ -435,11 +435,13 @@ async fn claim_resource(
         .get(host)
         .cloned()
         .ok_or("缺少 Server 实例信息")?;
-    state
-        .owned_instances
-        .lock()
-        .await
-        .insert((host.to_owned(), resource.clone()), server_id);
+    {
+        let mut owned = state.owned_instances.lock().await;
+        if state.quitting.load(Ordering::SeqCst) {
+            return Err("正在退出，任务未发送".into());
+        }
+        owned.insert((host.to_owned(), resource.clone()), server_id);
+    }
     let mut client = client.lock().await;
     client
         .claim_resources(state.owner_id().to_owned(), vec![resource])
@@ -580,6 +582,25 @@ async fn host_request(
     if state.quitting.load(Ordering::SeqCst) {
         return Err("正在退出，任务未发送".into());
     }
+    let resource = match &request {
+        Request::OpenAgentSession { session_id, .. }
+        | Request::Send { session_id, .. }
+        | Request::SendQueued { session_id, .. }
+        | Request::DispatchQueuedMessage { session_id, .. }
+        | Request::ResumeMessageQueue { session_id, .. } => Some(
+            latte_work_protocol::lifecycle::Resource::AgentSession(session_id.clone()),
+        ),
+        Request::CreateTerminal { terminal_id, .. } => Some(
+            latte_work_protocol::lifecycle::Resource::Terminal(terminal_id.clone()),
+        ),
+        _ => None,
+    };
+    if let Some(resource) = resource {
+        claim_resource(&state, &host_id, &client, resource).await?;
+        if state.quitting.load(Ordering::SeqCst) {
+            return Err("正在退出，任务未发送".into());
+        }
+    }
     if let Request::OpenAgentSession { session_id, .. }
     | Request::DispatchQueuedMessage { session_id, .. }
     | Request::ResumeMessageQueue { session_id, .. } = &request
@@ -640,25 +661,6 @@ async fn host_request(
     } else {
         None
     };
-    let resource = match &request {
-        Request::OpenAgentSession { session_id, .. }
-        | Request::Send { session_id, .. }
-        | Request::SendQueued { session_id, .. }
-        | Request::DispatchQueuedMessage { session_id, .. }
-        | Request::ResumeMessageQueue { session_id, .. } => Some(
-            latte_work_protocol::lifecycle::Resource::AgentSession(session_id.clone()),
-        ),
-        Request::CreateTerminal { terminal_id, .. } => Some(
-            latte_work_protocol::lifecycle::Resource::Terminal(terminal_id.clone()),
-        ),
-        _ => None,
-    };
-    if let Some(resource) = resource {
-        claim_resource(&state, &host_id, &client, resource).await?;
-        if state.quitting.load(Ordering::SeqCst) {
-            return Err("正在退出，任务未发送".into());
-        }
-    }
     let response = if matches!(&request, Request::AgentCommands { agent, .. } if agent == "opencode")
         || matches!(
             request,

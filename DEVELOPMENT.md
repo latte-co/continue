@@ -384,19 +384,25 @@ an unbounded list of candidates; unrelated owners and changed daemons stay fence
 After all batches acknowledge, recovery writes a consolidated durable handoff
 before deleting any old record. The handoff survives final-cleanup errors and a
 crash before in-memory registration; later recovery deduplicates overlapping records.
-Handoff reuses an existing source file and preserves its other hosts, so recovery
-at the 128-record limit never creates an unreadable 129th record. A reachable
+Recovery walks the directory in sorted pages of up to 128 records. Each page's
+handoff reuses a source file and preserves its other hosts, so a fresh quit
+record can be written while recovery is in progress, including beyond the first page. A reachable
 local daemon's durable unknown-close state retains the quit journal while allowing
 the connection to open for manual verification; transport failures remain errors.
-Before reaping Claude, the host requests native stops for tracked background
-tasks, including shells that have their own process group. A task's terminal
-lifecycle event is required to confirm its stop. The host then terminates the
-Agent process group and reaps the Agent. An App
+Before reaping Claude, the host sends the native `end_session` request to stop
+new work and let the CLI clean up its background tasks. Close confirmation
+requires the matching acknowledgement, clean exit, and a full drain of task
+lifecycle events through EOF. This includes task starts that had not reached
+the actor when the close began. A crash before the acknowledgement leaves the
+close pending even when the process has exited and the observed task set is empty.
+The host still reaps the Agent process group within a deadline. An App
 reclaim fences stale closes from an earlier App instance. New requests are blocked
 while quitting; admitted requests cannot send new work after claiming a resource
 if Quit has begun. Prompt input is never replayed.
 
-Quit persists a private, atomic resource record before closing. The UI is never
+Quit publishes a private, atomic resource record for its own App owner before
+closing. A recovery RPC for an older owner can delay compaction, while the
+original full record remains available for the next launch. The UI is never
 blocked by a quit-failure dialog: cleanup has an 8-second overall deadline, then
 the App exits. Unconfirmed work is not reported as stopped. Tab cleanup is advisory,
 with a one-second budget; native resource ownership remains authoritative. The

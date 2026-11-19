@@ -417,19 +417,29 @@ impl AgentAdapter for Claude {
     fn has_background_work(&self) -> bool {
         !self.tasks.is_empty() || !self.foreground_agents.is_empty()
     }
-    fn background_task_ids(&self) -> Vec<String> {
-        self.tasks.iter().cloned().collect()
-    }
-    fn stop_background_task(&self, task_id: &str) -> Result<Vec<u8>> {
+    fn close_request(&self) -> Result<Option<Vec<u8>>> {
         let mut request = serde_json::to_vec(&json!({
             "type": "control_request",
-            "request_id": format!("latte-stop-task-{task_id}"),
-            "request": { "subtype": "stop_task", "task_id": task_id },
+            "request_id": "latte-end-session",
+            "request": { "subtype": "end_session", "reason": "client_quit" },
         }))?;
         request.push(b'\n');
-        Ok(request)
+        Ok(Some(request))
     }
-    fn observe_background_shutdown(&mut self, line: &str) -> Result<()> {
+    fn close_ack(&self, line: &str) -> bool {
+        serde_json::from_str::<Value>(line).is_ok_and(|m| {
+            m["type"] == "control_response"
+                && m["response"]["request_id"] == "latte-end-session"
+                && m["response"]["subtype"] == "success"
+        })
+    }
+    fn requires_close_drain(&self) -> bool {
+        true
+    }
+    fn background_close_complete(&self) -> bool {
+        self.tasks.is_empty()
+    }
+    fn observe_close_output(&mut self, line: &str) -> Result<()> {
         let message: Value = serde_json::from_str(line)?;
         // Only task lifecycle frames can settle a task. A control receipt
         // acknowledges the request, and unrelated output cannot restart a turn.
