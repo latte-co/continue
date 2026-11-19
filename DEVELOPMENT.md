@@ -372,9 +372,16 @@ batch is idempotent and bound to both the daemon ID and App owner ID. The server
 reserves the owned resources before closing them independently. A slow or
 unconfirmed close leaves other conversations and the host handshake available.
 Quit and reconnect split resource inventories into at most 128 IDs per lifecycle
-RPC. Successful quit batches retire their local records immediately; failures
-retain only the remaining work. The size-bounded quit journal accepts larger
-host inventories and retains acknowledged remote adoption owners across a partial
+RPC. Some v1 Servers stop a batch at the first resource they cannot close.
+On a framed `upgrade_blocked` reply, Quit and local recovery retry each item
+with the original daemon ID and owner ID. Each acknowledgement retires that
+resource. If the bridge breaks, the journal retains the failed and unattempted
+resources for a later connection. Remote recovery continues to adopt live resources.
+The Linux and macOS final-binary suites run this case against the baseline
+`899411e` daemon. Locally, set `LATTE_WORK_TEST_LEGACY_SERVER` to that
+executable when running `make test-e2e`. The default uses the checkout's Server.
+
+The size-bounded quit journal accepts larger host inventories and retains acknowledged remote adoption owners across a partial
 recovery, so a later reconnect can finish without reopening or replaying work.
 Each remote batch durably records its source and target owner before transfer.
 If the acknowledgement is lost, recovery first reconciles that exact transfer

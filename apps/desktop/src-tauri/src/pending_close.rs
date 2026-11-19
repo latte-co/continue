@@ -1,8 +1,8 @@
 //! Explicit quit residual resources: finish local closes, reattach remote sessions.
 //! No passwords, prompts or Provider secrets.
 use crate::{Connections, Host};
-use latte_work_client::Client;
-use latte_work_protocol::lifecycle::Resource;
+use latte_work_client::{Client, CloseReceipt};
+use latte_work_protocol::lifecycle::{RESOURCE_BATCH_LIMIT, Resource};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashSet},
@@ -132,7 +132,7 @@ fn read(path: &Path) -> Result<Intent, String> {
                 .iter()
                 .any(|r| r.id().is_empty() || r.id().len() > 256)
                 || h.pending_adoption.as_ref().is_some_and(|pending| {
-                    h.resources.len() > latte_work_protocol::lifecycle::RESOURCE_BATCH_LIMIT
+                    h.resources.len() > RESOURCE_BATCH_LIMIT
                         || [&pending.previous_owner_id, &pending.owner_id]
                             .iter()
                             .any(|id| id.is_empty() || id.len() > 128)
@@ -273,16 +273,25 @@ async fn drain_directory_with_cleanup(
     let mut adopted = Vec::new();
     let mut seen = HashSet::new();
     let mut after = None;
+    let mut close_error = None;
     loop {
         let paths = recovery_page(directory, after.as_deref())?;
         if paths.is_empty() {
             break;
         }
-        let page = drain_page(directory, &paths, host, client, owner_id, &mut cleanup).await?;
-        adopted.extend(
-            page.into_iter()
-                .filter(|resource| seen.insert(resource.clone())),
-        );
+        if host.ssh.is_some() {
+            let page = adopt_page(directory, &paths, host, client, owner_id, &mut cleanup).await?;
+            adopted.extend(
+                page.into_iter()
+                    .filter(|resource| seen.insert(resource.clone())),
+            );
+        } else {
+            for path in &paths {
+                if let Some(error) = close_local_record(directory, path, host, client).await? {
+                    close_error.get_or_insert(error);
+                }
+            }
+        }
         if paths.len() < RECOVERY_PAGE_LIMIT {
             break;
         }
@@ -290,7 +299,7 @@ async fn drain_directory_with_cleanup(
         // Records for other hosts and pending closes cannot pin the cursor.
         after = paths.into_iter().last();
     }
-    Ok(adopted)
+    close_error.map_or(Ok(adopted), Err)
 }
 
 fn recovery_page(directory: &Path, after: Option<&Path>) -> Result<Vec<PathBuf>, String> {
@@ -309,7 +318,62 @@ fn recovery_page(directory: &Path, after: Option<&Path>) -> Result<Vec<PathBuf>,
     Ok(paths.into_iter().collect())
 }
 
-async fn drain_page(
+async fn close_local_record(
+    directory: &Path,
+    path: &Path,
+    host: &Host,
+    client: &mut Client,
+) -> Result<Option<String>, String> {
+    let mut intent = read(path)?;
+    let mut first_error = None;
+    let mut index = 0;
+    while index < intent.hosts.len() {
+        let item = &intent.hosts[index];
+        if !same_target(&item.host, host) {
+            index += 1;
+            continue;
+        }
+        let resources = item.resources.clone();
+        let server_id = item.server_id.clone();
+        let owner_id = intent.owner_id.clone();
+        let mut closes = client.close_owned_inventory(&server_id, &owner_id, &resources);
+        let mut blocked = Vec::new();
+        while let Some(receipt) = closes.next_receipt().await.map_err(|e| format!("{e:#}"))? {
+            match receipt {
+                CloseReceipt::Closed(closed) => {
+                    let closed: HashSet<_> = closed.iter().collect();
+                    intent.hosts[index]
+                        .resources
+                        .retain(|resource| !closed.contains(resource));
+                    // Checkpoint before the next RPC, which may lose its reply.
+                    if !intent.hosts[index].resources.is_empty() {
+                        write(directory, &intent)?;
+                    }
+                }
+                CloseReceipt::Blocked(resource, error) => blocked.push((resource.clone(), error)),
+            }
+        }
+        if intent.hosts[index].resources.is_empty() {
+            intent.hosts.remove(index);
+            write(directory, &intent)?;
+        } else {
+            index += 1;
+        }
+        for (resource, error) in blocked {
+            if has_unconfirmed_close(client, &resource).await? {
+                eprintln!(
+                    "本机会话 {} 关闭待核对，保留恢复记录：{error}",
+                    resource.id()
+                );
+            } else {
+                first_error.get_or_insert_with(|| format!("{}：{error}", resource.id()));
+            }
+        }
+    }
+    Ok(first_error)
+}
+
+async fn adopt_page(
     directory: &Path,
     paths: &[PathBuf],
     host: &Host,
@@ -326,59 +390,27 @@ async fn drain_page(
                 index += 1;
                 continue;
             }
-            let item = &intent.hosts[index];
-            let batch = item
-                .resources
-                .iter()
-                .take(latte_work_protocol::lifecycle::RESOURCE_BATCH_LIMIT)
-                .cloned()
-                .collect::<Vec<_>>();
-            if host.ssh.is_some() {
-                // Split before journaling: an uncertain transfer must identify
-                // exactly the resource batch sent, not the untouched remainder.
-                if intent.hosts[index].resources.len() > batch.len() {
-                    let remaining = intent.hosts[index].resources.split_off(batch.len());
-                    let item = &intent.hosts[index];
-                    let remainder = HostIntent {
-                        host: item.host.clone(),
-                        server_id: item.server_id.clone(),
-                        resources: remaining,
-                        adopted_owner_id: item.adopted_owner_id.clone(),
-                        pending_adoption: None,
-                    };
-                    intent.hosts.insert(index + 1, remainder);
-                }
-                adopt_batch(directory, &mut intent, index, client, owner_id).await?;
-                adopted.extend(intent.hosts[index].resources.clone());
-                if intent.hosts[index].resources.is_empty() {
-                    intent.hosts.remove(index);
-                } else {
-                    index += 1;
-                }
+            // Journal exactly the SSH transfer being sent, leaving later items untouched.
+            if intent.hosts[index].resources.len() > RESOURCE_BATCH_LIMIT {
+                let remaining = intent.hosts[index]
+                    .resources
+                    .split_off(RESOURCE_BATCH_LIMIT);
+                let item = &intent.hosts[index];
+                let remainder = HostIntent {
+                    host: item.host.clone(),
+                    server_id: item.server_id.clone(),
+                    resources: remaining,
+                    adopted_owner_id: item.adopted_owner_id.clone(),
+                    pending_adoption: None,
+                };
+                intent.hosts.insert(index + 1, remainder);
+            }
+            adopt_batch(directory, &mut intent, index, client, owner_id).await?;
+            adopted.extend(intent.hosts[index].resources.clone());
+            if intent.hosts[index].resources.is_empty() {
+                intent.hosts.remove(index);
             } else {
-                let closed = client
-                    .close_owned_resources(
-                        item.server_id.clone(),
-                        intent.owner_id.clone(),
-                        batch.clone(),
-                    )
-                    .await;
-                if let Err(error) = closed {
-                    // The daemon can be reachable while a native close needs
-                    // explicit user verification. Keep its durable intent, but
-                    // expose this healthy connection so ConfirmAgentClosed is
-                    // reachable. Transport/other failures still fail recovery.
-                    if !client.is_broken() && has_unconfirmed_close(client, &batch).await? {
-                        eprintln!("本机会话关闭待核对，保留恢复记录：{error:#}");
-                        index += 1;
-                        continue;
-                    }
-                    return Err(format!("{error:#}"));
-                }
-                intent.hosts[index].resources.drain(..batch.len());
-                if intent.hosts[index].resources.is_empty() {
-                    intent.hosts.remove(index);
-                }
+                index += 1;
             }
             write(directory, &intent)?;
         }
@@ -390,7 +422,7 @@ async fn drain_page(
     // The next recovery consolidates this record along with any remaining old
     // records; closed or foreign-owned resources simply do not get re-adopted.
     let mut handoff_path = None;
-    if host.ssh.is_some() && !adopted.is_empty() {
+    if !adopted.is_empty() {
         // Store this page's handoff in a source record before retiring its
         // duplicates. Its other hosts remain available for their own recovery.
         for path in paths {
@@ -418,7 +450,7 @@ async fn drain_page(
         }
     }
     for path in paths {
-        if !path.exists() || handoff_path == Some(path) || host.ssh.is_none() {
+        if !path.exists() || handoff_path == Some(path) {
             continue;
         }
         let mut intent = read(path)?;
@@ -428,30 +460,20 @@ async fn drain_page(
     Ok(adopted)
 }
 
-async fn has_unconfirmed_close(
-    client: &mut Client,
-    resources: &[Resource],
-) -> Result<bool, String> {
-    for resource in resources {
-        let Resource::AgentSession(id) = resource else {
-            continue;
-        };
-        match client
-            .request(latte_work_protocol::Request::Session {
-                session_id: id.clone(),
-            })
-            .await
-        {
-            Ok(latte_work_protocol::Response::Session { session })
-                if session.id == *id && session.agent_close_pending.is_some() =>
-            {
-                return Ok(true);
-            }
-            Ok(_) => {}
-            Err(error) => return Err(format!("{error:#}")),
-        }
-    }
-    Ok(false)
+async fn has_unconfirmed_close(client: &mut Client, resource: &Resource) -> Result<bool, String> {
+    let Resource::AgentSession(id) = resource else {
+        return Ok(false);
+    };
+    let response = client
+        .request(latte_work_protocol::Request::Session {
+            session_id: id.clone(),
+        })
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(
+        matches!(response, latte_work_protocol::Response::Session { session }
+        if session.id == *id && session.agent_close_pending.is_some()),
+    )
 }
 
 async fn adopt_batch(
@@ -1046,6 +1068,14 @@ for line in sys.stdin:
         let guard = lock(&directory).unwrap();
         let owner = uuid::Uuid::new_v4().to_string();
         let local = host();
+        let mut resources = vec![
+            Resource::Terminal("prefix".into()),
+            Resource::AgentSession("session".into()),
+            Resource::AgentSession("closed".into()),
+            Resource::Terminal("lost-reply".into()),
+            Resource::Terminal("temporarily-busy".into()),
+        ];
+        resources.extend((5..132).map(|id| Resource::Terminal(format!("terminal-{id}"))));
         write(
             &directory,
             &Intent {
@@ -1053,13 +1083,14 @@ for line in sys.stdin:
                 hosts: vec![HostIntent {
                     host: local.clone(),
                     server_id: "fixture".into(),
-                    resources: vec![Resource::AgentSession("session".into())],
+                    resources: resources.clone(),
                     adopted_owner_id: None,
                     pending_adoption: None,
                 }],
             },
         )
         .unwrap();
+        std::fs::write(directory.join("owner"), &owner).unwrap();
         let binary = directory.join("bridge");
         std::fs::write(&binary, r#"#!/usr/bin/env python3
 import sys,json,pathlib
@@ -1067,7 +1098,21 @@ base=pathlib.Path(sys.argv[sys.argv.index('--state-dir')+1]); confirmed=base/'co
 for line in sys.stdin:
     r=json.loads(line)
     if r['method']=='hello': out={'kind':'hello','version':1,'server_id':'fixture','agents':[]}
-    elif r['method']=='close_owned_resources': out={'kind':'resources_closed'} if confirmed.exists() else {'kind':'error','code':'upgrade_blocked','message':'close unknown'}
+    elif r['method']=='close_owned_resources':
+        assert r['server_id']=='fixture' and r['owner_id']==(base/'owner').read_text()
+        out={'kind':'resources_closed'}
+        for resource in r['resources']:
+            key=resource['id']
+            if key=='session' and not confirmed.exists():
+                out={'kind':'error','code':'upgrade_blocked','message':'close unknown'}
+                break
+            if key=='temporarily-busy' and not (base/'available').exists():
+                out={'kind':'error','code':'upgrade_blocked','message':'terminal busy'}
+                break
+            if key=='lost-reply' and not (base/key).exists():
+                (base/key).touch()
+                sys.exit(0)
+            (base/key).touch()
     elif r['method']=='session':
         out={'kind':'session','session':{'id':'session','project_id':'p','title':'main','agent':'codex','status':'unknown','created_at':0,'agent_close_pending':'verify-1'}}
     elif r['method']=='confirm_agent_closed':
@@ -1079,14 +1124,48 @@ for line in sys.stdin:
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         drop(guard);
         let mut client = Client::local(&binary, Some(&directory)).await.unwrap();
+        let path = directory.join(format!("{owner}.json"));
+        // Acknowledged singleton closes survive a lost reply on the next item.
+        assert!(
+            drain_directory(&directory, &local, &mut client, "new-app")
+                .await
+                .is_err()
+        );
+        assert!(client.is_broken());
+        let residual = read(&path).unwrap().hosts.remove(0).resources;
+        let expected: Vec<_> = resources
+            .iter()
+            .filter(|r| !matches!(r.id(), "prefix" | "closed"))
+            .cloned()
+            .collect();
+        assert_eq!(residual, expected);
+        let mut client = Client::local(&binary, Some(&directory)).await.unwrap();
+        let error = drain_directory(&directory, &local, &mut client, "new-app")
+            .await
+            .unwrap_err();
+        assert!(error.contains("terminal busy"));
+        assert!(
+            directory.join("terminal-131").exists(),
+            "later batches must still close"
+        );
+        assert_eq!(
+            read(&path).unwrap().hosts[0].resources,
+            [
+                Resource::AgentSession("session".into()),
+                Resource::Terminal("temporarily-busy".into())
+            ]
+        );
+        std::fs::write(directory.join("available"), "").unwrap();
         assert!(
             drain_directory(&directory, &local, &mut client, "new-app")
                 .await
                 .unwrap()
                 .is_empty()
         );
-        let path = directory.join(format!("{owner}.json"));
-        assert_eq!(read(&path).unwrap().hosts[0].resources.len(), 1);
+        assert_eq!(
+            read(&path).unwrap().hosts[0].resources,
+            [Resource::AgentSession("session".into())]
+        );
         assert!(!client.is_broken());
         assert!(matches!(
             client

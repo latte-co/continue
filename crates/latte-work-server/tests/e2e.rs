@@ -43,8 +43,15 @@ impl Host {
         host
     }
     fn spawn(directory: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Child {
+        Self::spawn_binary(
+            Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+            directory,
+            env,
+        )
+    }
+    fn spawn_binary(binary: &Path, directory: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Child {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude.py");
-        Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+        Command::new(binary)
             .env("LATTE_WORK_AGENT_ENV", "inherit")
             .arg("serve")
             .arg("--state-dir")
@@ -3295,6 +3302,132 @@ async fn quit_and_reconnect_keep_live_conversations_isolated_from_slow_or_unknow
         Response::Ok
     ));
     assert_ne!(agent_pid(good.path()), processes[0].0);
+}
+
+#[tokio::test]
+async fn busy_server_with_one_pending_close_releases_other_owned_processes() {
+    use latte_work_protocol::lifecycle::Resource;
+    let current = Path::new(env!("CARGO_BIN_EXE_latte-work-server"));
+    let baseline = std::env::var_os("LATTE_WORK_TEST_LEGACY_SERVER").map(PathBuf::from);
+    let binary = baseline.as_deref().unwrap_or(current);
+    let directory = tempfile::Builder::new()
+        .prefix("lw-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let process = Host::spawn_binary(binary, directory.path(), &[]);
+    let host = Host { directory, process };
+    host.wait_ready().await;
+    let mut app = Client::local_cleanup(current, Some(host.directory.path()))
+        .await
+        .unwrap();
+    let server = app.server_id().to_owned();
+    let project = tempfile::tempdir().unwrap();
+    let project_id = terminal_project(&mut app, project.path()).await;
+    let pending_root = tempfile::tempdir().unwrap();
+    let pending = session(&mut app, pending_root.path()).await;
+    let running_project = tempfile::tempdir().unwrap();
+    let running = session(&mut app, running_project.path()).await;
+    let terminal = uuid::Uuid::new_v4().to_string();
+    let reclaimed = uuid::Uuid::new_v4().to_string();
+    let resources = vec![
+        Resource::AgentSession(pending.clone()),
+        Resource::AgentSession(running.clone()),
+        Resource::Terminal(terminal.clone()),
+        Resource::Terminal(reclaimed.clone()),
+    ];
+    app.claim_resources("old-app".into(), resources.clone())
+        .await
+        .unwrap();
+    for id in [&terminal, &reclaimed] {
+        assert!(matches!(
+            ask(
+                &mut app,
+                Request::CreateTerminal {
+                    project_id: project_id.clone(),
+                    terminal_id: id.clone(),
+                    cols: 80,
+                    rows: 24
+                }
+            )
+            .await,
+            Response::Terminal { .. }
+        ));
+    }
+    // Model the durable close left after A lost its actor.
+    rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap().execute(
+        "INSERT INTO unconfirmed_agent_closes(session_id,reason,close_id) VALUES (?1,'close unknown','verify-a')",
+        [&pending]).unwrap();
+    send(&mut app, &running, "run-b", "background").await;
+    let events = wait(&mut app, &running, Status::Completed).await;
+    let child: i32 = events
+        .iter()
+        .find_map(|e| match &e.event {
+            EventKind::Text { text } => text.strip_prefix("background:")?.parse().ok(),
+            _ => None,
+        })
+        .unwrap();
+    let agent = agent_pid(running_project.path());
+    drop(app);
+    let mut reopened = host.client().await;
+    assert_eq!(reopened.server_id(), server);
+    // Reattach on the new bridge. A different App subsequently claims one terminal.
+    reopened
+        .claim_resources("reopened-app".into(), resources.clone())
+        .await
+        .unwrap();
+    let mut other = host.client().await;
+    other
+        .claim_resources(
+            "other-app".into(),
+            vec![Resource::Terminal(reclaimed.clone())],
+        )
+        .await
+        .unwrap();
+    if baseline.is_some() {
+        // Positive control: on the actual legacy build the blocked first item
+        // leaves the later native process and its child running.
+        assert!(
+            reopened
+                .close_owned_resources(server.clone(), "reopened-app".into(), resources.clone())
+                .await
+                .is_err()
+        );
+        assert!(process_is_running(Pid::from_raw(agent)));
+        assert!(process_is_running(Pid::from_raw(child)));
+    }
+    let mut remaining = resources.clone();
+    let mut blocked = Vec::new();
+    let mut closes = reopened.close_owned_inventory(&server, "reopened-app", &resources);
+    while let Some(receipt) = closes.next_receipt().await.unwrap() {
+        match receipt {
+            latte_work_client::CloseReceipt::Closed(closed) => {
+                remaining.retain(|r| !closed.contains(r))
+            }
+            latte_work_client::CloseReceipt::Blocked(resource, reason) => {
+                blocked.push((resource.clone(), reason))
+            }
+        }
+    }
+    assert_eq!(remaining, [Resource::AgentSession(pending.clone())]);
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0].0, remaining[0]);
+    assert!(
+        matches!(ask(&mut reopened, Request::Session { session_id: pending }).await,
+        Response::Session { session } if session.agent_close_pending.as_deref() == Some("verify-a"))
+    );
+    assert_gone(agent).await;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while process_is_running(Pid::from_raw(child)) {
+        assert!(
+            Instant::now() < deadline,
+            "B's background child survived its close"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        matches!(ask(&mut other, Request::Terminals { project_id }).await,
+        Response::Terminals { terminals } if terminals.len() == 1 && terminals[0].id == reclaimed && !terminals[0].exited)
+    );
 }
 
 #[tokio::test]

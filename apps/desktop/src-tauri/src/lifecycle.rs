@@ -1,6 +1,7 @@
 //! Graceful App exit: close every owned Agent session/terminal, then drain an idle local daemon.
 use crate::Connections;
-use latte_work_protocol::lifecycle::{RESOURCE_BATCH_LIMIT, Resource};
+use latte_work_client::CloseReceipt;
+use latte_work_protocol::lifecycle::Resource;
 use latte_work_protocol::{Request, Response};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -109,45 +110,38 @@ where
                 // Use a dedicated bridge: an in-flight reply or UI polling cannot
                 // prevent the server from receiving the whole cleanup batch.
                 let mut client = reconnect(host.clone()).await?;
-                let mut error = None;
-                for batch in resources.chunks(RESOURCE_BATCH_LIMIT) {
-                    if let Err(failure) = client
-                        .close_owned_resources(
-                            server.clone(),
-                            state.owner_id().to_owned(),
-                            batch.to_vec(),
-                        )
-                        .await
-                    {
-                        error.get_or_insert_with(|| format!("{failure:#}"));
-                        if client.is_broken() {
-                            break;
+                let mut closes =
+                    client.close_owned_inventory(&server, state.owner_id(), &resources);
+                let mut first_error = None;
+                while let Some(receipt) =
+                    closes.next_receipt().await.map_err(|e| format!("{e:#}"))?
+                {
+                    match receipt {
+                        CloseReceipt::Blocked(resource, reason) => {
+                            first_error
+                                .get_or_insert_with(|| format!("{}：{reason}", resource.id()));
                         }
-                        continue;
-                    }
-                    // A later batch can fail or exceed the overall quit deadline.
-                    // Remove only resources whose batch has already acknowledged.
-                    for resource in batch {
-                        state
-                            .owned_instances
-                            .lock()
-                            .await
-                            .remove(&(host.clone(), resource.clone()));
-                        match resource {
-                            Resource::AgentSession(id) => {
-                                state.turns.lock().await.remove(&(host.clone(), id.clone()));
-                            }
-                            Resource::Terminal(id) => {
+                        CloseReceipt::Closed(closed) => {
+                            for resource in closed {
                                 state
-                                    .terminals
+                                    .owned_instances
                                     .lock()
                                     .await
-                                    .remove(&(host.clone(), id.clone()));
+                                    .remove(&(host.clone(), resource.clone()));
+                                let key = (host.clone(), resource.id().to_owned());
+                                match resource {
+                                    Resource::AgentSession(_) => {
+                                        state.turns.lock().await.remove(&key);
+                                    }
+                                    Resource::Terminal(_) => {
+                                        state.terminals.lock().await.remove(&key);
+                                    }
+                                }
                             }
                         }
                     }
                 }
-                error.map_or(Ok(()), Err)
+                first_error.map_or(Ok(()), Err)
             }
             .await;
             if let Err(error) = result {
@@ -531,12 +525,14 @@ for line in sys.stdin:
     async fn quit_batches_large_inventories_and_retains_only_unacknowledged_resources() {
         use latte_work_protocol::lifecycle::Resource;
         use std::os::unix::fs::PermissionsExt;
-        for fail_last in [false, true] {
+        for failure in ["none", "last", "mixed"] {
             let directory =
                 std::env::temp_dir().join(format!("lw-quit-batches-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&directory).unwrap();
             let binary = directory.join("bridge");
-            std::fs::write(&binary, r#"#!/usr/bin/env python3
+            std::fs::write(
+                &binary,
+                r#"#!/usr/bin/env python3
 import sys,json,pathlib
 base=pathlib.Path(sys.argv[sys.argv.index('--state-dir')+1])
 for line in sys.stdin:
@@ -545,15 +541,23 @@ for line in sys.stdin:
     elif r['method']=='close_owned_resources':
         assert 0<len(r['resources'])<=128
         with (base/'sizes').open('a') as f: f.write(str(len(r['resources']))+'\n')
-        out={'kind':'error','code':'held','message':'last batch unconfirmed'} if len(r['resources'])==1 and (base/'fail').exists() else {'kind':'resources_closed'}
+        assert r['owner_id']==(base/'owner').read_text() and r['server_id']=='fixture'
+        mode=(base/'failure').read_text()
+        out={'kind':'resources_closed'}
+        for resource in r['resources']:
+            if ((mode=='last' and len(r['resources'])==1) or
+                (mode=='mixed' and resource['id'] in ('session-1','session-2'))):
+                out={'kind':'error','code':'upgrade_blocked','message':'close pending'}
+                break
     else: raise AssertionError(r)
     print(json.dumps(out),flush=True)
-"#).unwrap();
+"#,
+            )
+            .unwrap();
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-            if fail_last {
-                std::fs::write(directory.join("fail"), "").unwrap();
-            }
             let state = Connections::default();
+            std::fs::write(directory.join("owner"), state.owner_id()).unwrap();
+            std::fs::write(directory.join("failure"), failure).unwrap();
             for n in 0..129 {
                 let id = format!("session-{n}");
                 state
@@ -576,16 +580,26 @@ for line in sys.stdin:
                 }
             })
             .await;
-            assert_eq!(result.is_err(), fail_last);
-            assert_eq!(
-                state.owned_instances.lock().await.len(),
-                usize::from(fail_last)
-            );
-            assert_eq!(state.turns.lock().await.len(), usize::from(fail_last));
-            assert_eq!(
-                std::fs::read_to_string(directory.join("sizes")).unwrap(),
-                "128\n1\n"
-            );
+            assert_eq!(result.is_err(), failure != "none");
+            let owned = state.owned_instances.lock().await;
+            let turns = state.turns.lock().await;
+            let sizes = std::fs::read_to_string(directory.join("sizes")).unwrap();
+            if failure == "mixed" {
+                assert_eq!(owned.len(), 2);
+                assert_eq!(turns.len(), 2);
+                for id in ["session-1", "session-2"] {
+                    assert!(
+                        owned.contains_key(&("remote".into(), Resource::AgentSession(id.into())))
+                    );
+                    assert!(turns.contains_key(&("remote".into(), id.into())));
+                }
+                // Two blocked IDs guarantee at least one is in the full batch.
+                assert_eq!(sizes.lines().count(), 130);
+            } else {
+                assert_eq!(owned.len(), usize::from(failure == "last"));
+                assert_eq!(turns.len(), owned.len());
+                assert_eq!(sizes, "128\n1\n");
+            }
             std::fs::remove_dir_all(directory).unwrap();
         }
     }
