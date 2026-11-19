@@ -59,6 +59,9 @@ async fn spawn_output(
     environment: &AgentEnvironment,
     deadline: Option<tokio::time::Instant>,
 ) -> Result<(crate::runtime::Group, crate::redaction::Redactor)> {
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        bail!("Cursor 元数据读取超时");
+    }
     let binary = binary.to_owned();
     let args: Vec<_> = args.iter().map(|arg| (*arg).to_owned()).collect();
     let path = path.map(str::to_owned);
@@ -66,6 +69,9 @@ async fn spawn_output(
     // Environment preparation and Command::spawn are synchronous. Keep them off
     // the async executor; the shared deadline does not hard-bound a blocking spawn.
     tokio::task::spawn_blocking(move || {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            bail!("Cursor 元数据读取超时");
+        }
         let mut command = crate::agent_environment::command(binary);
         command
             .args(args)
@@ -170,9 +176,9 @@ fn binary_candidates(
     for name in ["cursor-agent", "agent"] {
         if let Some(home) = &home {
             let installed = home.join(".local/bin").join(name);
-            if installed.is_file()
-                && let Some(installed) = installed.to_str()
-            {
+            // Construct all priorities without touching the filesystem. Only
+            // the individual candidate admitted by discovery may be checked.
+            if let Some(installed) = installed.to_str() {
                 candidates.push(installed.to_owned());
             }
         }
@@ -187,9 +193,17 @@ pub(crate) async fn discover() -> (String, AgentInfo) {
     ))
     .await
 }
-async fn discovery_context() -> Result<(String, Option<std::ffi::OsString>)> {
+async fn discovery_context(
+    deadline: tokio::time::Instant,
+) -> Result<(String, Option<std::ffi::OsString>)> {
+    if tokio::time::Instant::now() >= deadline {
+        bail!("Cursor 元数据读取超时");
+    }
     let effective_path = crate::agent_environment::variable("PATH");
     tokio::task::spawn_blocking(move || {
+        if tokio::time::Instant::now() >= deadline {
+            bail!("Cursor 元数据读取超时");
+        }
         let cwd = std::env::current_dir().context("Cursor discovery cwd 无法读取")?;
         let cwd = cwd
             .to_str()
@@ -207,15 +221,46 @@ async fn probe_candidate(
     path: Option<std::ffi::OsString>,
     deadline: tokio::time::Instant,
 ) -> Result<Option<(String, String)>> {
-    let bound_cwd = PathBuf::from(cwd);
-    // Enumerate only this logical command. Generic fallback stays lazy, and
-    // filesystem I/O remains off the async executor.
-    let binaries = tokio::task::spawn_blocking(move || {
-        super::executable::resolve(candidate.as_ref(), path.as_deref(), &bound_cwd)
+    probe_candidate_with(candidate, cwd, path, deadline, candidate_is_file).await
+}
+
+async fn candidate_is_file(binary: PathBuf, deadline: tokio::time::Instant) -> Result<bool> {
+    if tokio::time::Instant::now() >= deadline {
+        bail!("Cursor 元数据读取超时");
+    }
+    // Await each admitted worker. A syscall already in progress is not hard
+    // bounded by the deadline; dropping a worker would not cancel that syscall.
+    tokio::task::spawn_blocking(move || {
+        if tokio::time::Instant::now() >= deadline {
+            bail!("Cursor 元数据读取超时");
+        }
+        Ok(std::fs::metadata(binary).is_ok_and(|metadata| metadata.is_file()))
     })
     .await
-    .context("Cursor CLI 路径绑定任务失败")?;
-    for binary in binaries {
+    .context("Cursor CLI 文件检查任务失败")?
+}
+
+// A private checker seam observes the actual production scheduling loop in UT.
+// It changes only filesystem checking, not probe/spawn/cleanup behavior.
+async fn probe_candidate_with<F, Fut>(
+    candidate: String,
+    cwd: &str,
+    path: Option<std::ffi::OsString>,
+    deadline: tokio::time::Instant,
+    mut is_file: F,
+) -> Result<Option<(String, String)>>
+where
+    F: FnMut(PathBuf, tokio::time::Instant) -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    let bound_cwd = PathBuf::from(cwd);
+    for binary in super::executable::resolve(candidate.as_ref(), path.as_deref(), &bound_cwd) {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        if !is_file(binary.clone(), deadline).await? {
+            continue;
+        }
         if tokio::time::Instant::now() >= deadline {
             break;
         }
@@ -240,7 +285,7 @@ async fn discover_candidates(candidates: Vec<String>) -> (String, AgentInfo) {
     let mut available = false;
     let mut detail = "未找到兼容的 Cursor Agent；在此 Host 安装并登录后重启 Server。".into();
     let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
-    match discovery_context().await {
+    match discovery_context(deadline).await {
         Ok((cwd, path)) => {
             for candidate in candidates {
                 if tokio::time::Instant::now() >= deadline {
@@ -519,6 +564,9 @@ pub(super) fn catalog(output: &str, _selected: Option<&str>) -> Result<Response>
     })
 }
 
+#[cfg(test)]
+#[path = "metadata_lookup_tests.rs"]
+mod lookup_tests;
 #[cfg(test)]
 #[path = "metadata_tests.rs"]
 mod tests;

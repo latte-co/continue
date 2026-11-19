@@ -95,6 +95,45 @@ fn cursor_candidates_prioritize_cursor_agent_and_never_fallback_from_override() 
     );
 }
 
+#[test]
+fn cursor_candidates_construct_home_paths_without_requiring_installed_files() {
+    let home = tempfile::tempdir().unwrap();
+    // Neither .local/bin nor either executable exists. Candidate ordering must
+    // be lexical; filesystem eligibility is checked only when discovery reaches
+    // the individual candidate, under its shared deadline.
+    let installed = home.path().join(".local/bin");
+    assert_eq!(
+        binary_candidates(None, Some(home.path().into())),
+        [
+            installed.join("cursor-agent").to_str().unwrap(),
+            "cursor-agent",
+            installed.join("agent").to_str().unwrap(),
+            "agent",
+        ]
+    );
+}
+
+#[test]
+fn cursor_candidates_do_not_pre_stat_lower_priority_home_generic_symlink() {
+    let home = tempfile::tempdir().unwrap();
+    let installed = home.path().join(".local/bin");
+    std::fs::create_dir_all(&installed).unwrap();
+    std::fs::write(installed.join("cursor-agent"), "fixture").unwrap();
+    // A deterministic local dangling symlink substitutes for an unavailable
+    // target. No network mount, timing assumption, or actual process is needed.
+    // Following it with is_file() would incorrectly remove this lexical entry.
+    std::os::unix::fs::symlink(home.path().join("absent"), installed.join("agent")).unwrap();
+    assert_eq!(
+        binary_candidates(None, Some(home.path().into())),
+        [
+            installed.join("cursor-agent").to_str().unwrap(),
+            "cursor-agent",
+            installed.join("agent").to_str().unwrap(),
+            "agent",
+        ]
+    );
+}
+
 #[tokio::test]
 async fn cursor_discovery_checks_help_and_advances_to_compatible_generic_agent() {
     let _permit = fixture_permit().await;

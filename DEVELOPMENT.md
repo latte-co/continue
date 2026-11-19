@@ -190,7 +190,11 @@ priority with a shared read budget; a compatible cursor-agent prevents probing a
 PATH lookup uses the actual initial version spawn as the permission authority, not
 any executable mode bit. Only a precise pre-start EACCES advances to the next
 same-name PATH entry; an already-started CLI is not replaced after an incompatible
-version/help response or a later help spawn failure. An explicit path never changes.
+version/help response or a later help spawn failure. PATH file checks are interleaved
+with probes: settling lookup never inspects a lower-priority path or symlink. Installed
+locations are lexical candidates too, not filesystem pre-scans. Each new check is
+admitted against the shared deadline; an in-flight blocking syscall is not a hard-wall
+bounded operation. An explicit path never changes.
 Each failed probe retires its owned group before a fallback is attempted. Queue edits
 reuse Cursor input validation before saving; execution keeps its guard for old rows.
 
