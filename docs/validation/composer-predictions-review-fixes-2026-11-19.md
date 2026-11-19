@@ -57,4 +57,22 @@ Claude 的隔离结论依据官方 [Hooks 文档](https://code.claude.com/docs/e
 - 未执行真实付费模型、真实 Tauri 窗口、中文 IME 实机或配置中的 SSH 主机验证。
 - 未测量覆盖率百分比，不以测试数量声称达到覆盖率门槛。
 - 未重跑远端 GitHub PR Gate，不能将本地结果作为远端检查通过的证据。
-- 本轮尚未提交或推送修复，未发布 GitHub 评审。
+- 上述首轮验证完成时未提交或推送修复；后续提交与重基验证见下节。未发布 GitHub 评审。
+
+## 重基到更新的 main 后验证
+
+用户后续明确授权提交并更新远端，另确认仅对 PR #33 的功能分支使用固定旧 SHA 保护的 `--force-with-lease`。先提交首轮修复，再重基到 `origin/main` 的 `899411ed927fbd5779dbaab563d4605acf452a9a`（模型列表刷新及侧聊续接修复）。重基无冲突，两个功能补丁的 `git range-diff` 均为 `=`；重基后的代码提交为 `b210c60bc32e11f3d940e47a1ed852a33f48221e`。
+
+前后端交集按 `review-code-changes` 分别只读复核，无新增 actionable finding。模型刷新回调的旧 LSP 类型诊断未被当前 `tsc` 复现，最新 main 的异步类型契约已完整保留，无需额外源码补丁。
+
+在该代码版本重新执行完整 `make ci`，退出码 **0**：
+
+- 前端 104 文件、**1137** 项测试通过。
+- 服务端单测 **297** 项、协议单测 **8** 项通过。
+- 最终二进制 E2E **180** 项通过、0 失败、1 项 SSH 测试按配置 ignored，耗时 1429.01 秒。
+- macOS 原生测试 **35** 项通过。
+- 格式、生成类型、actionlint／ShellCheck、workspace Clippy、Rust doc tests、前端 typecheck／Vite 和 Rustdoc 通过；Vite 仍有大于 500 kB 产物块的非阻断提示。
+
+已核验测试与审查期间工作区干净。测试代码 tree 为 `crates = 2be82643ca812cbd47a5b79a700aea7cdb5e1715`、`apps/desktop/src = b76d79e637365c1a742703e07b3a8bc3f47058b4`；后续仅记录本节，不改动已测产品代码。
+
+核验 target 为本 worktree 普通目录后，使用显式 checkout-local `CARGO_TARGET_DIR` 执行 `make clean`，清除 15323 个文件、4.3 GiB Rust 产物；worktree 与共享缓存保留。推送前远端 main 仍为上述 `899411e`，功能分支仍为租约锁定的 `a18c646772922ed885d8d6316dca5b4149af2d14`。远端 GitHub CI 结果另行产生，不以本地通过声称远端通过。
