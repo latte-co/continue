@@ -59,7 +59,7 @@ impl agents::AgentAdapter for OneShot {
         }
     }
 }
-fn context() -> (tempfile::TempDir, Database, Session, LaunchConfig) {
+pub(super) fn context() -> (tempfile::TempDir, Database, Session, LaunchConfig) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("state.sqlite")).unwrap();
     let project = store.add_project(dir.path()).unwrap();
@@ -70,7 +70,7 @@ fn context() -> (tempfile::TempDir, Database, Session, LaunchConfig) {
         .unwrap();
     (dir, Arc::new(Mutex::new(store)), session, config)
 }
-fn prepared(
+pub(super) fn prepared(
     dir: &tempfile::TempDir,
     database: &Database,
     session: &Session,
@@ -95,16 +95,17 @@ fn prepared(
     )
     .unwrap()
 }
-async fn start(p: &mut Process, database: &Database, session: &Session) {
+pub(super) async fn start(p: &mut Process, database: &Database, session: &Session) {
     db(database, |s| {
         s.begin(&session.id, "first", "hello", None, None, None, None)
     })
     .unwrap();
     p.turn_active = true;
+    p.active_request_id = Some("first".into());
     let actions = p.adapter.advance(Input::Start { prompt: "hello" }).unwrap();
     p.apply(actions, database, &session.id).await.unwrap();
 }
-async fn read_apply(p: &mut Process, database: &Database, session: &Session) {
+pub(super) async fn read_apply(p: &mut Process, database: &Database, session: &Session) {
     let (line, _) = p.next_message().await.unwrap().unwrap();
     let actions = p.adapter.advance(Input::Message(&line)).unwrap();
     p.apply(actions, database, &session.id).await.unwrap();
@@ -280,6 +281,7 @@ async fn per_turn_missing_native_id_fences_new_admission_but_reconciles_old_requ
                 config: config.clone(),
             },
             &Arc::new(AtomicBool::new(false)),
+            None,
             || {},
         )
         .await;
@@ -326,6 +328,7 @@ async fn per_turn_spawn_follows_request_and_baseline_and_deduplicates() {
                 config: config.clone(),
             },
             &Arc::new(AtomicBool::new(false)),
+            None,
             || {
                 assert!(db(&database, |s| s.has_admitted_request(&session.id)).unwrap());
             },
@@ -412,6 +415,43 @@ async fn per_turn_result_waits_for_stdout_exit_and_reap() {
     );
     assert!(!p.session_open.load(Ordering::SeqCst));
 }
+#[tokio::test]
+async fn per_turn_result_and_stdout_eof_wait_for_natural_child_cleanup_before_retirement() {
+    let (dir, database, session, mut config) = context();
+    // The test adapter captures launch ENV, so prepare it with the marker override.
+    let marker = dir.path().join("native-cleanup-finished");
+    config.environment.0.insert(
+        "CURSOR_CLEANUP_MARKER".into(),
+        marker.to_string_lossy().into_owned(),
+    );
+    let mut p = prepared(
+        &dir,
+        &database,
+        &session,
+        config,
+        "printf 'init\\nresult\\n'; exec 1>&-; sleep 0.05; printf 'natural exit' > \"$CURSOR_CLEANUP_MARKER\"; exit 0",
+    );
+    start(&mut p, &database, &session).await;
+    read_apply(&mut p, &database, &session).await;
+    read_apply(&mut p, &database, &session).await;
+    assert!(p.next_message().await.unwrap().is_none());
+    assert_eq!(
+        db(&database, |store| Ok(store.session(&session.id)?.status)).unwrap(),
+        Status::Running
+    );
+    p.finish_per_turn(&database, &session.id).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap(),
+        "natural exit",
+        "result + EOF must not SIGKILL a child still cleaning up before its successful natural exit"
+    );
+    assert_eq!(
+        db(&database, |store| Ok(store.session(&session.id)?.status)).unwrap(),
+        Status::Completed
+    );
+    assert!(p.transport.is_none() && p.can_start_turn());
+}
+
 #[tokio::test]
 async fn per_turn_eof_without_result_never_completes() {
     let (dir, database, session, config) = context();

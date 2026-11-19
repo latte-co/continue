@@ -52,6 +52,7 @@ async fn cursor_invalid_prompt_is_rejected_before_direct_or_queue_admission() {
                 busy,
                 false,
                 &mut HashMap::new(),
+                &Guard::reserve(&database, "invalid").unwrap(),
                 || panic!("invalid prompt must not be admitted"),
             )
             .await;
@@ -79,6 +80,7 @@ async fn cursor_real_enoent_allows_independent_retry_after_store_restart_and_ded
             dir.path().to_str().unwrap(),
             cursor_turn("first", "hello".into(), &config),
             &Arc::new(AtomicBool::new(false)),
+            None,
             || {},
         )
         .await
@@ -110,6 +112,7 @@ async fn cursor_real_enoent_allows_independent_retry_after_store_restart_and_ded
             dir.path().to_str().unwrap(),
             cursor_turn("first", "hello".into(), &config),
             &Arc::new(AtomicBool::new(false)),
+            None,
             || panic!("old ID must not replay"),
         )
         .await
@@ -124,6 +127,7 @@ async fn cursor_real_enoent_allows_independent_retry_after_store_restart_and_ded
             dir.path().to_str().unwrap(),
             cursor_turn("retry", "short retry".into(), &config),
             &Arc::new(AtomicBool::new(false)),
+            None,
             || {},
         )
         .await
@@ -215,6 +219,7 @@ async fn cursor_legacy_boundary_prompt_reconciles_admitted_and_queued_ids_before
             queued,
             false,
             &mut HashMap::new(),
+            &Guard::reserve(&database, "legacy-boundary").unwrap(),
             || panic!("legacy request cannot replay"),
         )
         .await
@@ -243,6 +248,7 @@ async fn cursor_send_queued_retries_only_fresh_request_and_preserves_paused_back
         true,
         false,
         &mut configs,
+        &Guard::reserve(&database, "failed-spawn").unwrap(),
         || {},
     )
     .await
@@ -274,6 +280,7 @@ async fn cursor_send_queued_retries_only_fresh_request_and_preserves_paused_back
         true,
         false,
         &mut configs,
+        &Guard::reserve(&database, "fresh").unwrap(),
         || {},
     )
     .await
@@ -300,6 +307,7 @@ async fn cursor_send_queued_retries_only_fresh_request_and_preserves_paused_back
         true,
         false,
         &mut configs,
+        &Guard::reserve(&database, "later").unwrap(),
         || panic!("paused backlog must not execute"),
     )
     .await
@@ -331,6 +339,7 @@ async fn cursor_spawn_evidence_failure_keeps_new_requests_fenced() {
             dir.path().to_str().unwrap(),
             cursor_turn("first", "hello".into(), &config),
             &Arc::new(AtomicBool::new(false)),
+            None,
             || {},
         )
         .await
@@ -345,6 +354,7 @@ async fn cursor_spawn_evidence_failure_keeps_new_requests_fenced() {
         dir.path().to_str().unwrap(),
         cursor_turn("retry", "hello".into(), &config),
         &Arc::new(AtomicBool::new(false)),
+        None,
         || panic!("missing evidence must fail closed"),
     )
     .await
@@ -359,7 +369,7 @@ async fn cursor_spawn_evidence_is_bound_to_active_request_not_latest_ledger_row(
     assert!(accept_turn(
         &mut process, &database, missing.to_str().unwrap(), &session,
         dir.path().to_str().unwrap(), cursor_turn("active", "hello".into(), &config),
-        &Arc::new(AtomicBool::new(false)), || {
+        &Arc::new(AtomicBool::new(false)), None, || {
             db(&database, |s| {
                 s.db.execute("INSERT INTO requests(id,session_id,text) VALUES ('newer-row',?1,'unrelated')", [&session.id])?;
                 Ok(())
@@ -384,6 +394,95 @@ async fn cursor_spawn_evidence_is_bound_to_active_request_not_latest_ledger_row(
     })
     .unwrap();
 }
+#[tokio::test]
+async fn cursor_admitted_spawn_failure_and_not_admitted_are_distinct_durable_facts() {
+    let (dir, database, session, config) = cursor_context();
+    let missing = dir.path().join("missing-cursor-agent");
+    let admission = Guard::reserve(&database, "spawn-failed").unwrap();
+    let mut process = None;
+    let mut admitted = false;
+    let result = accept_turn(
+        &mut process,
+        &database,
+        missing.to_str().unwrap(),
+        &session,
+        dir.path().to_str().unwrap(),
+        cursor_turn("spawn-failed", "hello".into(), &config),
+        &Arc::new(AtomicBool::new(false)),
+        Some(&admission),
+        || admitted = true,
+    )
+    .await;
+    assert!(matches!(result, Ok(true)) && admitted);
+    assert!(
+        !reject_send(&admission, "spawn-failed", "spawn failed".into()).is::<SendNotAdmitted>()
+    );
+    let events = db(&database, |store| store.events(&session.id, 0.0))
+        .unwrap()
+        .0;
+    let user = events.iter().find(|event| matches!(&event.event, EventKind::User { request_id, .. } if request_id == "spawn-failed")).unwrap();
+    assert!(user.seq > 0.0);
+    db(&database, |store| {
+        let evidence: Option<String> = store.db.query_row(
+            "SELECT confirmed_not_started FROM requests WHERE id='spawn-failed'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(evidence.as_deref(), Some("enoent"));
+        assert!(!store.request_identity_absent("spawn-failed")?);
+        assert!(!store.has_possibly_started_request(&session.id)?);
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        db(&database, |store| store.begin_with_source(
+            &session.id,
+            "spawn-failed",
+            "hello",
+            None,
+            None,
+            None,
+            None
+        ))
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(
+        db(&database, |store| store.events(&session.id, 0.0))
+            .unwrap()
+            .0
+            .len(),
+        events.len()
+    );
+    let rejected = Guard::reserve(&database, "invalid-fresh").unwrap();
+    let error = accept_turn(
+        &mut process,
+        &database,
+        missing.to_str().unwrap(),
+        &session,
+        dir.path().to_str().unwrap(),
+        cursor_turn("invalid-fresh", "hello\0world".into(), &config),
+        &Arc::new(AtomicBool::new(false)),
+        Some(&rejected),
+        || panic!("invalid fresh input must not reach begin_with_source"),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.is::<SendNotAdmitted>());
+    assert!(
+        db(&database, |store| store
+            .request_identity_absent("invalid-fresh"))
+        .unwrap()
+    );
+    assert_eq!(
+        db(&database, |store| store.events(&session.id, 0.0))
+            .unwrap()
+            .0
+            .len(),
+        events.len()
+    );
+}
+
 #[test]
 fn cursor_prompt_argument_bound_reserves_nul_and_counts_utf8_bytes() {
     assert!(agents::cursor::validate_prompt(&"x".repeat(128 * 1024 - 1)).is_ok());

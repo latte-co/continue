@@ -41,6 +41,8 @@ pub(super) struct Transport {
     pub sideband: Option<AgentSideband>,
     drain: tokio::task::JoinHandle<Result<Stderr>>,
     redactor: crate::redaction::Redactor,
+    /// Once reaped, only observation is allowed; retries never signal the old PGID.
+    retirement_signalled: bool,
     _settings: Option<tempfile::NamedTempFile>,
 }
 #[derive(Default)]
@@ -140,6 +142,7 @@ impl Transport {
             }),
             drain,
             redactor,
+            retirement_signalled: false,
             _settings: prepared._settings,
         })
     }
@@ -148,6 +151,12 @@ impl Transport {
         let status = tokio::time::timeout(Duration::from_secs(5), self.group.child.wait())
             .await
             .context("Agent stdout已结束，但进程退出未确认")??;
+        // Retire inherited writers immediately at the reap boundary, before any
+        // stderr/auxiliary await. Subsequent close retries are observation-only.
+        self.retirement_signalled = matches!(
+            killpg(Pid::from_raw(self.group.pid), Signal::SIGKILL),
+            Ok(()) | Err(Errno::ESRCH)
+        );
         let stderr = tokio::time::timeout(REAP_LIMIT, &mut self.drain)
             .await
             .context("Agent stderr尚未排空，进程收尾未确认")???
@@ -157,36 +166,51 @@ impl Transport {
         }
         Ok(format!("Agent进程退出 ({status})：{stderr}"))
     }
-    /// A parent wait is not proof that inherited descendants have stopped writing.
+    /// Physical retirement does not cancel or await auxiliary session owners.
     pub async fn terminate(&mut self, confirm_group: bool) -> bool {
-        let group = Pid::from_raw(self.group.pid);
-        let _ = killpg(group, Signal::SIGTERM);
-        let mut reaped = matches!(
-            tokio::time::timeout(REAP_LIMIT, self.group.child.wait()).await,
-            Ok(Ok(_))
-        );
-        let _ = killpg(group, Signal::SIGKILL);
-        let finished = tokio::time::timeout(REAP_LIMIT, async {
-            if !reaped {
-                reaped = self.group.child.wait().await.is_ok();
-            }
-            if confirm_group {
-                loop {
-                    match killpg(group, None) {
-                        Err(Errno::ESRCH) => break,
-                        Ok(()) | Err(Errno::EPERM) => {
-                            tokio::time::sleep(Duration::from_millis(10)).await
-                        }
-                        Err(_) => return false,
+        self.terminate_with_auxiliary(
+            confirm_group,
+            tokio::time::Instant::now() + REAP_LIMIT * 2,
+            std::future::ready(true),
+        )
+        .await
+    }
+    pub async fn terminate_with_auxiliary(
+        &mut self,
+        confirm_group: bool,
+        deadline: tokio::time::Instant,
+        auxiliary: impl std::future::Future<Output = bool>,
+    ) -> bool {
+        let live = self.group.child.id().is_some();
+        // close_group signals only while the direct child is still owned, and
+        // waits for auxiliary cleanup before reaping it. Already reaped PerTurn
+        // children must never be signalled after that wait.
+        let confirmed = close_group(&mut self.group, deadline, auxiliary).await;
+        if live {
+            self.retirement_signalled = true;
+        }
+        let group_confirmed = if confirm_group {
+            self.retirement_signalled && self.observe_group_retirement(deadline).await
+        } else {
+            true
+        };
+        self.drain.abort();
+        confirmed && group_confirmed
+    }
+    async fn observe_group_retirement(&self, deadline: tokio::time::Instant) -> bool {
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                match killpg(Pid::from_raw(self.group.pid), None) {
+                    Err(Errno::ESRCH) => return true,
+                    Ok(()) | Err(Errno::EPERM) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
+                    Err(_) => return false,
                 }
             }
-            reaped
         })
         .await
-        .unwrap_or(false);
-        self.drain.abort();
-        finished
+        .unwrap_or(false)
     }
 }
 
@@ -236,6 +260,43 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn per_turn_stop_allows_sigterm_cleanup_before_forced_group_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::providers::ProviderStore::open(dir.path())
+            .unwrap()
+            .turn_config("cursor", None, None)
+            .unwrap();
+        let marker = dir.path().join("graceful-cleanup");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "trap 'printf graceful > \"$CLEANUP_MARKER\"; exit 0' TERM; printf 'ready\\n'; while :; do :; done"])
+            .env("CLEANUP_MARKER", &marker);
+        let mut transport = Transport::spawn(
+            agents::AgentCommand {
+                command,
+                _settings: None,
+                sideband: None,
+            },
+            Some(1024),
+            &config,
+            agents::TransportLifetime::PerTurn,
+        )
+        .unwrap();
+        assert_eq!(transport.output.next().await.unwrap().unwrap(), "ready");
+        assert!(transport.terminate(true).await);
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            "graceful",
+            "TERM must receive a bounded grace period before KILL; otherwise native cleanup cannot run"
+        );
+        assert!(transport.group.child.id().is_none());
+        assert_eq!(
+            killpg(Pid::from_raw(transport.group.pid), None),
+            Err(Errno::ESRCH)
+        );
+    }
+
     #[tokio::test]
     async fn persistent_transport_retains_bidirectional_stdin() {
         let dir = tempfile::tempdir().unwrap();

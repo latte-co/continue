@@ -37,6 +37,7 @@ export function MessageQueue({
   onEdit,
   editingBlocked = false,
   onEditPending,
+  captureQueuedPredictionRetirement,
 }: {
   hostId: string;
   sessionId?: string;
@@ -47,6 +48,7 @@ export function MessageQueue({
   onEdit?: (entry: QueuedMessage) => void;
   editingBlocked?: boolean;
   onEditPending?: (pending: boolean) => void;
+  captureQueuedPredictionRetirement?: (requestId: string) => () => void;
 }) {
   const scope = JSON.stringify([hostId, sessionId]);
   const context = JSON.stringify([scope, active, connected]);
@@ -160,6 +162,11 @@ export function MessageQueue({
     if (acting.current === version || !connected || !active) return;
     const taking = command.method === "take_queued_message";
     if (taking && editingBlocked) return;
+    const retirePrediction =
+      command.method === "cancel_queued_message" ||
+      command.method === "take_queued_message"
+        ? captureQueuedPredictionRetirement?.(command.request_id)
+        : undefined;
     acting.current = version;
     if (taking) onEditPending?.(true);
     setBusy(true);
@@ -177,6 +184,20 @@ export function MessageQueue({
       const taken =
         command.method === "take_queued_message" &&
         response.kind === "queued_message_taken";
+      // Authority belongs to the captured operation even after navigation/unmount.
+      // Ordinary list omission and clear_queue do not prove a target was cancelled.
+      if (
+        (command.method === "cancel_queued_message" &&
+          response.kind === "message_queue" &&
+          !response.entries.some(
+            (entry) => entry.request_id === command.request_id,
+          )) ||
+        (command.method === "take_queued_message" &&
+          response.kind === "queued_message_taken" &&
+          response.entry.request_id === command.request_id &&
+          response.entry.revision === command.revision)
+      )
+        retirePrediction?.();
       // A confirmed take belongs to its captured session even after navigation.
       if (taken) onEdit?.(response.entry);
       if (!valid()) return;

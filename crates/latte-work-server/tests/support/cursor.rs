@@ -1,6 +1,8 @@
 use super::*;
 use latte_work_protocol::TurnProvider;
 
+#[path = "cursor_merge.rs"]
+mod merge;
 #[path = "cursor_review.rs"]
 mod review;
 

@@ -48,6 +48,134 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
+it.each(["cancel", "take"])(
+  "retires a captured provisional prediction only after confirmed %s, even after navigation",
+  async (action) => {
+    const retire = vi.fn();
+    const capture = vi.fn(() => retire);
+    const newerCapture = vi.fn(() => vi.fn());
+    let finish!: (response: unknown) => void;
+    const view = render(
+      <MessageQueue
+        {...props}
+        onEdit={vi.fn()}
+        captureQueuedPredictionRetirement={capture}
+      />,
+    );
+    await screen.findByText("Original message");
+    mocks.request.mockImplementation(async (_, command) =>
+      command.method === "cancel_queued_message" ||
+      command.method === "take_queued_message"
+        ? new Promise((resolve) => {
+            finish = resolve;
+          })
+        : { kind: "message_queue", entries: [], paused: false, reason: null },
+    );
+    if (action === "cancel")
+      fireEvent.click(
+        screen.getByRole("button", { name: "删除排队消息：Original message" }),
+      );
+    else {
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: "排队消息更多操作：Original message",
+        }),
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "编辑消息" }));
+    }
+    expect(capture).toHaveBeenCalledWith("q");
+    expect(retire).not.toHaveBeenCalled();
+    view.rerender(
+      <MessageQueue
+        {...props}
+        hostId="other"
+        connected={false}
+        captureQueuedPredictionRetirement={newerCapture}
+      />,
+    );
+    await act(async () =>
+      finish(
+        action === "cancel"
+          ? { kind: "message_queue", entries: [], paused: false, reason: null }
+          : { kind: "queued_message_taken", entry },
+      ),
+    );
+    expect(retire).toHaveBeenCalledOnce();
+    expect(newerCapture).not.toHaveBeenCalled();
+  },
+);
+it.each([
+  "cancel-failure",
+  "take-failure",
+  "take-id",
+  "take-revision",
+  "cancel-wrong-kind",
+  "cancel-still-pending",
+])("never retires provisional prediction for %s", async (outcome) => {
+  const retire = vi.fn();
+  render(
+    <MessageQueue
+      {...props}
+      onEdit={vi.fn()}
+      captureQueuedPredictionRetirement={() => retire}
+    />,
+  );
+  await screen.findByText("Original message");
+  mocks.request.mockImplementation(async (_, command) => {
+    if (command.method === "message_queue")
+      return {
+        kind: "message_queue",
+        entries: [],
+        paused: false,
+        reason: null,
+      };
+    if (outcome.endsWith("failure")) throw new Error("Not confirmed");
+    if (outcome.startsWith("take"))
+      return {
+        kind: "queued_message_taken",
+        entry: {
+          ...entry,
+          request_id: outcome === "take-id" ? "other" : entry.request_id,
+          revision: outcome === "take-revision" ? 4 : entry.revision,
+        },
+      };
+    if (outcome === "cancel-wrong-kind") return { kind: "ok" };
+    return {
+      kind: "message_queue",
+      entries: [entry],
+      paused: false,
+      reason: null,
+    };
+  });
+  if (outcome.startsWith("cancel"))
+    fireEvent.click(
+      screen.getByRole("button", { name: "删除排队消息：Original message" }),
+    );
+  else {
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "排队消息更多操作：Original message",
+      }),
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "编辑消息" }));
+  }
+  await act(async () => {});
+  expect(retire).not.toHaveBeenCalled();
+});
+it("does not infer queue retirement from an ordinary list omitting a request", async () => {
+  const capture = vi.fn(() => vi.fn());
+  mocks.request.mockResolvedValue({
+    kind: "message_queue",
+    entries: [],
+    paused: false,
+    reason: null,
+  });
+  render(
+    <MessageQueue {...props} captureQueuedPredictionRetirement={capture} />,
+  );
+  await act(async () => {});
+  expect(capture).not.toHaveBeenCalled();
+});
 it("takes an edited message out of the queue before restoring it to the composer", async () => {
   const onEdit = vi.fn();
   render(<MessageQueue {...props} onEdit={onEdit} />);

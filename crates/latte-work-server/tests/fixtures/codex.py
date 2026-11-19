@@ -23,6 +23,7 @@ waiting = None
 turn_prompt = None
 title_only = False
 title_provider = None
+auxiliary_model = None
 
 
 def emit(value):
@@ -86,8 +87,18 @@ for line in sys.stdin:
     elif method == 'initialized':
         pass
     elif method == 'model/list':
-        reply(value, {'data': [{'id': 'catalog-row', 'model': 'codex-test', 'displayName': 'Codex Test', 'isDefault': True,
-                               'supportedReasoningEfforts': [{'reasoningEffort': 'low'}, {'reasoningEffort': 'high'}]}], 'nextCursor': None})
+        catalog_file = pathlib.Path('codex-catalog.json')
+        if catalog_file.exists():
+            catalog = json.loads(catalog_file.read_text())
+            assert isinstance(catalog, list) and all(isinstance(model, str) for model in catalog)
+            with pathlib.Path('codex-catalog-reads').open('a') as f:
+                f.write(json.dumps(catalog) + '\n')
+            reply(value, {'data': [{'id': model, 'model': model, 'displayName': model, 'isDefault': index == 0,
+                                   'supportedReasoningEfforts': [{'reasoningEffort': 'low'}, {'reasoningEffort': 'high'}]}
+                                  for index, model in enumerate(catalog)], 'nextCursor': None})
+        else:
+            reply(value, {'data': [{'id': 'catalog-row', 'model': 'codex-test', 'displayName': 'Codex Test', 'isDefault': True,
+                                   'supportedReasoningEfforts': [{'reasoningEffort': 'low'}, {'reasoningEffort': 'high'}]}], 'nextCursor': None})
     elif method == 'config/read':
         config_file = pathlib.Path('codex-native-config.json')
         reply(value, {'config': json.loads(config_file.read_text()) if config_file.exists() else {'model_provider': None, 'model': None, 'developer_instructions': 'NATIVE_CODEX_INSTRUCTIONS'}})
@@ -99,12 +110,26 @@ for line in sys.stdin:
         }[params['sandbox']]
         assert params['approvalPolicy'] == approval
         assert 'inherited messages' in params['developerInstructions']
+        check_provider = pathlib.Path('check-side-provider-resume').exists()
+        source = params['threadId']
+        provider = params.get('modelProvider')
+        from_side = source.startswith('side-thread-')
+        if check_provider and from_side:
+            saved_provider = json.loads(pathlib.Path(f'{source}.fixture-provider').read_text())
+            if method == 'thread/resume' and saved_provider != provider:
+                emit({'id': value['id'], 'error': {'code': -32600, 'data': {'type': 'modelProviderNotConfigured'}}})
+                continue
+        parent_thread = thread
+        replacing_side = check_provider and from_side and method == 'thread/fork'
         if method == 'thread/fork':
-            assert params['threadId'] == thread and params['excludeTurns']
+            if replacing_side:
+                parent_thread = source
+            assert source == parent_thread and params['excludeTurns']
             if pathlib.Path('fail-side-initialization').exists():
                 sys.exit(0)
-        parent_thread = thread
-        thread = f'side-thread-{os.getpid()}' if method == 'thread/fork' else params['threadId']
+        thread = f'side-thread-{os.getpid()}' if method == 'thread/fork' else source
+        if check_provider and method == 'thread/fork':
+            pathlib.Path(f'{thread}.fixture-provider').write_text(json.dumps(provider))
         if method == 'thread/resume' and pathlib.Path('hold-side-resume').exists():
             pathlib.Path('side-resume-entered').touch()
             deadline = time.monotonic() + 10
@@ -117,6 +142,9 @@ for line in sys.stdin:
             launch_detached_writer()
         reply(value, {'thread': {'id': thread, 'forkedFromId': parent_thread},
                       'sandbox': {'type': sandbox}, 'approvalPolicy': approval})
+        if replacing_side:
+            emit({'method': 'thread/name/updated', 'params': {'threadId': thread,
+                  'threadName': 'Provider fixture-old / fixture-new'}})
     elif method in ('thread/start', 'thread/resume'):
         if params.get('ephemeral'):
             expected_env = pathlib.Path('title-environment.json')
@@ -133,6 +161,7 @@ for line in sys.stdin:
             assert params['developerInstructions'] == ''
             title_only = True
             title_provider = params['modelProvider']
+            auxiliary_model = params.get('model')
             thread = 'codex-title-thread'
             reply(value, {'thread': {'id': thread, 'ephemeral': True}, 'sandbox': {'type': 'readOnly'}})
             continue
@@ -150,8 +179,27 @@ for line in sys.stdin:
         reply(value, {})
     elif method == 'turn/start':
         if title_only:
-            assert params['threadId'] == thread and params['outputSchema']['required'] == ['title']
+            assert params['threadId'] == thread
             description = params['input'][0]['text']
+            if params['outputSchema']['required'] == ['suggestion']:
+                with pathlib.Path('prediction-inputs').open('a') as f:
+                    f.write(json.dumps({'description': description, 'pid':os.getpid(), 'provider':title_provider, 'model':auxiliary_model, 'effort':params.get('effort')})+'\n')
+                turn = 'prediction-turn'
+                notify('turn/started', {'turn':{'id':turn,'status':'inProgress'}})
+                reply(value, {'turn':{'id':turn,'status':'inProgress'}})
+                if 'prediction-held' in description:
+                    # Written after the request/turn handshake: tests can prove
+                    # both execution permits are occupied, not infer spawn order.
+                    pathlib.Path('prediction-active').touch()
+                    deadline=time.monotonic()+40
+                    while not pathlib.Path('prediction-release').exists() and time.monotonic()<deadline:time.sleep(.02)
+                if 'prediction-tools' in description:
+                    emit({'id':'unsafe','method':'item/commandExecution/requestApproval','params':{'threadId':thread,'turnId':turn,'command':'PREDICTION_UNSAFE'}})
+                else:
+                    text(json.dumps({'suggestion':None if 'prediction-none' in description else '运行测试并检查结果'},ensure_ascii=False))
+                    complete()
+                continue
+            assert params['outputSchema']['required'] == ['title']
             with pathlib.Path('codex-title-inputs').open('a') as f:
                 f.write(json.dumps({'description': description, 'pid': os.getpid(), 'provider': title_provider, 'effort': params.get('effort')}) + '\n')
             turn = 'title-turn'
@@ -287,6 +335,14 @@ for line in sys.stdin:
         else:
             reply(value, {'turnId': turn})
             text('STEER:' + extra)
+            if extra == 'hold-steer':
+                # The flushed ack/text precede completion, so tests can observe
+                # a real native handoff without inferring it from elapsed time.
+                pathlib.Path('steer-completion-held').touch()
+                deadline = time.monotonic() + 15
+                while not pathlib.Path('steer-completion-release').exists():
+                    assert time.monotonic() < deadline, 'steer completion was not released'
+                    time.sleep(.01)
             complete()
     elif method == 'turn/interrupt':
         assert params['turnId'] == turn

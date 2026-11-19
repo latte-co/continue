@@ -1,6 +1,24 @@
 #!/usr/bin/env python3
 """Deterministic native-protocol fixture. Never connects to a model."""
 import sys,json,time,os,subprocess,threading,pathlib,re
+
+# Synthetic managed policy: deliberately independent of child settings/safe-mode.
+# Only an explicit test environment enables it; no real managed config is read.
+managed_hook_root = os.environ.get('LATTE_FIXTURE_MANAGED_HOOK_ROOT')
+prediction_process = '--system-prompt' in sys.argv and 'Predict one short' in sys.argv[sys.argv.index('--system-prompt') + 1]
+
+def managed_record(file: str, value: dict) -> None:
+    if managed_hook_root:
+        with (pathlib.Path(managed_hook_root) / file).open('a') as record:
+            record.write(json.dumps(value, ensure_ascii=False) + '\n')
+
+def managed_user_prompt(text: str) -> None:
+    managed_record('managed-hook-inputs', {'event': 'UserPromptSubmit', 'prompt': text})
+
+managed_record('claude-invocations', {
+    'kind': 'prediction' if prediction_process else 'probe' if any(a.startswith('--permission-mode=latteWorkPermissionProbe') for a in sys.argv) else 'help' if '--help' in sys.argv else 'version' if '--version' in sys.argv else 'main',
+    'pid': os.getpid(),
+})
 if '--version' in sys.argv:
     print('fixture-claude 1.0');sys.exit(0)
 if '--help' in sys.argv:
@@ -12,7 +30,18 @@ if '--help' in sys.argv:
                 print("error: unknown option '--permission-mode'",file=sys.stderr)
             sys.exit(1)
         print('Usage: claude [options]\n  -h, --help Display help for command');sys.exit(0)
-    print('--permission-mode <mode> (choices: "default", "acceptEdits", "plan", "dontAsk", "bypassPermissions")');sys.exit(0)
+    print('--permission-mode <mode> (choices: "default", "acceptEdits", "plan", "dontAsk", "bypassPermissions")')
+    print('--safe-mode --tools --strict-mcp-config --mcp-config --disable-slash-commands --no-session-persistence --no-chrome --system-prompt --setting-sources --permission-prompts --prompt-suggestions Use "" to disable all tools; sessions will not be saved')
+    sys.exit(0)
+if prediction_process:
+    # Regression tripwire, not a simulated isolated prediction capability.
+    # A managed hook still sees plaintext stdin even with disableAllHooks.
+    description = sys.stdin.read()
+    managed_user_prompt(description)
+    root = pathlib.Path(os.environ.get('LATTE_FIXTURE_PREDICTION_ROOT', os.getcwd()))
+    with (root / 'prediction-inputs').open('a') as record:
+        record.write(json.dumps({'description': description, 'pid': os.getpid()}) + '\n')
+    raise RuntimeError('Claude composer predictions must fail closed before spawn')
 output_lock=threading.Lock()
 def emit(value):
     with output_lock: print(json.dumps(value),flush=True)
@@ -111,6 +140,7 @@ for line in sys.stdin:
         emit({'type':'control_response','response':{'subtype':'success','request_id':value['request_id'],'response':{'current_permission_mode':'plan' if readonly else 'default','commands':[{'name':'compact','description':'Compact history','argumentHint':'[instructions]'},{'name':'project:check','description':os.path.basename(os.getcwd()),'argumentHint':'<target>'},{'name':'agents','description':'Native child agents','argumentHint':''}]}}})
     elif value['type']=='user':
         text=value['message']['content']
+        managed_user_prompt(text)
         resumed=resumed or turns>0
         turns+=1
         metadata({'type':'user','message':{'content':text},'sessionId':native_id})

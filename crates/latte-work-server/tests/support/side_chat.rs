@@ -340,6 +340,361 @@ async fn open_side(client: &mut Client, parent: &Session) -> Session {
     }
 }
 
+#[tokio::test]
+async fn legacy_cli_parent_with_missing_request_digest_forks_without_recording_proof() {
+    let mut host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let project = terminal_project(&mut client, root.path()).await;
+    let parent = create_session(&mut client, project, "codex").await;
+    assert!(matches!(
+        send(&mut client, &parent.id, "legacy-cli", "hello").await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &parent.id, Status::Completed).await;
+    wait_for_agent_idle(&mut client, &parent.id, Status::Completed).await;
+    let turn = |session_id: &str, request_id: &str, provider: TurnProvider| Request::Send {
+        permission_mode: None,
+        provider: Some(provider),
+        session_id: session_id.into(),
+        request_id: request_id.into(),
+        text: request_id.into(),
+        model: None,
+        effort: None,
+    };
+    assert!(matches!(
+        ask(
+            &mut client,
+            turn(&parent.id, "explicit-cli", TurnProvider::Cli)
+        )
+        .await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &parent.id, Status::Completed).await;
+
+    drop(client);
+    kill(Pid::from_raw(host.process.id() as i32), Signal::SIGINT).unwrap();
+    assert!(host.process.wait().unwrap().success());
+    let db_path = host.directory.path().join("state.sqlite");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM requests WHERE session_id=?1 AND provider_fingerprint IS NULL",
+            [&parent.id],
+            |row| row.get::<_, u32>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.execute(
+            "DELETE FROM native_session_contexts WHERE session_id=?1",
+            [&parent.id],
+        )
+        .unwrap(),
+        1
+    );
+    drop(db);
+
+    host.process = Host::spawn(host.directory.path(), &[]);
+    host.wait_ready().await;
+    let mut client = host.client().await;
+    let side = open_side(&mut client, &parent).await;
+    assert!(matches!(
+        ask(
+            &mut client,
+            turn(&side.id, "legacy-cli-fork", TurnProvider::Cli)
+        )
+        .await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &side.id, Status::Completed).await;
+
+    let changed = open_side(&mut client, &parent).await;
+    let provider = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "id": "fixture-custom", "name": "Fixture", "protocol": "openai_responses",
+            "base_url": "http://fixture.test/v1", "model": "codex-test",
+            "auth": "none", "has_credential": false
+        },
+        "credential": ""
+    }))
+    .unwrap();
+    for (request_id, config) in [
+        ("legacy-new-provider", TurnProvider::Snapshot(provider)),
+        (
+            "legacy-custom-environment",
+            TurnProvider::Configured {
+                provider: None,
+                environment: AgentEnvironment(
+                    [("HTTPS_PROXY".into(), "http://fixture.test:8000".into())].into(),
+                ),
+            },
+        ),
+    ] {
+        assert!(matches!(
+            ask(&mut client, turn(&changed.id, request_id, config)).await,
+            Response::Accepted { duplicate: false }
+        ));
+        let rejected = wait(&mut client, &changed.id, Status::Failed).await;
+        assert!(rejected.iter().any(|event| matches!(&event.event,
+            EventKind::State { message: Some(message), .. } if message.contains("请用原 Provider 和 Agent 环境续接一次")
+        )));
+    }
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    assert!(
+        !db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM native_session_contexts WHERE session_id=?1)",
+            [&parent.id],
+            |row| row.get::<_, bool>(0)
+        )
+        .unwrap()
+    );
+    let inputs = std::fs::read_to_string(root.path().join("codex-inputs")).unwrap();
+    assert!(
+        !inputs.contains("legacy-new-provider") && !inputs.contains("legacy-custom-environment")
+    );
+}
+
+#[tokio::test]
+async fn side_chat_forks_and_resumes_after_switching_providers() {
+    use latte_work_protocol::{Provider, ProviderSnapshot};
+    use serde_json::{Value, json};
+
+    // After migration, an existing side chat must prove its original
+    // environment before accepting a Provider change.
+    for legacy in [false, true] {
+        let mut host = Host::start().await;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("check-side-provider-resume"), "").unwrap();
+        let mut client = host.client().await;
+        let project = terminal_project(&mut client, root.path()).await;
+        let parent = create_session(&mut client, project, "codex").await;
+        let environment =
+            AgentEnvironment([("HTTPS_PROXY".into(), "http://fixture.test:8000".into())].into());
+        let turn = |session: &Session,
+                    request_id: &str,
+                    version: &str,
+                    environment: &AgentEnvironment| {
+            let model = if version == "old" {
+                "codex-test"
+            } else {
+                "custom-codex"
+            };
+            let provider: Provider = serde_json::from_value(json!({
+                "id": format!("fixture-{version}"), "name": "Fixture", "protocol": "openai_responses",
+                "base_url": format!("http://{version}.test/v1"),
+                "model": model, "auth": "bearer", "has_credential": true
+            }))
+            .unwrap();
+            let snapshot = Box::new(ProviderSnapshot {
+                provider,
+                credential: format!("fixture-{version}"),
+            });
+            Request::Send {
+                session_id: session.id.clone(),
+                request_id: request_id.into(),
+                text: request_id.into(),
+                model: Some(model.into()),
+                effort: None,
+                permission_mode: None,
+                provider: Some(TurnProvider::Configured {
+                    provider: Some(snapshot),
+                    environment: environment.clone(),
+                }),
+            }
+        };
+        assert!(matches!(
+            ask(
+                &mut client,
+                turn(&parent, "parent-first", "old", &environment)
+            )
+            .await,
+            Response::Accepted { duplicate: false }
+        ));
+        wait(&mut client, &parent.id, Status::Completed).await;
+        wait_for_agent_idle(&mut client, &parent.id, Status::Completed).await;
+        let existing = open_side(&mut client, &parent).await;
+        assert!(matches!(
+            ask(
+                &mut client,
+                turn(&existing, "side-first", "old", &environment)
+            )
+            .await,
+            Response::Accepted { duplicate: false }
+        ));
+        wait(&mut client, &existing.id, Status::Completed).await;
+        let before = wait_for_agent_idle(&mut client, &existing.id, Status::Completed).await;
+        let existing_native_id = before.native_id.unwrap();
+
+        if legacy {
+            drop(client);
+            kill(Pid::from_raw(host.process.id() as i32), Signal::SIGINT).unwrap();
+            assert!(host.process.wait().unwrap().success());
+            let db =
+                rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
+            db.execute(
+                "ALTER TABLE native_session_contexts DROP COLUMN environment_proof",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                db.execute(
+                    "DELETE FROM native_session_contexts WHERE session_id=?1",
+                    [&parent.id],
+                )
+                .unwrap(),
+                1
+            );
+            drop(db);
+            host.process = Host::spawn(host.directory.path(), &[]);
+            host.wait_ready().await;
+            client = host.client().await;
+
+            assert!(matches!(
+                ask(
+                    &mut client,
+                    turn(
+                        &existing,
+                        "cleared-environment",
+                        "old",
+                        &AgentEnvironment::default()
+                    ),
+                )
+                .await,
+                Response::Accepted { duplicate: false }
+            ));
+            let rejected = wait(&mut client, &existing.id, Status::Failed).await;
+            assert!(rejected.iter().any(|event| matches!(&event.event,
+                EventKind::State { message: Some(message), .. } if message.contains("请用原 Provider 和 Agent 环境续接一次")
+            )));
+            let confirmation = open_side(&mut client, &parent).await;
+            assert!(matches!(
+                ask(
+                    &mut client,
+                    turn(
+                        &confirmation,
+                        "cleared-parent-environment",
+                        "old",
+                        &AgentEnvironment::default()
+                    ),
+                )
+                .await,
+                Response::Accepted { duplicate: false }
+            ));
+            let rejected = wait(&mut client, &confirmation.id, Status::Failed).await;
+            assert!(rejected.iter().any(|event| matches!(&event.event,
+                EventKind::State { message: Some(message), .. } if message.contains("请用原 Provider 和 Agent 环境续接一次")
+            )));
+            // The historical parent can establish its environment from the
+            // matching ledger without sending a new message in the main chat.
+            for (side, request) in [
+                (&existing, "confirm-child"),
+                (&confirmation, "confirm-parent"),
+            ] {
+                assert!(matches!(
+                    ask(&mut client, turn(side, request, "old", &environment)).await,
+                    Response::Accepted { duplicate: false }
+                ));
+                wait(&mut client, &side.id, Status::Completed).await;
+                wait_for_agent_idle(&mut client, &side.id, Status::Completed).await;
+            }
+        }
+
+        let fresh = open_side(&mut client, &parent).await;
+        assert!(matches!(
+            ask(
+                &mut client,
+                turn(&fresh, "fork-after-change", "new", &environment)
+            )
+            .await,
+            Response::Accepted { duplicate: false }
+        ));
+        wait(&mut client, &fresh.id, Status::Completed).await;
+        let forked = wait_for_agent_idle(&mut client, &fresh.id, Status::Completed).await;
+        assert!(
+            forked
+                .native_id
+                .as_deref()
+                .is_some_and(|id| id != existing_native_id)
+        );
+
+        assert!(matches!(
+            ask(
+                &mut client,
+                turn(&existing, "resume-after-change", "new", &environment)
+            )
+            .await,
+            Response::Accepted { duplicate: false }
+        ));
+        wait(&mut client, &existing.id, Status::Completed).await;
+        let resumed = wait_for_agent_idle(&mut client, &existing.id, Status::Completed).await;
+        let resumed_native_id = resumed.native_id.unwrap();
+        assert_ne!(resumed_native_id, existing_native_id);
+        assert_eq!(resumed.title, "Provider [redacted] / [redacted]");
+
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::CloseAgentSession {
+                    session_id: existing.id.clone(),
+                    only_if_idle: Some(true),
+                }
+            )
+            .await,
+            Response::Ok
+        ));
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::OpenSideChat {
+                    session_id: parent.id.clone(),
+                    side_id: Some(existing.id.clone()),
+                }
+            )
+            .await,
+            Response::Session { session } if session.native_id.as_deref() == Some(&resumed_native_id)
+        ));
+        assert!(matches!(
+            ask(
+                &mut client,
+                turn(&existing, "cold-resume-same-provider", "new", &environment)
+            )
+            .await,
+            Response::Accepted { duplicate: false }
+        ));
+        wait(&mut client, &existing.id, Status::Completed).await;
+        let reopened = wait_for_agent_idle(&mut client, &existing.id, Status::Completed).await;
+        assert_eq!(
+            reopened.native_id.as_deref(),
+            Some(resumed_native_id.as_str())
+        );
+
+        let inputs = std::fs::read_to_string(root.path().join("codex-inputs")).unwrap();
+        let inputs: Vec<Value> = inputs
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(inputs.len(), if legacy { 7 } else { 5 });
+        assert!(!inputs.iter().any(|input| matches!(
+            input["prompt"].as_str(),
+            Some("cleared-environment" | "cleared-parent-environment")
+        )));
+        for (input, prompt) in inputs[inputs.len() - 3..].iter().zip([
+            "fork-after-change",
+            "resume-after-change",
+            "cold-resume-same-provider",
+        ]) {
+            assert_eq!(input["prompt"], prompt);
+            assert_eq!(input["params"]["model"], "custom-codex");
+        }
+        assert_eq!(
+            inputs.last().unwrap()["params"]["threadId"],
+            resumed_native_id
+        );
+    }
+}
+
 async fn start_writable_side(client: &mut Client, side: &Session, prompt: &str) {
     send_writable_side(client, side, prompt, "default", TurnProvider::Cli).await;
     wait(client, &side.id, Status::Completed).await;
@@ -589,7 +944,7 @@ async fn undo_ignores_prelaunch_rejection_and_fences_unconfirmed_native_exit() {
         assert_eq!(inputs.contains(r#""prompt": "eof""#), launch);
         if !launch {
             assert!(events.iter().any(|event| matches!(&event.event,
-                EventKind::State { message: Some(message), .. } if message.contains("Provider 或环境已变化")
+                EventKind::State { message: Some(message), .. } if message.contains("Agent 环境无法与原会话匹配")
             )));
         }
         assert!(matches!(

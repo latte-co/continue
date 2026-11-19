@@ -114,6 +114,11 @@ pub enum Action {
         event: EventKind,
     },
     NativeSession(String),
+    /// Copy title credential digests before adopting a verified side-chat fork.
+    InheritSideChatTitleCredentials {
+        source: String,
+        target: String,
+    },
     Approval {
         id: String,
         tool_use_id: Option<String>,
@@ -179,6 +184,11 @@ pub trait AgentAdapter: Send {
         resume: Option<&str>,
         config: &LaunchConfig,
     ) -> Result<AgentCommand>;
+    /// Effective source-turn configuration for an isolated auxiliary request.
+    /// Unknown native Provider/model/effort must not be guessed.
+    fn prediction_snapshot(&self, _config: &LaunchConfig) -> Option<crate::predictions::Snapshot> {
+        None
+    }
     /// Optional native read bound for one stdio frame.
     fn frame_limit(&self) -> Option<usize> {
         None

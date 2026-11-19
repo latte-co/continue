@@ -481,11 +481,36 @@ pub enum AgentCommandUiAction {
     Subagents,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerPredictionStatus {
+    Pending,
+    Ready,
+    None,
+    Unsupported,
+    Failed,
+}
+
+/// Optional memory-only projection carried by the ordinary session read.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct ComposerPredictionSnapshot {
+    pub status: ComposerPredictionStatus,
+    pub source_request_id: Option<String>,
+    /// Sequence of the durable source User event, independent of history windows.
+    pub source_user_seq: Option<f64>,
+    pub generation_id: Option<String>,
+    pub suggestion: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum Request {
     Hello {
         version: u32,
+    },
+    /// Read an existing memory-only prediction; never starts inference.
+    ComposerPrediction {
+        session_id: String,
     },
     Projects,
     Terminals {
@@ -1252,9 +1277,19 @@ pub enum Response {
         providers: Vec<Provider>,
         bindings: Vec<AgentProviderBinding>,
     },
+    ComposerPrediction {
+        session_id: String,
+        status: ComposerPredictionStatus,
+        /// Durable Send identity of the successfully completed ordinary main turn.
+        source_request_id: Option<String>,
+        generation_id: Option<String>,
+        suggestion: Option<String>,
+    },
     Hello {
         version: u32,
         server_id: String,
+        #[serde(default)]
+        composer_predictions: bool,
         agents: Vec<AgentInfo>,
         #[serde(default)]
         permission_settings: bool,
@@ -1308,11 +1343,17 @@ pub enum Response {
         needs_earlier: bool,
         /// Exclusive raw-event cursor, independent of compacted text event IDs.
         before: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        composer_prediction: Option<ComposerPredictionSnapshot>,
     },
     Events {
         events: Vec<Event>,
         session: Session,
         has_more: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        composer_prediction: Option<ComposerPredictionSnapshot>,
     },
     EventContent {
         encoding: ContentEncoding,
@@ -1355,6 +1396,58 @@ pub enum Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn composer_prediction_is_read_only_and_legacy_hello_disables_it() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "method":"composer_prediction","session_id":"session"
+        }))
+        .unwrap();
+        assert!(
+            matches!(request, Request::ComposerPrediction { session_id } if session_id == "session")
+        );
+        let old: Response = serde_json::from_value(serde_json::json!({
+            "kind":"hello","version":1,"server_id":"old","agents":[]
+        }))
+        .unwrap();
+        assert!(matches!(
+            old,
+            Response::Hello {
+                composer_predictions: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn composer_prediction_snapshot_round_trips_inside_main_reads() {
+        let session = serde_json::json!({"id":"s","project_id":"p","title":"task","agent":"codex","native_id":null,"status":"completed","created_at":1});
+        let snapshot = serde_json::json!({"status":"ready","source_request_id":"source","source_user_seq":10.0,"generation_id":"generation","suggestion":"运行测试"});
+        for kind in ["history", "events"] {
+            let mut value = serde_json::json!({"kind":kind,"session":session,"events":[],"has_more":false,"needs_earlier":false,"before":null});
+            let legacy: Response = serde_json::from_value(value.clone()).unwrap();
+            assert!(
+                serde_json::to_value(legacy)
+                    .unwrap()
+                    .get("composer_prediction")
+                    .is_none()
+            );
+            value["composer_prediction"] = snapshot.clone();
+            let response: Response = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(response).unwrap()["composer_prediction"],
+                snapshot
+            );
+            value["composer_prediction"] = serde_json::Value::Null;
+            let response: Response = serde_json::from_value(value).unwrap();
+            assert!(
+                serde_json::to_value(response)
+                    .unwrap()
+                    .get("composer_prediction")
+                    .is_none()
+            );
+        }
+    }
+
     #[test]
     fn configured_agent_environment_round_trips_and_debug_hides_values() {
         let value = serde_json::json!({"kind":"configured","snapshot":{
