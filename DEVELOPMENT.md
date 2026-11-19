@@ -1252,6 +1252,19 @@ matching host/project/session/server, request ID and Send token. Generic
 preserve uncertainty; none authorizes automatic replay or clears another attempt.
 Observed User/handoff facts remain independent of this rejection.
 
+At the Send call site only, terminal native model/effort resolver errors use this
+same Guard and ledger proof before becoming `send_not_admitted`; SendQueued also
+uses this Send call site and retains that Guard. The resolver discovers metadata without
+submitting a prompt or creating a native thread. Its validation rules and other
+call sites are unchanged; the error text alone never establishes non-admission,
+and an older same-ID continuation or durable identity still preserves generic /
+unknown errors. The desktop returns false and retains the pending request identity
+and draft on failure; typed rejection retires only its captured prediction token.
+An explicit retry with identical text and launch parameters reuses the request ID.
+Selecting a different valid model creates a new ID on the next explicit Send;
+Accepted plus matching User/completed evidence permits that turn's later prediction
+only when no earlier unknown Send remains unresolved. No failure auto-replays input.
+
 The desktop sends no separate prediction request, including to older hosts whose
 Hello capability is true. Missing snapshots retain the default composer. Cache
 projection is nonblocking: contention or unavailable optional state omits the
@@ -1260,6 +1273,19 @@ broken-connection behavior. The legacy read-only `composer_prediction` request
 remains compatible but never schedules inference. Results are bounded in-memory
 state, not user events or persisted drafts; reconnect and daemon restart do not
 replay generation. A new turn invalidates the previous result.
+
+An ordinary same-configuration Send invalidates/cancels the old prediction and
+joins its observer, but does not await the isolated helper's child reap before
+starting or continuing the main turn. FIFO drain and explicit queued dispatch
+likewise do not wait on optional prediction cleanup. The detached owner retains
+its child, execution permits and registered inventory until cleanup is confirmed;
+observer cancellation does not release capacity or prove resources stopped.
+Unconfirmed auxiliary cleanup may suppress optional generation, never become a
+prediction-only post-Accepted failure of ordinary input. First-turn title work
+remains independent and is not cancelled or awaited by ordinary Send. This does
+not relax native Close, configuration replacement or daemon drain: those paths
+still require their native and auxiliary cleanup confirmations, and unconfirmed
+resources remain accounted for rather than reported Closed.
 
 Each enabled adapter must provide isolated, zero-tool inference with the source
 turn's effective model and Provider. An explicitly selected effort is forwarded;

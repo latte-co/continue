@@ -2026,12 +2026,6 @@ async fn accept_turn(
         if let Some(p) = process.as_mut() {
             p.cancel_prediction().await;
         }
-        if !agents::codex_jobs::registry()
-            .wait_predictions(&session.id, Duration::from_secs(3))
-            .await
-        {
-            bail!("旧输入建议的辅助进程回收待确认；本条消息已接收，但未启动执行");
-        }
         // Side chats share the main working directory. An independent snapshot
         // could attribute concurrent main writes to the child and undo them.
         if db(database, |s| Ok(s.side_parent(&session.id)?.is_none()))? {

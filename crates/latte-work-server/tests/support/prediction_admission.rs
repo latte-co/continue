@@ -29,13 +29,35 @@ async fn create(client: &mut Client, root: &Path) -> String {
 }
 
 fn send_request(session: &str, request: &str, text: &str, queued: bool) -> Request {
+    configured_request(session, request, text, queued, None)
+}
+
+fn native_request(
+    session: &str,
+    request: &str,
+    model: &str,
+    effort: Option<Effort>,
+    queued: bool,
+) -> Request {
+    configured_request(session, request, "hello", queued, Some((model, effort)))
+}
+
+fn configured_request(
+    session: &str,
+    request: &str,
+    text: &str,
+    queued: bool,
+    selection: Option<(&str, Option<Effort>)>,
+) -> Request {
+    let (model, effort) =
+        selection.map_or((None, None), |(model, effort)| (Some(model.into()), effort));
     if queued {
         Request::SendQueued {
             session_id: session.into(),
             request_id: request.into(),
             text: text.into(),
-            model: None,
-            effort: None,
+            model,
+            effort,
             permission_mode: None,
             provider: Some(TurnProvider::Cli),
         }
@@ -44,12 +66,228 @@ fn send_request(session: &str, request: &str, text: &str, queued: bool) -> Reque
             session_id: session.into(),
             request_id: request.into(),
             text: text.into(),
-            model: None,
-            effort: None,
+            model,
+            effort,
             permission_mode: None,
             provider: Some(TurnProvider::Cli),
         }
     }
+}
+
+fn catalog(root: &Path, models: &[&str]) {
+    std::fs::write(
+        root.join("codex-catalog.json"),
+        serde_json::to_vec(models).unwrap(),
+    )
+    .unwrap();
+}
+
+fn catalog_reads(root: &Path) -> usize {
+    fixture_records(root, "codex-catalog-reads")
+}
+
+fn fixture_records(root: &Path, record: &str) -> usize {
+    std::fs::read_to_string(root.join(record))
+        .unwrap()
+        .lines()
+        .count()
+}
+
+fn assert_native_rejection(response: Response, code: &str, message: &str) {
+    assert!(
+        matches!(&response, Response::Error { code: actual, message: detail } if actual == code && detail.contains(message)),
+        "{response:?}"
+    );
+}
+
+async fn assert_no_native_admission(
+    host: &Host,
+    client: &mut Client,
+    root: &Path,
+    session: &str,
+    request: &str,
+) {
+    assert_eq!(identity_counts(host, request), (0, 0, 0));
+    let Response::Events { events, .. } = ask(
+        client,
+        Request::Poll {
+            session_id: session.into(),
+            after: 0.0,
+        },
+    )
+    .await
+    else {
+        panic!("events")
+    };
+    assert!(
+        events.is_empty(),
+        "pre-admission rejection must not append User/terminal events: {events:?}"
+    );
+    assert!(!root.join("codex-inputs").exists());
+    assert!(!root.join("codex-opens").exists());
+    assert!(!root.join("prediction-inputs").exists());
+    assert!(!root.join("codex-title-inputs").exists());
+}
+
+#[tokio::test]
+async fn native_model_and_effort_rejections_are_not_admitted_for_send_and_send_queued() {
+    for queued in [false, true] {
+        for (model, effort, message) in [
+            ("missing-model", None, "模型不在当前 Codex 可选列表中"),
+            (
+                "codex-test",
+                Some(Effort::Medium),
+                "此 Codex 模型不支持所选思考强度",
+            ),
+        ] {
+            let host = Host::start().await;
+            let root = tempfile::tempdir().unwrap();
+            catalog(root.path(), &["codex-test"]);
+            let mut client = host.client().await;
+            let session = create(&mut client, root.path()).await;
+            let response = ask(
+                &mut client,
+                native_request(&session, "native-rejected", model, effort, queued),
+            )
+            .await;
+            assert_eq!(
+                catalog_reads(root.path()),
+                1,
+                "real resolver metadata probe"
+            );
+            assert_native_rejection(response, "send_not_admitted", message);
+            assert_no_native_admission(
+                &host,
+                &mut client,
+                root.path(),
+                &session,
+                "native-rejected",
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_catalog_removal_rejects_selected_model_then_new_valid_id_completes() {
+    for queued in [false, true] {
+        let host = Host::start().await;
+        let root = tempfile::tempdir().unwrap();
+        catalog(root.path(), &["codex-test", "retired-codex"]);
+        let mut client = host.client().await;
+        let session = create(&mut client, root.path()).await;
+        let Response::Session { session: current } = ask(
+            &mut client,
+            Request::Session {
+                session_id: session.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("session")
+        };
+        let response = ask(
+            &mut client,
+            Request::Models {
+                project_id: Some(current.project_id),
+                agent: "codex".into(),
+                model: Some("retired-codex".into()),
+            },
+        )
+        .await;
+        assert!(
+            matches!(response, Response::Models { models, .. } if models.contains(&"retired-codex".into()))
+        );
+        assert_eq!(catalog_reads(root.path()), 1);
+        catalog(root.path(), &["codex-test"]);
+        let response = ask(
+            &mut client,
+            native_request(&session, "removed-model", "retired-codex", None, queued),
+        )
+        .await;
+        assert_eq!(
+            catalog_reads(root.path()),
+            2,
+            "Send must re-read the current native catalog"
+        );
+        assert_native_rejection(
+            response,
+            "send_not_admitted",
+            "模型不在当前 Codex 可选列表中",
+        );
+        assert_no_native_admission(&host, &mut client, root.path(), &session, "removed-model")
+            .await;
+        let response = ask(
+            &mut client,
+            native_request(
+                &session,
+                "valid-new-id",
+                "codex-test",
+                Some(Effort::Low),
+                queued,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(response, Response::Accepted { duplicate: false }),
+            "{response:?}"
+        );
+        let events = wait(&mut client, &session, Status::Completed).await;
+        assert!(events.iter().any(
+            |event| matches!(&event.event, EventKind::Text { text } if text == "CODEX:hello")
+        ));
+        assert_eq!(identity_counts(&host, "removed-model"), (0, 0, 0));
+        assert_eq!(identity_counts(&host, "valid-new-id"), (1, 0, 1));
+        assert_eq!(fixture_records(root.path(), "codex-inputs"), 1);
+    }
+}
+
+#[tokio::test]
+async fn native_model_rejection_keeps_admitted_and_queue_tombstone_identities_generic() {
+    let host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let session = start_waiting(&host, &mut client, root.path()).await;
+    let response = ask(
+        &mut client,
+        send_request(&session, "reserved-queue", "hello", true),
+    )
+    .await;
+    assert!(matches!(
+        response,
+        Response::MessageQueued { duplicate: false }
+    ));
+    catalog(root.path(), &["codex-test"]);
+    for (index, (request, counts, status)) in [
+        ("active", (1, 0, 1), None),
+        ("reserved-queue", (0, 1, 0), Some("pending")),
+        ("reserved-queue", (0, 1, 0), Some("cancelled")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if status == Some("cancelled") {
+            ask(
+                &mut client,
+                Request::ClearMessageQueue {
+                    session_id: session.clone(),
+                },
+            )
+            .await;
+        }
+        let response = ask(
+            &mut client,
+            native_request(&session, request, "missing-model", None, true),
+        )
+        .await;
+        assert_eq!(catalog_reads(root.path()), index + 1);
+        assert_native_rejection(response, "request_failed", "模型不在当前 Codex 可选列表中");
+        assert_eq!(identity_counts(&host, request), counts);
+        if let Some(status) = status {
+            assert_eq!(queue_status(&host, request), status);
+        }
+    }
+    assert_eq!(fixture_records(root.path(), "codex-inputs"), 1);
 }
 
 fn snapshot_provider() -> TurnProvider {

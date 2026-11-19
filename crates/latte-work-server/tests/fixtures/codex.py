@@ -87,8 +87,18 @@ for line in sys.stdin:
     elif method == 'initialized':
         pass
     elif method == 'model/list':
-        reply(value, {'data': [{'id': 'catalog-row', 'model': 'codex-test', 'displayName': 'Codex Test', 'isDefault': True,
-                               'supportedReasoningEfforts': [{'reasoningEffort': 'low'}, {'reasoningEffort': 'high'}]}], 'nextCursor': None})
+        catalog_file = pathlib.Path('codex-catalog.json')
+        if catalog_file.exists():
+            catalog = json.loads(catalog_file.read_text())
+            assert isinstance(catalog, list) and all(isinstance(model, str) for model in catalog)
+            with pathlib.Path('codex-catalog-reads').open('a') as f:
+                f.write(json.dumps(catalog) + '\n')
+            reply(value, {'data': [{'id': model, 'model': model, 'displayName': model, 'isDefault': index == 0,
+                                   'supportedReasoningEfforts': [{'reasoningEffort': 'low'}, {'reasoningEffort': 'high'}]}
+                                  for index, model in enumerate(catalog)], 'nextCursor': None})
+        else:
+            reply(value, {'data': [{'id': 'catalog-row', 'model': 'codex-test', 'displayName': 'Codex Test', 'isDefault': True,
+                                   'supportedReasoningEfforts': [{'reasoningEffort': 'low'}, {'reasoningEffort': 'high'}]}], 'nextCursor': None})
     elif method == 'config/read':
         config_file = pathlib.Path('codex-native-config.json')
         reply(value, {'config': json.loads(config_file.read_text()) if config_file.exists() else {'model_provider': None, 'model': None, 'developer_instructions': 'NATIVE_CODEX_INSTRUCTIONS'}})

@@ -1144,7 +1144,10 @@ async fn dispatch_admitted(
                 Ok((session, path))
             })?;
             s.resolve_native_model(&agent_id, &path, &mut launch_config)
-                .await?;
+                .await
+                .map_err(|error| {
+                    runtime::reject_send(&admission, &request_id, error.to_string())
+                })?;
             runtime::submit_reserved(
                 s.database.clone(),
                 s.runs.clone(),
@@ -2272,6 +2275,95 @@ mod send_admission_tests {
     #[tokio::test]
     async fn decoded_send_attempt_is_owned_before_file_admission_gate() {
         decoded_send_is_owned_before_gate(false).await;
+    }
+
+    fn missing_native_model(session: &str, request: &str) -> Request {
+        Request::Send {
+            session_id: session.into(),
+            request_id: request.into(),
+            text: "never execute".into(),
+            model: Some("missing-model".into()),
+            effort: None,
+            permission_mode: None,
+            provider: Some(latte_work_protocol::TurnProvider::Cli),
+        }
+    }
+
+    async fn model_rejection(service: &Service, root: &Path, request: &str) -> anyhow::Error {
+        let session = db(&service.database, |store| {
+            let project = store.add_project(root)?;
+            store.create_session(project.id, "codex".into())
+        })
+        .unwrap();
+        std::fs::write(root.join("codex-catalog.json"), r#"["codex-test"]"#).unwrap();
+        let trace = root.join("codex-catalog-reads");
+        let reads = || std::fs::read_to_string(&trace).unwrap().lines().count();
+        let before = if trace.exists() { reads() } else { 0 };
+        let error = dispatch(
+            service,
+            missing_native_model(&session.id, request),
+            &mut upgrade::ConnectionClaims::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reads(), before + 1, "real resolver metadata probe must run");
+        assert!(!root.join("codex-inputs").exists());
+        assert!(!root.join("codex-opens").exists());
+        error
+    }
+
+    #[tokio::test]
+    async fn native_model_rejection_requires_sole_guard_not_old_same_id_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let service = service(root.path());
+        let older = admission::Guard::reserve(&service.database, "same-model-id").unwrap();
+        let error = model_rejection(&service, root.path(), "same-model-id").await;
+        assert!(
+            !error.is::<runtime::SendNotAdmitted>(),
+            "older continuation may still admit"
+        );
+        assert!(
+            db(&service.database, |store| store
+                .request_identity_absent("same-model-id"))
+            .unwrap()
+        );
+        assert_eq!(admission::active(&service.database, "same-model-id"), 1);
+        drop(older);
+        let error = model_rejection(&service, root.path(), "same-model-id").await;
+        assert!(
+            error.is::<runtime::SendNotAdmitted>(),
+            "sole guard and both ledgers absent: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_model_rejection_stays_generic_when_queue_ledger_read_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let service = service(root.path());
+        // Send's early dedup reads requests only; break the other ledger so
+        // native validation still runs but the final absence proof cannot pass.
+        rusqlite::Connection::open(root.path().join("state.sqlite"))
+            .unwrap()
+            .execute_batch("DROP TABLE message_queue")
+            .unwrap();
+        let error = model_rejection(&service, root.path(), "broken-model-ledger").await;
+        assert!(
+            !error.is::<runtime::SendNotAdmitted>(),
+            "DB failure is not absence"
+        );
+        assert!(
+            error.to_string().contains("无法核实消息准入状态"),
+            "ledger proof failure must remain generic/unknown: {error:#}"
+        );
+        assert!(
+            db(&service.database, |store| store
+                .request_identity_absent("broken-model-ledger"))
+            .is_err()
+        );
+        assert_eq!(
+            admission::active(&service.database, "broken-model-ledger"),
+            0
+        );
     }
 
     #[tokio::test(start_paused = true)]

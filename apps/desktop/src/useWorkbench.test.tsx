@@ -13,7 +13,6 @@ import {
   HOST_DISCONNECTED_EVENT,
   HostConnectionError,
 } from "./connectionErrors";
-import { updateWorkspace } from "./workspaceState";
 import { useWorkbench } from "./useWorkbench";
 import { ServerRequestError } from "./api";
 import type {
@@ -881,6 +880,118 @@ it.each([
     expect(standaloneReads()).toHaveLength(0);
   },
 );
+it.each([
+  ["send_not_admitted", true],
+  ["request_failed", false],
+  ["admission_unknown", false],
+] as const)(
+  "uses a new ID after changing a rejected model, restoring future predictions only for %s",
+  async (code, restores) => {
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    const base = mocks.request.getMockImplementation()!;
+    const sends: Extract<Request, { method: "send_queued" }>[] = [];
+    mocks.request.mockImplementation(async (host, r: Request) => {
+      if (r.method === "send_queued") {
+        sends.push(r);
+        if (r.model === "removed-model")
+          throw new ServerRequestError(code, "Selected model is unavailable");
+        return { kind: "accepted", duplicate: false };
+      }
+      return base(host, r);
+    });
+    const draft = "Continue with the same draft";
+    await act(async () => {
+      expect(
+        await view.result.current.send(draft, "removed-model", null, null),
+      ).toBe(false);
+    });
+    expect(view.result.current.error).toContain(
+      "Selected model is unavailable",
+    );
+    frame.events = [];
+    frame.snapshot = ready("B", 30, "Before explicit retry");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(sends).toHaveLength(1);
+    expect(view.result.current.composerPrediction?.suggestion ?? null).toBe(
+      restores ? "Before explicit retry" : null,
+    );
+    await act(async () => {
+      expect(
+        await view.result.current.send(draft, "valid-model", null, null),
+      ).toBe(true);
+    });
+    expect(sends).toHaveLength(2);
+    expect(sends[1]).toMatchObject({ text: draft, model: "valid-model" });
+    expect(sends[1].request_id).not.toBe(sends[0].request_id);
+    expect(view.result.current.composerPrediction).toBeNull();
+    status = "running";
+    frame.events = [
+      {
+        ...userEvent(sends[1].request_id, 40),
+        event: { kind: "user", request_id: sends[1].request_id, text: draft },
+      },
+    ];
+    frame.snapshot = undefined;
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction).toBeNull();
+    status = "completed";
+    frame.events = [
+      {
+        seq: 41,
+        at: 1,
+        session_id: "s",
+        event: { kind: "state", status: "completed", message: null },
+      },
+    ];
+    frame.snapshot = ready(sends[1].request_id, 40, "After valid model turn");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion ?? null).toBe(
+      restores ? "After valid model turn" : null,
+    );
+    expect(sends).toHaveLength(2);
+    expect(standaloneReads()).toHaveLength(0);
+  },
+);
+it("retains the rejected request ID for an explicit same-parameter retry", async () => {
+  predictionFixture();
+  const view = await openPredictionFixture();
+  const base = mocks.request.getMockImplementation()!;
+  const sends: Extract<Request, { method: "send_queued" }>[] = [];
+  mocks.request.mockImplementation(async (host, r: Request) => {
+    if (r.method === "send_queued") {
+      sends.push(r);
+      if (sends.length === 1)
+        throw new ServerRequestError("send_not_admitted", "Model unavailable");
+      return { kind: "accepted", duplicate: false };
+    }
+    return base(host, r);
+  });
+  await act(async () => {
+    expect(
+      await view.result.current.send(
+        "Retained draft",
+        "same-model",
+        null,
+        null,
+      ),
+    ).toBe(false);
+  });
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(sends).toHaveLength(1);
+  await act(async () => {
+    expect(
+      await view.result.current.send(
+        "Retained draft",
+        "same-model",
+        null,
+        null,
+      ),
+    ).toBe(true);
+  });
+  expect(sends).toHaveLength(2);
+  expect(sends[1]).toEqual(sends[0]);
+});
 it("does not retire a User-observed send on a late unadmitted error", async () => {
   const frame = predictionFixture();
   const view = await openPredictionFixture();

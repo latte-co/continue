@@ -119,6 +119,7 @@ impl Registry {
         self.wait_until(budget, || self.scope_confirmed(scope))
             .await
     }
+    #[cfg(test)]
     pub(crate) async fn wait_predictions(&self, id: &str, budget: Duration) -> bool {
         let scope = JobScope::session(id);
         self.wait_until(budget, || {

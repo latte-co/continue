@@ -514,6 +514,23 @@ it("loads native commands from the selected host and inserts without running; se
     expect(mocks.send).toHaveBeenCalledWith("/compact 保留结论"),
   );
 });
+it("preserves plain draft text when submission returns false until an explicit retry", async () => {
+  mocks.send.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+  render(<Harness />);
+  type("保留原草稿，改选有效模型后再发送");
+  await act(async () => fireEvent.click(screen.getByText("发送")));
+  expect(mocks.send).toHaveBeenCalledOnce();
+  expect(mocks.send).toHaveBeenLastCalledWith(
+    "保留原草稿，改选有效模型后再发送",
+  );
+  expect(inputText()).toBe("保留原草稿，改选有效模型后再发送");
+  expect(screen.getByText("发送")).toHaveProperty("disabled", false);
+  await act(async () => fireEvent.click(screen.getByText("发送")));
+  expect(mocks.send).toHaveBeenCalledTimes(2);
+  expect(mocks.send).toHaveBeenLastCalledWith(
+    "保留原草稿，改选有效模型后再发送",
+  );
+});
 it("adds a file with spaces at the caret, preserves surrounding text and retries failed sends", async () => {
   render(<Harness />);
   type("检查 @src/中文 file.ts 后文", 18);
