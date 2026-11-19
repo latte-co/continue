@@ -1252,11 +1252,15 @@ matching host/project/session/server, request ID and Send token. Generic
 preserve uncertainty; none authorizes automatic replay or clears another attempt.
 Observed User/handoff facts remain independent of this rejection.
 
-At the Send call site only, terminal native model/effort resolver errors use this
-same Guard and ledger proof before becoming `send_not_admitted`; SendQueued also
-uses this Send call site and retains that Guard. The resolver discovers metadata without
-submitting a prompt or creating a native thread. Its validation rules and other
-call sites are unchanged; the error text alone never establishes non-admission,
+At the Send call site only, terminal App Provider turn-configuration errors and
+native model/effort resolver errors use this same Guard and ledger proof before
+becoming `send_not_admitted`; SendQueued also uses this Send call site and retains
+that Guard. A cached desktop selection is still checked against the latest supplied
+Provider catalog, and a removed model is rejected before durable queue admission.
+The Provider-store lock is released before the Guard and ledger proof runs. The
+native resolver discovers metadata without submitting a prompt or creating a
+native thread. Shared validation rules and other call sites are unchanged; the
+error text alone never establishes non-admission,
 and an older same-ID continuation or durable identity still preserves generic /
 unknown errors. The desktop returns false and retains the pending request identity
 and draft on failure; typed rejection retires only its captured prediction token.

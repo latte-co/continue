@@ -1097,11 +1097,17 @@ async fn dispatch_admitted(
             }
             let agent_id = db(&s.database, |d| Ok(d.session(&session_id)?.agent))?;
             let binary = s.agent_binary(&agent_id)?;
-            let mut launch_config = s
-                .providers
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Provider 配置锁异常"))?
-                .turn_config(&agent_id, model.as_deref(), provider)?;
+            let launch_config = {
+                let providers = s
+                    .providers
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Provider 配置锁异常"))?;
+                providers.turn_config(&agent_id, model.as_deref(), provider)
+            };
+            // Release the Provider lock before the admission -> database proof.
+            let mut launch_config = launch_config.map_err(|error| {
+                runtime::reject_send(&admission, &request_id, error.to_string())
+            })?;
             let selected_model = launch_config.model.as_deref().or_else(|| {
                 launch_config
                     .provider
@@ -2310,6 +2316,94 @@ mod send_admission_tests {
         assert!(!root.join("codex-inputs").exists());
         assert!(!root.join("codex-opens").exists());
         error
+    }
+
+    async fn provider_model_rejection(
+        service: &Service,
+        root: &Path,
+        request: &str,
+    ) -> anyhow::Error {
+        let session = db(&service.database, |store| {
+            let project = store.add_project(root)?;
+            store.create_session(project.id, "codex".into())
+        })
+        .unwrap();
+        let mut send = unsupported(request, &session.id);
+        if let Request::Send { model, effort, .. } = &mut send {
+            *model = Some("removed-app-model".into());
+            *effort = None;
+        }
+        let error = dispatch(service, send, &mut upgrade::ConnectionClaims::default())
+            .await
+            .unwrap_err();
+        assert!(!root.join("codex-inputs").exists());
+        assert!(!root.join("codex-opens").exists());
+        error
+    }
+
+    #[tokio::test]
+    async fn provider_model_rejection_requires_sole_guard_not_old_same_id_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let service = service(root.path());
+        let older = admission::Guard::reserve(&service.database, "same-provider-model-id").unwrap();
+        let error = provider_model_rejection(&service, root.path(), "same-provider-model-id").await;
+        assert!(
+            !error.is::<runtime::SendNotAdmitted>(),
+            "older continuation may still admit"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("模型不在当前 Provider 的可选列表中")
+        );
+        assert!(
+            db(&service.database, |store| store
+                .request_identity_absent("same-provider-model-id"))
+            .unwrap()
+        );
+        assert_eq!(
+            admission::active(&service.database, "same-provider-model-id"),
+            1
+        );
+        drop(older);
+        let error = provider_model_rejection(&service, root.path(), "same-provider-model-id").await;
+        assert!(
+            error.is::<runtime::SendNotAdmitted>(),
+            "sole guard and both ledgers absent: {error:#}"
+        );
+        assert_eq!(
+            admission::active(&service.database, "same-provider-model-id"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_model_rejection_stays_generic_when_queue_ledger_read_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let service = service(root.path());
+        rusqlite::Connection::open(root.path().join("state.sqlite"))
+            .unwrap()
+            .execute_batch("DROP TABLE message_queue")
+            .unwrap();
+        let error =
+            provider_model_rejection(&service, root.path(), "broken-provider-model-ledger").await;
+        assert!(
+            !error.is::<runtime::SendNotAdmitted>(),
+            "DB failure is not absence"
+        );
+        assert!(
+            error.to_string().contains("无法核实消息准入状态"),
+            "{error:#}"
+        );
+        assert!(
+            db(&service.database, |store| store
+                .request_identity_absent("broken-provider-model-ledger"))
+            .is_err()
+        );
+        assert_eq!(
+            admission::active(&service.database, "broken-provider-model-ledger"),
+            0
+        );
     }
 
     #[tokio::test]
