@@ -8,7 +8,13 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
+import { createRef } from "react";
+import { ModelPicker, type ModelPickerHandle } from "./ModelPicker";
 import { ModelSelector } from "./ModelSelector";
+import type { Response } from "./protocol";
+
+const request = vi.hoisted(() => vi.fn());
+vi.mock("./api", () => ({ request, message: String }));
 
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn();
@@ -294,4 +300,133 @@ it("leaves ordinary models as direct choices and supports pointer mode selection
   );
   fireEvent.click(screen.getByRole("menuitemradio", { name: "Seed" }));
   expect(change).toHaveBeenLastCalledWith("seed");
+});
+
+it("refreshes the catalog in the open menu and can recover from a failed refresh", async () => {
+  const catalog = (model: string): Response => ({
+    kind: "models",
+    models: [model],
+    provider: null,
+    default_model: model,
+    effort_levels: ["medium"],
+    model_labels: {},
+  });
+  const responses: {
+    resolve: (value: Response) => void;
+    reject: (error: Error) => void;
+  }[] = [];
+  request.mockReset();
+  request.mockImplementation(
+    () =>
+      new Promise<Response>((resolve, reject) =>
+        responses.push({ resolve, reject }),
+      ),
+  );
+  const ref = createRef<ModelPickerHandle>();
+  const onChange = vi.fn();
+  const onReadyChange = vi.fn();
+  render(
+    <ModelPicker
+      ref={ref}
+      hostId="local"
+      projectId="project"
+      agent="codex"
+      connected
+      settingsOpen={false}
+      value={null}
+      onChange={onChange}
+      effort={null}
+      onEffortChange={vi.fn()}
+      onReadyChange={onReadyChange}
+      disabled={false}
+    />,
+  );
+  const trigger = screen.getByRole("button", {
+    name: "Model and reasoning effort",
+  });
+  fireEvent.click(trigger);
+  expect(request).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole("status").textContent).toBe("正在刷新模型…");
+  await act(async () => responses[0].resolve(catalog("gpt-old")));
+  expect(screen.getByRole("menuitemradio", { name: "gpt-old" })).toBeTruthy();
+
+  fireEvent.click(trigger);
+  fireEvent.click(trigger);
+  expect(request).toHaveBeenLastCalledWith("local", {
+    method: "models",
+    agent: "codex",
+    model: null,
+    project_id: "project",
+  });
+  expect(request).toHaveBeenCalledTimes(2);
+  expect(screen.queryByRole("menuitemradio", { name: "gpt-old" })).toBeNull();
+  expect(onReadyChange).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+
+  await act(async () => responses[1].reject(new Error("network")));
+  expect(screen.getByRole("status").textContent).toBe("刷新失败，使用上次列表");
+  expect(screen.getByRole("menuitemradio", { name: "default" })).toBe(
+    document.activeElement,
+  );
+  expect(onReadyChange).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+  fireEvent.click(screen.getByRole("menuitemradio", { name: "gpt-old" }));
+  expect(onChange).toHaveBeenCalledWith("gpt-old");
+  expect(document.activeElement).toBe(trigger);
+  fireEvent.keyDown(trigger, { key: "ArrowDown" });
+  expect(request).toHaveBeenCalledTimes(3);
+  await act(async () => responses[2].resolve(catalog("gpt-new")));
+  const latest = screen.getByRole("menuitemradio", { name: "gpt-new" });
+  expect(screen.queryByRole("menuitemradio", { name: "gpt-old" })).toBeNull();
+  expect(onReadyChange).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+  fireEvent.click(latest);
+  expect(onChange).toHaveBeenCalledWith("gpt-new");
+
+  let opening: ReturnType<ModelPickerHandle["openMenu"]> | undefined;
+  act(() => {
+    opening = ref.current?.openMenu("effort");
+  });
+  expect(request).toHaveBeenCalledTimes(4);
+  expect(screen.queryByRole("menu", { name: "Reasoning effort" })).toBeNull();
+  await act(async () => responses[3].resolve(catalog("gpt-new")));
+  await expect(opening).resolves.toBeNull();
+  expect(request).toHaveBeenCalledTimes(4);
+  const effortMenu = screen.getByRole("menu", { name: "Reasoning effort" });
+  expect(document.activeElement).toBe(
+    within(effortMenu).getByRole("menuitemradio", { name: "跟随 Agent" }),
+  );
+});
+
+it("lets the user clear an effort override even when the model's levels could not be fetched", () => {
+  const onEffortChange = vi.fn();
+  render(
+    <ModelSelector
+      options={[{ value: "haiku", label: "Haiku" }]}
+      value="haiku"
+      onChange={vi.fn()}
+      levels={[]}
+      effort="high"
+      canResetEffort
+      onEffortChange={onEffortChange}
+      disabled={false}
+    />,
+  );
+  const trigger = screen.getByRole("button", {
+    name: "Model and reasoning effort",
+  });
+  fireEvent.click(trigger);
+  fireEvent.click(screen.getByRole("menuitem", { name: /^Effort/ }));
+  const menu = screen.getByRole("menu", { name: "Reasoning effort" });
+  const followAgent = within(menu).getByRole("menuitemradio", {
+    name: "跟随 Agent",
+  });
+  expect(within(menu).getAllByRole("menuitemradio")).toEqual([followAgent]);
+  expect(document.activeElement).toBe(followAgent);
+  fireEvent.keyDown(followAgent, { key: "Enter" });
+  expect(onEffortChange).toHaveBeenCalledWith(null);
+  expect(document.activeElement).toBe(trigger);
 });

@@ -103,6 +103,11 @@ pub enum Action {
         event: EventKind,
     },
     NativeSession(String),
+    /// Copy title credential digests before adopting a verified side-chat fork.
+    InheritSideChatTitleCredentials {
+        source: String,
+        target: String,
+    },
     Approval {
         id: String,
         tool_use_id: Option<String>,

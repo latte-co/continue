@@ -907,9 +907,17 @@ impl TurnState {
                     }
                     Ok(())
                 })?,
+                Action::InheritSideChatTitleCredentials { source, target } => db(database, |s| {
+                    s.inherit_side_chat_title_credentials(session_id, &source, &target)
+                })?,
                 Action::NativeSession(id) => db(database, |s| {
                     let mut current = s.session(session_id)?;
-                    s.remember_native_context(session_id, &id, config.fingerprint()?.as_deref())?;
+                    s.remember_native_context(
+                        session_id,
+                        &id,
+                        config.fingerprint()?.as_deref(),
+                        &config.environment_fingerprint()?,
+                    )?;
                     if let Some(provider) = &config.provider {
                         s.remember_title_credential(session_id, &id, &provider.credential)?;
                     }
@@ -1276,16 +1284,13 @@ impl Process {
             session.title_requested,
         );
         if let Some((parent, native)) = db(database, |s| s.side_parent(&session.id))? {
-            let fingerprint = config.fingerprint()?;
             let (owner, source) = session
                 .native_id
                 .as_ref()
                 .map_or((&parent, &native), |id| (&session.id, id));
-            if !db(database, |s| {
-                s.native_rename_context_matches(owner, source, fingerprint.as_deref())
-            })? {
-                bail!("侧边聊天的 Provider 或环境已变化，请恢复原配置后重试");
-            }
+            db(database, |s| {
+                s.verify_side_native_environment(owner, source, &config)
+            })?;
             adapter.set_side_parent(native)?;
         }
         let prepared = adapter.command(binary, agent_cwd, session.native_id.as_deref(), &config)?;

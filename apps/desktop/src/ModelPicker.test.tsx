@@ -332,3 +332,76 @@ it("groups native backend modes and keeps the persisted Max value ready", async 
     expect.objectContaining({ ready: true }),
   );
 });
+
+it("keeps the last model list usable after changing selection within its host, project and Agent", async () => {
+  const catalog: Response = {
+    kind: "models",
+    models: ["first", "second"],
+    provider: null,
+    default_model: "first",
+    effort_levels: ["high"],
+    model_labels: {},
+  };
+  mocks.request
+    .mockResolvedValueOnce(catalog)
+    .mockRejectedValue(new Error("offline"));
+  const props = {
+    hostId: "devbox",
+    projectId: "p",
+    agent: "codex",
+    connected: true,
+    settingsOpen: false,
+    value: "first",
+    onChange: vi.fn(),
+    effort: "high" as const,
+    onEffortChange: vi.fn(),
+    onEffortInvalid: vi.fn(),
+    disabled: false,
+    onReadyChange: vi.fn(),
+  };
+  const view = render(<ModelPicker {...props} />);
+  await act(async () => {});
+  view.rerender(<ModelPicker {...props} value="second" />);
+  await act(async () => {});
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      value: "second",
+      notice: "刷新失败，使用上次列表",
+      status: undefined,
+      options: expect.arrayContaining([
+        expect.objectContaining({ value: "first" }),
+        expect.objectContaining({ value: "second" }),
+      ]),
+      levels: [],
+      canResetEffort: true,
+    }),
+    undefined,
+  );
+  expect(props.onEffortInvalid).not.toHaveBeenCalled();
+  expect(props.onReadyChange).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+  const reset = mocks.selector.mock.calls.at(-1)?.[0] as {
+    onEffortChange: (effort: null) => void;
+  };
+  act(() => reset.onEffortChange(null));
+  expect(props.onEffortChange).toHaveBeenCalledWith(null);
+  view.rerender(<ModelPicker {...props} value="second" effort={null} />);
+  expect(props.onReadyChange).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  view.rerender(<ModelPicker {...props} hostId="other-host" />);
+  await act(async () => {});
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      notice: undefined,
+      status: "模型刷新失败，重新打开可重试",
+      options: [{ value: "", label: "default" }],
+    }),
+    undefined,
+  );
+  expect(props.onReadyChange).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+});

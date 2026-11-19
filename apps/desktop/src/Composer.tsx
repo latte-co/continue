@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { chooseReferencePath, message, request } from "./api";
 import type { AgentSlashCommand, FileEntry } from "./protocol";
+import type { ModelPickerHandle } from "./ModelPicker";
 import {
   commandTitle,
   composerTrigger,
@@ -84,7 +85,7 @@ interface Props {
   onSubmit: (prompt: string) => Promise<boolean>;
   onOpenSideChat?: (draft?: string) => boolean | Promise<boolean>;
   onOpenSubagents?: () => void;
-  onOpenModelSettings?: (target: "model" | "effort") => string | null;
+  onOpenModelSettings?: ModelPickerHandle["openMenu"];
   toolbar: (
     submit: () => void,
     hasContent: boolean,
@@ -270,7 +271,15 @@ export function Composer(props: Props) {
   const [externalBusy, setExternalBusy] = useState(false);
   const referenceOperation = useRef(0);
   const currentContext = useRef("");
-  currentContext.current = `${scope}:${sessionId}:${disabled}:${sending}:${hidden}:${connected}`;
+  const commandContext = `${scope}:${sessionId}:${disabled}:${sending}:${hidden}:${connected}`;
+  currentContext.current = commandContext;
+  const modelCommandGeneration = useRef(0);
+  useLayoutEffect(
+    () => () => {
+      modelCommandGeneration.current++;
+    },
+    [commandContext, value],
+  );
   useEffect(
     () => () => {
       referenceOperation.current++;
@@ -916,9 +925,13 @@ export function Composer(props: Props) {
       }
       props.onOpenSubagents();
     } else {
-      const error =
-        props.onOpenModelSettings?.(action) ??
-        (props.onOpenModelSettings ? null : "无法打开模型设置");
+      const generation = modelCommandGeneration.current;
+      const isCurrent = () => modelCommandGeneration.current === generation;
+      const result = props.onOpenModelSettings
+        ? props.onOpenModelSettings(action, isCurrent)
+        : "无法打开模型设置";
+      const error = result instanceof Promise ? await result : result;
+      if (!isCurrent()) return;
       if (error) {
         setNotice(error);
         return;

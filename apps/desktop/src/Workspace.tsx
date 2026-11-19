@@ -607,7 +607,7 @@ function WorkspacePage({
           !conversationActive &&
           tabs.some((tab) => tab.kind === "sideChat" && tab.id === current) && (
             <SideChatHistoryButton
-              key={sessionId}
+              key={JSON.stringify(["side-chat-history", hostId, sessionId])}
               hostId={hostId}
               parentId={sessionId}
               currentId={sideChatId(current)}

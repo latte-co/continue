@@ -167,7 +167,10 @@ it("offers local settings and does not discover or submit native commands in sid
   expect(screen.getAllByRole("option")).toHaveLength(2);
   fireEvent.click(screen.getByRole("option", { name: /选择模型/ }));
   fireEvent.click(screen.getByText("发送"));
-  expect(mocks.openModelSettings).toHaveBeenCalledWith("model");
+  expect(mocks.openModelSettings).toHaveBeenCalledWith(
+    "model",
+    expect.any(Function),
+  );
 
   type("/compact ");
   fireEvent.click(screen.getByText("发送"));
@@ -1210,7 +1213,10 @@ it.each(["model", "effort"] as const)(
     render(<Harness agent="another" />);
     type(` /${target}  `);
     fireEvent.click(screen.getByText("发送"));
-    expect(mocks.openModelSettings).toHaveBeenCalledWith(target);
+    expect(mocks.openModelSettings).toHaveBeenCalledWith(
+      target,
+      expect.any(Function),
+    );
     expect(mocks.send).not.toHaveBeenCalled();
     expect(mocks.request).not.toHaveBeenCalled();
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
@@ -1271,7 +1277,10 @@ it("unifies native model and effort entries while retaining namespaced project c
   fireEvent.click(screen.getByRole("option", { name: /选择模型/ }));
   expect(mocks.openModelSettings).not.toHaveBeenCalled();
   fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
-  expect(mocks.openModelSettings).toHaveBeenCalledWith("model");
+  expect(mocks.openModelSettings).toHaveBeenCalledWith(
+    "model",
+    expect.any(Function),
+  );
   expect(mocks.send).not.toHaveBeenCalled();
 });
 
@@ -1285,7 +1294,10 @@ it("opens App settings when command discovery fails and preserves references", a
   fireEvent.click(screen.getByRole("option", { name: /思考强度/ }));
   mocks.request.mockClear();
   fireEvent.click(screen.getByText("发送"));
-  expect(mocks.openModelSettings).toHaveBeenCalledWith("effort");
+  expect(mocks.openModelSettings).toHaveBeenCalledWith(
+    "effort",
+    expect.any(Function),
+  );
   expect(mocks.send).not.toHaveBeenCalled();
   expect(mocks.request).not.toHaveBeenCalled();
   expect(

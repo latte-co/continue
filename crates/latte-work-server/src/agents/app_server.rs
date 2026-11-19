@@ -36,6 +36,7 @@ pub struct AppServer {
     cwd: String,
     resume: Option<String>,
     side_parent: Option<String>,
+    side_provider_fork: bool,
     side_config: Value,
     thread: Option<String>,
     turn: Option<String>,
@@ -270,7 +271,11 @@ impl AppServer {
             if self.codex || self.side_parent.is_some() {
                 params["excludeTurns"] = json!(true);
             }
-            "thread/resume"
+            if self.side_provider_fork {
+                "thread/fork"
+            } else {
+                "thread/resume"
+            }
         } else if let Some(parent) = &self.side_parent {
             params["threadId"] = json!(parent);
             params["excludeTurns"] = json!(true);
@@ -299,6 +304,22 @@ impl AppServer {
         };
         let method = request.method;
         if let Some(error) = message.get("error") {
+            if self.codex
+                && self.side_parent.is_some()
+                && self.phase == Phase::Opening
+                && self.pending_prompt.is_some()
+                && method == "thread/resume"
+                && error["code"] == -32600
+                && matches!(
+                    error["data"]["type"].as_str(),
+                    Some("modelProviderMismatch" | "modelProviderNotConfigured")
+                )
+            {
+                // Newer Codex requires a fork to select a different provider.
+                // Copy the child history before sending the pending prompt.
+                self.side_provider_fork = true;
+                return self.open_thread();
+            }
             if let Some((request_id, _)) = request.queued_input {
                 return Ok(vec![Action::InputRejected {
                     request_id,
@@ -473,13 +494,17 @@ impl AppServer {
             }
             "thread/start" | "thread/resume" | "thread/fork" => {
                 let thread = field(&result["thread"], "id")?.to_owned();
-                if self.resume.as_ref().is_some_and(|resume| resume != &thread) {
+                if method == "thread/resume"
+                    && self.resume.as_ref().is_some_and(|resume| resume != &thread)
+                {
                     bail!("Agent 恢复了不同的会话");
                 }
                 if let Some(parent) = &self.side_parent {
+                    let source = self.resume.as_deref().unwrap_or(parent);
                     if parent == &thread
                         || (method == "thread/fork"
-                            && result["thread"]["forkedFromId"].as_str() != Some(parent))
+                            && (source == thread
+                                || result["thread"]["forkedFromId"].as_str() != Some(source)))
                     {
                         bail!("Agent 未创建独立的侧边聊天");
                     }
@@ -500,6 +525,13 @@ impl AppServer {
                 }
                 let mut actions = Vec::new();
                 if method == "thread/fork" {
+                    if self.side_provider_fork {
+                        let source = self.resume.clone().context("侧边聊天的续接来源缺失")?;
+                        actions.push(Action::InheritSideChatTitleCredentials {
+                            source,
+                            target: thread.clone(),
+                        });
+                    }
                     actions.push(Action::NativeSession(thread.clone()));
                 }
                 self.thread = Some(thread);
@@ -1056,7 +1088,17 @@ impl AgentAdapter for AppServer {
         if resolved.model.is_none() {
             resolved.model = resolved.provider.as_ref().map(|p| p.metadata.model.clone());
         }
-        self.model_provider = resolved.provider.as_ref().map(|_| provider::id());
+        self.model_provider = resolved
+            .provider
+            .as_ref()
+            .map(|provider| {
+                if self.codex && self.side_parent.is_some() {
+                    super::codex::side_provider_id(&provider.metadata)
+                } else {
+                    Ok(provider::id())
+                }
+            })
+            .transpose()?;
         self.config = Some(resolved);
         let mut command = crate::agent_environment::command(binary);
         command.envs(&config.environment.0);
@@ -1298,6 +1340,67 @@ mod tests {
             assert!(agent.response(&response).is_err());
             assert!(agent.thread.is_none());
             assert!(agent.pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn codex_provider_recovery_forks_the_child_once_before_sending_the_prompt() {
+        let config = LaunchConfig {
+            permission_mode: None,
+            ..config()
+        };
+        for error_type in [
+            "modelProviderNotConfigured",
+            "modelProviderMismatch",
+            "modelProviderPolicyConflict",
+        ] {
+            let mut agent = AppServer {
+                codex: true,
+                phase: Phase::Opening,
+                side_parent: Some("parent".into()),
+                resume: Some("old-child".into()),
+                pending_prompt: Some("continue here".into()),
+                config: Some(config.clone()),
+                model_provider: Some("current-provider".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                encoded(&agent.open_thread().unwrap())[0]["method"],
+                "thread/resume"
+            );
+            let error = json!({"id":"latte-1", "error":{
+                "code":-32600, "message":"provider admission rejected",
+                "data":{"type":error_type}
+            }});
+            if error_type == "modelProviderPolicyConflict" {
+                assert!(agent.response(&error).is_err());
+                assert!(agent.pending.is_empty());
+                continue;
+            }
+            let writes = encoded(&agent.response(&error).unwrap());
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0]["method"], "thread/fork");
+            assert_eq!(writes[0]["params"]["threadId"], "old-child");
+            assert_eq!(writes[0]["params"]["modelProvider"], "current-provider");
+            assert_eq!(writes[0]["params"]["sandbox"], "read-only");
+
+            let actions = message(
+                &mut agent,
+                json!({"id":"latte-2", "result":{
+                    "thread":{"id":"new-child", "forkedFromId":"old-child"},
+                    "sandbox":{"type":"readOnly"}, "approvalPolicy":"never"
+                }}),
+            );
+            assert!(matches!(&actions[0],
+                Action::InheritSideChatTitleCredentials { source, target }
+                    if source == "old-child" && target == "new-child"
+            ));
+            assert!(matches!(&actions[1], Action::NativeSession(id) if id == "new-child"));
+            let writes = encoded(&actions);
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0]["method"], "turn/start");
+            assert_eq!(writes[0]["params"]["threadId"], "new-child");
+            assert_eq!(writes[0]["params"]["input"][0]["text"], "continue here");
         }
     }
 

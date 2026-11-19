@@ -125,7 +125,7 @@ impl Store {
         CREATE TABLE IF NOT EXISTS side_launch_writes(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), start_seq INTEGER NOT NULL, verified_end INTEGER);
         CREATE INDEX IF NOT EXISTS side_launch_writes_session ON side_launch_writes(session_id);
         CREATE TABLE IF NOT EXISTS native_title_secrets(session_id TEXT NOT NULL REFERENCES sessions(id), native_id TEXT NOT NULL, secret_hash BLOB NOT NULL, secret_bytes INTEGER NOT NULL, PRIMARY KEY(session_id,native_id,secret_hash));
-        CREATE TABLE IF NOT EXISTS native_session_contexts(session_id TEXT NOT NULL REFERENCES sessions(id), native_id TEXT NOT NULL, fingerprint TEXT, PRIMARY KEY(session_id,native_id));
+        CREATE TABLE IF NOT EXISTS native_session_contexts(session_id TEXT NOT NULL REFERENCES sessions(id), native_id TEXT NOT NULL, fingerprint TEXT, environment_proof TEXT, PRIMARY KEY(session_id,native_id));
         CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id), at REAL NOT NULL, data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS subagents(session_id TEXT NOT NULL REFERENCES sessions(id), id TEXT NOT NULL, native_id TEXT NOT NULL, tool_use_id TEXT, active INTEGER NOT NULL, at REAL NOT NULL, data TEXT NOT NULL, PRIMARY KEY(session_id,id));
         CREATE INDEX IF NOT EXISTS subagents_session ON subagents(session_id,active,at);
@@ -145,6 +145,16 @@ impl Store {
         CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,text TEXT NOT NULL);")?;
         let migration =
             rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
+        if !migration.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('native_session_contexts') WHERE name='environment_proof')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )? {
+            migration.execute(
+                "ALTER TABLE native_session_contexts ADD COLUMN environment_proof TEXT",
+                [],
+            )?;
+        }
         let legacy_side_chat = migration.query_row(
             "SELECT pk FROM pragma_table_info('side_chats') WHERE name='parent_id'",
             [],
@@ -676,6 +686,26 @@ impl Store {
         }
         Ok(())
     }
+    pub fn inherit_side_chat_title_credentials(
+        &self,
+        session_id: &str,
+        source: &str,
+        target: &str,
+    ) -> Result<()> {
+        if source == target
+            || self.side_parent(session_id)?.is_none()
+            || self.session(session_id)?.native_id.as_deref() != Some(source)
+        {
+            bail!("侧边聊天的原生续接来源已变化");
+        }
+        self.db.execute(
+            "INSERT OR IGNORE INTO native_title_secrets(session_id,native_id,secret_hash,secret_bytes)
+             SELECT session_id,?3,secret_hash,secret_bytes FROM native_title_secrets
+             WHERE session_id=?1 AND native_id=?2",
+            params![session_id, source, target],
+        )?;
+        Ok(())
+    }
     fn redact_native_title(&self, session: &Session, title: &str) -> Result<Option<String>> {
         use sha2::{Digest, Sha256};
         // Bound both reads and hashing. If an unusually long-lived session has
@@ -971,14 +1001,84 @@ impl Store {
             |row| row.get(0),
         ).map_err(Into::into)
     }
-    /// Preserve only the digest of the last verified native launch, never ENV.
+    /// Preserve only digests of the last verified native launch.
     pub fn remember_native_context(
         &self,
         session_id: &str,
         native_id: &str,
         fingerprint: Option<&str>,
+        environment_fingerprint: &str,
     ) -> Result<()> {
-        self.db.execute("INSERT INTO native_session_contexts(session_id,native_id,fingerprint) VALUES (?1,?2,?3) ON CONFLICT(session_id,native_id) DO UPDATE SET fingerprint=excluded.fingerprint", params![session_id, native_id, fingerprint])?;
+        // Bind the environment proof to this launch. An older Server can update
+        // the full fingerprint without updating the environment proof.
+        let proof = fingerprint.map(|full| format!("{full}:{environment_fingerprint}"));
+        self.db.execute(
+            "INSERT INTO native_session_contexts(session_id,native_id,fingerprint,environment_proof) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(session_id,native_id) DO UPDATE SET fingerprint=excluded.fingerprint,environment_proof=excluded.environment_proof",
+            params![session_id, native_id, fingerprint, proof],
+        )?;
+        Ok(())
+    }
+
+    pub fn verify_side_native_environment(
+        &self,
+        session_id: &str,
+        native_id: &str,
+        config: &crate::providers::LaunchConfig,
+    ) -> Result<()> {
+        let saved: Option<(Option<String>, Option<String>)> = self.db.query_row(
+            "SELECT fingerprint,environment_proof FROM native_session_contexts WHERE session_id=?1 AND native_id=?2",
+            params![session_id, native_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let environment_fingerprint = config.environment_fingerprint()?;
+        let (full, proof) = match saved {
+            Some((Some(full), proof)) => (full, proof),
+            // Side chats did not exist before native launch records. Their
+            // older main-thread sources can still prove an exact launch
+            // context using a nonempty, matching request ledger.
+            None if self.side_parent(session_id)?.is_none()
+                && self.session(session_id)?.native_id.as_deref() == Some(native_id) =>
+            {
+                let full = config.fingerprint()?.context("侧边聊天缺少启动配置摘要")?;
+                if !self.native_request_context_matches(session_id, Some(&full), false)? {
+                    // NULL entries remain compatible only with the original
+                    // CLI/default environment. They cannot attest a launch.
+                    if config.provider.is_none()
+                        && config.environment.is_empty()
+                        && self.native_request_context_matches(session_id, Some(&full), true)?
+                    {
+                        return Ok(());
+                    }
+                    bail!(
+                        "侧边聊天的历史配置无法确认 Agent 环境，请用原 Provider 和 Agent 环境续接一次"
+                    );
+                }
+                return self.remember_native_context(
+                    session_id,
+                    native_id,
+                    Some(&full),
+                    &environment_fingerprint,
+                );
+            }
+            _ => bail!("侧边聊天缺少原配置记录，请先用原配置在来源会话完成一轮"),
+        };
+        if let Some(proof) = &proof
+            && let Some((source, environment)) = proof.split_once(':')
+            && source == full
+        {
+            if environment != environment_fingerprint {
+                bail!("侧边聊天的 Agent 环境无法与原会话匹配，请恢复原环境后重试");
+            }
+            return Ok(());
+        }
+        // A matching combined digest proves the original environment once.
+        // Save that proof for later Provider changes, including further forks
+        // from this same source. Native IDs alone do not identify the environment.
+        if config.fingerprint()?.as_deref() != Some(full.as_str()) {
+            bail!("侧边聊天的历史配置无法确认 Agent 环境，请用原 Provider 和 Agent 环境续接一次");
+        }
+        self.remember_native_context(session_id, native_id, Some(&full), &environment_fingerprint)?;
         Ok(())
     }
     pub fn native_rename_context_matches(
@@ -991,6 +1091,17 @@ impl Store {
         if let Some(saved) = saved {
             return Ok(saved.as_deref() == fingerprint);
         }
+        let cli =
+            crate::providers::turn_fingerprint(Some(&latte_work_protocol::TurnProvider::Cli))?;
+        self.native_request_context_matches(session_id, fingerprint, fingerprint == cli.as_deref())
+    }
+
+    fn native_request_context_matches(
+        &self,
+        session_id: &str,
+        fingerprint: Option<&str>,
+        allow_legacy_cli: bool,
+    ) -> Result<bool> {
         // Older databases can prove the context only through accepted turns.
         // An empty ledger cannot establish where an open-only session lived.
         let exists: bool = self.db.query_row(
@@ -998,14 +1109,8 @@ impl Store {
             [session_id],
             |row| row.get(0),
         )?;
-        let cli =
-            crate::providers::turn_fingerprint(Some(&latte_work_protocol::TurnProvider::Cli))?;
         Ok(exists
-            && self.native_title_context_matches(
-                session_id,
-                fingerprint,
-                fingerprint == cli.as_deref(),
-            )?)
+            && self.native_title_context_matches(session_id, fingerprint, allow_legacy_cli)?)
     }
     pub fn child_history_cursor(
         &self,
@@ -2696,7 +2801,7 @@ mod tests {
                 .unwrap()
         );
         store
-            .remember_native_context(&session.id, "native", Some("B"))
+            .remember_native_context(&session.id, "native", Some("B"), "env")
             .unwrap();
         drop(store);
         let store = super::Store::open(&path).unwrap();
@@ -2716,7 +2821,7 @@ mod tests {
                 .unwrap()
         );
         store
-            .remember_native_context(&session.id, "native", Some("C"))
+            .remember_native_context(&session.id, "native", Some("C"), "env")
             .unwrap();
         assert!(
             !store

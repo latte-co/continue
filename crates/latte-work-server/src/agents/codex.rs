@@ -84,6 +84,21 @@ pub(crate) async fn validate_selection(
     Ok(())
 }
 
+/// Codex persists this key with the thread. Keep it stable across cold
+/// launches and derive it only from public metadata for the selected Provider
+/// revision. The App changes the opaque revision on edits, including rotation.
+pub(super) fn side_provider_id(provider: &latte_work_protocol::Provider) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let identity = (
+        &provider.id,
+        &provider.revision,
+        &provider.base_url,
+        &provider.auth,
+    );
+    let digest = Sha256::digest(serde_json::to_vec(&identity)?);
+    Ok(format!("latte-work-side-{digest:x}"))
+}
+
 /// Native Responses providers only. No secrets in argv, RPC, or user config.
 pub(super) fn configure_provider(
     command: &mut Command,
