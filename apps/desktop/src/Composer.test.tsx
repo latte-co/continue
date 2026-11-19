@@ -153,6 +153,70 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 const prediction = { id: "round-1", text: "检查修改结果\n并补充边界测试" };
+function expectNoPredictionDescription() {
+  const input = screen.getByRole("textbox", {
+    name: "任务输入",
+    description: "",
+  });
+  expect(input.getAttribute("aria-describedby")).toBeNull();
+  expect(
+    input.closest(".composer")!.querySelector(".composer-prediction"),
+  ).toBeNull();
+}
+it("describes the complete multiline prediction and Tab hint without a live announcement", () => {
+  const view = render(<Harness prediction={prediction} />);
+  const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+  // Role queries compute the description through dom-accessibility-api.
+  expect(
+    screen.getByRole("textbox", {
+      description: (description) =>
+        description.replace(/\s+/g, " ") ===
+        "检查修改结果 并补充边界测试 Tab 插入",
+    }),
+  ).toBe(input);
+  const descriptionIds = input.getAttribute("aria-describedby")!.split(" ");
+  expect(descriptionIds).toHaveLength(2);
+  const body = document.getElementById(descriptionIds[0])!;
+  expect(body.textContent).toBe(prediction.text);
+  expect(body.getAttribute("aria-hidden")).toBe("true");
+  expect(document.getElementById(descriptionIds[1])!.textContent).toBe(
+    "Tab 插入",
+  );
+  expect(view.container.querySelector("[aria-live]")).toBeNull();
+  expect(input.value).toBe("");
+  expect(screen.getByText("发送")).toHaveProperty("disabled", true);
+  expect(mocks.send).not.toHaveBeenCalled();
+});
+it("uses unique prediction description IDs for multiple composers", () => {
+  const other = { ...prediction, text: "另一条完整建议" };
+  render(
+    <>
+      <Harness prediction={prediction} inputLabel="第一个输入" />
+      <Harness prediction={other} inputLabel="第二个输入" />
+    </>,
+  );
+  const inputs = screen.getAllByRole("textbox");
+  expect(
+    screen.getByRole("textbox", {
+      name: "第一个输入",
+      description: (description) =>
+        description.replace(/\s+/g, " ") ===
+        "检查修改结果 并补充边界测试 Tab 插入",
+    }),
+  ).toBe(inputs[0]);
+  expect(
+    screen.getByRole("textbox", {
+      name: "第二个输入",
+      description: "另一条完整建议 Tab 插入",
+    }),
+  ).toBe(inputs[1]);
+  const ids = inputs.flatMap((input) =>
+    input.getAttribute("aria-describedby")!.split(" "),
+  );
+  expect(ids).toHaveLength(4);
+  expect(new Set(ids).size).toBe(4);
+  expect(ids.every((id) => document.getElementById(id))).toBe(true);
+});
 it("shows a multiline prediction outside the empty editor and Tab inserts without sending", () => {
   render(<Harness prediction={prediction} />);
   const input = screen.getByRole("textbox") as HTMLTextAreaElement;
@@ -167,6 +231,7 @@ it("shows a multiline prediction outside the empty editor and Tab inserts withou
   expect(screen.getByText("发送")).toHaveProperty("disabled", true);
   fireEvent.keyDown(input, { key: "Tab" });
   expect(input.value).toBe(prediction.text);
+  expectNoPredictionDescription();
   expect(input.selectionStart).toBe(prediction.text.length);
   expect(document.activeElement).toBe(input);
   expect(mocks.send).not.toHaveBeenCalled();
@@ -174,6 +239,7 @@ it("shows a multiline prediction outside the empty editor and Tab inserts withou
   expect(screen.getByText("发送")).toHaveProperty("disabled", false);
   type("");
   expect(screen.queryByText("Tab 插入")).toBeNull();
+  expectNoPredictionDescription();
 });
 it("fits the empty editor to multiline ghost height, caps at 200px and restores ordinary height", () => {
   const height = vi
@@ -214,6 +280,7 @@ it.each([" ", "\n", "已有草稿"])(
     render(<Harness prediction={prediction} />);
     type(value);
     expect(screen.queryByText("Tab 插入")).toBeNull();
+    expectNoPredictionDescription();
     fireEvent.keyDown(screen.getByRole("textbox"), { key: "Tab" });
     expect(inputText()).toBe(value);
   },
@@ -241,15 +308,18 @@ it("hides predictions during composition and Escape dismisses only this source",
   const input = screen.getByRole("textbox");
   fireEvent.compositionStart(input);
   expect(screen.queryByText("Tab 插入")).toBeNull();
+  expectNoPredictionDescription();
   fireEvent.keyDown(input, { key: "Tab" });
   expect(inputText()).toBe("");
   fireEvent.compositionEnd(input);
   fireEvent.keyDown(input, { key: "Escape" });
   expect(screen.queryByText("Tab 插入")).toBeNull();
+  expectNoPredictionDescription();
   view.rerender(
     <Harness prediction={{ ...prediction, text: "同轮晚到结果" }} />,
   );
   expect(screen.queryByText("Tab 插入")).toBeNull();
+  expectNoPredictionDescription();
   view.rerender(<Harness prediction={{ ...prediction, id: "round-2" }} />);
   expect(screen.getByText("Tab 插入")).toBeTruthy();
 });
@@ -284,13 +354,22 @@ it.each([
     },
   },
 ])("does not display or accept predictions in blocked state %j", (props) => {
-  render(
+  const view = render(<Harness prediction={prediction} />);
+  expect(
+    screen.getByRole("textbox", {
+      description: (description) =>
+        description.replace(/\s+/g, " ") ===
+        "检查修改结果 并补充边界测试 Tab 插入",
+    }),
+  ).toBeTruthy();
+  view.rerender(
     <Harness
       prediction={prediction}
       {...(props as Partial<ComponentProps<typeof Composer>>)}
     />,
   );
   expect(screen.queryByText("Tab 插入")).toBeNull();
+  expectNoPredictionDescription();
   expect(fireEvent.keyDown(screen.getByRole("textbox"), { key: "Tab" })).toBe(
     true,
   );
@@ -332,6 +411,7 @@ it("gives menus priority and preserves normal Tab when no prediction exists", ()
   const view = render(<Harness prediction={prediction} />);
   fireEvent.click(screen.getByRole("button", { name: "添加文件" }));
   expect(screen.queryByText("Tab 插入")).toBeNull();
+  expectNoPredictionDescription();
   fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
   expect(screen.getByText("Tab 插入")).toBeTruthy();
   view.rerender(<Harness />);

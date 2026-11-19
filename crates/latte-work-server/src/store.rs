@@ -1737,6 +1737,20 @@ impl Store {
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?)
     }
+    /// Checks both durable admission ledgers globally in one SQLite read snapshot.
+    /// Queue tombstones and unknown statuses still reserve the request identity.
+    /// This is only a point-in-time absence check, not proof of a timed-out send's outcome.
+    pub fn request_identity_absent(&mut self, request_id: &str) -> Result<bool> {
+        self.db
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM requests WHERE id=?1)
+                    AND NOT EXISTS(SELECT 1 FROM message_queue WHERE request_id=?1)",
+                [request_id],
+                |row| row.get(0),
+            )
+            .context("读取请求持久化身份失败")
+    }
+
     pub fn latest_request(&self, id: &str) -> Result<String> {
         self.db
             .query_row(
@@ -4334,6 +4348,129 @@ mod tests {
         assert!(session.pinned_at.is_none());
         assert!(session.effort.is_none());
     }
+    #[test]
+    fn request_identity_absent_checks_global_accepted_ids_despite_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("identity.db");
+        let mut store = Store::open(&path).unwrap();
+        let project = store.add_project(tmp.path()).unwrap();
+        let original = store
+            .create_session(project.id.clone(), "claude".into())
+            .unwrap();
+        let other = store.create_session(project.id, "claude".into()).unwrap();
+        assert!(store.request_identity_absent("accepted").unwrap());
+        store
+            .begin(
+                &original.id,
+                "accepted",
+                "hello",
+                None,
+                None,
+                Some("provider-a"),
+                None,
+            )
+            .unwrap();
+        assert!(
+            store
+                .begin(
+                    &other.id,
+                    "accepted",
+                    "hello",
+                    None,
+                    None,
+                    Some("provider-a"),
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .begin(
+                    &original.id,
+                    "accepted",
+                    "different",
+                    None,
+                    None,
+                    Some("provider-a"),
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .begin(
+                    &original.id,
+                    "accepted",
+                    "hello",
+                    None,
+                    None,
+                    Some("provider-b"),
+                    None
+                )
+                .is_err()
+        );
+        assert!(!store.request_identity_absent("accepted").unwrap());
+        assert!(store.request_identity_absent("unused").unwrap());
+        drop(store);
+        let mut reopened = Store::open(&path).unwrap();
+        assert!(!reopened.request_identity_absent("accepted").unwrap());
+    }
+
+    #[test]
+    fn request_identity_absent_includes_every_queue_status_across_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("queue-identity.db");
+        let mut store = Store::open(&path).unwrap();
+        let project = store.add_project(tmp.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        // Identity evidence does not depend on parsing legacy admission/data JSON.
+        store.db.execute("INSERT INTO message_queue(request_id,session_id,admission,data) VALUES ('queued',?1,'invalid','invalid')", [&session.id]).unwrap();
+        for status in [
+            "pending",
+            "dispatched",
+            "forwarded",
+            "taken",
+            "cancelled",
+            "uncertain",
+            "future-status",
+        ] {
+            store
+                .db
+                .execute(
+                    "UPDATE message_queue SET status=?1 WHERE request_id='queued'",
+                    [status],
+                )
+                .unwrap();
+            assert!(
+                !store.request_identity_absent("queued").unwrap(),
+                "{status}"
+            );
+            assert!(store.request_identity_absent("unused").unwrap(), "{status}");
+        }
+        assert!(store.queued(&session.id).unwrap().is_empty());
+        drop(store);
+        let mut reopened = Store::open(&path).unwrap();
+        assert!(!reopened.request_identity_absent("queued").unwrap());
+        assert!(reopened.request_identity_absent("unused").unwrap());
+    }
+
+    #[test]
+    fn request_identity_absent_propagates_failures_from_either_table() {
+        for table in ["requests", "message_queue"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut store = Store::open(&tmp.path().join("broken.db")).unwrap();
+            assert!(store.request_identity_absent("unused").unwrap());
+            store
+                .db
+                .execute_batch(&format!(
+                    "ALTER TABLE {table} RENAME TO unavailable_identity_table"
+                ))
+                .unwrap();
+            let error = store.request_identity_absent("unused").unwrap_err();
+            assert!(format!("{error:#}").contains(table), "{error:#}");
+        }
+    }
+
     #[test]
     fn legacy_request_migration_preserves_duplicate_protection() {
         let tmp = tempfile::tempdir().unwrap();

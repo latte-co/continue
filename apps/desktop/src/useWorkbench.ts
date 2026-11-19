@@ -27,6 +27,7 @@ import {
   localHost,
   native,
   message,
+  ServerRequestError,
   type Host,
 } from "./api";
 import type {
@@ -75,9 +76,12 @@ import {
 } from "./sessionNavigation";
 
 import {
+  beginPredictionSend,
+  capturePredictionAttempt,
   consumePredictionSnapshot,
   observePredictionSource,
   predictionAfterSend,
+  retirePredictionSend,
   type PredictionSend,
   type PredictionSource,
 } from "./predictionSource";
@@ -322,8 +326,10 @@ export function useWorkbench() {
   const predictionSends = useRef(new Map<string, PredictionSend>());
   const [prediction, setPrediction] = useState<{
     scope: string;
+    sendScope: string;
     epoch: number;
-    value: Extract<Response, { kind: "composer_prediction" }>;
+    value: Extract<Response, { kind: "composer_prediction" }> &
+      ComposerPredictionSnapshot;
   } | null>(null);
   function invalidatePrediction() {
     predictionEpoch.current++;
@@ -340,7 +346,27 @@ export function useWorkbench() {
       null,
       targetSession,
     );
-    if (observed.send) predictionSends.current.set(scope, observed.send);
+    storePredictionSend(scope, observed.send, targetSession);
+  }
+  function storePredictionSend(
+    scope: string,
+    send: PredictionSend | undefined,
+    targetSession: string,
+  ) {
+    if (send) predictionSends.current.set(scope, send);
+    // Facts may invalidate a visible suggestion independently of this frame's
+    // publication eligibility. Read the latest facts when React applies the update.
+    setPrediction((old) =>
+      old?.sendScope === scope &&
+      !predictionAfterSend(
+        predictionSends.current.get(scope),
+        [],
+        old.value,
+        targetSession,
+      ).allowed
+        ? null
+        : old,
+    );
   }
   const [hasEarlierHistory, setHasEarlierHistory] = useState(false);
   const [earlierHistoryLoading, setEarlierHistoryLoading] = useState(false);
@@ -779,8 +805,7 @@ export function useWorkbench() {
         frame.composer_prediction,
         sessionId,
       );
-      if (afterSend.send)
-        predictionSends.current.set(predictionSendScope, afterSend.send);
+      storePredictionSend(predictionSendScope, afterSend.send, sessionId);
       const candidate = consumePredictionSnapshot(
         observed,
         frame.composer_prediction,
@@ -817,6 +842,7 @@ export function useWorkbench() {
       }
       setPrediction({
         scope: predictionScope,
+        sendScope: predictionSendScope,
         epoch,
         value: { ...value, kind: "composer_prediction", session_id: sessionId },
       });
@@ -1311,6 +1337,7 @@ export function useWorkbench() {
     if (!connected || !text.trim() || sending.current) return false;
     sending.current = true;
     invalidatePrediction();
+    let retireUnadmitted = () => {};
     try {
       const target =
         session ?? (await persistSession(navigationRevision.current));
@@ -1331,11 +1358,15 @@ export function useWorkbench() {
         target.id,
         hostHellos.current.get(hostId)?.server_id,
       ]);
-      predictionSends.current.set(predictionSendScope, {
-        requestId: id,
-        seq: null,
-        token: predictionEpoch.current,
-      });
+      predictionSends.current.set(
+        predictionSendScope,
+        beginPredictionSend(
+          predictionSends.current.get(predictionSendScope),
+          id,
+          predictionEpoch.current,
+        ),
+      );
+      retireUnadmitted = capturePredictionRetirement(predictionSendScope, id);
       pendingSend.current = {
         id,
         host: hostId,
@@ -1382,6 +1413,8 @@ export function useWorkbench() {
       setError("");
       return true;
     } catch (e) {
+      if (e instanceof ServerRequestError && e.code === "send_not_admitted")
+        retireUnadmitted();
       if (!(e instanceof HostConnectionError)) setError(message(e));
       return false;
     } finally {
@@ -1597,24 +1630,37 @@ export function useWorkbench() {
     sessionId,
     serverId,
   ]);
+  function capturePredictionRetirement(
+    scope: string,
+    requestId: string,
+    authoritative = false,
+  ): () => void {
+    const captured = authoritative
+      ? capturePredictionAttempt(predictionSends.current.get(scope), requestId)
+      : predictionSends.current.get(scope);
+    return () => {
+      const current = predictionSends.current.get(scope);
+      const retired = retirePredictionSend(
+        captured,
+        current,
+        requestId,
+        authoritative,
+      );
+      if (retired === current) return;
+      const remaining = new Map(predictionSends.current);
+      if (retired) remaining.set(scope, retired);
+      else remaining.delete(scope);
+      predictionSends.current = remaining;
+      // Retire provisional waiting only; never rewind User or handoff facts.
+    };
+  }
   function captureQueuedPredictionRetirement(requestId: string): () => void {
     // Capture at queue-operation start, not render time: Send may not trigger a render.
-    const captured = predictionSends.current.get(selectedPredictionSendScope);
-    return () => {
-      const current = predictionSends.current.get(selectedPredictionSendScope);
-      if (
-        !captured ||
-        captured.requestId !== requestId ||
-        current?.requestId !== requestId ||
-        current.token !== captured.token ||
-        current.seq !== null
-      )
-        return;
-      const remaining = new Map(predictionSends.current);
-      remaining.delete(selectedPredictionSendScope);
-      predictionSends.current = remaining;
-      // Retire provisional waiting only; never rewind the durable source frontier.
-    };
+    return capturePredictionRetirement(
+      selectedPredictionSendScope,
+      requestId,
+      true,
+    );
   }
   return {
     captureQueuedPredictionRetirement,

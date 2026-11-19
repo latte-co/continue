@@ -317,27 +317,22 @@ pub(crate) fn schedule(
             .lock()
             .ok()?
             .begin(session, &context.request_id, context.source_user_seq);
+    // Register the resource owner before spawning the result observer. Closing
+    // the session must not miss a helper that has not yet been polled.
+    let job = crate::agents::codex_title::start_predict(
+        session,
+        &binary,
+        &path,
+        &snapshot.config,
+        &context.description(),
+        snapshot.native_provider.as_ref(),
+    );
     let session = session.to_owned();
-    let agent = agent.to_owned();
     Some(tokio::spawn(async move {
-        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            match agent.as_str() {
-                "codex" => {
-                    crate::agents::codex_title::predict(
-                        &binary,
-                        &path,
-                        &snapshot.config,
-                        &context.description(),
-                        snapshot.native_provider.as_ref(),
-                    )
-                    .await
-                }
-                _ => Err(Unsupported.into()),
-            }
-        })
-        .await
-        .context("建议生成超时")
-        .and_then(|result| result)
+        let result = match job {
+            Ok(job) => job.wait().await,
+            Err(error) => Err(error),
+        }
         .and_then(|suggestion| {
             suggestion
                 .map(|s| validate(json!({"suggestion":snapshot.config.redact(&s)})))

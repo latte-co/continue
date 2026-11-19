@@ -8,6 +8,25 @@ use latte_work_protocol::{QueuedMessage, Response};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 
+/// Capacity checks reject before any durable enqueue write; callers must still
+/// check global request identity before claiming that this send was not admitted.
+#[derive(Debug)]
+pub(crate) enum QueueCapacityExceeded {
+    Messages,
+    Bytes,
+}
+
+impl std::fmt::Display for QueueCapacityExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Messages => "此会话最多排队 16 条消息",
+            Self::Bytes => "排队内容已达 512 KiB，请等待执行或移除消息",
+        })
+    }
+}
+
+impl std::error::Error for QueueCapacityExceeded {}
+
 pub fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS message_queue(position INTEGER PRIMARY KEY AUTOINCREMENT,request_id TEXT NOT NULL UNIQUE,session_id TEXT NOT NULL REFERENCES sessions(id),admission TEXT NOT NULL,data TEXT NOT NULL,fingerprint TEXT,status TEXT NOT NULL DEFAULT 'pending');
     CREATE INDEX IF NOT EXISTS message_queue_session ON message_queue(session_id,status,position);
@@ -124,7 +143,7 @@ impl Store {
             |r| r.get(0),
         )?;
         if count >= 16 {
-            bail!("此会话最多排队 16 条消息");
+            return Err(QueueCapacityExceeded::Messages.into());
         }
         let entry = QueuedMessage {
             request_id: turn.request_id.clone(),
@@ -138,7 +157,7 @@ impl Store {
         let data = serde_json::to_string(&entry)?;
         let size:u32=self.db.query_row("SELECT COALESCE(SUM(length(CAST(data AS BLOB))),0) FROM message_queue WHERE session_id=?1 AND status IN ('pending','forwarded')",[id],|r|r.get(0))?;
         if size as usize + data.len() > 512 * 1024 {
-            bail!("排队内容已达 512 KiB，请等待执行或移除消息");
+            return Err(QueueCapacityExceeded::Bytes.into());
         }
         let tx = self.db.unchecked_transaction()?;
         tx.execute("INSERT INTO message_queue(request_id,session_id,admission,data,fingerprint,sort_order) VALUES (?1,?2,?3,?3,?4,(SELECT COALESCE(MAX(sort_order),0)+1 FROM message_queue WHERE session_id=?2 AND status='pending'))",params![turn.request_id,id,data,turn.fingerprint])?;
@@ -332,6 +351,170 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn turn(request_id: &str, text: String) -> SendTurn {
+        SendTurn {
+            request_id: request_id.into(),
+            text,
+            model: None,
+            fingerprint: None,
+            config: crate::providers::LaunchConfig {
+                environment: Default::default(),
+                traex_model: None,
+                provider: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                settings_dir: Default::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn queue_capacity_count_rejection_is_typed_and_has_no_admission_write() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&root.path().join("state.sqlite")).unwrap();
+        let project = store.add_project(root.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        for index in 0..16 {
+            store
+                .enqueue(
+                    &session.id,
+                    &turn(&format!("queued-{index}"), "hello".into()),
+                )
+                .unwrap();
+        }
+        store.mark_forwarded(&session.id, "queued-0", 0).unwrap();
+        let error = store
+            .enqueue(&session.id, &turn("overflow", "hello".into()))
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<QueueCapacityExceeded>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(error.to_string(), "此会话最多排队 16 条消息");
+        assert!(store.request_identity_absent("overflow").unwrap());
+        // A capacity error on a reused ID still cannot prove non-admission.
+        let error = store
+            .enqueue(&session.id, &turn("queued-0", "different".into()))
+            .unwrap_err();
+        assert!(error.downcast_ref::<QueueCapacityExceeded>().is_some());
+        assert!(!store.request_identity_absent("queued-0").unwrap());
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT COUNT(*) FROM message_queue", [], |r| r
+                    .get::<_, u32>(0))
+                .unwrap(),
+            16
+        );
+    }
+
+    #[test]
+    fn queue_capacity_bytes_rejection_is_typed_and_has_no_admission_write() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&root.path().join("state.sqlite")).unwrap();
+        let project = store.add_project(root.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        for index in 0..3 {
+            store
+                .enqueue(
+                    &session.id,
+                    &turn(&format!("large-{index}"), "x".repeat(128 * 1024)),
+                )
+                .unwrap();
+        }
+        let error = store
+            .enqueue(&session.id, &turn("overflow-bytes", "x".repeat(128 * 1024)))
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<QueueCapacityExceeded>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "排队内容已达 512 KiB，请等待执行或移除消息"
+        );
+        assert!(store.request_identity_absent("overflow-bytes").unwrap());
+        assert_eq!(store.queued(&session.id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn queue_identity_provider_and_database_errors_are_not_capacity_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&root.path().join("state.sqlite")).unwrap();
+        let project = store.add_project(root.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        store
+            .enqueue(&session.id, &turn("original", "hello".into()))
+            .unwrap();
+        let reused = turn("original", "different".into());
+        for error in [
+            store.queued_duplicate(&session.id, &reused).unwrap_err(),
+            store.enqueue(&session.id, &reused).unwrap_err(),
+        ] {
+            assert!(error.downcast_ref::<QueueCapacityExceeded>().is_none());
+            assert!(!store.request_identity_absent("original").unwrap());
+        }
+        let provider_changed = SendTurn {
+            fingerprint: Some("other-provider".into()),
+            ..turn("other-provider", "hello".into())
+        };
+        let error = store.enqueue(&session.id, &provider_changed).unwrap_err();
+        assert!(error.downcast_ref::<QueueCapacityExceeded>().is_none());
+        assert!(store.request_identity_absent("other-provider").unwrap());
+        store
+            .db
+            .execute_batch("ALTER TABLE message_queue RENAME TO unavailable_queue")
+            .unwrap();
+        let error = store
+            .enqueue(&session.id, &turn("db-error", "hello".into()))
+            .unwrap_err();
+        assert!(error.downcast_ref::<QueueCapacityExceeded>().is_none());
+        assert!(store.request_identity_absent("db-error").is_err());
+    }
+
+    #[test]
+    fn request_identity_absent_preserves_taken_and_cancelled_queue_tombstones() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.sqlite");
+        let mut store = Store::open(&path).unwrap();
+        let project = store.add_project(root.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        store
+            .enqueue(&session.id, &turn("taken", "edit me".into()))
+            .unwrap();
+        store
+            .enqueue(&session.id, &turn("cancelled", "cancel me".into()))
+            .unwrap();
+        store.take_queued(&session.id, "taken", 0).unwrap();
+        store.clear_queue(&session.id).unwrap();
+        assert!(store.queued(&session.id).unwrap().is_empty());
+        for id in ["taken", "cancelled"] {
+            assert!(
+                store
+                    .queued_duplicate(
+                        &session.id,
+                        &turn(
+                            id,
+                            if id == "taken" {
+                                "edit me"
+                            } else {
+                                "cancel me"
+                            }
+                            .into()
+                        )
+                    )
+                    .is_err()
+            );
+            assert!(!store.request_identity_absent(id).unwrap());
+        }
+        drop(store);
+        let mut reopened = Store::open(&path).unwrap();
+        assert!(!reopened.request_identity_absent("taken").unwrap());
+        assert!(!reopened.request_identity_absent("cancelled").unwrap());
+    }
+
     #[test]
     fn definitive_rejection_restores_exact_content_once_with_a_new_revision() {
         let root = tempfile::tempdir().unwrap();

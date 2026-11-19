@@ -15,6 +15,7 @@ import {
 } from "./connectionErrors";
 import { updateWorkspace } from "./workspaceState";
 import { useWorkbench } from "./useWorkbench";
+import { ServerRequestError } from "./api";
 import type {
   ComposerPredictionSnapshot as Snapshot,
   Event,
@@ -26,7 +27,8 @@ const mocks = vi.hoisted(() => ({
   connect: vi.fn(),
   loadHosts: vi.fn(),
 }));
-vi.mock("./api", () => ({
+vi.mock("./api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./api")>()),
   native: true,
   localHost: { id: "local", name: "Local" },
   loadHosts: mocks.loadHosts,
@@ -399,6 +401,711 @@ it.each(["navigate", "reconnect", "send"])(
     ).toBeNull();
   },
 );
+const handoffEvent = (source: string, seq: number): Event => ({
+  seq,
+  at: 1,
+  session_id: "s",
+  event: { kind: "queued_message_sent", request_id: source, text: source },
+});
+it.each(["live", "staggered", "early", "reconnect"])(
+  "recovers three unknown C/D/E sends after exact matching facts via %s",
+  async (arrival) => {
+    const frame = predictionFixture(arrival === "early");
+    const view = await openPredictionFixture();
+    const base = mocks.request.getMockImplementation()!;
+    const ids: string[] = [];
+    mocks.request.mockImplementation(async (host, r) => {
+      if (r.method === "send_queued") {
+        ids.push(r.request_id);
+        throw new ServerRequestError("admission_unknown", "unknown");
+      }
+      return base(host, r);
+    });
+    for (const text of ["C", "D", "E"])
+      await act(async () => {
+        expect(await view.result.current.send(text, null, null, null)).toBe(
+          false,
+        );
+      });
+    frame.events = [];
+    frame.snapshot = ready("F", 70, "Later known source");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction).toBeNull();
+    if (arrival === "reconnect")
+      await act(async () =>
+        view.result.current.refreshHost(view.result.current.host),
+      );
+    if (arrival === "staggered") {
+      frame.events = [handoffEvent(ids[0], 40), userEvent(ids[2], 60)];
+      await act(async () => vi.advanceTimersByTimeAsync(650));
+      expect(view.result.current.composerPrediction).toBeNull();
+      frame.events = [userEvent(ids[1], 50)];
+    } else
+      frame.events = [
+        userEvent(ids[2], 60),
+        handoffEvent(ids[0], 40),
+        userEvent(ids[1], 50),
+      ];
+    if (arrival === "early") {
+      await act(async () => {
+        await view.result.current.loadEarlierHistory();
+      });
+      expect(view.result.current.composerPrediction).toBeNull();
+      frame.events = [];
+    }
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "Later known source",
+    );
+    expect(standaloneReads()).toHaveLength(0);
+    expect(ids).toHaveLength(3);
+  },
+);
+it("uses an earlier untracked handoff only as a blocking fence, not a User frontier or page snapshot", async () => {
+  const frame = predictionFixture(true);
+  frame.snapshot = ready("D", 50, "Displayed");
+  const view = await openPredictionFixture();
+  expect(view.result.current.composerPrediction?.suggestion).toBe("Displayed");
+  frame.events = [
+    handoffEvent("Older resolved C", 55),
+    userEvent("Unrelated page User", 200),
+  ];
+  frame.snapshot = ready("Unrelated page User", 200, "Do not publish");
+  await act(async () => {
+    await view.result.current.loadEarlierHistory();
+  });
+  expect(view.result.current.composerPrediction).toBeNull();
+  frame.events = [];
+  frame.snapshot = ready("D", 50, "Before H55");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction).toBeNull();
+  frame.snapshot = ready("E", 60, "After H55 without page User frontier");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "After H55 without page User frontier",
+  );
+});
+it("updates the blocking fence when a resolved older C is legitimately handed off again", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  const base = mocks.request.getMockImplementation()!;
+  const ids: string[] = [];
+  mocks.request.mockImplementation(async (host, r) => {
+    if (r.method === "send_queued") {
+      ids.push(r.request_id);
+      if (ids.length === 3)
+        throw new ServerRequestError("send_not_admitted", "rejected");
+      return { kind: "message_queued", duplicate: false };
+    }
+    return base(host, r);
+  });
+  await act(async () => {
+    await view.result.current.send("C", null, null, null);
+  });
+  frame.events = [handoffEvent(ids[0], 40)];
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  await act(async () => {
+    await view.result.current.send("D", null, null, null);
+  });
+  frame.events = [handoffEvent(ids[1], 45)];
+  frame.snapshot = ready("F", 50, "Before redispatch");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  await act(async () => {
+    await view.result.current.send("E", null, null, null);
+  });
+  frame.events = [];
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "Before redispatch",
+  );
+  frame.events = [handoffEvent(ids[0], 55)];
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction).toBeNull();
+  frame.events = [];
+  frame.snapshot = ready("G", 60, "After redispatch");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "After redispatch",
+  );
+});
+it.each([
+  ["cancel", "during"],
+  ["take", "during"],
+  ["cancel", "after"],
+  ["take", "after"],
+])(
+  "retires authoritative %s for pending C %s E rejection",
+  async (_action, timing) => {
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    const base = mocks.request.getMockImplementation()!;
+    let id = "";
+    let rejectE!: (error: Error) => void;
+    mocks.request.mockImplementation(async (host, r) => {
+      if (r.method === "send_queued") {
+        if (!id) {
+          id = r.request_id;
+          throw new ServerRequestError("admission_unknown", "unknown");
+        }
+        return new Promise((_, reject) => {
+          rejectE = reject;
+        });
+      }
+      return base(host, r);
+    });
+    await act(async () => {
+      await view.result.current.send("C", null, null, null);
+    });
+    let submitted!: Promise<boolean>;
+    await act(async () => {
+      submitted = view.result.current.send("E", null, null, null);
+    });
+    if (timing === "during")
+      act(() => view.result.current.captureQueuedPredictionRetirement(id)());
+    await act(async () => {
+      rejectE(new ServerRequestError("send_not_admitted", "rejected"));
+      await submitted;
+    });
+    if (timing === "after")
+      act(() => view.result.current.captureQueuedPredictionRetirement(id)());
+    frame.events = [];
+    frame.snapshot = ready("D", 50, "After authoritative retirement");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "After authoritative retirement",
+    );
+  },
+);
+it.each(["different", "same"])(
+  "retains an earlier unknown Send after a %s-ID attempt is not admitted",
+  async (identity) => {
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    const base = mocks.request.getMockImplementation()!;
+    let count = 0;
+    mocks.request.mockImplementation(async (host, r) => {
+      if (r.method === "send_queued")
+        throw new ServerRequestError(
+          ++count === 1 ? "admission_unknown" : "send_not_admitted",
+          "error",
+        );
+      return base(host, r);
+    });
+    await act(async () => {
+      expect(await view.result.current.send("C", null, null, null)).toBe(false);
+    });
+    await act(async () => {
+      expect(
+        await view.result.current.send(
+          identity === "same" ? "C" : "E",
+          null,
+          null,
+          null,
+        ),
+      ).toBe(false);
+    });
+    frame.events = [];
+    frame.snapshot = ready("A", 10, "Must not revive");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction).toBeNull();
+    const firstId = mocks.request.mock.calls.find(
+      ([, r]) => r.method === "send_queued",
+    )![1].request_id;
+    frame.events = [handoffEvent(firstId, 40)];
+    frame.snapshot = ready("D", 50, "After original handoff");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "After original handoff",
+    );
+  },
+);
+it.each(["user", "handoff"])(
+  "harvests fallback C %s facts while E is pending before E rejection",
+  async (fact) => {
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    const base = mocks.request.getMockImplementation()!;
+    let original = "";
+    let rejectE!: (error: Error) => void;
+    mocks.request.mockImplementation(async (host, r) => {
+      if (r.method === "send_queued") {
+        if (!original) {
+          original = r.request_id;
+          throw new ServerRequestError("admission_unknown", "unknown");
+        }
+        return new Promise((_, reject) => {
+          rejectE = reject;
+        });
+      }
+      return base(host, r);
+    });
+    await act(async () => {
+      await view.result.current.send("C", null, null, null);
+    });
+    let pending!: Promise<boolean>;
+    await act(async () => {
+      pending = view.result.current.send("E", null, null, null);
+    });
+    frame.events = [
+      fact === "user" ? userEvent(original, 40) : handoffEvent(original, 40),
+    ];
+    frame.snapshot = ready("A", 10);
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    await act(async () => {
+      rejectE(new ServerRequestError("send_not_admitted", "rejected"));
+      expect(await pending).toBe(false);
+    });
+    frame.events = [];
+    frame.snapshot = ready("A", 10, "Before updated fallback");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction).toBeNull();
+    frame.snapshot = ready("D", 50, "After updated fallback");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "After updated fallback",
+    );
+  },
+);
+it("withdraws D50 when a stale cached source contradicts known User C40", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  const base = mocks.request.getMockImplementation()!;
+  let id = "";
+  mocks.request.mockImplementation(async (host, r) =>
+    r.method === "send_queued"
+      ? ((id = r.request_id), { kind: "message_queued", duplicate: false })
+      : base(host, r),
+  );
+  await act(async () => {
+    await view.result.current.send("C", null, null, null);
+  });
+  frame.events = [userEvent(id, 40)];
+  frame.snapshot = ready("D", 50, "Displayed");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion).toBe("Displayed");
+  frame.events = [];
+  frame.snapshot = ready(id, 45, "Contradictory stale User cache");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction).toBeNull();
+});
+it("preserves C handoff40 when a newer E send is explicitly rejected", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  const base = mocks.request.getMockImplementation()!;
+  let source = "";
+  let reject = false;
+  mocks.request.mockImplementation(async (host, r) => {
+    if (r.method === "send_queued") {
+      if (reject) throw new ServerRequestError("send_not_admitted", "rejected");
+      source = r.request_id;
+      return { kind: "message_queued", duplicate: false };
+    }
+    return base(host, r);
+  });
+  await act(async () => {
+    await view.result.current.send("C", null, null, null);
+  });
+  frame.events = [handoffEvent(source, 40)];
+  frame.snapshot = ready("A", 10);
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  reject = true;
+  await act(async () => {
+    expect(await view.result.current.send("E", null, null, null)).toBe(false);
+  });
+  frame.events = [];
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction).toBeNull();
+  frame.snapshot = ready("D", 50, "After retained C");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "After retained C",
+  );
+});
+it.each(["user", "handoff", "conflict"])(
+  "preserves %s facts on same-ID duplicate retry without receipt replay",
+  async (fact) => {
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    const id = "00000000-0000-4000-8000-000000000000";
+    vi.spyOn(crypto, "randomUUID").mockReturnValue(id);
+    const base = mocks.request.getMockImplementation()!;
+    mocks.request.mockImplementation(async (host, r) =>
+      r.method === "send_queued"
+        ? { kind: "message_queued", duplicate: true }
+        : base(host, r),
+    );
+    await act(async () => {
+      await view.result.current.send("C", null, null, null);
+    });
+    frame.events =
+      fact === "conflict"
+        ? [userEvent(id, 40), userEvent(id, 45)]
+        : fact === "user"
+          ? [userEvent(id, 40)]
+          : [handoffEvent(id, 40)];
+    frame.snapshot = ready("A", 10);
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    frame.events = [];
+    await act(async () => {
+      await view.result.current.send("C", null, null, null);
+    });
+    frame.snapshot = ready("D", 50, "After retry");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion ?? null).toBe(
+      fact === "conflict" ? null : "After retry",
+    );
+    if (fact === "conflict") {
+      // A newly observed User would unlock a reset record, but must not erase conflict.
+      frame.events = [userEvent(id, 60)];
+      frame.snapshot = ready("E", 70, "Must remain conflicted");
+      await act(async () => vi.advanceTimersByTimeAsync(650));
+      expect(view.result.current.composerPrediction).toBeNull();
+    }
+  },
+);
+it.each([
+  ["live", "stale"],
+  ["live", "missing"],
+  ["early", "stale"],
+  ["early", "missing"],
+])(
+  "withdraws displayed D50 when %s matching handoff advances to H55 with %s snapshot",
+  async (arrival, snapshot) => {
+    const frame = predictionFixture(arrival === "early");
+    const view = await openPredictionFixture();
+    const base = mocks.request.getMockImplementation()!;
+    let id = "";
+    mocks.request.mockImplementation(async (host, r) =>
+      r.method === "send_queued"
+        ? ((id = r.request_id), { kind: "message_queued", duplicate: false })
+        : base(host, r),
+    );
+    await act(async () => {
+      await view.result.current.send("C", null, null, null);
+    });
+    frame.events = [handoffEvent(id, 40)];
+    frame.snapshot = ready("D", 50, "Displayed");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "Displayed",
+    );
+    frame.events = [handoffEvent(id, 55)];
+    frame.snapshot =
+      snapshot === "stale" ? ready("A", 10, "Stale frame") : undefined;
+    if (arrival === "early")
+      await act(async () => {
+        await view.result.current.loadEarlierHistory();
+      });
+    else await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction).toBeNull();
+    frame.events = [];
+    frame.snapshot = ready("D", 50, "Cannot revive before H55");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction).toBeNull();
+    frame.snapshot = ready("E", 60, "After H55");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "After H55",
+    );
+  },
+);
+it.each(["live", "early"])(
+  "preserves displayed D50 across legitimate H45 from %s without advancing frontier from an earlier page",
+  async (arrival) => {
+    const frame = predictionFixture(arrival === "early");
+    const view = await openPredictionFixture();
+    const base = mocks.request.getMockImplementation()!;
+    let id = "";
+    mocks.request.mockImplementation(async (host, r) =>
+      r.method === "send_queued"
+        ? ((id = r.request_id), { kind: "message_queued", duplicate: false })
+        : base(host, r),
+    );
+    await act(async () => {
+      await view.result.current.send("C", null, null, null);
+    });
+    frame.events = [handoffEvent(id, 40)];
+    frame.snapshot = ready("D", 50, "Displayed");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    frame.events = [
+      handoffEvent(id, 45),
+      ...(arrival === "early" ? [userEvent("Unrelated", 200)] : []),
+    ];
+    frame.snapshot = ready("A", 10, "Stale");
+    if (arrival === "early")
+      await act(async () => {
+        await view.result.current.loadEarlierHistory();
+      });
+    else await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "Displayed",
+    );
+    frame.events = [];
+    frame.snapshot = ready("D", 50, "D frontier still live");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "D frontier still live",
+    );
+  },
+);
+it.each([
+  [new ServerRequestError("send_not_admitted", "rejected"), true],
+  [new ServerRequestError("request_failed", "rejected"), false],
+  [new ServerRequestError("admission_unknown", "unknown"), false],
+  [new HostConnectionError("local", "disconnected"), false],
+  [new Error("send_not_admitted"), false],
+])(
+  "retires only explicitly unadmitted provisional sends (%#)",
+  async (error, restores) => {
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    const base = mocks.request.getMockImplementation()!;
+    mocks.request.mockImplementation(async (host, r) => {
+      if (r.method === "send_queued") throw error;
+      return base(host, r);
+    });
+    await act(async () => {
+      expect(
+        await view.result.current.send("Rejected turn", null, null, null),
+      ).toBe(false);
+    });
+    frame.events = [];
+    frame.snapshot = ready("B", 30, "Later source");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion ?? null).toBe(
+      restores ? "Later source" : null,
+    );
+    expect(
+      mocks.request.mock.calls.filter(([, r]) => r.method === "send_queued"),
+    ).toHaveLength(1);
+    expect(standaloneReads()).toHaveLength(0);
+  },
+);
+it("does not retire a User-observed send on a late unadmitted error", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  const base = mocks.request.getMockImplementation()!;
+  let rejectSend!: (error: Error) => void;
+  let source = "";
+  mocks.request.mockImplementation(async (host, r) => {
+    if (r.method === "send_queued") {
+      source = r.request_id;
+      return new Promise((_, reject) => {
+        rejectSend = reject;
+      });
+    }
+    return base(host, r);
+  });
+  let submitted!: Promise<boolean>;
+  await act(async () => {
+    submitted = view.result.current.send("Turn", null, null, null);
+  });
+  frame.events = [userEvent(source, 40)];
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  await act(async () => {
+    rejectSend(new ServerRequestError("send_not_admitted", "rejected"));
+    await submitted;
+  });
+  frame.events = [];
+  frame.snapshot = ready("B", 30, "Old source");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction).toBeNull();
+  frame.snapshot = ready("D", 50, "Later source");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "Later source",
+  );
+});
+it.each(["none", "cancel", "take", "rejection"])(
+  "retains a handoff fence without a User across %s",
+  async (retirement) => {
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    const base = mocks.request.getMockImplementation()!;
+    let source = "";
+    let rejectSend!: (error: Error) => void;
+    mocks.request.mockImplementation(async (host, r) => {
+      if (r.method === "send_queued") {
+        source = r.request_id;
+        if (retirement === "rejection")
+          return new Promise((_, reject) => {
+            rejectSend = reject;
+          });
+        return { kind: "message_queued", duplicate: false };
+      }
+      return base(host, r);
+    });
+    let submitted!: Promise<boolean>;
+    await act(async () => {
+      submitted = view.result.current.send("Steer", null, null, null);
+    });
+    const retire =
+      view.result.current.captureQueuedPredictionRetirement(source);
+    frame.events = [handoffEvent(source, 40)];
+    frame.snapshot = ready("A", 10, "Old source");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    if (retirement === "rejection")
+      await act(async () => {
+        rejectSend(new ServerRequestError("send_not_admitted", "rejected"));
+        await submitted;
+      });
+    else {
+      await submitted;
+      if (retirement !== "none") act(() => retire());
+    }
+    frame.events = [];
+    // A handoff must not become a User anchor or allow equal/older cache sources.
+    frame.snapshot = ready(source, 40, "Not a User");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction).toBeNull();
+    frame.snapshot = ready("D", 50, "After steering");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "After steering",
+    );
+    expect(standaloneReads()).toHaveLength(0);
+  },
+);
+it.each(["request", "event-session", "frame-session", "frame-project"])(
+  "rejects a foreign %s handoff as Send evidence",
+  async (foreign) => {
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    const base = mocks.request.getMockImplementation()!;
+    let source = "";
+    mocks.request.mockImplementation(async (host, r) => {
+      if (r.method === "send_queued") {
+        source = r.request_id;
+        return { kind: "message_queued", duplicate: false };
+      }
+      if (r.method === "poll" && r.after !== Number.MAX_SAFE_INTEGER) {
+        const event = handoffEvent(
+          foreign === "request" ? "foreign" : source,
+          40,
+        );
+        return {
+          kind: "events",
+          session: {
+            ...session(),
+            ...(foreign === "frame-session" ? { id: "foreign" } : {}),
+            ...(foreign === "frame-project" ? { project_id: "foreign" } : {}),
+          },
+          events: [
+            {
+              ...event,
+              session_id: foreign === "event-session" ? "foreign" : "s",
+            },
+          ],
+          has_more: false,
+          composer_prediction: ready("D", 50, "Foreign receipt"),
+        };
+      }
+      return base(host, r);
+    });
+    await act(async () => {
+      await view.result.current.send("Steer", null, null, null);
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction).toBeNull();
+    mocks.request.mockImplementation(base);
+    frame.events = [];
+    frame.snapshot = ready("D", 50, "Still unconfirmed");
+    // A mismatched frame is discarded by terminating its poll owner; reconnect
+    // explicitly starts a valid owner without retaining the foreign receipt.
+    if (foreign === "frame-session" || foreign === "frame-project")
+      await act(async () =>
+        view.result.current.refreshHost(view.result.current.host),
+      );
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction).toBeNull();
+    frame.events = [handoffEvent(source, 40)];
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "Still unconfirmed",
+    );
+  },
+);
+it("retains handoff facts across same-server reconnect but rejects the old connection frame", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  const base = mocks.request.getMockImplementation()!;
+  let source = "";
+  let delayed = false;
+  let finish!: (value: unknown) => void;
+  mocks.request.mockImplementation(async (host, r) => {
+    if (r.method === "send_queued") {
+      source = r.request_id;
+      return { kind: "message_queued", duplicate: false };
+    }
+    if (r.method === "poll" && r.after !== Number.MAX_SAFE_INTEGER && delayed) {
+      delayed = false;
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    }
+    return base(host, r);
+  });
+  await act(async () => {
+    await view.result.current.send("Steer", null, null, null);
+  });
+  delayed = true;
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  frame.events = [];
+  frame.snapshot = ready("D", 50, "No receipt yet");
+  await act(async () =>
+    view.result.current.refreshHost(view.result.current.host),
+  );
+  await act(async () =>
+    finish({
+      kind: "events",
+      session: session(),
+      events: [handoffEvent(source, 40)],
+      has_more: false,
+    }),
+  );
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction).toBeNull();
+  frame.events = [handoffEvent(source, 40)];
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "No receipt yet",
+  );
+  frame.events = [];
+  frame.snapshot = ready("A", 10, "Before handoff");
+  await act(async () =>
+    view.result.current.refreshHost(view.result.current.host),
+  );
+  expect(view.result.current.composerPrediction).toBeNull();
+  frame.snapshot = ready("E", 60, "After retained handoff");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "After retained handoff",
+  );
+});
+it("fails closed on contradictory User facts even after queue retirement", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  const base = mocks.request.getMockImplementation()!;
+  let source = "";
+  mocks.request.mockImplementation(async (host, r) => {
+    if (r.method === "send_queued") {
+      source = r.request_id;
+      return { kind: "message_queued", duplicate: false };
+    }
+    return base(host, r);
+  });
+  await act(async () => {
+    await view.result.current.send("Steer", null, null, null);
+  });
+  frame.events = [userEvent(source, 40), userEvent(source, 45)];
+  frame.snapshot = ready("D", 50, "Conflicting");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  act(() => view.result.current.captureQueuedPredictionRetirement(source)());
+  frame.events = [];
+  frame.snapshot = ready("E", 60, "Still conflicting");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction).toBeNull();
+});
 it("does not restore pre-send snapshots on later polls and accepts the new send source", async () => {
   const frame = predictionFixture();
   const view = await openPredictionFixture();
@@ -456,9 +1163,14 @@ it("requires evidence of the new local send before accepting a different newer c
     "Later external source",
   );
 });
-it.each(["sending", "old-epoch"])(
-  "harvests the current Send User anchor when its main frame arrives during %s, without publishing that frame's snapshot",
-  async (phase) => {
+it.each([
+  ["sending", "user"],
+  ["old-epoch", "user"],
+  ["sending", "handoff"],
+  ["old-epoch", "handoff"],
+])(
+  "harvests the current Send fact during %s (%s), without publishing that frame's snapshot",
+  async (phase, fact) => {
     const frame = predictionFixture();
     const view = await openPredictionFixture();
     const base = mocks.request.getMockImplementation()!;
@@ -484,7 +1196,11 @@ it.each(["sending", "old-epoch"])(
           return {
             kind: "events",
             session: session(),
-            events: [userEvent(source, 30)],
+            events: [
+              fact === "user"
+                ? userEvent(source, 30)
+                : handoffEvent(source, 30),
+            ],
             has_more: false,
             composer_prediction: ready(source, 30, "Unsafe frame suggestion"),
           };
@@ -508,7 +1224,9 @@ it.each(["sending", "old-epoch"])(
         finishFrame({
           kind: "events",
           session: session(),
-          events: [userEvent(source, 30)],
+          events: [
+            fact === "user" ? userEvent(source, 30) : handoffEvent(source, 30),
+          ],
           has_more: false,
           composer_prediction: ready(source, 30, "Unsafe frame suggestion"),
         }),
@@ -804,79 +1522,83 @@ it.each(["sending", "old-epoch"])(
     );
   },
 );
-it("harvests only the matching Send User anchor from an automatic earlier history page", async () => {
-  predictionFixture(true);
-  const base = mocks.request.getMockImplementation()!;
-  let source = "";
-  let finishWindow!: (value: unknown) => void;
-  mocks.request.mockImplementation(async (host, r) => {
-    if (r.method === "send_queued") {
-      source = r.request_id;
-      return { kind: "accepted", duplicate: true };
-    }
-    if (r.method === "history" && r.before === null)
-      return new Promise((resolve) => {
-        finishWindow = resolve;
-      });
-    if (r.method === "history")
-      return {
+it.each(["user", "handoff"])(
+  "harvests only the matching Send %s fact from an automatic earlier history page",
+  async (fact) => {
+    predictionFixture(true);
+    const base = mocks.request.getMockImplementation()!;
+    let source = "";
+    let finishWindow!: (value: unknown) => void;
+    mocks.request.mockImplementation(async (host, r) => {
+      if (r.method === "send_queued") {
+        source = r.request_id;
+        return { kind: "accepted", duplicate: true };
+      }
+      if (r.method === "history" && r.before === null)
+        return new Promise((resolve) => {
+          finishWindow = resolve;
+        });
+      if (r.method === "history")
+        return {
+          kind: "history",
+          session: session(),
+          events: [
+            fact === "user" ? userEvent(source, 40) : handoffEvent(source, 40),
+            userEvent("Unrelated earlier-page source", 200),
+            handoffEvent("Unrelated earlier-page handoff", 20),
+          ],
+          has_more: true,
+          needs_earlier: false,
+          before: 20,
+          composer_prediction: ready(
+            "Unrelated earlier-page source",
+            200,
+            "Never publish the page snapshot",
+          ),
+        };
+      if (r.method === "poll")
+        return {
+          kind: "events",
+          session: session(),
+          events: [],
+          has_more: false,
+          composer_prediction: ready("D", 50, "Later live source"),
+        };
+      return base(host, r);
+    });
+    const view = await openPredictionFixture();
+    await act(async () => {
+      await view.result.current.send("New turn", null, null, null);
+    });
+    await act(async () =>
+      finishWindow({
         kind: "history",
         session: session(),
         events: [
-          userEvent(source, 40),
-          userEvent("Unrelated earlier-page source", 200),
+          {
+            seq: 300,
+            at: 1,
+            session_id: "s",
+            event: { kind: "text", text: "Most recent reply without User C" },
+          },
         ],
         has_more: true,
-        needs_earlier: false,
-        before: 20,
-        composer_prediction: ready(
-          "Unrelated earlier-page source",
-          200,
-          "Never publish the page snapshot",
-        ),
-      };
-    if (r.method === "poll")
-      return {
-        kind: "events",
-        session: session(),
-        events: [],
-        has_more: false,
-        composer_prediction: ready("D", 50, "Later live source"),
-      };
-    return base(host, r);
-  });
-  const view = await openPredictionFixture();
-  await act(async () => {
-    await view.result.current.send("New turn", null, null, null);
-  });
-  await act(async () =>
-    finishWindow({
-      kind: "history",
-      session: session(),
-      events: [
-        {
-          seq: 300,
-          at: 1,
-          session_id: "s",
-          event: { kind: "text", text: "Most recent reply without User C" },
-        },
-      ],
-      has_more: true,
-      needs_earlier: true,
-      before: 250,
-      composer_prediction: ready(source, 40, "Old window snapshot"),
-    }),
-  );
-  expect(view.result.current.composerPrediction).toBeNull();
-  await act(async () => vi.advanceTimersByTimeAsync(0));
-  expect(view.result.current.historyLoading).toBe(false);
-  expect(view.result.current.composerPrediction).toBeNull();
-  await act(async () => vi.advanceTimersByTimeAsync(650));
-  expect(view.result.current.composerPrediction?.suggestion).toBe(
-    "Later live source",
-  );
-  expect(standaloneReads()).toHaveLength(0);
-});
+        needs_earlier: true,
+        before: 250,
+        composer_prediction: ready(source, 40, "Old window snapshot"),
+      }),
+    );
+    expect(view.result.current.composerPrediction).toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(view.result.current.historyLoading).toBe(false);
+    expect(view.result.current.composerPrediction).toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "Later live source",
+    );
+    expect(standaloneReads()).toHaveLength(0);
+  },
+);
 it.each(["invisible", "settings", "skills", "hidden", "sending"])(
   "retains a live external User frontier across %s publication gating and a tail without that User",
   async (gate) => {

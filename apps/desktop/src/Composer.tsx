@@ -1585,7 +1585,9 @@ export function Composer(props: Props) {
             {visiblePrediction && (
               <div
                 className="composer-prediction"
+                id={`${listId}-prediction-body`}
                 ref={ghost}
+                /* Explicitly described by the editor, not a separate browse stop. */
                 aria-hidden="true"
               >
                 {visiblePrediction.text}
@@ -1602,7 +1604,9 @@ export function Composer(props: Props) {
               {...autocomplete}
               placeholder={visiblePrediction ? "" : placeholder}
               aria-describedby={
-                visiblePrediction ? `${listId}-prediction-hint` : undefined
+                visiblePrediction
+                  ? `${listId}-prediction-body ${listId}-prediction-hint`
+                  : undefined
               }
               value={concealSubmitted ? "" : value}
               disabled={disabled || sending || pasting}

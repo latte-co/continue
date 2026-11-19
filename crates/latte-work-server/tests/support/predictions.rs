@@ -442,12 +442,12 @@ async fn codex_composer_prediction_invalid_tools_fail_without_main_events_and_cl
         .await,
         Response::Ok
     ));
+    assert_eq!(
+        kill(Pid::from_raw(pid), None),
+        Err(nix::errno::Errno::ESRCH),
+        "successful close must acknowledge prediction child reaping, not just request cancellation"
+    );
     prediction(&mut client, &id, PredictionStatus::None).await;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while kill(Pid::from_raw(pid), None).is_ok() {
-        assert!(Instant::now() < deadline, "prediction child not reaped");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     std::fs::write(root.path().join("prediction-release"), "release").unwrap();
     prediction(&mut client, &id, PredictionStatus::None).await;
 }

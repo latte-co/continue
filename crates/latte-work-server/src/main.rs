@@ -1,4 +1,5 @@
 //! A single host daemon; `connect` is a disposable local/SSH byte bridge.
+mod admission;
 mod agent_environment;
 mod agents;
 mod attachments;
@@ -265,28 +266,52 @@ async fn serve(dir: &Path) -> Result<()> {
         _=service.lifecycle.shutdown.notified()=>break,
         }
     }
-    service
-        .terminals
-        .lock()
-        .map_err(|_| anyhow::anyhow!("终端锁异常"))?
-        .close_all();
-    let controls: Vec<_> = service
-        .runs
-        .lock()
-        .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
-        .values()
-        .map(|run| run.control.clone())
-        .collect();
-    for control in controls {
-        let _ = control
-            .send(Control::Cancel {
-                reply: None,
-                only_if_idle: false,
-            })
-            .await;
-    }
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    drain_service(&service).await?;
     std::fs::remove_file(socket)?;
+    Ok(())
+}
+async fn drain_service(service: &Service) -> Result<()> {
+    let jobs = agents::codex_jobs::registry();
+    jobs.begin_drain();
+    *service.lifecycle.draining.write().await = true;
+    match service.terminals.lock() {
+        Ok(mut terminals) => terminals.close_all(),
+        Err(error) => eprintln!("Terminal shutdown remains unconfirmed: {error}"),
+    }
+    let controls: Vec<_> = match service.runs.lock() {
+        Ok(runs) => runs.values().map(|run| run.control.clone()).collect(),
+        Err(error) => {
+            eprintln!("Agent shutdown inventory unavailable: {error}");
+            Vec::new()
+        }
+    };
+    let mut closing: futures_util::stream::FuturesUnordered<_> = controls
+        .into_iter()
+        .map(|control| async move {
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                let (reply, receive) = oneshot::channel();
+                control
+                    .send(Control::Cancel {
+                        reply: Some(reply),
+                        only_if_idle: false,
+                    })
+                    .await?;
+                receive.await?.map_err(anyhow::Error::msg)
+            })
+            .await
+            .context("停止时 Agent 关闭结果待确认")?
+        })
+        .collect();
+    while let Some(result) = closing.next().await {
+        if let Err(error) = result {
+            eprintln!("Agent shutdown remains unconfirmed: {error}");
+        }
+    }
+    // An observation deadline cannot destroy a resource owner. Keep the runtime
+    // alive until direct children are reaped; forced OS termination is best effort.
+    while !jobs.wait_drained(Duration::from_secs(5)).await {
+        eprintln!("Codex auxiliary cleanup remains unconfirmed; continuing drain");
+    }
     Ok(())
 }
 async fn connection(stream: UnixStream, service: Service) -> Result<()> {
@@ -308,6 +333,13 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
             written??;
             continue;
         }
+        // Own decoded Send continuations before any lifecycle/file gate can suspend them.
+        // This covers received attempts, not future requests or unread transport bytes.
+        let decoded = serde_json::from_str::<Request>(&line);
+        let admission = match &decoded {
+            Ok(request) if ready => reserve_send(&service.database, request),
+            _ => Ok(None),
+        };
         // Hold admission through dispatch so a Send/CreateTerminal cannot race an idle check.
         let draining = service.lifecycle.draining.read().await;
         let response = if *draining {
@@ -316,7 +348,7 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
                 message: "本机后台正在更新，请重新连接；任务不会自动重发".into(),
             }
         } else {
-            match serde_json::from_str::<Request>(&line) {
+            match decoded {
                 Ok(Request::Hello { version }) => {
                     if version == VERSION {
                         ready = true;
@@ -345,20 +377,30 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
                         }
                     }
                 }
-                Ok(request) if ready => match dispatch(&service, request, &mut claims).await {
-                    Ok(response) => response,
-                    Err(error) => Response::Error {
-                        code: if error.is::<runtime::AdmissionUnknown>() {
-                            "admission_unknown"
-                        } else if error.is::<files::NotGitRepository>() {
-                            "not_git_repository"
-                        } else {
-                            "request_failed"
+                Ok(request) if ready => {
+                    let result = match admission {
+                        Ok(admission) => {
+                            dispatch_reserved(&service, request, &mut claims, admission).await
                         }
-                        .into(),
-                        message: error.to_string(),
-                    },
-                },
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(response) => response,
+                        Err(error) => Response::Error {
+                            code: if error.is::<runtime::SendNotAdmitted>() {
+                                "send_not_admitted"
+                            } else if error.is::<runtime::AdmissionUnknown>() {
+                                "admission_unknown"
+                            } else if error.is::<files::NotGitRepository>() {
+                                "not_git_repository"
+                            } else {
+                                "request_failed"
+                            }
+                            .into(),
+                            message: error.to_string(),
+                        },
+                    }
+                }
                 Ok(_) => Response::Error {
                     code: "handshake_required".into(),
                     message: "请先发送 hello".into(),
@@ -381,10 +423,28 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
     }
     Ok(())
 }
+fn reserve_send(database: &Database, request: &Request) -> Result<Option<admission::Guard>> {
+    match request {
+        Request::Send { request_id, .. } | Request::SendQueued { request_id, .. } => {
+            admission::Guard::reserve(database, request_id).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+#[cfg(test)]
 async fn dispatch(
     s: &Service,
     request: Request,
     claims: &mut upgrade::ConnectionClaims,
+) -> Result<Response> {
+    let admission = reserve_send(&s.database, &request)?;
+    dispatch_reserved(s, request, claims, admission).await
+}
+async fn dispatch_reserved(
+    s: &Service,
+    request: Request,
+    claims: &mut upgrade::ConnectionClaims,
+    admission: Option<admission::Guard>,
 ) -> Result<Response> {
     let allow_queue = matches!(&request, Request::SendQueued { .. });
     let request = match request {
@@ -494,6 +554,7 @@ async fn dispatch(
         request,
         claims,
         allow_queue,
+        admission,
         closed_resource,
         closing_claim,
     )
@@ -509,6 +570,7 @@ async fn dispatch_admitted(
     request: Request,
     claims: &mut upgrade::ConnectionClaims,
     allow_queue: bool,
+    admission: Option<admission::Guard>,
     mut closed_resource: Option<upgrade::Resource>,
     closing_claim: Option<uuid::Uuid>,
 ) -> Result<Response> {
@@ -999,11 +1061,23 @@ async fn dispatch_admitted(
             effort,
             permission_mode,
         } => {
+            let admission = admission.context("消息准入所有权缺失，请使用原请求 ID 核对")?;
+            if !admission.matches(&s.database, &request_id) {
+                bail!("消息准入所有权不匹配，请使用原请求 ID 核对");
+            }
             if allow_queue && db(&s.database, |d| Ok(d.side_parent(&session_id)?.is_some()))? {
-                bail!("侧边聊天暂不支持消息排队");
+                return Err(runtime::reject_send(
+                    &admission,
+                    &request_id,
+                    "侧边聊天暂不支持消息排队".into(),
+                ));
             }
             if allow_queue && provider.is_none() {
-                bail!("消息排队需要明确的执行配置，请更新客户端");
+                return Err(runtime::reject_send(
+                    &admission,
+                    &request_id,
+                    "消息排队需要明确的执行配置，请更新客户端".into(),
+                ));
             }
             let fingerprint = providers::turn_fingerprint(provider.as_ref())?;
             if !allow_queue
@@ -1039,7 +1113,11 @@ async fn dispatch_admitted(
                     !agents::effort_levels(&agent_id, selected_model).contains(&level)
                 })
             {
-                bail!("此 Agent 不支持所选思考强度");
+                return Err(runtime::reject_send(
+                    &admission,
+                    &request_id,
+                    "此 Agent 不支持所选思考强度".into(),
+                ));
             }
             if let Some(mode) = &permission_mode {
                 let _permit = s
@@ -1051,7 +1129,11 @@ async fn dispatch_admitted(
                     .iter()
                     .any(|item| &item.id == mode)
                 {
-                    bail!("此 Agent 不支持所选权限模式：{mode}");
+                    return Err(runtime::reject_send(
+                        &admission,
+                        &request_id,
+                        format!("此 Agent 不支持所选权限模式：{mode}"),
+                    ));
                 }
             }
             launch_config.permission_mode = permission_mode.clone();
@@ -1063,20 +1145,23 @@ async fn dispatch_admitted(
             })?;
             s.resolve_native_model(&agent_id, &path, &mut launch_config)
                 .await?;
-            runtime::submit(
+            runtime::submit_reserved(
                 s.database.clone(),
                 s.runs.clone(),
                 binary.to_owned(),
                 session,
                 path,
-                runtime::SendTurn {
-                    request_id,
-                    text,
-                    model,
-                    fingerprint,
-                    config: launch_config,
+                runtime::Submission {
+                    turn: runtime::SendTurn {
+                        request_id,
+                        text,
+                        model,
+                        fingerprint,
+                        config: launch_config,
+                    },
+                    allow_queue,
+                    admission,
                 },
-                allow_queue,
             )
             .await?
         }
@@ -2050,6 +2135,230 @@ async fn dispatch_admitted(
     })?;
     runtime::project_session_state(&s.runs, &mut response)?;
     Ok(response)
+}
+
+#[cfg(test)]
+mod send_admission_tests {
+    use super::*;
+
+    fn service(dir: &Path) -> Service {
+        Service {
+            attachments: Arc::new(Mutex::new(attachments::Attachments::new(dir).unwrap())),
+            skills: Arc::new(skills::Skills::new(dir).unwrap()),
+            skill_worker: skill_worker::Worker::new(),
+            lifecycle: Arc::new(upgrade::Lifecycle::new().unwrap()),
+            terminals: Arc::new(Mutex::new(terminal::Terminals::default())),
+            database: Arc::new(Mutex::new(
+                store::Store::open(&dir.join("state.sqlite")).unwrap(),
+            )),
+            runs: Arc::default(),
+            title_refresh: Arc::default(),
+            command_probes: Arc::new(tokio::sync::Semaphore::new(2)),
+            file_admission: Arc::new(tokio::sync::RwLock::new(())),
+            agents: vec![(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/codex.py")
+                    .to_string_lossy()
+                    .into_owned(),
+                AgentInfo {
+                    id: "codex".into(),
+                    name: "Fixture".into(),
+                    available: true,
+                    provider_protocols: vec![],
+                    detail: "fixture".into(),
+                },
+            )],
+            server_id: "fixture".into(),
+            providers: Arc::new(Mutex::new(providers::ProviderStore::open(dir).unwrap())),
+        }
+    }
+
+    fn unsupported(request_id: &str, session_id: &str) -> Request {
+        Request::Send {
+            session_id: session_id.into(), request_id: request_id.into(), text: "once".into(),
+            model: None, effort: Some(latte_work_protocol::Effort::High), permission_mode: None,
+            provider: Some(serde_json::from_value(serde_json::json!({"kind":"snapshot","snapshot":{"provider":{"id":"fixture","name":"Fixture","protocol":"openai_responses","base_url":"http://localhost:8000/v1","model":"custom-codex","auth":"bearer","has_credential":true},"credential":"not-a-real-credential"}})).unwrap()),
+        }
+    }
+
+    async fn decoded_send_is_owned_before_gate(lifecycle: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let service = service(root.path());
+        let session = db(&service.database, |store| {
+            let project = store.add_project(root.path())?;
+            store.create_session(project.id, "codex".into())
+        })
+        .unwrap();
+        let (server_socket, socket) = UnixStream::pair().unwrap();
+        let server = tokio::spawn(connection(server_socket, service.clone()));
+        let (reader, mut writer) = socket.into_split();
+        let mut responses = FramedRead::new(reader, LinesCodec::new());
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&Request::Hello { version: VERSION }).unwrap()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        responses.next().await.unwrap().unwrap();
+        let draining = if lifecycle {
+            Some(service.lifecycle.draining.write().await)
+        } else {
+            None
+        };
+        let file_gate = if lifecycle {
+            None
+        } else {
+            Some(service.file_admission.write().await)
+        };
+        let request = Request::Send {
+            session_id: session.id.clone(),
+            request_id: "gate-held".into(),
+            text: "once".into(),
+            model: None,
+            effort: None,
+            permission_mode: None,
+            provider: Some(latte_work_protocol::TurnProvider::Cli),
+        };
+        writer
+            .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while admission::active(&service.database, "gate-held") != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("decoded Send must reserve before waiting on the gate");
+        let later = admission::Guard::reserve(&service.database, "gate-held").unwrap();
+        let error = runtime::reject_send(&later, "gate-held", "明确前置拒绝".into());
+        assert!(
+            !error.is::<runtime::SendNotAdmitted>(),
+            "older decoded continuation still exists"
+        );
+        drop(later);
+        drop(draining);
+        drop(file_gate);
+        let response = tokio::time::timeout(Duration::from_secs(10), responses.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Response>(&response).unwrap(),
+            Response::Accepted { duplicate: false }
+        ));
+        assert!(
+            !db(&service.database, |store| store
+                .request_identity_absent("gate-held"))
+            .unwrap()
+        );
+        runtime::close(&service.database, &service.runs, &session.id, false)
+            .await
+            .unwrap();
+        drop(writer);
+        drop(responses);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn decoded_send_attempt_is_owned_before_lifecycle_gate() {
+        decoded_send_is_owned_before_gate(true).await;
+    }
+    #[tokio::test]
+    async fn decoded_send_attempt_is_owned_before_file_admission_gate() {
+        decoded_send_is_owned_before_gate(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsupported_prevalidation_does_not_prove_absence_with_an_older_timed_out_control() {
+        let root = tempfile::tempdir().unwrap();
+        let service = service(root.path());
+        let session = db(&service.database, |store| {
+            let project = store.add_project(root.path())?;
+            store.create_session(project.id, "codex".into())
+        })
+        .unwrap();
+        let (control, mut receive) = tokio::sync::mpsc::channel(1);
+        service.runs.lock().unwrap().insert(
+            session.id.clone(),
+            runtime::Run {
+                control,
+                safe_to_close: Arc::default(),
+                session_open: Arc::default(),
+            },
+        );
+        let config = service
+            .providers
+            .lock()
+            .unwrap()
+            .turn_config("codex", None, Some(latte_work_protocol::TurnProvider::Cli))
+            .unwrap();
+        let error = runtime::submit(
+            service.database.clone(),
+            service.runs.clone(),
+            "/missing/cli".into(),
+            session.clone(),
+            root.path().to_string_lossy().into_owned(),
+            runtime::SendTurn {
+                request_id: "old-control".into(),
+                text: "once".into(),
+                model: None,
+                fingerprint: None,
+                config,
+            },
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is::<runtime::AdmissionUnknown>());
+        let error = dispatch(
+            &service,
+            unsupported("old-control", &session.id),
+            &mut upgrade::ConnectionClaims::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !error.is::<runtime::SendNotAdmitted>(),
+            "old decoded attempt can still admit: {error:#}"
+        );
+        let Control::Send {
+            turn,
+            admission,
+            reply,
+            ..
+        } = receive.recv().await.unwrap()
+        else {
+            panic!("send")
+        };
+        assert!(reply.is_closed());
+        assert_eq!(
+            crate::admission::active(&service.database, "old-control"),
+            1
+        );
+        assert!(
+            db(&service.database, |store| store.begin(
+                &session.id,
+                &turn.request_id,
+                &turn.text,
+                None,
+                None,
+                None,
+                None
+            ))
+            .unwrap()
+        );
+        drop(admission);
+        assert_eq!(
+            crate::admission::active(&service.database, "old-control"),
+            0
+        );
+    }
 }
 
 #[cfg(test)]

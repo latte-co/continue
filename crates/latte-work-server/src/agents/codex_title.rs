@@ -1,14 +1,11 @@
 //! Codex has no title-generation RPC. Use an isolated ephemeral structured turn,
 //! following its TUI's temporary_structured_request contract (CLI 0.162.0).
+use super::codex_jobs::{self, ChildOwner, JobHandle, JobKind, JobScope};
 use crate::providers::LaunchConfig;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::{
-    process::Stdio,
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
@@ -156,103 +153,69 @@ fn isolated_config(effective: &Value) -> Result<Value> {
     Ok(config)
 }
 
-pub(crate) async fn generate(
+pub(crate) fn start_generate(
+    session_id: &str,
     binary: &str,
     cwd: &str,
     config: &LaunchConfig,
     description: &str,
     native_provider: Option<&NativeProvider>,
-) -> Result<String> {
-    let _job = jobs().title().await?;
-    let result = structured(binary, cwd, config, description, native_provider, INSTRUCTIONS,
-        json!({"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false})).await?;
-    super::titles::valid(result["title"].as_str().unwrap_or_default())
-        .map(str::to_owned)
-        .context("标题摘要无效")
+) -> Result<JobHandle<String>> {
+    let (binary, cwd, config, description, native_provider) = (
+        binary.to_owned(),
+        cwd.to_owned(),
+        config.clone(),
+        description.to_owned(),
+        native_provider.cloned(),
+    );
+    codex_jobs::registry().start(JobScope::session(session_id), JobKind::Title, move |owner| Box::pin(async move {
+        let result = structured(owner, &binary, &cwd, &config, &description, native_provider.as_ref(), INSTRUCTIONS,
+            json!({"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false})).await?;
+        super::titles::valid(result["title"].as_str().unwrap_or_default()).map(str::to_owned).context("标题摘要无效")
+    }))
 }
 
-const EXECUTION_CAPACITY: usize = 2;
-const TITLE_CAPACITY: usize = 8;
-const TITLE_WAIT_TIMEOUT: Duration = Duration::from_secs(150);
-
-struct JobPool {
-    execution: Arc<tokio::sync::Semaphore>,
-    titles: Arc<tokio::sync::Semaphore>,
-    title_wait_timeout: Duration,
-}
-
-// Hold admission for the whole title lifecycle, including the execution wait
-// and structured process cleanup. The execution slot is not a second acquire.
-struct TitleJob {
-    _execution: tokio::sync::OwnedSemaphorePermit,
-    _capacity: tokio::sync::OwnedSemaphorePermit,
-}
-
-impl JobPool {
-    fn new(title_wait_timeout: Duration) -> Self {
-        Self {
-            execution: Arc::new(tokio::sync::Semaphore::new(EXECUTION_CAPACITY)),
-            titles: Arc::new(tokio::sync::Semaphore::new(TITLE_CAPACITY)),
-            title_wait_timeout,
-        }
-    }
-
-    fn try_prediction(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
-        self.execution
-            .clone()
-            .try_acquire_owned()
-            .context("辅助生成繁忙")
-    }
-
-    async fn title(&self) -> Result<TitleJob> {
-        let capacity = self
-            .titles
-            .clone()
-            .try_acquire_owned()
-            .context("自动命名队列已满")?;
-        let execution = tokio::time::timeout(
-            self.title_wait_timeout,
-            self.execution.clone().acquire_owned(),
-        )
-        .await
-        .context("自动命名等待超时")?
-        .context("自动命名执行队列已关闭")?;
-        Ok(TitleJob {
-            _execution: execution,
-            _capacity: capacity,
-        })
-    }
-}
-
-fn jobs() -> &'static JobPool {
-    static JOBS: OnceLock<JobPool> = OnceLock::new();
-    JOBS.get_or_init(|| JobPool::new(TITLE_WAIT_TIMEOUT))
-}
-
-pub(crate) async fn predict(
+pub(crate) fn start_predict(
+    session_id: &str,
     binary: &str,
     cwd: &str,
     config: &LaunchConfig,
     description: &str,
     native_provider: Option<&NativeProvider>,
-) -> Result<Option<String>> {
-    let _permit = jobs().try_prediction()?;
-    crate::predictions::validate(
-        structured(
-            binary,
-            cwd,
-            config,
-            description,
-            native_provider,
-            crate::predictions::INSTRUCTIONS,
-            crate::predictions::schema(),
-        )
-        .await?,
+) -> Result<JobHandle<Option<String>>> {
+    let (binary, cwd, config, description, native_provider) = (
+        binary.to_owned(),
+        cwd.to_owned(),
+        config.clone(),
+        description.to_owned(),
+        native_provider.cloned(),
+    );
+    codex_jobs::registry().start(
+        JobScope::session(session_id),
+        JobKind::Prediction,
+        move |owner| {
+            Box::pin(async move {
+                crate::predictions::validate(
+                    structured(
+                        owner,
+                        &binary,
+                        &cwd,
+                        &config,
+                        &description,
+                        native_provider.as_ref(),
+                        crate::predictions::INSTRUCTIONS,
+                        crate::predictions::schema(),
+                    )
+                    .await?,
+                )
+            })
+        },
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn structured(
+    owner: &mut ChildOwner,
     binary: &str,
     cwd: &str,
     config: &LaunchConfig,
@@ -261,7 +224,7 @@ async fn structured(
     instructions: &str,
     schema: Value,
 ) -> Result<Value> {
-    // Wrappers own the shared execution permit through this function's cleanup.
+    // The detached owner retains the child and permits across all setup failures.
     let mut command = crate::agent_environment::command(binary);
     command.args(["app-server", "--stdio"]).current_dir(cwd);
     command.envs(&config.environment.0);
@@ -269,29 +232,21 @@ async fn structured(
     if let Some(provider) = &config.provider {
         super::codex::configure_provider(&mut command, provider, &provider_id)?;
     }
-    let child = command
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .process_group(0)
-        .spawn()?;
-    let pid = child.id().context("Codex 标题进程无 PID")? as i32;
-    let mut group = crate::runtime::Group { child, pid };
+        .stderr(Stdio::null());
+    let child = owner.spawn(command)?;
     let mut wire = Wire {
-        input: group.child.stdin.take().context("Codex 标题 stdin 缺失")?,
+        input: child.stdin.take().context("Codex 标题 stdin 缺失")?,
         output: FramedRead::new(
-            group
-                .child
-                .stdout
-                .take()
-                .context("Codex 标题 stdout 缺失")?,
+            child.stdout.take().context("Codex 标题 stdout 缺失")?,
             LinesCodec::new_with_max_length(256 * 1024),
         ),
         bytes: 0,
         messages: 0,
     };
-    let result = tokio::time::timeout(Duration::from_secs(30), async {
+    async {
         wire.rpc("title-init", "initialize", json!({"clientInfo":{"name":"latte-work","version":"0.1.0"},"capabilities":{"experimentalApi":true}})).await?;
         wire.send(json!({"method":"initialized"})).await?;
         let effective = wire.rpc("title-config", "config/read", json!({"cwd":cwd,"includeLayers":false})).await?;
@@ -362,166 +317,12 @@ async fn structured(
                 }
             }
         }
-    }).await.unwrap_or_else(|_| Err(anyhow::anyhow!("自动命名超时")));
-    let _ = nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGKILL,
-    );
-    let _ = group.child.wait().await;
-    result
+    }.await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        future::Future,
-        pin::Pin,
-        task::{Context as TaskContext, Poll},
-    };
-
-    fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-        future.poll(&mut TaskContext::from_waker(
-            futures_util::task::noop_waker_ref(),
-        ))
-    }
-
-    fn assert_title_full(pool: &JobPool) {
-        let mut ninth = Box::pin(pool.title());
-        let Poll::Ready(Err(error)) = poll(ninth.as_mut()) else {
-            panic!("ninth title must be rejected immediately, not wait")
-        };
-        assert!(error.to_string().contains("队列已满"));
-    }
-
-    #[tokio::test]
-    async fn job_pool_title_fifo_precedes_predictions_and_execution_never_exceeds_two() {
-        let pool = JobPool::new(Duration::from_millis(50));
-        let prediction_one = pool.try_prediction().unwrap();
-        let prediction_two = pool.try_prediction().unwrap();
-        assert!(pool.try_prediction().is_err());
-        let mut first = Box::pin(pool.title());
-        let mut second = Box::pin(pool.title());
-        // Queue order is established by polling acquire to Pending, not spawn order.
-        assert!(poll(first.as_mut()).is_pending());
-        assert!(poll(second.as_mut()).is_pending());
-        drop(prediction_one);
-        assert!(
-            pool.try_prediction().is_err(),
-            "queued title owns the released slot"
-        );
-        assert!(
-            poll(second.as_mut()).is_pending(),
-            "second cannot overtake first"
-        );
-        let Poll::Ready(Ok(first_job)) = poll(first.as_mut()) else {
-            panic!("first waiter")
-        };
-        drop(prediction_two);
-        let Poll::Ready(Ok(second_job)) = poll(second.as_mut()) else {
-            panic!("second waiter")
-        };
-        let mut third = Box::pin(pool.title());
-        assert!(poll(third.as_mut()).is_pending());
-        assert!(pool.try_prediction().is_err());
-        drop(first_job);
-        let Poll::Ready(Ok(third_job)) = poll(third.as_mut()) else {
-            panic!("third waiter")
-        };
-        assert!(pool.try_prediction().is_err());
-        drop((second_job, third_job));
-        assert_eq!(pool.execution.available_permits(), 2);
-        assert_eq!(pool.titles.available_permits(), 8);
-    }
-
-    #[tokio::test]
-    async fn job_pool_title_capacity_counts_active_waiting_and_cleanup_and_rejects_ninth() {
-        let pool = JobPool::new(Duration::from_millis(50));
-        let active_one = pool.title().await.unwrap();
-        let active_two = pool.title().await.unwrap();
-        let mut waiting: Vec<_> = (0..6).map(|_| Box::pin(pool.title())).collect();
-        for waiter in &mut waiting {
-            assert!(poll(waiter.as_mut()).is_pending());
-        }
-        assert_title_full(&pool); // Two active plus six waiting fill capacity.
-        drop(active_one);
-        // Refill only the admission slot released by the finished first title.
-        let mut replacement = Box::pin(pool.title());
-        assert!(poll(replacement.as_mut()).is_pending());
-        let Poll::Ready(Ok(cleanup_job)) = poll(waiting[0].as_mut()) else {
-            panic!("waiting title")
-        };
-        // A completed generation still retains both slots while cleanup is in
-        // progress. No release is triggered by acquire completing or queue pop.
-        assert_eq!(pool.titles.available_permits(), 0);
-        assert_title_full(&pool); // Cleanup still counts toward title capacity.
-        drop(cleanup_job);
-        assert_eq!(pool.titles.available_permits(), 1);
-        drop((replacement, waiting, active_two));
-        assert_eq!(pool.titles.available_permits(), 8);
-        assert_eq!(pool.execution.available_permits(), 2);
-    }
-
-    #[tokio::test]
-    async fn job_pool_cancelling_waiter_releases_capacity_and_does_not_block_next_title() {
-        let pool = JobPool::new(Duration::from_millis(50));
-        let prediction_one = pool.try_prediction().unwrap();
-        let prediction_two = pool.try_prediction().unwrap();
-        let mut cancelled = Box::pin(pool.title());
-        let mut next = Box::pin(pool.title());
-        assert!(poll(cancelled.as_mut()).is_pending());
-        assert!(poll(next.as_mut()).is_pending());
-        assert_eq!(pool.titles.available_permits(), 6);
-        drop(cancelled);
-        assert_eq!(pool.titles.available_permits(), 7);
-        drop(prediction_one);
-        let Poll::Ready(Ok(job)) = poll(next.as_mut()) else {
-            panic!("live waiter")
-        };
-        drop((job, prediction_two));
-        assert_eq!(pool.execution.available_permits(), 2);
-        assert_eq!(pool.titles.available_permits(), 8);
-    }
-
-    #[tokio::test]
-    async fn job_pool_cancelling_active_lifecycle_releases_both_slots() {
-        let pool = JobPool::new(Duration::from_millis(50));
-        let mut lifecycle = Box::pin(async {
-            let _job = pool.title().await.unwrap();
-            std::future::pending::<()>().await;
-        });
-        assert!(poll(lifecycle.as_mut()).is_pending());
-        assert_eq!(pool.execution.available_permits(), 1);
-        assert_eq!(pool.titles.available_permits(), 7);
-        drop(lifecycle);
-        assert_eq!(pool.execution.available_permits(), 2);
-        assert_eq!(pool.titles.available_permits(), 8);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn job_pool_wait_timeout_releases_capacity_and_fifo_reservation() {
-        let pool = JobPool::new(Duration::from_millis(50));
-        let prediction_one = pool.try_prediction().unwrap();
-        let prediction_two = pool.try_prediction().unwrap();
-        let mut timed_out = Box::pin(pool.title());
-        assert!(poll(timed_out.as_mut()).is_pending());
-        assert_eq!(pool.titles.available_permits(), 7);
-        tokio::time::advance(Duration::from_millis(51)).await;
-        let Poll::Ready(Err(error)) = poll(timed_out.as_mut()) else {
-            panic!("wait should time out")
-        };
-        assert!(error.to_string().contains("等待超时"));
-        assert_eq!(pool.titles.available_permits(), 8);
-        drop(prediction_one);
-        assert!(
-            pool.try_prediction().is_ok(),
-            "timeout removed the FIFO reservation"
-        );
-        drop(prediction_two);
-        assert_eq!(pool.execution.available_permits(), 2);
-        assert!(pool.title().await.is_ok());
-    }
-
     #[test]
     fn isolation_disables_each_effective_mcp_server_and_preserves_custom_policy() {
         let config = isolated_config(&json!({"mcp_servers":{"private.server":{"required":true}},"default_permissions":"restricted","notify":["side-effect"],"features":{"stable_environment_tools":true,"sleep_tool":{"enabled":true,"mode":"always_on"}}})).unwrap();

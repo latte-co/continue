@@ -325,6 +325,14 @@ for line in sys.stdin:
         else:
             reply(value, {'turnId': turn})
             text('STEER:' + extra)
+            if extra == 'hold-steer':
+                # The flushed ack/text precede completion, so tests can observe
+                # a real native handoff without inferring it from elapsed time.
+                pathlib.Path('steer-completion-held').touch()
+                deadline = time.monotonic() + 15
+                while not pathlib.Path('steer-completion-release').exists():
+                    assert time.monotonic() < deadline, 'steer completion was not released'
+                    time.sleep(.01)
             complete()
     elif method == 'turn/interrupt':
         assert params['turnId'] == turn

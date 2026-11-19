@@ -506,13 +506,11 @@ async fn codex_title_handles_early_completion_and_close_cancels_pending_generati
             .await,
             Response::Ok
         ));
-        while nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok() {
-            assert!(
-                Instant::now() < deadline,
-                "title worker still alive after close"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        assert_eq!(
+            nix::sys::signal::kill(Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH),
+            "successful close must acknowledge title worker reaping, not just request cancellation"
+        );
         title(&mut client, &id, prompt).await;
     }
 }

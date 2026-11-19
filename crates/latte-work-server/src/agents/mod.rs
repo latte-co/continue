@@ -6,6 +6,7 @@ mod claude_models;
 mod claude_sessions;
 pub(crate) mod claude_skills;
 pub(crate) mod codex;
+pub(crate) mod codex_jobs;
 pub(crate) mod codex_title;
 mod opencode;
 mod titles;
