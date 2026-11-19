@@ -250,6 +250,45 @@ it("does not open /effort after the user edits the pending command", async () =>
   expect(screen.queryByRole("menu")).toBeNull();
   expect(p.send).not.toHaveBeenCalled();
 });
+it.each(["Enter", "click"])(
+  "accepts /model via %s before an obsolete /effort refresh settles",
+  async (submitVia) => {
+    const catalog = {
+      kind: "models",
+      models: ["opus", "haiku"],
+      provider: null,
+      default_model: null,
+      effort_levels: ["high"],
+      model_labels: {},
+    };
+    mocks.request.mockResolvedValueOnce(catalog);
+    let finishRefresh!: (result: typeof catalog) => void;
+    mocks.request.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRefresh = resolve;
+        }),
+    );
+    const p = setup();
+    await act(async () => {});
+    command("/effort");
+    expect(mocks.request).toHaveBeenCalledTimes(2);
+    expect(input().value).toBe("/effort ");
+
+    fireEvent.change(input(), { target: { value: "/model " } });
+    if (submitVia === "Enter") fireEvent.keyDown(input(), { key: "Enter" });
+    else fireEvent.click(screen.getByRole("button", { name: "选择模型" }));
+    expect(input().value).toBe("");
+    expect(screen.getByRole("menu", { name: "Model" })).toBeTruthy();
+    expect(screen.getByText("正在刷新模型…")).toBeTruthy();
+
+    await act(async () => finishRefresh(catalog));
+    expect(screen.getByRole("menuitemradio", { name: "haiku" })).toBeTruthy();
+    expect(screen.queryByRole("menu", { name: "Reasoning effort" })).toBeNull();
+    expect(mocks.request).toHaveBeenCalledTimes(2);
+    expect(p.send).not.toHaveBeenCalled();
+  },
+);
 it("preserves a model command during disconnect without opening a stale menu", () => {
   const p = setup({ connected: false });
   command("/model");

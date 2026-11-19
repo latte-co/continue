@@ -341,6 +341,122 @@ async fn open_side(client: &mut Client, parent: &Session) -> Session {
 }
 
 #[tokio::test]
+async fn legacy_cli_parent_with_missing_request_digest_forks_without_recording_proof() {
+    let mut host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let project = terminal_project(&mut client, root.path()).await;
+    let parent = create_session(&mut client, project, "codex").await;
+    assert!(matches!(
+        send(&mut client, &parent.id, "legacy-cli", "hello").await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &parent.id, Status::Completed).await;
+    wait_for_agent_idle(&mut client, &parent.id, Status::Completed).await;
+    let turn = |session_id: &str, request_id: &str, provider: TurnProvider| Request::Send {
+        permission_mode: None,
+        provider: Some(provider),
+        session_id: session_id.into(),
+        request_id: request_id.into(),
+        text: request_id.into(),
+        model: None,
+        effort: None,
+    };
+    assert!(matches!(
+        ask(
+            &mut client,
+            turn(&parent.id, "explicit-cli", TurnProvider::Cli)
+        )
+        .await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &parent.id, Status::Completed).await;
+
+    drop(client);
+    kill(Pid::from_raw(host.process.id() as i32), Signal::SIGINT).unwrap();
+    assert!(host.process.wait().unwrap().success());
+    let db_path = host.directory.path().join("state.sqlite");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM requests WHERE session_id=?1 AND provider_fingerprint IS NULL",
+            [&parent.id],
+            |row| row.get::<_, u32>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.execute(
+            "DELETE FROM native_session_contexts WHERE session_id=?1",
+            [&parent.id],
+        )
+        .unwrap(),
+        1
+    );
+    drop(db);
+
+    host.process = Host::spawn(host.directory.path(), &[]);
+    host.wait_ready().await;
+    let mut client = host.client().await;
+    let side = open_side(&mut client, &parent).await;
+    assert!(matches!(
+        ask(
+            &mut client,
+            turn(&side.id, "legacy-cli-fork", TurnProvider::Cli)
+        )
+        .await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &side.id, Status::Completed).await;
+
+    let changed = open_side(&mut client, &parent).await;
+    let provider = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "id": "fixture-custom", "name": "Fixture", "protocol": "openai_responses",
+            "base_url": "http://fixture.test/v1", "model": "codex-test",
+            "auth": "none", "has_credential": false
+        },
+        "credential": ""
+    }))
+    .unwrap();
+    for (request_id, config) in [
+        ("legacy-new-provider", TurnProvider::Snapshot(provider)),
+        (
+            "legacy-custom-environment",
+            TurnProvider::Configured {
+                provider: None,
+                environment: AgentEnvironment(
+                    [("HTTPS_PROXY".into(), "http://fixture.test:8000".into())].into(),
+                ),
+            },
+        ),
+    ] {
+        assert!(matches!(
+            ask(&mut client, turn(&changed.id, request_id, config)).await,
+            Response::Accepted { duplicate: false }
+        ));
+        let rejected = wait(&mut client, &changed.id, Status::Failed).await;
+        assert!(rejected.iter().any(|event| matches!(&event.event,
+            EventKind::State { message: Some(message), .. } if message.contains("请用原 Provider 和 Agent 环境续接一次")
+        )));
+    }
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    assert!(
+        !db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM native_session_contexts WHERE session_id=?1)",
+            [&parent.id],
+            |row| row.get::<_, bool>(0)
+        )
+        .unwrap()
+    );
+    let inputs = std::fs::read_to_string(root.path().join("codex-inputs")).unwrap();
+    assert!(
+        !inputs.contains("legacy-new-provider") && !inputs.contains("legacy-custom-environment")
+    );
+}
+
+#[tokio::test]
 async fn side_chat_forks_and_resumes_after_switching_providers() {
     use latte_work_protocol::{Provider, ProviderSnapshot};
     use serde_json::{Value, json};

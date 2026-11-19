@@ -21,6 +21,7 @@ export interface ModelPickerHandle {
 }
 
 type Catalog = Extract<Response, { kind: "models" }>;
+const effortContextChanged = "模型设置已变化，请重新打开思考强度菜单。";
 export function ModelPicker({
   hostId,
   projectId,
@@ -169,7 +170,10 @@ export function ModelPicker({
           return selector.current?.openMenu("model")
             ? null
             : "无法打开模型设置。";
-        if (effortCommand.current) return "正在刷新思考强度，请稍候。";
+        const pending = effortCommand.current;
+        if (pending && pending.isCurrent?.() !== false)
+          return "正在刷新思考强度，请稍候。";
+        pending?.resolve(effortContextChanged);
         return new Promise<string | null>((resolve) => {
           effortCommand.current = {
             scope,
@@ -197,7 +201,7 @@ export function ModelPicker({
       !connected ||
       settingsOpen
     ) {
-      outcome = "模型设置已变化，请重新打开思考强度菜单。";
+      outcome = effortContextChanged;
     } else if (
       loading ||
       settledRetry < pending.retry ||

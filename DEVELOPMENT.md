@@ -219,7 +219,9 @@ selector or effort submenu; they never change native configuration via a CLI com
 These names are reserved across all Agents to keep one App navigation contract;
 unsupported selections report their capability error rather than forwarding the
 reserved name to a different native CLI.
-The effort command refreshes capabilities before opening the submenu.
+The effort command refreshes capabilities before opening the submenu. Editing the
+draft or switching sessions invalidates the pending command while the catalog
+request can finish.
 Arguments are retained in the draft with a menu-selection notice. A disabled/unready
 selector reports its reason without clearing the draft or stopping a running turn.
 Namespaced project commands remain native. The workbench send boundary also rejects
@@ -1879,8 +1881,10 @@ before the Server adopts its native ID.
 Older records with only a combined digest require an exact launch-context
 match once to establish independent evidence of their Agent environment.
 An older main session without a launch record can prove the same context from
-its matching request ledger. Codex cold resumes reuse the side thread's
-Provider key for the same App Provider revision.
+its matching request ledger. A ledger with missing digests permits only the
+default CLI with an empty Agent environment and leaves the source unverified.
+Codex cold resumes reuse the side thread's Provider key for the same App
+Provider revision.
 The side chat shares the working directory, with an independent request ledger and
 transcript. Side chats do not take undo snapshots because main and side file activity can
 overlap. The host rejects main-turn undo when write-capable side work on the

@@ -1042,6 +1042,14 @@ impl Store {
             {
                 let full = config.fingerprint()?.context("侧边聊天缺少启动配置摘要")?;
                 if !self.native_request_context_matches(session_id, Some(&full), false)? {
+                    // NULL entries remain compatible only with the original
+                    // CLI/default environment. They cannot attest a launch.
+                    if config.provider.is_none()
+                        && config.environment.is_empty()
+                        && self.native_request_context_matches(session_id, Some(&full), true)?
+                    {
+                        return Ok(());
+                    }
                     bail!(
                         "侧边聊天的历史配置无法确认 Agent 环境，请用原 Provider 和 Agent 环境续接一次"
                     );

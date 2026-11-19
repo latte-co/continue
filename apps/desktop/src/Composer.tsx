@@ -271,7 +271,15 @@ export function Composer(props: Props) {
   const [externalBusy, setExternalBusy] = useState(false);
   const referenceOperation = useRef(0);
   const currentContext = useRef("");
-  currentContext.current = `${scope}:${sessionId}:${disabled}:${sending}:${hidden}:${connected}`;
+  const commandContext = `${scope}:${sessionId}:${disabled}:${sending}:${hidden}:${connected}`;
+  currentContext.current = commandContext;
+  const modelCommandGeneration = useRef(0);
+  useLayoutEffect(
+    () => () => {
+      modelCommandGeneration.current++;
+    },
+    [commandContext, value],
+  );
   useEffect(
     () => () => {
       referenceOperation.current++;
@@ -917,24 +925,13 @@ export function Composer(props: Props) {
       }
       props.onOpenSubagents();
     } else {
-      const owner = currentContext.current;
-      const isCurrent = () =>
-        currentContext.current === owner && latestValue.current === value;
+      const generation = modelCommandGeneration.current;
+      const isCurrent = () => modelCommandGeneration.current === generation;
       const result = props.onOpenModelSettings
         ? props.onOpenModelSettings(action, isCurrent)
         : "无法打开模型设置";
-      let error: string | null;
-      if (result instanceof Promise) {
-        submitting.current = true;
-        try {
-          error = await result;
-        } finally {
-          submitting.current = false;
-        }
-        if (!isCurrent()) return;
-      } else {
-        error = result;
-      }
+      const error = result instanceof Promise ? await result : result;
+      if (!isCurrent()) return;
       if (error) {
         setNotice(error);
         return;
