@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
   state: {} as Workbench,
   drafts: undefined as DraftStore | undefined,
   workspaceSideChat: vi.fn(),
+  queuedPredictionCapture: undefined as
+    Workbench["captureQueuedPredictionRetirement"] | undefined,
 }));
 vi.mock("./useWorkbench", () => ({ useWorkbench: () => mocks.state }));
 vi.mock("./appLifecycle", () => ({ useAppLifecycle: () => {} }));
@@ -43,8 +45,15 @@ vi.mock("./Sidebar", () => ({
   ),
 }));
 vi.mock("./Conversation", () => ({
-  Conversation: ({ drafts }: { drafts: DraftStore }) => {
+  Conversation: ({
+    drafts,
+    captureQueuedPredictionRetirement,
+  }: {
+    drafts: DraftStore;
+    captureQueuedPredictionRetirement?: Workbench["captureQueuedPredictionRetirement"];
+  }) => {
     mocks.drafts = drafts;
+    mocks.queuedPredictionCapture = captureQueuedPredictionRetirement;
     return null;
   },
 }));
@@ -135,6 +144,12 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+});
+it("routes the Workbench queue retirement capture factory to Conversation", () => {
+  const capture = vi.fn(() => vi.fn());
+  mocks.state = { ...mocks.state, captureQueuedPredictionRetirement: capture };
+  render(<App />);
+  expect(mocks.queuedPredictionCapture).toBe(capture);
 });
 it("offers Claude side chat through the workspace without adding a title bar button", () => {
   mocks.state = {

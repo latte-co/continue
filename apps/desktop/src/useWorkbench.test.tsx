@@ -1,5 +1,13 @@
 // @vitest-environment jsdom
-import { act, cleanup, renderHook } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  renderHook,
+  screen,
+} from "@testing-library/react";
+import { MessageQueue } from "./MessageQueue";
+import { renderWithStatus } from "./test/renderWithStatus";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   HOST_DISCONNECTED_EVENT,
@@ -7,7 +15,12 @@ import {
 } from "./connectionErrors";
 import { updateWorkspace } from "./workspaceState";
 import { useWorkbench } from "./useWorkbench";
-import type { Request, Session } from "./protocol";
+import type {
+  ComposerPredictionSnapshot as Snapshot,
+  Event,
+  Request,
+  Session,
+} from "./protocol";
 const mocks = vi.hoisted(() => ({
   request: vi.fn(),
   connect: vi.fn(),
@@ -101,303 +114,971 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
-it("reads predictions on the existing poll cadence only while pending, never creates a turn", async () => {
+const ready = (source = "A", seq = 10, text = "补充测试"): Snapshot => ({
+  status: "ready",
+  source_request_id: source,
+  source_user_seq: seq,
+  generation_id: `generation-${source}`,
+  suggestion: text,
+});
+const userEvent = (source: string, seq: number): Event => ({
+  seq,
+  at: 1,
+  session_id: "s",
+  event: { kind: "user", request_id: source, text: source },
+});
+const standaloneReads = () =>
+  mocks.request.mock.calls.filter(
+    ([, r]) => r.method === "composer_prediction",
+  );
+function predictionFixture(windowed = false) {
   mocks.connect.mockResolvedValue({
     kind: "hello",
     server_id: "server-local",
     composer_predictions: true,
+    history_window: windowed,
     agents: [{ id: "claude", available: true }],
   });
-  const original = mocks.request.getMockImplementation()!;
-  let predictionStatus = "pending";
+  const base = mocks.request.getMockImplementation()!;
+  const frame: { snapshot: Snapshot | null | undefined; events: Event[] } = {
+    snapshot: ready(),
+    events: [userEvent("A", 10)],
+  };
   mocks.request.mockImplementation(async (host, r) => {
-    if (r.method === "poll")
+    // A standalone optional read would never return (and used to block the live loop).
+    if (r.method === "composer_prediction") return new Promise(() => {});
+    if (r.method === "poll" || r.method === "history")
       return {
-        kind: "events",
+        kind: r.method === "history" ? "history" : "events",
         session: session(),
-        events: [
-          {
-            seq: 1,
-            at: 1,
-            session_id: "s",
-            event: { kind: "user", request_id: "source", text: "检查项目" },
-          },
-        ],
-        has_more: false,
+        events: frame.events,
+        has_more: windowed && r.method === "history" && r.before === null,
+        needs_earlier: false,
+        before: 20,
+        ...(frame.snapshot === undefined
+          ? {}
+          : { composer_prediction: frame.snapshot }),
       };
-    if (r.method === "composer_prediction")
-      return {
-        kind: "composer_prediction",
-        session_id: "s",
-        status: predictionStatus,
-        source_request_id: "source",
-        generation_id: "generation",
-        suggestion: predictionStatus === "ready" ? "补充测试" : null,
-      };
-    return original(host, r);
+    return base(host, r);
   });
+  return frame;
+}
+async function openPredictionFixture() {
   const view = renderHook(useWorkbench);
   await act(async () => {});
   await act(async () =>
     view.result.current.openSession({ ...session(), hostId: "local" }),
   );
-  const reads = () =>
-    mocks.request.mock.calls.filter(
-      ([, r]) => r.method === "composer_prediction",
-    );
-  expect(reads()).toHaveLength(1);
-  predictionStatus = "ready";
+  return view;
+}
+it("consumes piggyback predictions while a standalone read would hang, without blocking main polls or creating turns", async () => {
+  const frame = predictionFixture();
+  frame.snapshot = { ...ready(), status: "pending", suggestion: null };
+  const view = await openPredictionFixture();
+  expect(standaloneReads()).toHaveLength(0);
+  frame.snapshot = ready();
   await act(async () => vi.advanceTimersByTimeAsync(650));
   expect(view.result.current.composerPrediction).toMatchObject({
     suggestion: "补充测试",
-    source_request_id: "source",
+    source_request_id: "A",
   });
-  expect(reads()).toHaveLength(2);
+  frame.events = [
+    {
+      seq: 11,
+      at: 1,
+      session_id: "s",
+      event: { kind: "text", text: "Live output" },
+    },
+  ];
   await act(async () => vi.advanceTimersByTimeAsync(5000));
-  expect(reads()).toHaveLength(2);
+  expect(view.result.current.events.at(-1)?.seq).toBe(11);
+  expect(
+    mocks.request.mock.calls.filter(([, r]) => r.method === "poll").length,
+  ).toBeGreaterThan(3);
+  expect(standaloneReads()).toHaveLength(0);
   expect(
     mocks.request.mock.calls.some(([, r]) =>
       ["send", "send_queued", "create_session"].includes(r.method),
     ),
   ).toBe(false);
 });
-it.each(["pending", "error", "mismatch"])(
-  "clears the previous ready prediction before a fast external turn query returns %s",
+it.each(["pending", "failed", "mismatch"])(
+  "clears the previous ready prediction when a fast external turn snapshot is %s",
   async (outcome) => {
-    mocks.connect.mockResolvedValue({
-      kind: "hello",
-      server_id: "server-local",
-      composer_predictions: true,
-      agents: [{ id: "claude", available: true }],
-    });
-    const original = mocks.request.getMockImplementation()!;
-    let source = "source";
-    let resolve!: (value: unknown) => void;
-    let reject!: (reason: Error) => void;
-    mocks.request.mockImplementation(async (host, r) => {
-      if (r.method === "poll")
-        return {
-          kind: "events",
-          session: session(),
-          events: [
-            {
-              seq: source === "source" ? 1 : 2,
-              at: 1,
-              session_id: "s",
-              event: { kind: "user", request_id: source, text: source },
-            },
-          ],
-          has_more: false,
-        };
-      if (r.method === "composer_prediction") {
-        if (source === "source")
-          return {
-            kind: "composer_prediction",
-            session_id: "s",
-            status: "ready",
-            source_request_id: source,
-            generation_id: "generation",
-            suggestion: "旧建议",
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    expect(view.result.current.composerPrediction?.suggestion).toBe("补充测试");
+    frame.events = [userEvent("B", 30)];
+    frame.snapshot =
+      outcome === "mismatch"
+        ? ready("A", 10)
+        : {
+            ...ready("B", 30),
+            status: outcome as "pending" | "failed",
+            suggestion: null,
           };
-        return new Promise((yes, no) => {
-          resolve = yes;
-          reject = no;
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(
+      view.result.current.composerPrediction?.suggestion ?? null,
+    ).toBeNull();
+    expect(standaloneReads()).toHaveLength(0);
+  },
+);
+it.each(["none", "unsupported", "failed", "missing", "null"])(
+  "keeps main polling and the default composer for %s, never falling back despite Hello true",
+  async (outcome) => {
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    expect(view.result.current.composerPrediction?.suggestion).toBe("补充测试");
+    frame.snapshot =
+      outcome === "missing"
+        ? undefined
+        : outcome === "null"
+          ? null
+          : {
+              ...ready(),
+              status: outcome as "none" | "unsupported" | "failed",
+              suggestion: null,
+            };
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(
+      view.result.current.composerPrediction?.suggestion ?? null,
+    ).toBeNull();
+    expect(standaloneReads()).toHaveLength(0);
+    frame.snapshot = ready();
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe("补充测试");
+  },
+);
+it("does not impose the old 35s pending deadline and suppresses hidden composer snapshots", async () => {
+  const frame = predictionFixture();
+  frame.snapshot = { ...ready(), status: "pending", suggestion: null };
+  const view = await openPredictionFixture();
+  act(() => view.result.current.setPredictionVisible(false));
+  frame.snapshot = ready();
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(view.result.current.composerPrediction?.suggestion ?? null).toBeNull();
+  act(() => view.result.current.setPredictionVisible(true));
+  frame.snapshot = { ...ready(), status: "pending", suggestion: null };
+  await act(async () => vi.advanceTimersByTimeAsync(60_000));
+  frame.snapshot = ready();
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion).toBe("补充测试");
+  expect(standaloneReads()).toHaveLength(0);
+});
+it("accepts the latest window snapshot without its source User event or loading older history", async () => {
+  const frame = predictionFixture(true);
+  frame.events = [
+    {
+      seq: 100,
+      at: 1,
+      session_id: "s",
+      event: { kind: "text", text: "Truncated final reply" },
+    },
+  ];
+  const view = await openPredictionFixture();
+  expect(view.result.current.composerPrediction?.suggestion).toBe("补充测试");
+  expect(view.result.current.hasEarlierHistory).toBe(true);
+  expect(
+    mocks.request.mock.calls.filter(([, r]) => r.method === "history"),
+  ).toHaveLength(1);
+});
+it("advances known A10 to server B30 without User B and rejects a late A10 snapshot", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  frame.events = [];
+  frame.snapshot = ready("B", 30, "New suggestion");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.source_request_id).toBe("B");
+  frame.snapshot = ready("A", 10, "Old suggestion");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.source_request_id).toBe("B");
+});
+it("rejects same-seq different-source conflicts", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  frame.events = [];
+  frame.snapshot = ready("B", 10, "Conflicting suggestion");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.source_request_id).toBe("A");
+});
+it("does not let an invalid observed User request ID poison the source frontier", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  frame.events = [userEvent("", 90), userEvent("   ", 100)];
+  frame.snapshot = ready("B", 30, "New suggestion");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.source_request_id).toBe("B");
+});
+it.each(["A", "B"])(
+  "earlier page %s only changes transcript, not the live source frontier or prediction",
+  async (source) => {
+    const frame = predictionFixture(true);
+    frame.events = [userEvent("B", 30)];
+    frame.snapshot = ready("B", 30, "Live suggestion");
+    const view = await openPredictionFixture();
+    frame.events = [userEvent(source, source === "A" ? 10 : 100)];
+    frame.snapshot = ready(
+      source,
+      source === "A" ? 10 : 100,
+      "Page suggestion",
+    );
+    await act(async () => view.result.current.loadEarlierHistory());
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "Live suggestion",
+    );
+    frame.events = [];
+    frame.snapshot = ready("B", 30, "Refreshed live suggestion");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "Refreshed live suggestion",
+    );
+  },
+);
+it("keeps a source frontier monotonic across same-connection navigation", async () => {
+  const frame = predictionFixture();
+  frame.snapshot = ready("B", 30);
+  frame.events = [userEvent("B", 30)];
+  const view = await openPredictionFixture();
+  await act(async () => view.result.current.createSession());
+  frame.snapshot = ready("A", 10, "Old suggestion");
+  frame.events = [userEvent("A", 10)];
+  await act(async () =>
+    view.result.current.openSession({ ...session(), hostId: "local" }),
+  );
+  expect(view.result.current.composerPrediction?.suggestion ?? null).toBeNull();
+});
+it.each(["navigate", "reconnect", "send"])(
+  "discards a delayed main frame after %s",
+  async (action) => {
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    const base = mocks.request.getMockImplementation()!;
+    let finish!: (value: unknown) => void;
+    let delayed = true;
+    mocks.request.mockImplementation(async (host, r) => {
+      if (r.method === "send_queued")
+        return { kind: "accepted", duplicate: true };
+      if (
+        r.method === "poll" &&
+        r.after !== Number.MAX_SAFE_INTEGER &&
+        delayed
+      ) {
+        delayed = false;
+        return new Promise((resolve) => {
+          finish = resolve;
         });
       }
-      return original(host, r);
+      return base(host, r);
     });
-    const view = renderHook(useWorkbench);
-    await act(async () => {});
-    await act(async () =>
-      view.result.current.openSession({ ...session(), hostId: "local" }),
-    );
-    expect(view.result.current.composerPrediction?.suggestion).toBe("旧建议");
-    // Another client or the queue completed a new turn between two polls; status stays completed.
-    source = "new-source";
     await act(async () => vi.advanceTimersByTimeAsync(650));
-    expect(view.result.current.composerPrediction).toBeNull();
-    await act(async () => {
-      if (outcome === "error") reject(new Error("unavailable"));
-      else
-        resolve({
-          kind: "composer_prediction",
-          session_id: "s",
-          status: outcome === "pending" ? "pending" : "ready",
-          source_request_id: outcome === "mismatch" ? "source" : source,
-          generation_id: "new-generation",
-          suggestion: outcome === "mismatch" ? "旧建议" : null,
-        });
-    });
+    expect(finish).toBeTypeOf("function");
+    if (action === "navigate")
+      await act(async () => view.result.current.createSession());
+    if (action === "reconnect") {
+      frame.snapshot = { ...ready(), status: "none", suggestion: null };
+      await act(async () =>
+        view.result.current.refreshHost(view.result.current.host),
+      );
+    }
+    if (action === "send")
+      await act(async () => {
+        await view.result.current.send("New turn", null, null, null);
+      });
+    await act(async () =>
+      finish({
+        kind: "events",
+        session: session(),
+        events: [userEvent("B", 30)],
+        has_more: false,
+        composer_prediction: ready("B", 30, "Late suggestion"),
+      }),
+    );
     expect(
       view.result.current.composerPrediction?.suggestion ?? null,
     ).toBeNull();
   },
 );
-it.each(["none", "unsupported", "failed", "error"])(
-  "stops optional prediction reads after %s",
-  async (outcome) => {
-    mocks.connect.mockResolvedValue({
-      kind: "hello",
-      server_id: "server-local",
-      composer_predictions: true,
-      agents: [{ id: "claude", available: true }],
-    });
-    const original = mocks.request.getMockImplementation()!;
+it("does not restore pre-send snapshots on later polls and accepts the new send source", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  const base = mocks.request.getMockImplementation()!;
+  mocks.request.mockImplementation(async (host, r) =>
+    r.method === "send_queued"
+      ? { kind: "accepted", duplicate: true }
+      : base(host, r),
+  );
+  await act(async () => {
+    await view.result.current.send("New turn", null, null, null);
+  });
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion ?? null).toBeNull();
+  const source = mocks.request.mock.calls.find(
+    ([, r]) => r.method === "send_queued",
+  )![1].request_id;
+  frame.events = [userEvent(source, 30)];
+  frame.snapshot = ready(source, 30, "Next turn suggestion");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "Next turn suggestion",
+  );
+});
+it("requires evidence of the new local send before accepting a different newer cached source", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  const base = mocks.request.getMockImplementation()!;
+  mocks.request.mockImplementation(async (host, r) =>
+    r.method === "send_queued"
+      ? { kind: "accepted", duplicate: true }
+      : base(host, r),
+  );
+  await act(async () => {
+    await view.result.current.send("New turn", null, null, null);
+  });
+  frame.events = [];
+  frame.snapshot = ready("B", 30, "Unobserved pre-send source");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion ?? null).toBeNull();
+  const source = mocks.request.mock.calls.find(
+    ([, r]) => r.method === "send_queued",
+  )![1].request_id;
+  frame.events = [userEvent(source, 40)];
+  frame.snapshot = {
+    ...ready(source, 40),
+    status: "pending",
+    suggestion: null,
+  };
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  frame.events = [];
+  frame.snapshot = ready("D", 50, "Later external source");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "Later external source",
+  );
+});
+it.each(["sending", "old-epoch"])(
+  "harvests the current Send User anchor when its main frame arrives during %s, without publishing that frame's snapshot",
+  async (phase) => {
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    const base = mocks.request.getMockImplementation()!;
+    let finishSend!: (value: unknown) => void;
+    let finishFrame!: (value: unknown) => void;
+    let source = "";
+    let delayed = phase === "old-epoch";
     mocks.request.mockImplementation(async (host, r) => {
-      if (r.method === "poll")
-        return {
+      if (r.method === "send_queued") {
+        source = r.request_id;
+        return new Promise((resolve) => {
+          finishSend = resolve;
+        });
+      }
+      if (r.method === "poll" && r.after !== Number.MAX_SAFE_INTEGER) {
+        if (delayed) {
+          delayed = false;
+          return new Promise((resolve) => {
+            finishFrame = resolve;
+          });
+        }
+        if (phase === "sending" && r.after === 10)
+          return {
+            kind: "events",
+            session: session(),
+            events: [userEvent(source, 30)],
+            has_more: false,
+            composer_prediction: ready(source, 30, "Unsafe frame suggestion"),
+          };
+      }
+      return base(host, r);
+    });
+    if (phase === "old-epoch")
+      await act(async () => vi.advanceTimersByTimeAsync(650));
+    let submitted!: Promise<boolean>;
+    await act(async () => {
+      submitted = view.result.current.send("New turn", null, null, null);
+    });
+    if (phase === "sending")
+      await act(async () => vi.advanceTimersByTimeAsync(650));
+    await act(async () => {
+      finishSend({ kind: "accepted", duplicate: true });
+      await submitted;
+    });
+    if (phase === "old-epoch")
+      await act(async () =>
+        finishFrame({
           kind: "events",
           session: session(),
-          events: [
-            {
-              seq: 1,
-              at: 1,
-              session_id: "s",
-              event: { kind: "user", request_id: "source", text: "检查项目" },
-            },
-          ],
+          events: [userEvent(source, 30)],
           has_more: false,
-        };
-      if (r.method === "composer_prediction") {
-        if (outcome === "error") throw new Error("unavailable");
-        return {
-          kind: "composer_prediction",
-          session_id: "s",
-          status: outcome,
-          source_request_id: "source",
-          generation_id: "generation",
-          suggestion: null,
-        };
-      }
-      return original(host, r);
-    });
-    const view = renderHook(useWorkbench);
-    await act(async () => {});
-    await act(async () =>
-      view.result.current.openSession({ ...session(), hostId: "local" }),
+          composer_prediction: ready(source, 30, "Unsafe frame suggestion"),
+        }),
+      );
+    expect(view.result.current.composerPrediction).toBeNull();
+    expect(view.result.current.events.at(-1)?.seq).toBe(30);
+    frame.events = [];
+    frame.snapshot = ready("D", 50, "Later external suggestion");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "Later external suggestion",
     );
-    await act(async () => vi.advanceTimersByTimeAsync(5000));
     expect(
-      mocks.request.mock.calls.filter(
-        ([, r]) => r.method === "composer_prediction",
+      mocks.request.mock.calls.some(
+        ([, r]) => r.method === "poll" && r.after === 30,
       ),
-    ).toHaveLength(1);
+    ).toBe(true);
+    expect(standaloneReads()).toHaveLength(0);
   },
 );
-it("bounds pending reads and pauses them while the composer is hidden", async () => {
-  mocks.connect.mockResolvedValue({
-    kind: "hello",
-    server_id: "server-local",
-    composer_predictions: true,
-    agents: [{ id: "claude", available: true }],
-  });
-  const original = mocks.request.getMockImplementation()!;
-  mocks.request.mockImplementation(async (host, r) => {
-    if (r.method === "poll")
-      return {
-        kind: "events",
-        session: session(),
-        events: [
-          {
-            seq: 1,
-            at: 1,
-            session_id: "s",
-            event: { kind: "user", request_id: "source", text: "检查项目" },
-          },
-        ],
-        has_more: false,
-      };
-    if (r.method === "composer_prediction")
-      return {
-        kind: "composer_prediction",
-        session_id: "s",
-        status: "pending",
-        source_request_id: "source",
-        generation_id: "generation",
-        suggestion: null,
-      };
-    return original(host, r);
-  });
-  const view = renderHook(useWorkbench);
-  await act(async () => {});
-  await act(async () =>
-    view.result.current.openSession({ ...session(), hostId: "local" }),
+it("retains the current Send barrier across a same-server reconnect before its User anchor is observed", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  const base = mocks.request.getMockImplementation()!;
+  mocks.request.mockImplementation(async (host, r) =>
+    r.method === "send_queued"
+      ? { kind: "accepted", duplicate: true }
+      : base(host, r),
   );
-  const reads = () =>
-    mocks.request.mock.calls.filter(
-      ([, r]) => r.method === "composer_prediction",
-    ).length;
-  act(() => view.result.current.setPredictionVisible(false));
-  await act(async () => vi.advanceTimersByTimeAsync(5000));
-  expect(reads()).toBe(1);
-  act(() => view.result.current.setPredictionVisible(true));
-  await act(async () => vi.advanceTimersByTimeAsync(60_000));
-  const bounded = reads();
-  expect(bounded).toBeLessThanOrEqual(55);
-  await act(async () => vi.advanceTimersByTimeAsync(60_000));
-  expect(reads()).toBe(bounded);
+  await act(async () => {
+    await view.result.current.send("New turn", null, null, null);
+  });
+  frame.events = [];
+  frame.snapshot = ready("A", 10, "Pre-send cache");
+  await act(async () =>
+    view.result.current.refreshHost(view.result.current.host),
+  );
+  expect(view.result.current.composerPrediction?.suggestion ?? null).toBeNull();
+  const source = mocks.request.mock.calls.find(
+    ([, r]) => r.method === "send_queued",
+  )![1].request_id;
+  frame.snapshot = ready(source, 30, "Current Send suggestion");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "Current Send suggestion",
+  );
 });
-it("discards a late prediction after navigating to a new task", async () => {
+it.each(["cancel", "take"])(
+  "restores later predictions after authoritative queued Send %s without a User event",
+  async (action) => {
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    const base = mocks.request.getMockImplementation()!;
+    let source = "";
+    let pending = true;
+    const entry = () => ({
+      request_id: source,
+      text: "Queued instruction",
+      model: null,
+      effort: null,
+      permission_mode: null,
+      revision: 0,
+      created_at: 1,
+    });
+    mocks.request.mockImplementation(async (host, r) => {
+      if (r.method === "send_queued") {
+        source = r.request_id;
+        return { kind: "message_queued", duplicate: false };
+      }
+      if (r.method === "message_queue")
+        return {
+          kind: "message_queue",
+          entries: pending ? [entry()] : [],
+          paused: false,
+          reason: null,
+        };
+      if (r.method === "cancel_queued_message") {
+        pending = false;
+        return {
+          kind: "message_queue",
+          entries: [],
+          paused: false,
+          reason: null,
+        };
+      }
+      if (r.method === "take_queued_message") {
+        pending = false;
+        return { kind: "queued_message_taken", entry: entry() };
+      }
+      return base(host, r);
+    });
+    await act(async () => {
+      await view.result.current.send("Queued instruction", null, null, null);
+    });
+    renderWithStatus(
+      <MessageQueue
+        hostId="local"
+        sessionId="s"
+        connected
+        active
+        running
+        revision="0"
+        onEdit={vi.fn()}
+        captureQueuedPredictionRetirement={
+          view.result.current.captureQueuedPredictionRetirement
+        }
+      />,
+    );
+    await act(async () => {});
+    if (action === "cancel")
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: "删除排队消息：Queued instruction",
+        }),
+      );
+    else {
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: "排队消息更多操作：Queued instruction",
+        }),
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "编辑消息" }));
+    }
+    await act(async () => {});
+    frame.events = [];
+    frame.snapshot = ready("D", 50, "Later external suggestion");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "Later external suggestion",
+    );
+    expect(standaloneReads()).toHaveLength(0);
+  },
+);
+it("does not let a captured queue retirement clear a newer Send with the same request ID", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  vi.spyOn(crypto, "randomUUID").mockReturnValue(
+    "00000000-0000-4000-8000-000000000000",
+  );
+  const base = mocks.request.getMockImplementation()!;
+  mocks.request.mockImplementation(async (host, r) =>
+    r.method === "send_queued"
+      ? { kind: "message_queued", duplicate: true }
+      : base(host, r),
+  );
+  await act(async () => {
+    await view.result.current.send("Queued instruction", null, null, null);
+  });
+  const retireOld = view.result.current.captureQueuedPredictionRetirement(
+    "00000000-0000-4000-8000-000000000000",
+  );
+  await act(async () => {
+    await view.result.current.send("Queued instruction", null, null, null);
+  });
+  act(() => retireOld());
+  frame.events = [];
+  frame.snapshot = ready("D", 50, "Unconfirmed newer Send");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion ?? null).toBeNull();
+});
+it("keeps an observed Send source frontier after a late queue retirement", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  const base = mocks.request.getMockImplementation()!;
+  let source = "";
+  mocks.request.mockImplementation(async (host, r) => {
+    if (r.method === "send_queued") {
+      source = r.request_id;
+      return { kind: "message_queued", duplicate: false };
+    }
+    return base(host, r);
+  });
+  await act(async () => {
+    await view.result.current.send("Queued instruction", null, null, null);
+  });
+  const retire = view.result.current.captureQueuedPredictionRetirement(source);
+  frame.events = [userEvent(source, 40)];
+  frame.snapshot = ready(source, 40, "Observed source");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  act(() => retire());
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "Observed source",
+  );
+  frame.events = [];
+  frame.snapshot = ready("A", 10, "Older source");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "Observed source",
+  );
+});
+it("does not let an old-server queue retirement clear a new-server Send barrier", async () => {
+  const frame = predictionFixture();
+  const view = await openPredictionFixture();
+  vi.spyOn(crypto, "randomUUID").mockReturnValue(
+    "00000000-0000-4000-8000-000000000000",
+  );
+  const base = mocks.request.getMockImplementation()!;
+  mocks.request.mockImplementation(async (host, r) =>
+    r.method === "send_queued"
+      ? { kind: "message_queued", duplicate: true }
+      : base(host, r),
+  );
+  await act(async () => {
+    await view.result.current.send("Queued instruction", null, null, null);
+  });
+  const retireOld = view.result.current.captureQueuedPredictionRetirement(
+    "00000000-0000-4000-8000-000000000000",
+  );
   mocks.connect.mockResolvedValue({
     kind: "hello",
-    server_id: "server-local",
-    composer_predictions: true,
+    server_id: "new-server",
     agents: [{ id: "claude", available: true }],
   });
-  const original = mocks.request.getMockImplementation()!;
-  let resolve!: (value: unknown) => void;
+  await act(async () =>
+    view.result.current.refreshHost(view.result.current.host),
+  );
+  await act(async () => {
+    await view.result.current.send("Queued instruction", null, null, null);
+  });
+  act(() => retireOld());
+  frame.events = [];
+  frame.snapshot = ready("D", 50, "Unconfirmed new-server source");
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion ?? null).toBeNull();
+});
+it.each(["sending", "old-epoch"])(
+  "rejects an older C40 cache after a same-connection %s frame contains current Send C40 and later User D50",
+  async (phase) => {
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    const base = mocks.request.getMockImplementation()!;
+    let source = "";
+    let finishSend!: (value: unknown) => void;
+    let finishFrame!: (value: unknown) => void;
+    let hold = phase === "old-epoch";
+    mocks.request.mockImplementation(async (host, r) => {
+      if (r.method === "send_queued") {
+        source = r.request_id;
+        return new Promise((resolve) => {
+          finishSend = resolve;
+        });
+      }
+      if (r.method === "poll" && r.after !== Number.MAX_SAFE_INTEGER) {
+        if (hold) {
+          hold = false;
+          return new Promise((resolve) => {
+            finishFrame = resolve;
+          });
+        }
+        if (phase === "sending" && r.after === 10)
+          return {
+            kind: "events",
+            session: session(),
+            events: [userEvent(source, 40), userEvent("D", 50)],
+            has_more: false,
+            composer_prediction: ready(source, 40, "Older C40 cache"),
+          };
+      }
+      return base(host, r);
+    });
+    if (phase === "old-epoch")
+      await act(async () => vi.advanceTimersByTimeAsync(650));
+    let submitted!: Promise<boolean>;
+    await act(async () => {
+      submitted = view.result.current.send("New turn", null, null, null);
+    });
+    if (phase === "sending")
+      await act(async () => vi.advanceTimersByTimeAsync(650));
+    await act(async () => {
+      finishSend({ kind: "accepted", duplicate: true });
+      await submitted;
+    });
+    if (phase === "old-epoch")
+      await act(async () =>
+        finishFrame({
+          kind: "events",
+          session: session(),
+          events: [userEvent(source, 40), userEvent("D", 50)],
+          has_more: false,
+          composer_prediction: ready(source, 40, "Older C40 cache"),
+        }),
+      );
+    frame.events = [];
+    frame.snapshot = ready(source, 40, "Older C40 cache");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(
+      view.result.current.composerPrediction?.suggestion ?? null,
+    ).toBeNull();
+    frame.snapshot = ready("D", 50, "Current D50 cache");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "Current D50 cache",
+    );
+  },
+);
+it("harvests only the matching Send User anchor from an automatic earlier history page", async () => {
+  predictionFixture(true);
+  const base = mocks.request.getMockImplementation()!;
+  let source = "";
+  let finishWindow!: (value: unknown) => void;
   mocks.request.mockImplementation(async (host, r) => {
+    if (r.method === "send_queued") {
+      source = r.request_id;
+      return { kind: "accepted", duplicate: true };
+    }
+    if (r.method === "history" && r.before === null)
+      return new Promise((resolve) => {
+        finishWindow = resolve;
+      });
+    if (r.method === "history")
+      return {
+        kind: "history",
+        session: session(),
+        events: [
+          userEvent(source, 40),
+          userEvent("Unrelated earlier-page source", 200),
+        ],
+        has_more: true,
+        needs_earlier: false,
+        before: 20,
+        composer_prediction: ready(
+          "Unrelated earlier-page source",
+          200,
+          "Never publish the page snapshot",
+        ),
+      };
     if (r.method === "poll")
       return {
         kind: "events",
         session: session(),
-        events: [
-          {
-            seq: 1,
-            at: 1,
-            session_id: "s",
-            event: { kind: "user", request_id: "source", text: "检查项目" },
-          },
-        ],
+        events: [],
         has_more: false,
+        composer_prediction: ready("D", 50, "Later live source"),
       };
-    if (r.method === "composer_prediction")
-      return new Promise((done) => {
-        resolve = done;
-      });
-    return original(host, r);
+    return base(host, r);
   });
-  const view = renderHook(useWorkbench);
-  await act(async () => {});
+  const view = await openPredictionFixture();
+  await act(async () => {
+    await view.result.current.send("New turn", null, null, null);
+  });
   await act(async () =>
-    view.result.current.openSession({ ...session(), hostId: "local" }),
-  );
-  act(() => view.result.current.setSessionId(""));
-  await act(async () =>
-    resolve({
-      kind: "composer_prediction",
-      session_id: "s",
-      status: "ready",
-      source_request_id: "source",
-      generation_id: "generation",
-      suggestion: "旧建议",
+    finishWindow({
+      kind: "history",
+      session: session(),
+      events: [
+        {
+          seq: 300,
+          at: 1,
+          session_id: "s",
+          event: { kind: "text", text: "Most recent reply without User C" },
+        },
+      ],
+      has_more: true,
+      needs_earlier: true,
+      before: 250,
+      composer_prediction: ready(source, 40, "Old window snapshot"),
     }),
   );
   expect(view.result.current.composerPrediction).toBeNull();
-});
-it("does not query predictions on a legacy host", async () => {
-  const view = renderHook(useWorkbench);
-  await act(async () => {});
-  await act(async () =>
-    view.result.current.openSession({ ...session(), hostId: "local" }),
+  await act(async () => vi.advanceTimersByTimeAsync(0));
+  expect(view.result.current.historyLoading).toBe(false);
+  expect(view.result.current.composerPrediction).toBeNull();
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "Later live source",
   );
+  expect(standaloneReads()).toHaveLength(0);
+});
+it.each(["invisible", "settings", "skills", "hidden", "sending"])(
+  "retains a live external User frontier across %s publication gating and a tail without that User",
+  async (gate) => {
+    const frame = predictionFixture();
+    const view = await openPredictionFixture();
+    let finishSend!: (value: unknown) => void;
+    let submitted!: Promise<boolean>;
+    if (gate === "sending") {
+      const base = mocks.request.getMockImplementation()!;
+      mocks.request.mockImplementation(async (host, r) =>
+        r.method === "send_queued"
+          ? new Promise((resolve) => {
+              finishSend = resolve;
+            })
+          : base(host, r),
+      );
+      await act(async () => {
+        submitted = view.result.current.send(
+          "Queued instruction",
+          null,
+          null,
+          null,
+        );
+      });
+    }
+    if (gate === "invisible")
+      act(() => view.result.current.setPredictionVisible(false));
+    if (gate === "settings" || gate === "skills")
+      act(() => view.result.current.setModal(gate));
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    if (gate === "hidden") visibility.mockReturnValue("hidden");
+    // Native handoff/another client supplies a newer durable User while cache is still A10.
+    frame.events = [userEvent("B", 30)];
+    frame.snapshot = ready("A", 10, "Old main source");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(
+      view.result.current.composerPrediction?.suggestion ?? null,
+    ).toBeNull();
+    frame.events = [];
+    if (gate === "sending") {
+      await act(async () => {
+        finishSend({ kind: "message_queued", duplicate: false });
+        await submitted;
+      });
+      const requestId = mocks.request.mock.calls.find(
+        ([, r]) => r.method === "send_queued",
+      )![1].request_id;
+      // Model the already separately tested authoritative Cancel/Take callback.
+      act(() =>
+        view.result.current.captureQueuedPredictionRetirement(requestId)(),
+      );
+    }
+    act(() => {
+      view.result.current.setPredictionVisible(true);
+      view.result.current.setModal(null);
+    });
+    visibility.mockReturnValue("visible");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(
+      view.result.current.composerPrediction?.suggestion ?? null,
+    ).toBeNull();
+    frame.snapshot = ready("B", 30, "Current external source");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(view.result.current.composerPrediction?.suggestion).toBe(
+      "Current external source",
+    );
+    expect(
+      mocks.request.mock.calls.some(
+        ([, r]) => r.method === "poll" && r.after === 30,
+      ),
+    ).toBe(true);
+  },
+);
+it("does not query predictions on a legacy host", async () => {
+  const view = await openPredictionFixture();
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(standaloneReads()).toHaveLength(0);
+  expect(view.result.current.composerPrediction).toBeNull();
+});
+it("consumes only the initial live history snapshot while assembling earlier final-reply pages", async () => {
+  predictionFixture(true);
+  const base = mocks.request.getMockImplementation()!;
+  mocks.request.mockImplementation(async (host, r) => {
+    if (r.method !== "history") return base(host, r);
+    return {
+      kind: "history",
+      session: session(),
+      events: r.before === null ? [userEvent("B", 30)] : [userEvent("A", 10)],
+      has_more: true,
+      needs_earlier: r.before === null,
+      before: r.before === null ? 20 : 5,
+      composer_prediction:
+        r.before === null
+          ? ready("B", 30, "Live suggestion")
+          : ready("A", 10, "Page suggestion"),
+    };
+  });
+  const view = await openPredictionFixture();
+  await act(async () => vi.advanceTimersByTimeAsync(0));
+  expect(view.result.current.historyLoading).toBe(false);
+  expect(view.result.current.events.map((event) => event.seq)).toEqual([
+    10, 30,
+  ]);
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "Live suggestion",
+  );
+});
+it("captures the Send epoch before an initial History request starts", async () => {
+  predictionFixture(true);
+  const base = mocks.request.getMockImplementation()!;
+  let finish!: (value: unknown) => void;
+  mocks.request.mockImplementation(async (host, r) => {
+    if (r.method === "history")
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    if (r.method === "send_queued")
+      return { kind: "accepted", duplicate: true };
+    return base(host, r);
+  });
+  const view = await openPredictionFixture();
+  await act(async () => {
+    await view.result.current.send("new input", null, null, null);
+  });
+  await act(async () =>
+    finish({
+      kind: "history",
+      session: session(),
+      events: [],
+      has_more: false,
+      needs_earlier: false,
+      before: null,
+      composer_prediction: ready("A", 10, "Pre-send snapshot"),
+    }),
+  );
+  expect(view.result.current.historyLoading).toBe(false);
+  expect(view.result.current.composerPrediction).toBeNull();
+});
+it("allows a new connection's source frontier to restart without restoring an old frame", async () => {
+  const frame = predictionFixture();
+  frame.snapshot = ready("B", 30);
+  frame.events = [userEvent("B", 30)];
+  const view = await openPredictionFixture();
+  frame.snapshot = ready("A", 10, "New connection snapshot");
+  frame.events = [];
+  await act(async () =>
+    view.result.current.refreshHost(view.result.current.host),
+  );
+  expect(view.result.current.composerPrediction?.suggestion).toBe(
+    "New connection snapshot",
+  );
+});
+it("retains real main transport disconnect handling without replaying a prompt", async () => {
+  predictionFixture();
+  const view = await openPredictionFixture();
+  const base = mocks.request.getMockImplementation()!;
+  let fail = true;
+  mocks.request.mockImplementation(async (host, r) => {
+    if (r.method === "poll" && fail) {
+      fail = false;
+      const failure = new HostConnectionError(host, "Main transport failed");
+      window.dispatchEvent(
+        new CustomEvent(HOST_DISCONNECTED_EVENT, { detail: failure }),
+      );
+      throw failure;
+    }
+    return base(host, r);
+  });
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.connected).toBe(false);
+  expect(view.result.current.composerPrediction).toBeNull();
+  expect(view.result.current.error).toContain("Main transport failed");
+  await act(async () => vi.advanceTimersByTimeAsync(5000));
+  expect(view.result.current.connected).toBe(true);
+  expect(standaloneReads()).toHaveLength(0);
+  expect(
+    mocks.request.mock.calls.some(([, r]) => r.method === "send_queued"),
+  ).toBe(false);
+});
+it("keeps ordinary main poll errors retryable instead of treating them as optional cache failures", async () => {
+  predictionFixture();
+  const view = await openPredictionFixture();
+  const base = mocks.request.getMockImplementation()!;
+  let fail = true;
+  mocks.request.mockImplementation(async (host, r) => {
+    if (r.method === "poll" && fail) {
+      fail = false;
+      throw new Error("Main read unavailable");
+    }
+    return base(host, r);
+  });
+  await act(async () => vi.advanceTimersByTimeAsync(650));
+  expect(view.result.current.connected).toBe(true);
+  expect(view.result.current.error).toContain("Main read unavailable");
+  const reads = mocks.request.mock.calls.filter(
+    ([, r]) => r.method === "poll",
+  ).length;
   await act(async () => vi.advanceTimersByTimeAsync(5000));
   expect(
-    mocks.request.mock.calls.some(
-      ([, r]) => r.method === "composer_prediction",
-    ),
-  ).toBe(false);
-  expect(view.result.current.composerPrediction).toBeNull();
+    mocks.request.mock.calls.filter(([, r]) => r.method === "poll").length,
+  ).toBeGreaterThan(reads);
+  expect(standaloneReads()).toHaveLength(0);
 });
 const acknowledgements = () =>
   mocks.request.mock.calls.filter(

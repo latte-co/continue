@@ -1953,6 +1953,7 @@ impl Store {
         Ok(false)
     }
     /// Returns false for an exact already-accepted request; conflicting reuse fails.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn begin(
         &mut self,
@@ -1964,6 +1965,30 @@ impl Store {
         provider_fingerprint: Option<&str>,
         permission_mode: Option<&str>,
     ) -> Result<bool> {
+        Ok(self
+            .begin_with_source(
+                id,
+                request_id,
+                text,
+                model,
+                effort,
+                provider_fingerprint,
+                permission_mode,
+            )?
+            .is_some())
+    }
+    /// Capture the source User row at durable admission, without scanning history.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_with_source(
+        &mut self,
+        id: &str,
+        request_id: &str,
+        text: &str,
+        model: Option<&str>,
+        effort: Option<Effort>,
+        provider_fingerprint: Option<&str>,
+        permission_mode: Option<&str>,
+    ) -> Result<Option<f64>> {
         if self.already_accepted(
             id,
             request_id,
@@ -1973,7 +1998,7 @@ impl Store {
             provider_fingerprint,
             permission_mode,
         )? {
-            return Ok(false);
+            return Ok(None);
         }
         let mut session = self.session(id)?;
         if session.status.active() {
@@ -2012,6 +2037,7 @@ impl Store {
             "UPDATE sessions SET data=?2 WHERE id=?1",
             params![id, serde_json::to_string(&session)?],
         )?;
+        let mut source_user_seq = None;
         for event in [
             EventKind::User {
                 text: text.into(),
@@ -2026,6 +2052,9 @@ impl Store {
                 "INSERT INTO events(session_id,at,data) VALUES (?1,?2,?3)",
                 params![id, now(), serde_json::to_string(&event)?],
             )?;
+            if matches!(event, EventKind::User { .. }) {
+                source_user_seq = Some(tx.last_insert_rowid() as f64);
+            }
             index_event(&tx, id, &event)?;
         }
         if is_side_chat && permission_mode.is_some() {
@@ -2038,7 +2067,7 @@ impl Store {
         }
         tx.execute("UPDATE message_queue SET status='dispatched' WHERE request_id=?1 AND session_id=?2 AND status IN ('pending','forwarded')", params![request_id,id])?;
         tx.commit()?;
-        Ok(true)
+        Ok(source_user_seq)
     }
     fn presentation_event(&self, id: &str, data: &str) -> Result<EventKind> {
         let event: EventKind = serde_json::from_str(data)?;
@@ -2455,6 +2484,37 @@ fn index_source(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admission_returns_source_user_sequence_without_replaying_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = super::Store::open(&directory.path().join("state.sqlite")).unwrap();
+        let project = store.add_project(directory.path()).unwrap();
+        let session = store.create_session(project.id, "codex".into()).unwrap();
+        let seq = store
+            .begin_with_source(&session.id, "source", "hello", None, None, None, None)
+            .unwrap()
+            .unwrap();
+        let (events, _) = store.events(&session.id, 0.0).unwrap();
+        let user = events.iter().find(|event| matches!(&event.event, super::EventKind::User { request_id, .. } if request_id == "source")).unwrap();
+        assert_eq!(seq, user.seq);
+        assert!(events.iter().any(|event| event.seq > seq));
+        assert!(
+            store
+                .begin_with_source(&session.id, "source", "hello", None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.events(&session.id, 0.0).unwrap().0.len(),
+            events.len()
+        );
+        assert!(
+            store
+                .begin_with_source(&session.id, "source", "different", None, None, None, None)
+                .is_err()
+        );
+    }
+
     #[test]
     fn side_chat_relationship_survives_restart_and_an_interrupted_turn_stays_unknown() {
         let directory = tempfile::tempdir().unwrap();

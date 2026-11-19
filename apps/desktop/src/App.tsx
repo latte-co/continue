@@ -352,6 +352,9 @@ export default function App() {
           </header>
           <Conversation
             composerPrediction={workbench.composerPrediction}
+            captureQueuedPredictionRetirement={
+              workbench.captureQueuedPredictionRetirement
+            }
             openSubagents={showSubagents}
             openSideChat={canOpenSide ? showSide : undefined}
             quoteInSideChat={

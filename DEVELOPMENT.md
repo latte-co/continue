@@ -1196,24 +1196,41 @@ queries results and never launches an Agent. New tasks with no conversation,
 legacy hosts and unsupported adapters retain their existing placeholder and
 welcome suggestions.
 
-The additive Hello capability `composer_predictions` defaults to false.
-`composer_prediction` takes a `session_id` and returns a read-only result with
-`status` (`pending`, `ready`, `none`, `unsupported` or `failed`),
-`source_request_id`, `generation_id` and nullable `suggestion`. The source is the
-completed main request, not a UI-selected model or arbitrary client transcript.
-Querying does not trigger inference. Results are bounded in-memory state, not
-user events or persisted draft contents; reconnect and daemon restart do not
+History and Events carry an optional memory-only `composer_prediction` snapshot
+with `status` (`pending`, `ready`, `none`, `unsupported` or `failed`),
+`source_request_id`, `source_user_seq`, `generation_id` and nullable `suggestion`.
+The source is the completed main request and its durable User event sequence,
+not a UI-selected model or arbitrary client transcript. The sequence is captured
+at admission, so truncated history need not contain that User event. The desktop
+uses a monotonic source frontier and request-start epoch to reject stale snapshots;
+loading earlier history cannot replace the live snapshot. A provisional local Send
+barrier survives reconnects to the same durable server identity. Valid live User
+facts advance the frontier independently of the Send epoch and display gates;
+only prediction publication is rejected for an old Send epoch. Earlier history
+pages may reconcile a matching Send User without replacing the live frontier or
+snapshot. Old connection/session/server frames remain excluded.
+Confirmed cancellation or take of the matching queued request retires only its
+provisional barrier, never an observed source frontier or a later Send.
+
+The desktop sends no separate prediction request, including to older hosts whose
+Hello capability is true. Missing snapshots retain the default composer. Cache
+projection is nonblocking: contention or unavailable optional state omits the
+field without failing ordinary reads. Real transport failures retain the existing
+broken-connection behavior. The legacy read-only `composer_prediction` request
+remains compatible but never schedules inference. Results are bounded in-memory
+state, not user events or persisted drafts; reconnect and daemon restart do not
 replay generation. A new turn invalidates the previous result.
 
 Each enabled adapter must provide isolated, zero-tool inference with the source
 turn's effective model and Provider. An explicitly selected effort is forwarded;
 when effort was not selected, the isolated request uses the CLI default without
-claiming to capture an unreported native effort setting. Codex reuses the supervised ephemeral
-structured-request path used for titles; Claude uses a separate non-resuming,
-non-persistent text request when an App Provider snapshot is available. Native
-Claude CLI-backed sessions retain the default prompt because the current control
-protocol cannot reliably pin their effective Provider endpoint. Traex and
-OpenCode currently report unsupported; a future adapter must verify its installed
+claiming to capture an unreported native effort setting. Codex reuses the supervised
+ephemeral structured-request path used for titles. All Claude modes, including
+App Provider snapshots, retain the default prompt: `--safe-mode` and user-level
+`disableAllHooks` cannot disable managed Hooks, so zero tools alone does not prove
+isolation. No Claude prediction helper is probed or started; normal task/title/
+side-chat behavior and managed policy remain unchanged. Traex and OpenCode also
+report unsupported; a future adapter must verify its installed
 CLI's safe one-shot capability before enabling predictions. Do not create a
 persistent auxiliary conversation or fall back to the main Agent loop merely to
 supply a prediction. Missing isolation or changed native Provider identity fails
@@ -1274,8 +1291,13 @@ naming instead of forwarding the transcript to the changed service.
 It disables legacy `notify`, inherited stable environment/sleep tools,
 environment access, built-in/extension tools, skills, hooks and every effective
 MCP server, and verifies read-only or preserved custom permissions before sending.
-The host permits two concurrent jobs, with a 30-second deadline, 256-KiB frames,
-1-MiB total output, 4,096 messages and an 8-KiB structured reply limit. Its process
+Titles and predictions share at most two executing jobs. Predictions only try to
+acquire execution capacity and never queue. Titles have a FIFO wait bounded to
+150 seconds and a capacity of eight jobs total, including waiting, executing and
+cleanup; an already-waiting title precedes later prediction acquisitions. Queue
+overflow or timeout explicitly fails the once-only attempt rather than retrying.
+Execution retains a 30-second deadline, 256-KiB frames, 1-MiB total output,
+4,096 messages and an 8-KiB structured reply limit. Its process
 group is reaped on completion/failure; closing or replacing the owning session,
 or confirming a manual native name, cancels it and releases its concurrency permit.
 Generated titles remain Work metadata. This adds an optional model

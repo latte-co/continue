@@ -1608,7 +1608,11 @@ impl Process {
                             snapshot,
                         );
                     } else {
-                        crate::predictions::unsupported(id, &context.request_id);
+                        crate::predictions::unsupported(
+                            id,
+                            &context.request_id,
+                            context.source_user_seq,
+                        );
                     }
                 }
             }
@@ -1850,8 +1854,8 @@ async fn accept_turn(
         }
         closed?;
     }
-    db(database, |s| {
-        s.begin(
+    let Some(source_user_seq) = db(database, |s| {
+        s.begin_with_source(
             &session.id,
             &turn.request_id,
             &turn.text,
@@ -1860,7 +1864,10 @@ async fn accept_turn(
             turn.fingerprint.as_deref(),
             config.permission_mode.as_deref(),
         )
-    })?;
+    })?
+    else {
+        return Ok(false);
+    };
     crate::predictions::invalidate(&session.id);
     if let Some(p) = process.as_mut() {
         p.cancel_prediction().await;
@@ -1919,6 +1926,7 @@ async fn accept_turn(
         {
             p.prediction_turn = crate::predictions::TurnContext::try_new(
                 &turn.request_id,
+                source_user_seq,
                 &p.config.redact(&turn.text),
                 p.config.redactor(),
             );

@@ -1,6 +1,8 @@
 //! Memory-only composer predictions. Queries never schedule work.
 use anyhow::{Context, Result, bail};
-use latte_work_protocol::{ComposerPredictionStatus as Status, EventKind, Response, Session};
+use latte_work_protocol::{
+    ComposerPredictionSnapshot, ComposerPredictionStatus as Status, EventKind, Response, Session,
+};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -84,6 +86,7 @@ fn visible_prompt(prompt: &str) -> &str {
 }
 pub(crate) struct TurnContext {
     pub(crate) request_id: String,
+    pub(crate) source_user_seq: Option<f64>,
     prompt: String,
     reply: String,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -94,6 +97,7 @@ impl TurnContext {
     pub(crate) fn new(request_id: &str, prompt: &str) -> Self {
         Self {
             request_id: request_id.into(),
+            source_user_seq: None,
             prompt: bounded(visible_prompt(prompt), PROMPT_BYTES, false),
             reply: String::new(),
             _permit: None,
@@ -103,6 +107,7 @@ impl TurnContext {
     }
     pub(crate) fn try_new(
         request_id: &str,
+        source_user_seq: f64,
         prompt: &str,
         redactor: crate::redaction::Redactor,
     ) -> Option<Self> {
@@ -114,6 +119,7 @@ impl TurnContext {
             .ok()?;
         let mut context = Self::new(request_id, prompt);
         context._permit = Some(permit);
+        context.source_user_seq = Some(source_user_seq);
         context.redactor = redactor;
         Some(context)
     }
@@ -165,6 +171,7 @@ impl TurnContext {
 }
 struct Entry {
     source: String,
+    source_user_seq: Option<f64>,
     generation: String,
     status: Status,
     suggestion: Option<String>,
@@ -176,8 +183,12 @@ struct Cache {
     order: u64,
 }
 impl Cache {
-    fn begin(&mut self, session: &str, source: &str) -> String {
-        if let Some(entry) = self.entries.get(session).filter(|e| e.source == source) {
+    fn begin(&mut self, session: &str, source: &str, source_user_seq: Option<f64>) -> String {
+        if let Some(entry) = self
+            .entries
+            .get(session)
+            .filter(|e| e.source == source && e.source_user_seq == source_user_seq)
+        {
             return entry.generation.clone();
         }
         if self.entries.len() >= MAX_ENTRIES
@@ -196,6 +207,7 @@ impl Cache {
             session.into(),
             Entry {
                 source: source.into(),
+                source_user_seq,
                 generation: generation.clone(),
                 status: Status::Pending,
                 suggestion: None,
@@ -223,6 +235,28 @@ impl Cache {
     fn invalidate(&mut self, session: &str) {
         self.entries.remove(session);
     }
+    fn snapshot(&self, session: &Session, is_side: bool) -> ComposerPredictionSnapshot {
+        let supported = session.agent == "codex" && !is_side;
+        let entry = self.entries.get(&session.id).filter(|_| {
+            supported
+                && !session.archived
+                && session.status == latte_work_protocol::Status::Completed
+        });
+        ComposerPredictionSnapshot {
+            status: entry.map_or(
+                if supported {
+                    Status::None
+                } else {
+                    Status::Unsupported
+                },
+                |e| e.status.clone(),
+            ),
+            source_request_id: entry.map(|e| e.source.clone()),
+            source_user_seq: entry.and_then(|e| e.source_user_seq),
+            generation_id: entry.map(|e| e.generation.clone()),
+            suggestion: entry.and_then(|e| e.suggestion.clone()),
+        }
+    }
 }
 fn cache() -> &'static Mutex<Cache> {
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
@@ -233,32 +267,32 @@ pub(crate) fn invalidate(session: &str) {
         cache.invalidate(session);
     }
 }
+fn project(
+    cache: &Mutex<Cache>,
+    session: &Session,
+    is_side: bool,
+) -> Option<ComposerPredictionSnapshot> {
+    Some(cache.try_lock().ok()?.snapshot(session, is_side))
+}
+pub(crate) fn snapshot(session: &Session, is_side: bool) -> Option<ComposerPredictionSnapshot> {
+    project(cache(), session, is_side)
+}
 pub(crate) fn query(session: &Session, is_side: bool) -> Result<Response> {
-    let supported = matches!(session.agent.as_str(), "codex" | "claude") && !is_side;
-    let cache = cache()
+    let snapshot = cache()
         .lock()
-        .map_err(|_| anyhow::anyhow!("建议状态不可用"))?;
-    let entry = cache.entries.get(&session.id).filter(|_| {
-        supported && !session.archived && session.status == latte_work_protocol::Status::Completed
-    });
+        .map_err(|_| anyhow::anyhow!("建议状态不可用"))?
+        .snapshot(session, is_side);
     Ok(Response::ComposerPrediction {
         session_id: session.id.clone(),
-        status: entry.map_or(
-            if supported {
-                Status::None
-            } else {
-                Status::Unsupported
-            },
-            |e| e.status.clone(),
-        ),
-        source_request_id: entry.map(|e| e.source.clone()),
-        generation_id: entry.map(|e| e.generation.clone()),
-        suggestion: entry.and_then(|e| e.suggestion.clone()),
+        status: snapshot.status,
+        source_request_id: snapshot.source_request_id,
+        generation_id: snapshot.generation_id,
+        suggestion: snapshot.suggestion,
     })
 }
-pub(crate) fn unsupported(session: &str, source: &str) {
+pub(crate) fn unsupported(session: &str, source: &str, source_user_seq: Option<f64>) {
     if let Ok(mut cache) = cache().lock() {
-        let generation = cache.begin(session, source);
+        let generation = cache.begin(session, source, source_user_seq);
         cache.finish(session, &generation, Err(Unsupported.into()));
     }
 }
@@ -274,7 +308,15 @@ pub(crate) fn schedule(
     context: TurnContext,
     snapshot: Snapshot,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let generation = cache().lock().ok()?.begin(session, &context.request_id);
+    if agent != "codex" {
+        unsupported(session, &context.request_id, context.source_user_seq);
+        return None;
+    }
+    let generation =
+        cache()
+            .lock()
+            .ok()?
+            .begin(session, &context.request_id, context.source_user_seq);
     let session = session.to_owned();
     let agent = agent.to_owned();
     Some(tokio::spawn(async move {
@@ -290,16 +332,7 @@ pub(crate) fn schedule(
                     )
                     .await
                 }
-                "claude" => {
-                    crate::agents::claude::predict(
-                        &binary,
-                        &path,
-                        &snapshot.config,
-                        &context.description(),
-                    )
-                    .await
-                }
-                _ => Err(anyhow::anyhow!("unsupported")),
+                _ => Err(Unsupported.into()),
             }
         })
         .await
@@ -322,6 +355,28 @@ pub(crate) fn schedule(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn optional_projection_never_waits_for_unavailable_cache() {
+        let session: Session = serde_json::from_value(json!({"id":"s","project_id":"p","title":"task","agent":"codex","native_id":null,"status":"completed","created_at":1})).unwrap();
+        let cache = Mutex::new(Cache::default());
+        let guard = cache.lock().unwrap();
+        assert!(project(&cache, &session, false).is_none());
+        drop(guard);
+        assert_eq!(
+            project(&cache, &session, false).unwrap().status,
+            Status::None
+        );
+        assert_eq!(
+            project(&cache, &session, true).unwrap().status,
+            Status::Unsupported
+        );
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = cache.lock().unwrap();
+            panic!("synthetic cache poison");
+        });
+        assert!(project(&cache, &session, false).is_none());
+    }
 
     #[test]
     fn output_is_strict_short_plain_user_text_or_null() {
@@ -383,9 +438,9 @@ mod tests {
     #[test]
     fn cache_is_bounded_deduplicated_and_late_generation_cannot_replace_new_turn() {
         let mut cache = Cache::default();
-        let old = cache.begin("s", "first");
-        assert_eq!(cache.begin("s", "first"), old);
-        let fresh = cache.begin("s", "second");
+        let old = cache.begin("s", "first", Some(10.0));
+        assert_eq!(cache.begin("s", "first", Some(10.0)), old);
+        let fresh = cache.begin("s", "second", Some(30.0));
         cache.finish("s", &old, Ok(Some("stale".into())));
         assert_eq!(cache.entries["s"].generation, fresh);
         assert_eq!(
@@ -401,7 +456,7 @@ mod tests {
         cache.finish("s", &fresh, Ok(Some("late".into())));
         assert!(!cache.entries.contains_key("s"));
         for n in 0..MAX_ENTRIES + 10 {
-            cache.begin(&format!("s-{n}"), "request");
+            cache.begin(&format!("s-{n}"), "request", Some(n as f64));
         }
         assert_eq!(cache.entries.len(), MAX_ENTRIES);
     }

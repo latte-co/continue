@@ -68,6 +68,7 @@ vi.mock("./ModelPicker", async () => {
 vi.mock("./PermissionPicker", () => ({ PermissionPicker: () => null }));
 vi.mock("./TaskProjectPicker", () => ({ TaskProjectPicker: () => null }));
 beforeEach(() => {
+  mocks.request.mockClear();
   HTMLElement.prototype.scrollTo = vi.fn();
   HTMLElement.prototype.scrollIntoView = vi.fn();
   mocks.request.mockImplementation(async (_, request) =>
@@ -83,6 +84,62 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
+it.each(["cancel", "take"])(
+  "passes authoritative queued %s retirement through Conversation without sending",
+  async (action) => {
+    const p = props();
+    const retire = vi.fn();
+    const capture = vi.fn(() => retire);
+    const entry = {
+      request_id: "queued",
+      text: "Queued instruction",
+      model: null,
+      effort: null,
+      permission_mode: null,
+      revision: 0,
+      created_at: 1,
+    };
+    let pending = true;
+    mocks.request.mockImplementation(async (_, command) => {
+      if (command.method === "take_queued_message") {
+        pending = false;
+        return { kind: "queued_message_taken", entry };
+      }
+      if (command.method === "cancel_queued_message") pending = false;
+      return {
+        kind: "message_queue",
+        entries: pending ? [entry] : [],
+        paused: false,
+        reason: null,
+      };
+    });
+    render(
+      <Conversation
+        {...p}
+        session={session("s")}
+        captureQueuedPredictionRetirement={capture}
+      />,
+    );
+    await screen.findByText("Queued instruction");
+    if (action === "cancel")
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: "删除排队消息：Queued instruction",
+        }),
+      );
+    else {
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: "排队消息更多操作：Queued instruction",
+        }),
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "编辑消息" }));
+    }
+    await waitFor(() => expect(retire).toHaveBeenCalledOnce());
+    expect(capture).toHaveBeenCalledWith("queued");
+    expect(p.send).not.toHaveBeenCalled();
+  },
+);
 it.each(["opening", "restoring"] as const)(
   "places %s feedback in the return-to-latest slot",
   (phase) => {

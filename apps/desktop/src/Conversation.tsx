@@ -62,6 +62,7 @@ export const statusNames = {
 };
 interface Props {
   composerPrediction?: ComposerPredictionResponse | null;
+  captureQueuedPredictionRetirement?: (requestId: string) => () => void;
   openSideChat?: (draft?: string) => boolean | Promise<boolean>;
   quoteInSideChat?: (text: string) => void;
   openSubagents?: () => void;
@@ -115,6 +116,7 @@ const FOLLOW_THRESHOLD = 90;
 
 export function Conversation({
   composerPrediction,
+  captureQueuedPredictionRetirement,
   openSubagents,
   openSideChat,
   quoteInSideChat,
@@ -1071,6 +1073,7 @@ export function Conversation({
           revision={String(sending)}
           running={!!active}
           editingBlocked={sending}
+          captureQueuedPredictionRetirement={captureQueuedPredictionRetirement}
           onEditPending={(pending) =>
             setQueueEdits((previous) => {
               const next = new Map(previous);

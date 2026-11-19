@@ -178,6 +178,9 @@ for line in sys.stdin:
                 notify('turn/started', {'turn':{'id':turn,'status':'inProgress'}})
                 reply(value, {'turn':{'id':turn,'status':'inProgress'}})
                 if 'prediction-held' in description:
+                    # Written after the request/turn handshake: tests can prove
+                    # both execution permits are occupied, not infer spawn order.
+                    pathlib.Path('prediction-active').touch()
                     deadline=time.monotonic()+40
                     while not pathlib.Path('prediction-release').exists() and time.monotonic()<deadline:time.sleep(.02)
                 if 'prediction-tools' in description:

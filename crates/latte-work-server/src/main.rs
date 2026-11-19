@@ -1222,12 +1222,17 @@ async fn dispatch_admitted(
         Request::History { session_id, before } => db(&s.database, |d| {
             let session = d.session(&session_id)?;
             let (events, has_more, needs_earlier, before) = d.history(&session_id, before)?;
+            let composer_prediction = d
+                .side_parent(&session_id)
+                .ok()
+                .and_then(|parent| predictions::snapshot(&session, parent.is_some()));
             Ok(Response::History {
                 session,
                 events,
                 has_more,
                 needs_earlier,
                 before,
+                composer_prediction,
             })
         })?,
         Request::Subagents { session_id } => db(&s.database, |d| {
@@ -1412,10 +1417,15 @@ async fn dispatch_admitted(
         Request::Poll { session_id, after } => db(&s.database, |d| {
             let session = d.session(&session_id)?;
             let (events, has_more) = d.events(&session_id, after)?;
+            let composer_prediction = d
+                .side_parent(&session_id)
+                .ok()
+                .and_then(|parent| predictions::snapshot(&session, parent.is_some()));
             Ok(Response::Events {
                 session,
                 events,
                 has_more,
+                composer_prediction,
             })
         })?,
         Request::EventContent {
