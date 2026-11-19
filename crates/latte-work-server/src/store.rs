@@ -1737,6 +1737,20 @@ impl Store {
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?)
     }
+    /// Checks both durable admission ledgers globally in one SQLite read snapshot.
+    /// Queue tombstones and unknown statuses still reserve the request identity.
+    /// This is only a point-in-time absence check, not proof of a timed-out send's outcome.
+    pub fn request_identity_absent(&mut self, request_id: &str) -> Result<bool> {
+        self.db
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM requests WHERE id=?1)
+                    AND NOT EXISTS(SELECT 1 FROM message_queue WHERE request_id=?1)",
+                [request_id],
+                |row| row.get(0),
+            )
+            .context("读取请求持久化身份失败")
+    }
+
     pub fn latest_request(&self, id: &str) -> Result<String> {
         self.db
             .query_row(
@@ -1953,6 +1967,7 @@ impl Store {
         Ok(false)
     }
     /// Returns false for an exact already-accepted request; conflicting reuse fails.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn begin(
         &mut self,
@@ -1964,6 +1979,30 @@ impl Store {
         provider_fingerprint: Option<&str>,
         permission_mode: Option<&str>,
     ) -> Result<bool> {
+        Ok(self
+            .begin_with_source(
+                id,
+                request_id,
+                text,
+                model,
+                effort,
+                provider_fingerprint,
+                permission_mode,
+            )?
+            .is_some())
+    }
+    /// Capture the source User row at durable admission, without scanning history.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_with_source(
+        &mut self,
+        id: &str,
+        request_id: &str,
+        text: &str,
+        model: Option<&str>,
+        effort: Option<Effort>,
+        provider_fingerprint: Option<&str>,
+        permission_mode: Option<&str>,
+    ) -> Result<Option<f64>> {
         if self.already_accepted(
             id,
             request_id,
@@ -1973,7 +2012,7 @@ impl Store {
             provider_fingerprint,
             permission_mode,
         )? {
-            return Ok(false);
+            return Ok(None);
         }
         let mut session = self.session(id)?;
         if session.status.active() {
@@ -2012,6 +2051,7 @@ impl Store {
             "UPDATE sessions SET data=?2 WHERE id=?1",
             params![id, serde_json::to_string(&session)?],
         )?;
+        let mut source_user_seq = None;
         for event in [
             EventKind::User {
                 text: text.into(),
@@ -2026,6 +2066,9 @@ impl Store {
                 "INSERT INTO events(session_id,at,data) VALUES (?1,?2,?3)",
                 params![id, now(), serde_json::to_string(&event)?],
             )?;
+            if matches!(event, EventKind::User { .. }) {
+                source_user_seq = Some(tx.last_insert_rowid() as f64);
+            }
             index_event(&tx, id, &event)?;
         }
         if is_side_chat && permission_mode.is_some() {
@@ -2038,7 +2081,7 @@ impl Store {
         }
         tx.execute("UPDATE message_queue SET status='dispatched' WHERE request_id=?1 AND session_id=?2 AND status IN ('pending','forwarded')", params![request_id,id])?;
         tx.commit()?;
-        Ok(true)
+        Ok(source_user_seq)
     }
     fn presentation_event(&self, id: &str, data: &str) -> Result<EventKind> {
         let event: EventKind = serde_json::from_str(data)?;
@@ -2455,6 +2498,37 @@ fn index_source(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admission_returns_source_user_sequence_without_replaying_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = super::Store::open(&directory.path().join("state.sqlite")).unwrap();
+        let project = store.add_project(directory.path()).unwrap();
+        let session = store.create_session(project.id, "codex".into()).unwrap();
+        let seq = store
+            .begin_with_source(&session.id, "source", "hello", None, None, None, None)
+            .unwrap()
+            .unwrap();
+        let (events, _) = store.events(&session.id, 0.0).unwrap();
+        let user = events.iter().find(|event| matches!(&event.event, super::EventKind::User { request_id, .. } if request_id == "source")).unwrap();
+        assert_eq!(seq, user.seq);
+        assert!(events.iter().any(|event| event.seq > seq));
+        assert!(
+            store
+                .begin_with_source(&session.id, "source", "hello", None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.events(&session.id, 0.0).unwrap().0.len(),
+            events.len()
+        );
+        assert!(
+            store
+                .begin_with_source(&session.id, "source", "different", None, None, None, None)
+                .is_err()
+        );
+    }
+
     #[test]
     fn side_chat_relationship_survives_restart_and_an_interrupted_turn_stays_unknown() {
         let directory = tempfile::tempdir().unwrap();
@@ -4274,6 +4348,129 @@ mod tests {
         assert!(session.pinned_at.is_none());
         assert!(session.effort.is_none());
     }
+    #[test]
+    fn request_identity_absent_checks_global_accepted_ids_despite_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("identity.db");
+        let mut store = Store::open(&path).unwrap();
+        let project = store.add_project(tmp.path()).unwrap();
+        let original = store
+            .create_session(project.id.clone(), "claude".into())
+            .unwrap();
+        let other = store.create_session(project.id, "claude".into()).unwrap();
+        assert!(store.request_identity_absent("accepted").unwrap());
+        store
+            .begin(
+                &original.id,
+                "accepted",
+                "hello",
+                None,
+                None,
+                Some("provider-a"),
+                None,
+            )
+            .unwrap();
+        assert!(
+            store
+                .begin(
+                    &other.id,
+                    "accepted",
+                    "hello",
+                    None,
+                    None,
+                    Some("provider-a"),
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .begin(
+                    &original.id,
+                    "accepted",
+                    "different",
+                    None,
+                    None,
+                    Some("provider-a"),
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .begin(
+                    &original.id,
+                    "accepted",
+                    "hello",
+                    None,
+                    None,
+                    Some("provider-b"),
+                    None
+                )
+                .is_err()
+        );
+        assert!(!store.request_identity_absent("accepted").unwrap());
+        assert!(store.request_identity_absent("unused").unwrap());
+        drop(store);
+        let mut reopened = Store::open(&path).unwrap();
+        assert!(!reopened.request_identity_absent("accepted").unwrap());
+    }
+
+    #[test]
+    fn request_identity_absent_includes_every_queue_status_across_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("queue-identity.db");
+        let mut store = Store::open(&path).unwrap();
+        let project = store.add_project(tmp.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        // Identity evidence does not depend on parsing legacy admission/data JSON.
+        store.db.execute("INSERT INTO message_queue(request_id,session_id,admission,data) VALUES ('queued',?1,'invalid','invalid')", [&session.id]).unwrap();
+        for status in [
+            "pending",
+            "dispatched",
+            "forwarded",
+            "taken",
+            "cancelled",
+            "uncertain",
+            "future-status",
+        ] {
+            store
+                .db
+                .execute(
+                    "UPDATE message_queue SET status=?1 WHERE request_id='queued'",
+                    [status],
+                )
+                .unwrap();
+            assert!(
+                !store.request_identity_absent("queued").unwrap(),
+                "{status}"
+            );
+            assert!(store.request_identity_absent("unused").unwrap(), "{status}");
+        }
+        assert!(store.queued(&session.id).unwrap().is_empty());
+        drop(store);
+        let mut reopened = Store::open(&path).unwrap();
+        assert!(!reopened.request_identity_absent("queued").unwrap());
+        assert!(reopened.request_identity_absent("unused").unwrap());
+    }
+
+    #[test]
+    fn request_identity_absent_propagates_failures_from_either_table() {
+        for table in ["requests", "message_queue"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut store = Store::open(&tmp.path().join("broken.db")).unwrap();
+            assert!(store.request_identity_absent("unused").unwrap());
+            store
+                .db
+                .execute_batch(&format!(
+                    "ALTER TABLE {table} RENAME TO unavailable_identity_table"
+                ))
+                .unwrap();
+            let error = store.request_identity_absent("unused").unwrap_err();
+            assert!(format!("{error:#}").contains(table), "{error:#}");
+        }
+    }
+
     #[test]
     fn legacy_request_migration_preserves_duplicate_protection() {
         let tmp = tempfile::tempdir().unwrap();

@@ -528,65 +528,11 @@ impl AgentAdapter for Claude {
             command.env("CLAUDE_CODE_EFFORT_LEVEL", level.as_str());
             command.arg(format!("--effort={}", level.as_str()));
         }
-        let mut settings = if let Some(provider) = &config.provider {
-            let metadata = &provider.metadata;
-            let model = config.model.as_deref().unwrap_or(&metadata.model);
-            let mut env = json!({
-                "ANTHROPIC_BASE_URL": metadata.base_url,
-                "ANTHROPIC_MODEL": model,
-                "ANTHROPIC_DEFAULT_MODEL": model,
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
-                "ANTHROPIC_DEFAULT_FABLE_MODEL": model,
-                "ANTHROPIC_SMALL_FAST_MODEL": model,
-                "CLAUDE_CODE_SUBAGENT_MODEL": model,
-                "ANTHROPIC_AUTH_TOKEN": "",
-                "ANTHROPIC_API_KEY": "",
-                "CLAUDE_CODE_OAUTH_TOKEN": "",
-                "ANTHROPIC_CUSTOM_HEADERS": "",
-                "CLAUDE_CODE_USE_BEDROCK": "",
-                "CLAUDE_CODE_USE_VERTEX": "",
-                "CLAUDE_CODE_USE_FOUNDRY": ""
-            });
-            if metadata.protocol != latte_work_protocol::ProviderProtocol::AnthropicMessages {
-                bail!("Claude Code 只支持 Anthropic Messages Provider");
-            }
-            let base = model.strip_suffix("[1m]").unwrap_or(model);
-            if metadata.models_1m.iter().any(|id| id == base) {
-                let extended = base != model;
-                // Native 1M models also need an explicit hold for the 200K mode.
-                // Override both inherited env and settings for this child only.
-                env["CLAUDE_CODE_DISABLE_1M_CONTEXT"] = json!(if extended { "0" } else { "1" });
-                env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] =
-                    json!(if extended { "1000000" } else { "200000" });
-            }
-            let (key, credential) = match metadata.auth {
-                latte_work_protocol::ProviderAuth::Bearer => {
-                    ("ANTHROPIC_AUTH_TOKEN", provider.credential.as_str())
-                }
-                latte_work_protocol::ProviderAuth::ApiKey => {
-                    ("ANTHROPIC_API_KEY", provider.credential.as_str())
-                }
-                // Claude requires a nonempty credential even for unauthenticated gateways.
-                latte_work_protocol::ProviderAuth::None => {
-                    ("ANTHROPIC_AUTH_TOKEN", "latte-work-no-auth")
-                }
-            };
-            env[key] = json!(credential);
-            for (key, value) in env.as_object().expect("env object") {
-                command.env(key, value.as_str().expect("env string"));
-            }
-            command.arg(format!("--model={model}"));
-            json!({"env":env,"model":model,"apiKeyHelper":""})
-        } else {
-            if let Some(model) = &config.model {
-                command.arg(format!("--model={model}"));
-            } else if resume.is_some() || self.side_parent.is_some() {
-                command.arg("--model=default");
-            }
-            json!({"env":{}})
-        };
+        let mut settings = provider_settings(
+            &mut command,
+            config,
+            resume.is_some() || self.side_parent.is_some(),
+        )?;
         if let Some(level) = config.effort {
             settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"] = json!(level.as_str());
         }
@@ -2140,6 +2086,74 @@ fn parse_commands(value: &Value) -> Result<Vec<latte_work_protocol::AgentSlashCo
         });
     }
     Ok(result)
+}
+
+/// Shared Provider injection only; no platform context, session or ordinary-task launch.
+fn provider_settings(
+    command: &mut tokio::process::Command,
+    config: &LaunchConfig,
+    reset_default: bool,
+) -> Result<Value> {
+    let settings = if let Some(provider) = &config.provider {
+        let metadata = &provider.metadata;
+        let model = config.model.as_deref().unwrap_or(&metadata.model);
+        let mut env = json!({
+            "ANTHROPIC_BASE_URL": metadata.base_url,
+            "ANTHROPIC_MODEL": model,
+            "ANTHROPIC_DEFAULT_MODEL": model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+            "ANTHROPIC_DEFAULT_FABLE_MODEL": model,
+            "ANTHROPIC_SMALL_FAST_MODEL": model,
+            "CLAUDE_CODE_SUBAGENT_MODEL": model,
+            "ANTHROPIC_AUTH_TOKEN": "",
+            "ANTHROPIC_API_KEY": "",
+            "CLAUDE_CODE_OAUTH_TOKEN": "",
+            "ANTHROPIC_CUSTOM_HEADERS": "",
+            "CLAUDE_CODE_USE_BEDROCK": "",
+            "CLAUDE_CODE_USE_VERTEX": "",
+            "CLAUDE_CODE_USE_FOUNDRY": ""
+        });
+        if metadata.protocol != latte_work_protocol::ProviderProtocol::AnthropicMessages {
+            bail!("Claude Code 只支持 Anthropic Messages Provider");
+        }
+        let base = model.strip_suffix("[1m]").unwrap_or(model);
+        if metadata.models_1m.iter().any(|id| id == base) {
+            let extended = base != model;
+            // Native 1M models also need an explicit hold for the 200K mode.
+            // Override both inherited env and settings for this child only.
+            env["CLAUDE_CODE_DISABLE_1M_CONTEXT"] = json!(if extended { "0" } else { "1" });
+            env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] =
+                json!(if extended { "1000000" } else { "200000" });
+        }
+        let (key, credential) = match metadata.auth {
+            latte_work_protocol::ProviderAuth::Bearer => {
+                ("ANTHROPIC_AUTH_TOKEN", provider.credential.as_str())
+            }
+            latte_work_protocol::ProviderAuth::ApiKey => {
+                ("ANTHROPIC_API_KEY", provider.credential.as_str())
+            }
+            // Claude requires a nonempty credential even for unauthenticated gateways.
+            latte_work_protocol::ProviderAuth::None => {
+                ("ANTHROPIC_AUTH_TOKEN", "latte-work-no-auth")
+            }
+        };
+        env[key] = json!(credential);
+        for (key, value) in env.as_object().expect("env object") {
+            command.env(key, value.as_str().expect("env string"));
+        }
+        command.arg(format!("--model={model}"));
+        json!({"env":env,"model":model,"apiKeyHelper":""})
+    } else {
+        if let Some(model) = &config.model {
+            command.arg(format!("--model={model}"));
+        } else if reset_default {
+            command.arg("--model=default");
+        }
+        json!({"env":{}})
+    };
+    Ok(settings)
 }
 
 #[cfg(test)]

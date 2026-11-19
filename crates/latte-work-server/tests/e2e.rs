@@ -5,6 +5,12 @@ mod codex_e2e;
 mod environment_e2e;
 #[path = "support/opencode.rs"]
 mod opencode_e2e;
+#[path = "support/prediction_admission.rs"]
+mod prediction_admission_e2e;
+#[path = "support/prediction_reads.rs"]
+mod prediction_reads_e2e;
+#[path = "support/predictions.rs"]
+mod predictions_e2e;
 #[path = "support/side_chat.rs"]
 mod side_chat_e2e;
 #[path = "support/ssh.rs"]

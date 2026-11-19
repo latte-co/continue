@@ -67,7 +67,8 @@ executable SHA-256 with the bundled binary and requests an idle shutdown before
 starting the new build. This identity is separate from wire protocol v1. The
 private `server_status` / `prepare_upgrade` lifecycle handshake is available before
 Hello and is not a WebView API. The latter binds to a server instance and closes
-request admission atomically; running/waiting tasks and any open terminal veto it.
+request admission atomically; running/waiting tasks, any open terminal and any
+registered auxiliary owner (including unconfirmed cleanup) veto it.
 Local coordinators serialize via `upgrade.lock` and time out after 20 seconds.
 SSH still uses `connect`, with no automatic remote replacement. Legacy daemons
 without the lifecycle handshake require a one-time manual restart after tasks
@@ -413,8 +414,16 @@ dropping connections; unreachable remote resources remain available for adoption
 on the next connection.
 
 The local daemon receives the existing instance-bound idle/drain handshake after
-cleanup; busy/shared resources veto daemon exit without being killed. Remote daemons
-remain alive. No unrelated sessions or terminal IDs are enumerated and killed.
+cleanup; busy/shared resources veto daemon exit without being killed. Session
+close combines native and auxiliary-owner cleanup confirmation within the common
+bounded observation budget; unconfirmed auxiliary cleanup is not a successful
+close even when the main child has exited. Daemon shutdown stops auxiliary
+admission, broadcasts cancellation and observes the registered owner inventory
+until drained. An observation timeout records unconfirmed cleanup while owners
+and the runtime remain alive; a fixed sleep is not cleanup evidence. Forced OS
+termination or runtime failure remains best effort, with interrupted resources
+Unknown and no prompt replay. Remote daemons remain alive. No unrelated sessions
+or terminal IDs are enumerated and killed.
 App transport pipes close on exit; connect-local and SSH bridges end on EOF.
 Reopening reconciles events without replaying prompts.
 
@@ -1187,6 +1196,137 @@ a real ephemeral WebKit cookie store without browsing or using a user profile.
 Native UI checks and the data-store test are recorded separately in
 `docs/validation/browser-site-info-2026-10-16.md`.
 
+## Composer predictions
+
+Composer predictions are optional, host-owned model requests after a successful
+ordinary main turn. They predict one editable next user message from bounded
+visible conversation text; they do not run the proposed task. The desktop only
+queries results and never launches an Agent. New tasks with no conversation,
+legacy hosts and unsupported adapters retain their existing placeholder and
+welcome suggestions.
+
+History and Events carry an optional memory-only `composer_prediction` snapshot
+with `status` (`pending`, `ready`, `none`, `unsupported` or `failed`),
+`source_request_id`, `source_user_seq`, `generation_id` and nullable `suggestion`.
+The source is the completed main request and its durable User event sequence,
+not a UI-selected model or arbitrary client transcript. The sequence is captured
+at admission, so truncated history need not contain that User event. The desktop
+uses a monotonic source frontier and request-start epoch to reject stale snapshots;
+loading earlier history cannot replace the live snapshot. A provisional local Send
+barrier survives reconnects to the same durable server identity. Valid live User
+facts advance the frontier independently of the Send epoch and display gates;
+only prediction publication is rejected for an old Send epoch. Earlier history
+pages may reconcile a matching Send User without replacing the live frontier or
+snapshot. Old connection/session/server frames remain excluded.
+A matching `QueuedMessageSent` receipt supplies a separate handoff ordering fence,
+not a User sequence or proof of native acceptance, execution or success. A real
+prediction's `source_user_seq` must be later than that fence, even if steering
+never produces its own User event. All valid same-session handoff receipts may
+raise the maximum pure blocking fence, but only matching request identities can
+resolve an unknown Send; unrelated receipts, queue disappearance or an arbitrary
+source sequence never do so. New Sends preserve prior User and handoff ordering
+facts independently of the current provisional attempt. Unknown attempts use a
+flat correlation budget of 128 pending identities, checked individually against
+matching User/handoff evidence rather than a nested or small fixed chain. An
+authoritative queue cancellation or take may retire its captured matching unknown
+identity and token; it never erases durable ordering facts, regresses the live
+frontier or clears a later token. Correlation overflow retains the default prompt
+without guessing resolution and does not block ordinary Send.
+
+Decoded Send attempts reserve one of at most 2,048 in-flight guards before waiting
+on lifecycle or file-admission gates. Keys combine database identity with a
+32-byte SHA-256 request-ID hash; the guard retains the database identity and travels
+through `Submission` into actor/Control ownership. Sender timeout does not release
+a guard still owned by a queued Control or another known continuation.
+The typed `send_not_admitted` error is reserved for terminal pre-admission rejection
+of this attempt: no durable admission callback ran, its continuation cannot later
+admit, and it is the sole currently known attempt for that identity. The same
+guard-state lock is held through one successful SQLite snapshot proving absence
+from the global `requests` ledger and every `message_queue` state, including
+tombstones. This does not exclude future new requests or unread transport bytes.
+A same-ID older known continuation, capacity exhaustion, lock/read failure or
+point-in-time absence after a timeout cannot establish typed rejection.
+Only this code may retire this captured, still-provisional prediction attempt with
+matching host/project/session/server, request ID and Send token. Generic
+`request_failed`, `admission_unknown`, transport failure and bare invoke errors
+preserve uncertainty; none authorizes automatic replay or clears another attempt.
+Observed User/handoff facts remain independent of this rejection.
+
+At the Send call site only, terminal App Provider turn-configuration errors and
+native model/effort resolver errors use this same Guard and ledger proof before
+becoming `send_not_admitted`; SendQueued also uses this Send call site and retains
+that Guard. A cached desktop selection is still checked against the latest supplied
+Provider catalog, and a removed model is rejected before durable queue admission.
+The Provider-store lock is released before the Guard and ledger proof runs. The
+native resolver discovers metadata without submitting a prompt or creating a
+native thread. Shared validation rules and other call sites are unchanged; the
+error text alone never establishes non-admission,
+and an older same-ID continuation or durable identity still preserves generic /
+unknown errors. The desktop returns false and retains the pending request identity
+and draft on failure; typed rejection retires only its captured prediction token.
+An explicit retry with identical text and launch parameters reuses the request ID.
+Selecting a different valid model creates a new ID on the next explicit Send;
+Accepted plus matching User/completed evidence permits that turn's later prediction
+only when no earlier unknown Send remains unresolved. No failure auto-replays input.
+
+The desktop sends no separate prediction request, including to older hosts whose
+Hello capability is true. Missing snapshots retain the default composer. Cache
+projection is nonblocking: contention or unavailable optional state omits the
+field without failing ordinary reads. Real transport failures retain the existing
+broken-connection behavior. The legacy read-only `composer_prediction` request
+remains compatible but never schedules inference. Results are bounded in-memory
+state, not user events or persisted drafts; reconnect and daemon restart do not
+replay generation. A new turn invalidates the previous result.
+
+An ordinary same-configuration Send invalidates/cancels the old prediction and
+joins its observer, but does not await the isolated helper's child reap before
+starting or continuing the main turn. FIFO drain and explicit queued dispatch
+likewise do not wait on optional prediction cleanup. The detached owner retains
+its child, execution permits and registered inventory until cleanup is confirmed;
+observer cancellation does not release capacity or prove resources stopped.
+Unconfirmed auxiliary cleanup may suppress optional generation, never become a
+prediction-only post-Accepted failure of ordinary input. First-turn title work
+remains independent and is not cancelled or awaited by ordinary Send. This does
+not relax native Close, configuration replacement or daemon drain: those paths
+still require their native and auxiliary cleanup confirmations, and unconfirmed
+resources remain accounted for rather than reported Closed.
+
+Each enabled adapter must provide isolated, zero-tool inference with the source
+turn's effective model and Provider. An explicitly selected effort is forwarded;
+when effort was not selected, the isolated request uses the CLI default without
+claiming to capture an unreported native effort setting. Codex reuses the supervised
+ephemeral structured-request path used for titles. All Claude modes, including
+App Provider snapshots, retain the default prompt: `--safe-mode` and user-level
+`disableAllHooks` cannot disable managed Hooks, so zero tools alone does not prove
+isolation. No Claude prediction helper is probed or started; normal task/title/
+side-chat behavior and managed policy remain unchanged. Traex and OpenCode also
+report unsupported; a future adapter must verify its installed
+CLI's safe one-shot capability before enabling predictions. Do not create a
+persistent auxiliary conversation or fall back to the main Agent loop merely to
+supply a prediction. Missing isolation or changed native Provider identity fails
+closed without changing the main task.
+
+Generation treats the transcript as data and excludes hidden reasoning, tool
+output and attachment contents. It makes no additional workspace reads. One
+successful source turn gets at most one generation attempt, with bounded input,
+output, concurrency and a deadline; empty or invalid predictions never become
+user input. Optional failures are diagnosed without transcript or credential
+contents and do not add ordinary conversation notices.
+
+The shared Composer renders a non-editable, weak-grey multiline prediction only
+when the actual draft is empty and normal input is available. It is not the
+textarea value and does not enable Send. Unmodified Tab inserts it as a draft;
+Enter or the Send button remains a separate action. IME composition, completion
+menus, Shift+Tab, non-empty drafts, references, attachments, approvals and offline
+states retain their existing behavior. Escape dismisses the current prediction;
+acceptance and context changes cannot revive an old result. In the textarea branch,
+`aria-describedby` explicitly references the full ghost body and the Tab hint with
+per-Composer unique IDs. The body retains `aria-hidden` to avoid a separate browse
+stop; no live announcement or value/Send-state change is introduced. Acceptance,
+Escape and blocked display gates remove the description along with the ghost.
+Computed accessible-description DOM checks are separate from real macOS VoiceOver
+acceptance; VoiceOver behavior has not been verified for this change.
+
 ## Native session titles
 
 Claude Code 2.1.302 is the tested CLI compatibility baseline. Earlier releases
@@ -1227,10 +1367,30 @@ naming instead of forwarding the transcript to the changed service.
 It disables legacy `notify`, inherited stable environment/sleep tools,
 environment access, built-in/extension tools, skills, hooks and every effective
 MCP server, and verifies read-only or preserved custom permissions before sending.
-The host permits two concurrent jobs, with a 30-second deadline, 256-KiB frames,
-1-MiB total output, 4,096 messages and an 8-KiB structured reply limit. Its process
-group is reaped on completion/failure; closing or replacing the owning session,
-or confirming a manual native name, cancels it and releases its concurrency permit.
+Titles and predictions share at most two execution permits. Predictions only
+try to acquire execution capacity and never queue. Titles have a wait bounded to
+150 seconds and a capacity of eight jobs total, including waiting, executing and
+cleanup. FIFO is provided by the existing Tokio Semaphore for titles whose
+acquisition future has actually been polled into its wait queue, not by spawn or
+registration order; those waiters precede later prediction acquisitions. Queue
+overflow or timeout explicitly fails the once-only attempt rather than retrying.
+Execution retains a 30-second deadline, 256-KiB frames, 1-MiB total output,
+4,096 messages and an 8-KiB structured reply limit.
+
+A private owner is synchronously registered before its observer handle is
+returned and exclusively owns the child and permits. Caller timeout, observer
+abort or handle Drop requests cancellation only; it cannot abort the owner or
+its cleanup epilogue. Completion, error, cancellation and inference timeout all
+terminate the owned group and wait for the direct child before releasing permits
+or publishing completion. Closing/replacing the owning session or confirming a
+manual native name requests the same cancellation. Group signals (including
+ESRCH) and direct-child reap are distinct evidence, not proof that arbitrary
+grandchildren or detached processes stopped. Cleanup errors remain explicit;
+retrying a group signal must never reuse a PID after its direct child was reaped.
+If signal cleanup remains unconfirmed at that point, retain the uncertainty and
+owner accounting rather than signal a possibly recycled PID. Bounded observation
+may return unconfirmed, but must not release permits, remove the owner inventory
+or report resources Closed before cleanup is confirmed.
 Generated titles remain Work metadata. This adds an optional model
 request using the selected Agent's existing service; no separate Provider is needed.
 

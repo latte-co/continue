@@ -1,14 +1,11 @@
 //! Codex has no title-generation RPC. Use an isolated ephemeral structured turn,
 //! following its TUI's temporary_structured_request contract (CLI 0.162.0).
+use super::codex_jobs::{self, ChildOwner, JobHandle, JobKind, JobScope};
 use crate::providers::LaunchConfig;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::{
-    process::Stdio,
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
@@ -20,6 +17,7 @@ identifiers and PR/issue numbers, and prefer an action and its object. Use at mo
 Do not use tools or perform the task. Return only JSON matching the title schema.";
 
 /// Memory-only identity/config snapshot. Never log or serialize native credentials.
+#[derive(Clone)]
 pub(crate) struct NativeProvider {
     id: String,
     definition: Option<Value>,
@@ -155,19 +153,78 @@ fn isolated_config(effective: &Value) -> Result<Value> {
     Ok(config)
 }
 
-pub(crate) async fn generate(
+pub(crate) fn start_generate(
+    session_id: &str,
     binary: &str,
     cwd: &str,
     config: &LaunchConfig,
     description: &str,
     native_provider: Option<&NativeProvider>,
-) -> Result<String> {
-    static JOBS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
-    let _permit = JOBS
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
-        .clone()
-        .try_acquire_owned()
-        .context("自动命名繁忙，保留原名称")?;
+) -> Result<JobHandle<String>> {
+    let (binary, cwd, config, description, native_provider) = (
+        binary.to_owned(),
+        cwd.to_owned(),
+        config.clone(),
+        description.to_owned(),
+        native_provider.cloned(),
+    );
+    codex_jobs::registry().start(JobScope::session(session_id), JobKind::Title, move |owner| Box::pin(async move {
+        let result = structured(owner, &binary, &cwd, &config, &description, native_provider.as_ref(), INSTRUCTIONS,
+            json!({"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false})).await?;
+        super::titles::valid(result["title"].as_str().unwrap_or_default()).map(str::to_owned).context("标题摘要无效")
+    }))
+}
+
+pub(crate) fn start_predict(
+    session_id: &str,
+    binary: &str,
+    cwd: &str,
+    config: &LaunchConfig,
+    description: &str,
+    native_provider: Option<&NativeProvider>,
+) -> Result<JobHandle<Option<String>>> {
+    let (binary, cwd, config, description, native_provider) = (
+        binary.to_owned(),
+        cwd.to_owned(),
+        config.clone(),
+        description.to_owned(),
+        native_provider.cloned(),
+    );
+    codex_jobs::registry().start(
+        JobScope::session(session_id),
+        JobKind::Prediction,
+        move |owner| {
+            Box::pin(async move {
+                crate::predictions::validate(
+                    structured(
+                        owner,
+                        &binary,
+                        &cwd,
+                        &config,
+                        &description,
+                        native_provider.as_ref(),
+                        crate::predictions::INSTRUCTIONS,
+                        crate::predictions::schema(),
+                    )
+                    .await?,
+                )
+            })
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn structured(
+    owner: &mut ChildOwner,
+    binary: &str,
+    cwd: &str,
+    config: &LaunchConfig,
+    description: &str,
+    native_provider: Option<&NativeProvider>,
+    instructions: &str,
+    schema: Value,
+) -> Result<Value> {
+    // The detached owner retains the child and permits across all setup failures.
     let mut command = crate::agent_environment::command(binary);
     command.args(["app-server", "--stdio"]).current_dir(cwd);
     command.envs(&config.environment.0);
@@ -175,29 +232,21 @@ pub(crate) async fn generate(
     if let Some(provider) = &config.provider {
         super::codex::configure_provider(&mut command, provider, &provider_id)?;
     }
-    let child = command
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .process_group(0)
-        .spawn()?;
-    let pid = child.id().context("Codex 标题进程无 PID")? as i32;
-    let mut group = crate::runtime::Group { child, pid };
+        .stderr(Stdio::null());
+    let child = owner.spawn(command)?;
     let mut wire = Wire {
-        input: group.child.stdin.take().context("Codex 标题 stdin 缺失")?,
+        input: child.stdin.take().context("Codex 标题 stdin 缺失")?,
         output: FramedRead::new(
-            group
-                .child
-                .stdout
-                .take()
-                .context("Codex 标题 stdout 缺失")?,
+            child.stdout.take().context("Codex 标题 stdout 缺失")?,
             LinesCodec::new_with_max_length(256 * 1024),
         ),
         bytes: 0,
         messages: 0,
     };
-    let result = tokio::time::timeout(Duration::from_secs(30), async {
+    async {
         wire.rpc("title-init", "initialize", json!({"clientInfo":{"name":"latte-work","version":"0.1.0"},"capabilities":{"experimentalApi":true}})).await?;
         wire.send(json!({"method":"initialized"})).await?;
         let effective = wire.rpc("title-config", "config/read", json!({"cwd":cwd,"includeLayers":false})).await?;
@@ -208,7 +257,7 @@ pub(crate) async fn generate(
         let custom_profile = effective["config"]["default_permissions"].as_str().filter(|s| !s.starts_with(':'));
         let mut params = json!({"cwd":cwd,"model":config.model,"modelProvider":provider,
             "ephemeral":true,"runtimeWorkspaceRoots":[],"environments":[],"dynamicTools":[],"selectedCapabilityRoots":[],
-            "config":isolated,"baseInstructions":INSTRUCTIONS,"developerInstructions":""});
+            "config":isolated,"baseInstructions":instructions,"developerInstructions":""});
         if let Some(profile) = custom_profile { params["permissions"] = json!(profile); }
         else { params["sandbox"] = json!("read-only"); }
         let opened = wire.rpc("title-open", "thread/start", params).await?;
@@ -219,7 +268,7 @@ pub(crate) async fn generate(
         let thread = opened["thread"]["id"].as_str().context("标题会话 ID 缺失")?;
         wire.send(json!({"id":"title-turn","method":"turn/start","params":{
             "threadId":thread,"input":[{"type":"text","text":description}],"effort":config.effort,
-            "outputSchema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}
+            "outputSchema":schema
         }})).await?;
         let mut turn: Option<String> = None;
         let mut response = None;
@@ -254,9 +303,7 @@ pub(crate) async fn generate(
             } else if message["method"] == "turn/completed" && turn.is_some()
                 && params["turn"]["id"].as_str() == turn.as_deref() {
                 if params["turn"]["status"] != "completed" { bail!("标题摘要未完成"); }
-                let result: Value = serde_json::from_str(response.as_deref().context("标题摘要为空")?)?;
-                return super::titles::valid(result["title"].as_str().unwrap_or_default())
-                    .map(str::to_owned).context("标题摘要无效");
+                return Ok(serde_json::from_str(response.as_deref().context("结构化摘要为空")?)?);
             } else if params["turnId"].as_str() == turn.as_deref() && turn.is_some()
                 && matches!(message["method"].as_str(), Some("item/started" | "item/completed")) {
                 match params["item"]["type"].as_str() {
@@ -270,13 +317,7 @@ pub(crate) async fn generate(
                 }
             }
         }
-    }).await.unwrap_or_else(|_| Err(anyhow::anyhow!("自动命名超时")));
-    let _ = nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGKILL,
-    );
-    let _ = group.child.wait().await;
-    result
+    }.await
 }
 
 #[cfg(test)]

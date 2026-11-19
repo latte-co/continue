@@ -308,7 +308,10 @@ async fn handle_inner(
                             .lock()
                             .map_err(|_| anyhow::anyhow!("执行状态锁异常"))?
                             .contains_key(id);
-                        if exists {
+                        if exists
+                            || !crate::agents::codex_jobs::registry()
+                                .scope_confirmed(&crate::agents::codex_jobs::JobScope::session(id))
+                        {
                             crate::runtime::close(&service.database, &service.runs, id, false)
                                 .await?;
                         }
@@ -354,7 +357,12 @@ async fn handle_inner(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("终端锁异常"))?
                 .is_empty();
-            if running || terminals || db(&service.database, |d| d.has_active_sessions())? {
+            let auxiliary = !crate::agents::codex_jobs::registry().inventory().is_empty();
+            if running
+                || terminals
+                || auxiliary
+                || db(&service.database, |d| d.has_active_sessions())?
+            {
                 bail!(
                     "本机后台需要更新，但仍有任务或终端；请等待任务完成并关闭终端后重新连接。当前任务不会中断"
                 );

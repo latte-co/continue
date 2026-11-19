@@ -115,6 +115,18 @@ export type Subagent = {
   updated_at: number;
 };
 export type AgentCommandUiAction = "subagents";
+export type ComposerPredictionStatus =
+  "pending" | "ready" | "none" | "unsupported" | "failed";
+export type ComposerPredictionSnapshot = {
+  status: ComposerPredictionStatus;
+  source_request_id: string | null;
+  /**
+   * Sequence of the durable source User event, independent of history windows.
+   */
+  source_user_seq: number | null;
+  generation_id: string | null;
+  suggestion: string | null;
+};
 export type EventKind =
   | { kind: "turn_changes"; changes: TurnChanges }
   | { kind: "subagent"; update: SubagentUpdate }
@@ -377,6 +389,7 @@ export type TurnProvider =
     };
 export type Request =
   | { method: "hello"; version: number }
+  | { method: "composer_prediction"; session_id: string }
   | { method: "projects" }
   | { method: "terminals"; project_id: string }
   | {
@@ -787,9 +800,21 @@ export type Response =
       bindings: Array<AgentProviderBinding>;
     }
   | {
+      kind: "composer_prediction";
+      session_id: string;
+      status: ComposerPredictionStatus;
+      /**
+       * Durable Send identity of the successfully completed ordinary main turn.
+       */
+      source_request_id: string | null;
+      generation_id: string | null;
+      suggestion: string | null;
+    }
+  | {
       kind: "hello";
       version: number;
       server_id: string;
+      composer_predictions: boolean;
       agents: Array<AgentInfo>;
       permission_settings: boolean;
       custom_agent_environment: boolean;
@@ -829,12 +854,14 @@ export type Response =
        * Exclusive raw-event cursor, independent of compacted text event IDs.
        */
       before: number | null;
+      composer_prediction?: ComposerPredictionSnapshot;
     }
   | {
       kind: "events";
       events: Array<Event>;
       session: Session;
       has_more: boolean;
+      composer_prediction?: ComposerPredictionSnapshot;
     }
   | {
       kind: "event_content";

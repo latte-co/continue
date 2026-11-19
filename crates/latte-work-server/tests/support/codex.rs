@@ -544,3 +544,6 @@ async fn codex_background_command_survives_the_turn_and_releases_on_native_exit(
         "released background work must not block idle close"
     );
 }
+
+#[path = "app_provider_admission.rs"]
+mod app_provider_admission;
