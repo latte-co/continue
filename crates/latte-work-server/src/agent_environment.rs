@@ -93,11 +93,15 @@ pub fn configured_command(
     let mut cmd: PreparedCommand = Command::new(binary).into();
     #[cfg(windows)]
     let mut cmd = {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let directory = cwd
             .map(std::path::Path::to_owned)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let paths = configured_variable("PATH", environment);
-        backend::command_in(binary.as_ref(), paths.as_deref(), &directory)
+        let mut command = backend::command_in(binary.as_ref(), paths.as_deref(), &directory);
+        // Directly spawned helpers such as Git also run under the detached server.
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
     };
     if let Some(env) = ENVIRONMENT.get() {
         cmd.envs(env);
