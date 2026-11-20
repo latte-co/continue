@@ -19,6 +19,8 @@ fn main() {
         SubagentUpdate::decl(),
         Subagent::decl(),
         AgentCommandUiAction::decl(),
+        ComposerPredictionStatus::decl(),
+        ComposerPredictionSnapshot::decl(),
         EventKind::decl(),
         QuestionOption::decl(),
         UserQuestion::decl(),

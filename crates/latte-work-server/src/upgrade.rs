@@ -342,9 +342,11 @@ async fn handle_inner(
                 .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?
                 .values()
                 .any(|owner| owner.closing);
+            let auxiliary = !crate::agents::codex_jobs::registry().inventory().is_empty();
             if running
                 || terminals
                 || closing
+                || auxiliary
                 || db(&service.database, |d| d.has_active_sessions())?
             {
                 bail!(
@@ -420,7 +422,10 @@ async fn close_owned(service: &Service, owner_id: &str, resources: Vec<Resource>
                         .lock()
                         .map_err(|_| anyhow::anyhow!("执行状态锁异常"))?
                         .contains_key(id);
-                    if exists {
+                    if exists
+                        || !crate::agents::codex_jobs::registry()
+                            .scope_confirmed(&crate::agents::codex_jobs::JobScope::session(id))
+                    {
                         crate::runtime::close(&service.database, &service.runs, id, false).await?;
                     } else {
                         // An actor can be gone while its native close is still unknown.

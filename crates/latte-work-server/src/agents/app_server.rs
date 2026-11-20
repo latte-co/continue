@@ -817,7 +817,7 @@ impl AppServer {
                             native_session_id: self.thread.clone().expect("active thread"),
                             description: context.description(),
                             model: self.config.as_ref().and_then(|c| c.model.clone()),
-                            native_provider: self.title_provider.take(),
+                            native_provider: self.title_provider.clone(),
                         });
                     } else {
                         self.generating_title = true;
@@ -1067,6 +1067,19 @@ impl AgentAdapter for AppServer {
         self.side_parent = Some(native_id);
         self.title_attempted = true;
         Ok(())
+    }
+    fn prediction_snapshot(&self, _config: &LaunchConfig) -> Option<crate::predictions::Snapshot> {
+        if !self.codex || self.side_parent.is_some() {
+            return None;
+        }
+        let config = self.config.clone()?;
+        if config.model.is_none() || (config.provider.is_none() && self.title_provider.is_none()) {
+            return None;
+        }
+        Some(crate::predictions::Snapshot {
+            config,
+            native_provider: self.title_provider.clone(),
+        })
     }
     fn command(
         &mut self,

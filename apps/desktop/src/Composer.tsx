@@ -55,7 +55,18 @@ import {
   type InlineSelection,
 } from "./InlineReferenceInput";
 
+const EXPANDED_TOOLBAR_CONTROL =
+  '.composer-toolbar [aria-haspopup][aria-expanded="true"], .composer-toolbar [role="combobox"][aria-expanded="true"]';
+
+export interface ComposerPrediction {
+  /** Stable source identity, independent of the draft and suggestion text. */
+  id: string;
+  text: string;
+}
 interface Props {
+  prediction?: ComposerPrediction | null;
+  predictionBlocked?: boolean;
+  onDismissPrediction?: (id: string) => void;
   skillCreator?: boolean;
   onRemoveSkillCreator?: () => void;
   focusRequest?: number;
@@ -145,6 +156,37 @@ export function Composer(props: Props) {
       (inlineInput.current ?? input.current)?.focus();
   }, [concealSubmitted, hidden]);
   const composing = useRef(false);
+  const [imeActive, setImeActive] = useState(false);
+  const ghost = useRef<HTMLDivElement>(null);
+  const [dismissedPrediction, setDismissedPrediction] = useState<string | null>(
+    null,
+  );
+  const [pickingFiles, setPickingFiles] = useState(false);
+  const [toolbarMenuOpen, setToolbarMenuOpen] = useState(false);
+  useEffect(() => {
+    const element = root.current;
+    if (!element) return;
+    const update = () =>
+      setToolbarMenuOpen(!!element.querySelector(EXPANDED_TOOLBAR_CONTROL));
+    const observer = new MutationObserver(update);
+    observer.observe(element, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["aria-expanded"],
+    });
+    update();
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
+    const element = fileInput.current;
+    const cancel = () => {
+      pickerContext.current = null;
+      setPickingFiles(false);
+    };
+    element?.addEventListener("cancel", cancel);
+    return () => element?.removeEventListener("cancel", cancel);
+  }, []);
   const submitting = useRef(false);
   const scope = `${hostId}:${projectId}:${agent}`;
   const currentScope = useRef(scope);
@@ -159,25 +201,6 @@ export function Composer(props: Props) {
   const inlineAttached = attached.filter((entry) => !entry.attachmentKind);
   const separateAttached = attached.filter((entry) => !!entry.attachmentKind);
   const inlineMode = !concealSubmitted && !!inlineAttached.length;
-  useLayoutEffect(() => {
-    const element = input.current;
-    if (!element || hidden) return;
-    function fit() {
-      if (!element) return;
-      element.style.height = "auto";
-      element.style.height = `${Math.min(element.scrollHeight, 200)}px`;
-    }
-    fit();
-    if (typeof ResizeObserver === "undefined") return;
-    let width = element.clientWidth;
-    const observer = new ResizeObserver(() => {
-      if (element.clientWidth === width) return;
-      width = element.clientWidth;
-      fit();
-    });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [value, hidden, concealSubmitted, inlineMode]);
   // The native editor may be replaced after the last reference is removed.
   // Restore the caret only after React has mounted the destination editor.
   const editorContext = JSON.stringify([scope, sessionId]);
@@ -191,6 +214,7 @@ export function Composer(props: Props) {
   }
   useLayoutEffect(() => {
     composing.current = false;
+    setImeActive(false);
   }, [editorContext, inlineMode, concealSubmitted]);
   function inputSelection(): InlineSelection | null {
     if (inlineMode && inlineInput.current)
@@ -250,6 +274,7 @@ export function Composer(props: Props) {
     setPasteProgress("");
     setRetryFiles([]);
     pickerContext.current = null;
+    setPickingFiles(false);
     setDragging(false);
     dragDepth.current = 0;
     return () => {
@@ -293,6 +318,57 @@ export function Composer(props: Props) {
     !sending &&
     !hidden &&
     (addMenu || browse !== null || trigger !== null);
+  const predictionKey = props.prediction
+    ? JSON.stringify([editorContext, props.prediction.id])
+    : null;
+  const visiblePrediction =
+    props.prediction?.text &&
+    value === "" &&
+    connected &&
+    !disabled &&
+    !sending &&
+    !hidden &&
+    !concealSubmitted &&
+    !props.predictionBlocked &&
+    !props.skillCreator &&
+    !(props.hasContext ?? !!props.context) &&
+    !props.annotations?.length &&
+    !attached.length &&
+    !menu &&
+    !toolbarMenuOpen &&
+    !pasting &&
+    !retryFiles.length &&
+    !externalBusy &&
+    !pickingFiles &&
+    !dragging &&
+    !imeActive &&
+    dismissedPrediction !== predictionKey
+      ? props.prediction
+      : null;
+  function dismissPrediction() {
+    if (!visiblePrediction) return;
+    setDismissedPrediction(predictionKey);
+    props.onDismissPrediction?.(visiblePrediction.id);
+  }
+  useLayoutEffect(() => {
+    const element = input.current;
+    if (!element || hidden) return;
+    function fit() {
+      if (!element) return;
+      element.style.height = "auto";
+      element.style.height = `${Math.min(Math.max(element.scrollHeight, ghost.current?.scrollHeight ?? 0), 200)}px`;
+    }
+    fit();
+    if (typeof ResizeObserver === "undefined") return;
+    let width = element.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (element.clientWidth === width) return;
+      width = element.clientWidth;
+      fit();
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [value, hidden, concealSubmitted, inlineMode, visiblePrediction?.text]);
   const mode = addMenu ? "add" : browse !== null ? "files" : trigger?.kind;
   const query = browse !== null ? search : (trigger?.query ?? "");
   const slash = query.lastIndexOf("/");
@@ -972,7 +1048,14 @@ export function Composer(props: Props) {
         );
         return;
       }
-      if ((event.key === "Enter" && !event.shiftKey) || event.key === "Tab") {
+      if (
+        (event.key === "Enter" && !event.shiftKey) ||
+        (event.key === "Tab" &&
+          !event.shiftKey &&
+          !event.ctrlKey &&
+          !event.metaKey &&
+          !event.altKey)
+      ) {
         event.preventDefault();
         const option = options[index];
         const entry = entries.find(
@@ -980,6 +1063,38 @@ export function Composer(props: Props) {
         );
         if (event.key === "Tab" && entry?.directory) attach(entry);
         else option?.choose();
+        return;
+      }
+    }
+    if (
+      !menu &&
+      visiblePrediction &&
+      !submitting.current &&
+      !pasteBusy.current &&
+      !root.current?.querySelector(EXPANDED_TOOLBAR_CONTROL)
+    ) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        dismissPrediction();
+        return;
+      }
+      if (
+        event.key === "Tab" &&
+        !event.shiftKey &&
+        !event.ctrlKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        latestValue.current === "" &&
+        input.current?.value === ""
+      ) {
+        event.preventDefault();
+        dismissPrediction();
+        replaceTrigger(visiblePrediction.text, undefined, {
+          start: 0,
+          end: 0,
+          selectedPaths: [],
+        });
         return;
       }
     }
@@ -1033,6 +1148,7 @@ export function Composer(props: Props) {
           if (pickerContext.current === currentContext.current)
             void addFiles(files);
           pickerContext.current = null;
+          setPickingFiles(false);
         }}
       />
       {dragging && (
@@ -1080,6 +1196,7 @@ export function Composer(props: Props) {
             }
             onClick={() => {
               pickerContext.current = currentContext.current;
+              setPickingFiles(true);
               close();
               fileInput.current?.click();
             }}
@@ -1442,10 +1559,12 @@ export function Composer(props: Props) {
             }}
             onCompositionStart={() => {
               composing.current = true;
+              setImeActive(true);
               close();
             }}
             onCompositionEnd={(text, offset) => {
               composing.current = false;
+              setImeActive(false);
               setTrigger(composerTrigger(text, offset));
             }}
             renderImage={(entry) => (
@@ -1462,64 +1581,84 @@ export function Composer(props: Props) {
             )}
           />
         ) : (
-          <textarea
-            ref={input}
-            /* Remount across conceal transitions: a fresh node carries no IME
+          <div className="composer-editor">
+            {visiblePrediction && (
+              <div
+                className="composer-prediction"
+                id={`${listId}-prediction-body`}
+                ref={ghost}
+                /* Explicitly described by the editor, not a separate browse stop. */
+                aria-hidden="true"
+              >
+                {visiblePrediction.text}
+              </div>
+            )}
+            <textarea
+              ref={input}
+              /* Remount across conceal transitions: a fresh node carries no IME
            composition state, so an engine cannot replay the submitted text
            into the cleared field after re-enabling it. */
-            key={concealSubmitted ? "concealed" : "editing"}
-            rows={1}
-            aria-label={props.inputLabel ?? "任务输入"}
-            {...autocomplete}
-            placeholder={placeholder}
-            value={concealSubmitted ? "" : value}
-            disabled={disabled || sending || pasting}
-            onPaste={(event) => void paste(event)}
-            onChange={(event) => {
-              onChange(event.target.value);
-              setNotice("");
-              setBrowse(null);
-              setAddMenu(false);
-              setTrigger(
-                composing.current
-                  ? null
-                  : composerTrigger(
-                      event.target.value,
-                      event.target.selectionStart,
+              key={concealSubmitted ? "concealed" : "editing"}
+              rows={1}
+              aria-label={props.inputLabel ?? "任务输入"}
+              {...autocomplete}
+              placeholder={visiblePrediction ? "" : placeholder}
+              aria-describedby={
+                visiblePrediction
+                  ? `${listId}-prediction-body ${listId}-prediction-hint`
+                  : undefined
+              }
+              value={concealSubmitted ? "" : value}
+              disabled={disabled || sending || pasting}
+              onPaste={(event) => void paste(event)}
+              onChange={(event) => {
+                onChange(event.target.value);
+                setNotice("");
+                setBrowse(null);
+                setAddMenu(false);
+                setTrigger(
+                  composing.current
+                    ? null
+                    : composerTrigger(
+                        event.target.value,
+                        event.target.selectionStart,
+                      ),
+                );
+              }}
+              onClick={(event) => {
+                const el = event.currentTarget;
+                setTrigger(composerTrigger(el.value, el.selectionStart));
+                setBrowse(null);
+              }}
+              onKeyUp={(event) => {
+                if (
+                  ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)
+                )
+                  setTrigger(
+                    composerTrigger(
+                      event.currentTarget.value,
+                      event.currentTarget.selectionStart,
                     ),
-              );
-            }}
-            onClick={(event) => {
-              const el = event.currentTarget;
-              setTrigger(composerTrigger(el.value, el.selectionStart));
-              setBrowse(null);
-            }}
-            onKeyUp={(event) => {
-              if (
-                ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)
-              )
+                  );
+              }}
+              onCompositionStart={() => {
+                composing.current = true;
+                setImeActive(true);
+                close();
+              }}
+              onCompositionEnd={(event) => {
+                composing.current = false;
+                setImeActive(false);
                 setTrigger(
                   composerTrigger(
                     event.currentTarget.value,
                     event.currentTarget.selectionStart,
                   ),
                 );
-            }}
-            onCompositionStart={() => {
-              composing.current = true;
-              close();
-            }}
-            onCompositionEnd={(event) => {
-              composing.current = false;
-              setTrigger(
-                composerTrigger(
-                  event.currentTarget.value,
-                  event.currentTarget.selectionStart,
-                ),
-              );
-            }}
-            onKeyDown={keys}
-          />
+              }}
+              onKeyDown={keys}
+            />
+          </div>
         )}
       </ImageGallery>
       {pasting && (
@@ -1552,6 +1691,14 @@ export function Composer(props: Props) {
         </div>
       )}
       <div className="composer-toolbar">
+        {visiblePrediction && (
+          <span
+            className="composer-prediction-hint"
+            id={`${listId}-prediction-hint`}
+          >
+            Tab 插入
+          </span>
+        )}
         <button
           className="icon-button composer-add"
           title="添加附件或引用工作区文件"
