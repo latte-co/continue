@@ -140,7 +140,11 @@ export function AgentSettings({
       const saved = await saveAgentEnvironment(
         host.id,
         agent,
-        parseEnvironment(environmentDrafts[agent]?.text ?? ""),
+        parseEnvironment(
+          environmentDrafts[agent]?.text ?? "",
+          host.platform === "windows",
+        ),
+        host.platform,
       );
       if (current === generation.current) {
         setEnvironments((values) => ({ ...values, [agent]: saved }));

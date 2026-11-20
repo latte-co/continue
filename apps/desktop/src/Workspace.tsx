@@ -35,6 +35,7 @@ import { SubagentsPanel } from "./SubagentsPanel";
 import type { SubagentsState } from "./useSubagents";
 import { TerminalPane } from "./TerminalPane";
 import { SidebarToggle } from "./SidebarToggle";
+import { WindowControls } from "./WindowControls";
 import { useStatusIssues } from "./statusNotices";
 import { SideChatHistoryButton } from "./SideChatHistory";
 import type { SidebarPreview } from "./useSidebarPreview";
@@ -124,6 +125,7 @@ export function Workspace({
   sidebarPreview,
   hostId,
   hostName,
+  supportsTerminal = () => true,
   project,
   visible,
   connected,
@@ -146,6 +148,7 @@ export function Workspace({
   sidebarPreview?: SidebarPreview;
   hostId: string;
   hostName: string;
+  supportsTerminal?: (hostId: string) => boolean;
   project?: Project;
   visible: boolean;
   connected: boolean;
@@ -204,6 +207,7 @@ export function Workspace({
             sidebarPreview={sidebarPreview}
             hostId={selected ? hostId : page.hostId}
             hostName={selected ? hostName : page.hostName}
+            supportsTerminal={supportsTerminal}
             project={selected ? project : page.project}
             selected={selected}
             active={selected && visible}
@@ -236,6 +240,7 @@ function WorkspacePage({
   sidebarPreview,
   hostId,
   hostName,
+  supportsTerminal = () => true,
   project,
   selected,
   active,
@@ -246,6 +251,7 @@ function WorkspacePage({
 }: {
   hostId: string;
   hostName: string;
+  supportsTerminal?: (hostId: string) => boolean;
   workspaceId: string;
   subagents?: SubagentsState;
   overview?: React.ReactNode;
@@ -349,6 +355,7 @@ function WorkspacePage({
     for (const tab of tabs) {
       if (tab.kind !== "terminal") continue;
       const ownerHost = tab.hostId ?? hostId;
+      if (!supportsTerminal(ownerHost)) continue;
       const projectId = tab.terminal.project_id;
       const key = JSON.stringify([ownerHost, projectId]);
       const group = groups.get(key) ?? {
@@ -359,6 +366,13 @@ function WorkspacePage({
       group.ids.add(tab.id);
       groups.set(key, group);
     }
+    setTabs((tabs) => {
+      const kept = tabs.filter(
+        (tab) =>
+          tab.kind !== "terminal" || supportsTerminal(tab.hostId ?? hostId),
+      );
+      return kept.length === tabs.length ? tabs : kept;
+    });
     if (!groups.size) return;
     void Promise.all(
       [...groups.values()].map(async (group) => {
@@ -403,6 +417,10 @@ function WorkspacePage({
   async function add(kind: Kind) {
     setMenu(false);
     setError("");
+    if (kind === "terminal" && !supportsTerminal(hostId)) {
+      setError("此 Host 暂不支持终端");
+      return;
+    }
     if (kind === "sideChat") {
       openSideChatTab(workspaceId, crypto.randomUUID(), true);
       return;
@@ -635,6 +653,7 @@ function WorkspacePage({
         >
           <PanelRight size={16} />
         </button>
+        {expanded && selected && <WindowControls />}
       </header>
       {menu && trigger.current && (
         <AddMenu

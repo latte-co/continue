@@ -51,7 +51,13 @@ pub fn labels(
     let directory = crate::agent_environment::configured_variable("CLAUDE_CONFIG_DIR", environment)
         .map(PathBuf::from)
         .or_else(|| {
-            crate::agent_environment::variable("HOME").map(|h| PathBuf::from(h).join(".claude"))
+            crate::agent_environment::variable("HOME")
+                .or_else(|| {
+                    latte_work_platform::dirs::home_dir()
+                        .ok()
+                        .map(|p| p.into_os_string())
+                })
+                .map(|h| PathBuf::from(h).join(".claude"))
         });
     let mut files = Vec::new();
     if let Some(directory) = directory {
@@ -66,6 +72,11 @@ pub fn labels(
     // resolved by Claude itself; this metadata is not an execution policy.
     files.push(if cfg!(target_os = "macos") {
         PathBuf::from("/Library/Application Support/ClaudeCode/managed-settings.json")
+    } else if cfg!(windows) {
+        PathBuf::from(
+            std::env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into()),
+        )
+        .join("ClaudeCode/managed-settings.json")
     } else {
         PathBuf::from("/etc/claude-code/managed-settings.json")
     });

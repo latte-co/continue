@@ -6,6 +6,7 @@ use std::{
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
 };
+#[cfg(test)]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 pub const RECORD_LIMIT: usize = 256 * 1024;
@@ -32,7 +33,9 @@ impl Object {
         let path = self.root.join(&self.key);
         let metadata = path.symlink_metadata().context("快照对象缺失")?;
         ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() == self.size,
+            metadata.is_file()
+                && !latte_work_platform::fs::is_link(&metadata)
+                && metadata.len() == self.size,
             "快照对象已改变"
         );
         Ok(path)
@@ -62,14 +65,19 @@ impl Object {
     }
 }
 struct CheckedReader {
+    _directory: latte_work_platform::fs::PrivateDir,
     input: BufReader<std::fs::File>,
     digest: Sha256,
     expected: String,
 }
 impl CheckedReader {
     fn new(object: &Object) -> Result<Self> {
+        let directory = latte_work_platform::fs::PrivateDir::prepare(&object.root)?;
+        let file = latte_work_platform::fs::open_regular_file(&object.path()?)?;
+        directory.protect_file(object.key())?;
         Ok(Self {
-            input: BufReader::new(std::fs::File::open(object.path()?)?),
+            _directory: directory,
+            input: BufReader::new(file),
             digest: Sha256::new(),
             expected: object.key.clone(),
         })
@@ -109,6 +117,7 @@ fn publish(temp: tempfile::NamedTempFile, root: &Path, key: String, size: u64) -
     temp.as_file().sync_all()?;
     match temp.persist_noclobber(root.join(&key)) {
         Ok(_) => {
+            #[cfg(unix)]
             std::fs::File::open(root)?.sync_all()?;
         }
         Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -123,17 +132,49 @@ fn publish(temp: tempfile::NamedTempFile, root: &Path, key: String, size: u64) -
     Ok(object)
 }
 pub fn prepare(root: &Path) -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(root)?;
-    ensure!(
-        !root.symlink_metadata()?.file_type().is_symlink(),
-        "快照目录不能是符号链接"
-    );
-    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
-    Ok(root.canonicalize()?)
+    Ok(latte_work_platform::fs::PrivateDir::prepare(root)?
+        .path()
+        .to_owned())
+}
+/// Stream source files into immutable storage without retaining their contents in memory.
+pub fn capture_reader(storage: Option<&Path>, mut source: impl Read) -> Result<Contents> {
+    let mut chunk = [0; 64 * 1024];
+    if let Some(root) = storage {
+        let directory = latte_work_platform::fs::PrivateDir::prepare(root)?;
+        let mut temp = directory.tempfile(".snapshot-", "")?;
+        let mut writer = HashedWriter {
+            output: BufWriter::new(temp.as_file_mut()),
+            digest: Sha256::new(),
+            size: 0,
+        };
+        loop {
+            let count = source.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            writer.write_all(&chunk[..count])?;
+        }
+        writer.flush()?;
+        let key = format!("{:x}", writer.digest.clone().finalize());
+        let size = writer.size;
+        drop(writer);
+        Ok(Contents::Object(publish(temp, root, key, size)?))
+    } else {
+        let mut bytes = Vec::new();
+        loop {
+            let count = source.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            bytes.try_reserve(count).context("无法分配文件快照内存")?;
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        Ok(Contents::Legacy(bytes))
+    }
 }
 pub fn save_json(root: &Path, value: &impl Serialize) -> Result<Object> {
-    let mut temp = tempfile::NamedTempFile::new_in(root)?;
+    let directory = latte_work_platform::fs::PrivateDir::prepare(root)?;
+    let mut temp = directory.tempfile(".snapshot-", "")?;
     let mut writer = HashedWriter {
         output: BufWriter::new(temp.as_file_mut()),
         digest: Sha256::new(),
@@ -147,7 +188,8 @@ pub fn save_json(root: &Path, value: &impl Serialize) -> Result<Object> {
     publish(temp, root, key, size)
 }
 pub fn save_bytes(root: &Path, bytes: &[u8]) -> Result<Object> {
-    let mut temp = tempfile::NamedTempFile::new_in(root)?;
+    let directory = latte_work_platform::fs::PrivateDir::prepare(root)?;
+    let mut temp = directory.tempfile(".snapshot-", "")?;
     let mut writer = HashedWriter {
         output: BufWriter::new(temp.as_file_mut()),
         digest: Sha256::new(),
@@ -160,8 +202,10 @@ pub fn save_bytes(root: &Path, bytes: &[u8]) -> Result<Object> {
     drop(writer);
     publish(temp, root, key, size)
 }
+#[cfg(test)]
 pub async fn save_file(root: &Path, mut source: impl AsyncRead + Unpin) -> Result<Object> {
-    let temp = tempfile::NamedTempFile::new_in(root)?;
+    let directory = latte_work_platform::fs::PrivateDir::prepare(root)?;
+    let temp = directory.tempfile(".snapshot-", "")?;
     let mut output = tokio::fs::File::from_std(temp.reopen()?);
     let mut digest = Sha256::new();
     let mut size = 0;
@@ -283,8 +327,11 @@ impl Contents {
             Self::Object(o) => o.copy_to(path),
         }
     }
+    #[cfg(unix)]
     pub fn matches(&self, path: &Path) -> Result<bool> {
-        let mut input = std::fs::File::open(path)?;
+        self.matches_reader(std::fs::File::open(path)?)
+    }
+    pub fn matches_reader(&self, mut input: impl Read) -> Result<bool> {
         let mut digest = Sha256::new();
         let mut chunk = [0; 16 * 1024];
         let mut count = 0;
@@ -298,12 +345,12 @@ impl Contents {
         }
         Ok(count == self.len() && format!("{:x}", digest.finalize()) == self.digest())
     }
-    pub fn write_to_file(&self, file: &mut std::fs::File) -> Result<()> {
+    pub fn write_to_file(&self, mut file: impl Write) -> Result<()> {
         match self {
             Self::Legacy(bytes) => file.write_all(bytes)?,
             Self::Object(o) => {
                 let mut input = CheckedReader::new(o)?;
-                std::io::copy(&mut input, file)?;
+                std::io::copy(&mut input, &mut file)?;
                 input.finish()?;
             }
         }
@@ -341,7 +388,7 @@ mod tests {
     #[tokio::test]
     async fn corrupted_disk_objects_are_never_used_for_restoration() {
         let directory = tempfile::tempdir().unwrap();
-        let root = prepare(directory.path()).unwrap();
+        let root = prepare(&directory.path().join("objects")).unwrap();
         let object = save_file(&root, tokio::io::repeat(42).take(1024 * 1024))
             .await
             .unwrap();

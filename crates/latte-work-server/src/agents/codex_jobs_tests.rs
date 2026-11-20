@@ -41,10 +41,7 @@ async fn second_spawn_is_rejected_without_replacing_owned_child() {
         .unwrap();
     let pid = pid_rx.await.unwrap();
     assert!(handle.wait().await.unwrap());
-    assert_eq!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
-        Err(nix::errno::Errno::ESRCH)
-    );
+    assert_pid_gone(pid);
 }
 
 #[tokio::test]
@@ -78,10 +75,7 @@ async fn spawned_child_setup_failure_is_reaped_before_error_completion() {
             .to_string()
             .contains("stdout setup failed")
     );
-    assert_eq!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
-        Err(nix::errno::Errno::ESRCH)
-    );
+    assert_pid_gone(pid);
     assert!(pool.scope_confirmed(&JobScope::session("setup")));
 }
 
@@ -262,6 +256,7 @@ async fn kind_cancellation_preserves_other_scope_and_title() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn failed_group_signal_after_direct_reap_never_resignals_or_releases_slots() {
     let pool = Registry::new(Duration::from_secs(150), Duration::from_secs(30));
     let gate = ReapGate::new();
@@ -427,4 +422,28 @@ async fn caller_abort_keeps_execution_and_inventory_until_reap_confirmed() {
     );
     assert_eq!(pool.execution.available_permits(), 2);
     assert!(gate.confirmed.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "native child owned by auxiliary cleanup regressions"]
+fn owned_windows_fixture() {
+    std::thread::sleep(Duration::from_secs(60));
+}
+
+fn assert_pid_gone(pid: u32) {
+    #[cfg(unix)]
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
+        Err(nix::errno::Errno::ESRCH)
+    );
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("tasklist.exe")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(&format!("\",\"{pid}\",")));
+    }
 }

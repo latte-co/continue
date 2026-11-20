@@ -19,7 +19,8 @@ pub fn migrate(db: &Connection, directory: &Path) -> Result<()> {
                 break;
             };
             let archive = crate::snapshot_storage::prepare(&directory.join("legacy"))?;
-            let mut file = tempfile::NamedTempFile::new_in(&archive)?;
+            let private = latte_work_platform::fs::PrivateDir::prepare(&archive)?;
+            let mut file = private.tempfile(".legacy-", "")?;
             let mut blob = db.blob_open("main", table, column, rowid, true)?;
             anyhow::ensure!(blob.len() as i64 == size, "旧快照在迁移时已改变");
             std::io::copy(&mut blob, &mut file)?;
@@ -28,6 +29,7 @@ pub fn migrate(db: &Connection, directory: &Path) -> Result<()> {
             let name = format!("{}.json", uuid::Uuid::new_v4());
             let path = archive.join(&name);
             file.persist_noclobber(&path)?;
+            #[cfg(unix)]
             std::fs::File::open(&archive)?.sync_all()?;
             let unavailable = "旧版大型快照已完整归档，自动撤销状态未知；请核对工作区。";
             let snapshot = crate::task_changes::Snapshot::unavailable(unavailable.into());

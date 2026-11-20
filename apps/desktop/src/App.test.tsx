@@ -108,6 +108,8 @@ beforeEach(() => {
     hostId: "local",
     host: { id: "local", name: "本机" },
     connected: true,
+    hostSupportsTerminal: () => true,
+    hostSupportsUndo: () => true,
     connecting: false,
     composerPrediction: null,
     setPredictionVisible: vi.fn(),

@@ -33,7 +33,12 @@ pub fn references(text: &str) -> Vec<TaskSource> {
                 name: r["name"]
                     .as_str()
                     .filter(|s| !s.is_empty() && s.len() <= 256)
-                    .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path))
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(path)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or(path)
+                    })
                     .into(),
                 kind,
                 path: Some(path.into()),
@@ -101,7 +106,11 @@ pub async fn preview(target: &Path, offset: u64) -> Result<latte_work_protocol::
                     truncated = true;
                     break;
                 }
-                let name = entry.file_name().to_string_lossy().to_string();
+                let name = entry
+                    .file_name()
+                    .to_str()
+                    .context("文件名不是 UTF-8")?
+                    .to_owned();
                 if matches!(
                     name.as_str(),
                     ".git" | "node_modules" | "target" | ".DS_Store"
@@ -110,7 +119,7 @@ pub async fn preview(target: &Path, offset: u64) -> Result<latte_work_protocol::
                 }
                 let path = entry.path();
                 // Never follow a directory symlink into a different preview scope.
-                if path.symlink_metadata()?.file_type().is_symlink() {
+                if latte_work_platform::fs::is_link(&path.symlink_metadata()?) {
                     continue;
                 }
                 let metadata = entry.metadata().await?;

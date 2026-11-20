@@ -1,15 +1,17 @@
 //! Claude session metadata: bounded incremental reads and append-only offline rename.
 //! Matches the official SDK customTitle > aiTitle > summary ordering. No transcript rewrite.
 use anyhow::{Context, Result, bail};
+use latte_work_platform::fs::is_link;
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::{
     collections::HashMap,
-    fs::{Metadata, OpenOptions},
+    fs::Metadata,
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
-    time::Instant,
+    time::{Instant, SystemTime},
 };
 const WINDOW: u64 = 64 * 1024;
 const SCAN_BUDGET: u64 = 4 * 1024 * 1024;
@@ -61,9 +63,9 @@ impl Titles {
     }
 }
 struct TitleIndex {
-    identity: (u64, u64),
+    identity: String,
     size: u64,
-    modified: (i64, i64),
+    modified: SystemTime,
     offset: u64,
     line: Vec<u8>,
     oversized: bool,
@@ -71,11 +73,11 @@ struct TitleIndex {
     touched: Instant,
 }
 impl TitleIndex {
-    fn new(meta: &Metadata) -> Self {
+    fn new(meta: &Metadata, identity: String, modified: SystemTime) -> Self {
         Self {
-            identity: (meta.dev(), meta.ino()),
+            identity,
             size: meta.len(),
-            modified: (meta.mtime(), meta.mtime_nsec()),
+            modified,
             offset: 0,
             line: Vec::new(),
             oversized: false,
@@ -83,16 +85,19 @@ impl TitleIndex {
             touched: Instant::now(),
         }
     }
-    fn read(&mut self, file: &mut std::fs::File, meta: &Metadata) -> Result<Option<Title>> {
-        if self.identity != (meta.dev(), meta.ino())
+    fn read(&mut self, opened: &mut native::SessionFile, meta: &Metadata) -> Result<Option<Title>> {
+        let identity = native::identity(opened)?;
+        let modified = meta.modified()?;
+        if self.identity != identity
             || meta.len() < self.size
-            || (meta.len() == self.size && self.modified != (meta.mtime(), meta.mtime_nsec()))
+            || (meta.len() == self.size && self.modified != modified)
         {
-            *self = Self::new(meta);
+            *self = Self::new(meta, identity, modified);
         }
         self.size = meta.len();
-        self.modified = (meta.mtime(), meta.mtime_nsec());
+        self.modified = modified;
         self.touched = Instant::now();
+        let file = opened.file_mut();
         file.seek(SeekFrom::Start(self.offset))?;
         let mut bytes = Vec::new();
         file.take(SCAN_BUDGET.min(self.size - self.offset))
@@ -143,6 +148,11 @@ fn configured_projects(
         .or_else(|| {
             crate::agent_environment::variable("HOME").map(|p| PathBuf::from(p).join(".claude"))
         })
+        .or_else(|| {
+            latte_work_platform::dirs::home_dir()
+                .ok()
+                .map(|p| p.join(".claude"))
+        })
         .context("无法确定 Claude 会话目录")?;
     Ok(cwd.join(config).join("projects"))
 }
@@ -150,25 +160,21 @@ fn locate_in(projects: &Path, cwd: &Path, id: &str) -> Result<Option<PathBuf>> {
     uuid::Uuid::parse_str(id).context("原生会话 ID 无效")?;
     // Require the canonical UUID spelling; never use an input as a free-form path.
     let filename = format!("{}.jsonl", uuid::Uuid::parse_str(id)?);
-    let canonical = cwd.canonicalize()?;
-    let sanitized: String = canonical
-        .to_string_lossy()
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-        .collect();
+    let sanitized = native::project_key(&cwd.canonicalize()?);
     let root = match projects.canonicalize() {
         Ok(root) => root,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    let search_root = native::search_root(projects, &root)?;
     let mut candidates = if sanitized.len() <= 200 {
-        vec![root.join(&sanitized).join(&filename)]
+        vec![search_root.join(&sanitized).join(&filename)]
     } else {
         // Native Bun and SDK hash suffixes differ for long paths; match the exact UUID
         // beneath the shared 200-character prefix, bounded and ambiguity checked.
         let prefix = format!("{}-", &sanitized[..200]);
         let mut paths = vec![];
-        for (n, entry) in root.read_dir()?.enumerate() {
+        for (n, entry) in search_root.read_dir()?.enumerate() {
             if n >= 1024 {
                 bail!("Claude 会话目录超出读取范围");
             }
@@ -189,17 +195,19 @@ fn locate_in(projects: &Path, cwd: &Path, id: &str) -> Result<Option<PathBuf>> {
         return Ok(None);
     };
     let target = path.canonicalize()?;
-    if !target.starts_with(&root) || path.symlink_metadata()?.file_type().is_symlink() {
+    if !target.starts_with(&root) || is_link(&path.symlink_metadata()?) {
         bail!("拒绝访问 Claude 会话目录外的路径");
     }
-    Ok(Some(target))
+    Ok(Some(native::located_path(path, target)))
+}
+fn sanitized_project_key(path: &str) -> String {
+    path.chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect()
 }
 fn read_path(path: &Path) -> Result<Option<Title>> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(path)?;
-    let metadata = file.metadata()?;
+    let mut opened = native::SessionFile::open(path, false)?;
+    let metadata = opened.file().metadata()?;
     if !metadata.is_file() {
         bail!("Claude 会话不是普通文件");
     }
@@ -221,18 +229,18 @@ fn read_path(path: &Path) -> Result<Option<Title>> {
         // could repeatedly evict every unfinished scan before it reaches its end.
         return Ok(None);
     }
+    let identity = native::identity(&opened)?;
+    let modified = metadata.modified()?;
     indexes
         .entry(path.to_owned())
-        .or_insert_with(|| TitleIndex::new(&metadata))
-        .read(&mut file, &metadata)
+        .or_insert_with(|| TitleIndex::new(&metadata, identity, modified))
+        .read(&mut opened, &metadata)
 }
 /// Offline rename always verifies the latest bounded tail, even if a large file's
 /// incremental index has not caught up yet. Partial tail records are ignored.
 fn read_tail(path: &Path) -> Result<Option<Title>> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(path)?;
+    let mut opened = native::SessionFile::open(path, false)?;
+    let file = opened.file_mut();
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         bail!("Claude 会话不是普通文件");
@@ -290,46 +298,32 @@ pub(super) fn read_child(
     read_child_path(&parent_path, child)
 }
 
-fn open_child_path(parent: &Path, child: &str) -> Result<Option<std::fs::File>> {
+fn open_child_path(parent: &Path, child: &str) -> Result<Option<native::SessionFile>> {
     let session_dir = parent.with_extension("");
     let directory = session_dir.join("subagents");
     for path in [&session_dir, &directory] {
         match path.symlink_metadata() {
-            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+            Ok(meta) if meta.is_dir() && !is_link(&meta) => {}
             Ok(_) => bail!("子会话目录不是普通目录"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         }
     }
     let path = directory.join(format!("agent-{child}.jsonl"));
-    let expected = match path.symlink_metadata() {
-        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => meta,
+    match path.symlink_metadata() {
+        Ok(meta) if meta.is_file() && !is_link(&meta) => {}
         Ok(_) => bail!("子会话记录不是普通文件"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
-    };
-    if directory.canonicalize()? != directory || path.canonicalize()? != path {
-        bail!("拒绝读取子会话目录外的记录");
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(&path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.dev() != expected.dev()
-        || metadata.ino() != expected.ino()
-        || metadata.uid() != nix::unistd::Uid::current().as_raw()
-    {
-        bail!("子会话记录身份已改变");
-    }
-    Ok(Some(file))
+    Ok(Some(native::open_child(&path)?))
 }
 fn read_child_path(parent: &Path, child: &str) -> Result<Option<ChildBytes>> {
     const LIMIT: u64 = 512 * 1024;
-    let Some(mut file) = open_child_path(parent, child)? else {
+    let Some(mut opened) = open_child_path(parent, child)? else {
         return Ok(None);
     };
+    let file = opened.file_mut();
     let start = file.metadata()?.len().saturating_sub(LIMIT);
     file.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::new();
@@ -373,11 +367,12 @@ fn read_child_page_path(
     child: &str,
     mut cursor: super::ChildHistoryCursor,
 ) -> Result<Option<ChildPageBytes>> {
-    let Some(mut file) = open_child_path(parent, child)? else {
+    let Some(mut opened) = open_child_path(parent, child)? else {
         return Ok(None);
     };
+    let identity = native::identity(&opened)?;
+    let file = opened.file_mut();
     let metadata = file.metadata()?;
-    let identity = format!("{}:{}", metadata.dev(), metadata.ino());
     if !cursor.identity.is_empty() && cursor.identity != identity {
         bail!("子会话原始文件已替换，请核对记录");
     }
@@ -435,22 +430,10 @@ fn append(path: &Path, id: &str, title: &str) -> Result<()> {
     if !valid_title(title) {
         bail!("原生会话标题无效");
     }
-    let expected = path.symlink_metadata()?;
-    if path.canonicalize()? != path || !expected.is_file() {
-        bail!("原生会话路径已改变，标题未修改");
-    }
-    let mut file = OpenOptions::new()
-        .append(true)
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(path)?;
+    let mut opened = native::SessionFile::open(path, true)?;
+    let file = opened.file_mut();
     let meta = file.metadata()?;
-    if !meta.is_file()
-        || meta.len() == 0
-        || meta.dev() != expected.dev()
-        || meta.ino() != expected.ino()
-        || path.canonicalize()? != path
-    {
+    if !meta.is_file() || meta.len() == 0 {
         bail!("原生会话文件不可用，标题未修改");
     }
     file.seek(SeekFrom::End(-1))?;
@@ -470,9 +453,108 @@ fn append(path: &Path, id: &str, title: &str) -> Result<()> {
     file.sync_data()?;
     Ok(())
 }
+#[cfg(unix)]
+mod native {
+    use super::*;
+    use std::{
+        fs::{File, OpenOptions},
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+
+    pub(super) struct SessionFile(File);
+
+    impl SessionFile {
+        pub(super) fn open(path: &Path, append: bool) -> Result<Self> {
+            let expected = path.symlink_metadata()?;
+            if !expected.is_file() || path.canonicalize()? != path {
+                bail!("原生会话路径已改变");
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .append(append)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+                .open(path)?;
+            let actual = file.metadata()?;
+            if !actual.is_file()
+                || actual.dev() != expected.dev()
+                || actual.ino() != expected.ino()
+                || path.canonicalize()? != path
+            {
+                bail!("原生会话文件身份已改变");
+            }
+            Ok(Self(file))
+        }
+        pub(super) fn file(&self) -> &File {
+            &self.0
+        }
+        pub(super) fn file_mut(&mut self) -> &mut File {
+            &mut self.0
+        }
+    }
+
+    pub(super) fn identity(file: &SessionFile) -> Result<String> {
+        let metadata = file.file().metadata()?;
+        Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+    }
+    pub(super) fn open_child(path: &Path) -> Result<SessionFile> {
+        let file = SessionFile::open(path, false)?;
+        if file.file().metadata()?.uid() != nix::unistd::Uid::current().as_raw() {
+            bail!("子会话记录属于其他用户");
+        }
+        Ok(file)
+    }
+    pub(super) fn project_key(path: &Path) -> String {
+        sanitized_project_key(&path.to_string_lossy())
+    }
+    pub(super) fn search_root(_projects: &Path, canonical: &Path) -> Result<PathBuf> {
+        Ok(canonical.to_owned())
+    }
+    pub(super) fn located_path(_path: PathBuf, canonical: PathBuf) -> PathBuf {
+        canonical
+    }
+}
+
+#[cfg(windows)]
+mod native {
+    use super::*;
+    pub(super) use latte_work_platform::fs::NativeSessionFile as SessionFile;
+
+    pub(super) fn identity(file: &SessionFile) -> Result<String> {
+        let identity = file.identity()?;
+        Ok(format!(
+            "{}:{}",
+            identity.volume,
+            uuid::Uuid::from_bytes(identity.file_id).simple()
+        ))
+    }
+    pub(super) fn open_child(path: &Path) -> Result<SessionFile> {
+        // The constructor verifies the owner SID of every opened native file.
+        Ok(SessionFile::open(path, false)?)
+    }
+    pub(super) fn project_key(path: &Path) -> String {
+        let text = path.to_string_lossy();
+        // canonicalize adds a Win32 namespace prefix absent from Claude's cwd.
+        let text = if matches!(path.components().next(), Some(std::path::Component::Prefix(p))
+            if matches!(p.kind(), std::path::Prefix::VerbatimDisk(_)))
+        {
+            text.strip_prefix(r"\\?\").unwrap_or(&text)
+        } else {
+            &text
+        };
+        sanitized_project_key(text)
+    }
+    pub(super) fn search_root(projects: &Path, _canonical: &Path) -> Result<PathBuf> {
+        Ok(std::path::absolute(projects)?)
+    }
+    pub(super) fn located_path(path: PathBuf, _canonical: PathBuf) -> PathBuf {
+        path
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
+    #[cfg(unix)]
     fn configured_child_reads_keep_scope_and_symlink_guards() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
@@ -556,6 +638,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg(unix)]
     fn child_record_reads_are_bounded_and_reject_symlink_files_and_directories() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -753,6 +836,7 @@ mod tests {
         assert_eq!(read_path(&path).unwrap().unwrap().text, "New inode");
     }
     #[test]
+    #[cfg(unix)]
     fn session_paths_reject_invalid_ids_symlinks_and_keep_reads_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("project");

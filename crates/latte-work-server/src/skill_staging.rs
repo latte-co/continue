@@ -4,10 +4,32 @@ use anyhow::{Result, bail};
 use std::{
     fs::File,
     io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
     path::Path,
 };
 
+fn open_lease(path: &Path, create: bool) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // OPEN_REPARSE_POINT; share deletion so cleanup can unlink its own lease.
+        options.custom_flags(0x0020_0000).share_mode(0x0000_0007);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || latte_work_platform::fs::is_link(&metadata) {
+        return Err(std::io::Error::other("stage lease must be a regular file"));
+    }
+    Ok(file)
+}
 const LEASE: &str = ".latte-work-stage";
 const MARKER: &[u8] = b"latte-work-skill-stage-v1\n";
 pub struct Staging {
@@ -32,15 +54,11 @@ impl Staging {
             if suffix.len() != 6
                 || !suffix.bytes().all(|b| b.is_ascii_alphanumeric())
                 || !entry.file_type()?.is_dir()
+                || latte_work_platform::fs::is_link(&entry.path().symlink_metadata()?)
             {
                 continue;
             }
-            let Ok(mut lease) = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-                .open(entry.path().join(LEASE))
-            else {
+            let Ok(mut lease) = open_lease(&entry.path().join(LEASE), false) else {
                 continue;
             };
             if !lease.metadata()?.is_file()
@@ -62,13 +80,7 @@ impl Staging {
         }
         check(budget)?;
         let directory = tempfile::Builder::new().prefix(prefix).tempdir_in(parent)?;
-        let mut lease = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(nix::libc::O_NOFOLLOW)
-            .open(directory.path().join(LEASE))?;
+        let mut lease = open_lease(&directory.path().join(LEASE), true)?;
         lease.try_lock()?;
         lease.write_all(MARKER)?;
         Ok(Self {
@@ -95,7 +107,14 @@ fn remove(path: &Path, depth: usize, count: &mut usize, budget: Option<&Budget>)
         if *count > 516 {
             bail!("技能暂存目录项数异常，请手动核对：{}", path.display());
         }
-        if entry.file_type()?.is_dir() {
+        let metadata = entry.path().symlink_metadata()?;
+        if latte_work_platform::fs::is_link(&metadata) {
+            if metadata.is_dir() {
+                std::fs::remove_dir(entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
+            }
+        } else if metadata.is_dir() {
             remove(&entry.path(), depth + 1, count, budget)?;
         } else {
             std::fs::remove_file(entry.path())?;
@@ -113,6 +132,7 @@ fn remove(path: &Path, depth: usize, count: &mut usize, budget: Option<&Budget>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     #[test]
     fn recovers_abandoned_stages_but_preserves_active_unmarked_and_linked_paths() {
         let parent = tempfile::tempdir().unwrap();

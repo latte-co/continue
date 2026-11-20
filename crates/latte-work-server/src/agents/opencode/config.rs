@@ -66,12 +66,13 @@ pub(super) fn configure(
             .as_ref()
             .map(|file| file.path().to_str().context("OpenCode 指令路径不是 UTF-8"))
             .transpose()?;
-        overlay.array_value_or_create("plugins")
+        overlay
+            .array_value_or_create("plugins")
             .context("OpenCode plugins 必须是数组")?
             .append(jsonc_parser::json!({
                 "package": (directory.to_str().context("OpenCode 插件路径不是 UTF-8")?),
                 "options": {
-                    "socket": (directory.join("events").to_str().context("OpenCode Socket 路径不是 UTF-8")?),
+                    "socket": (sideband.address()),
                     "permissionMode": (config.permission_mode.as_deref().unwrap_or_default()),
                     "instructions": (instructions.unwrap_or_default())
                 }

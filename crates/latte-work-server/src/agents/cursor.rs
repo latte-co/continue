@@ -40,7 +40,11 @@ fn valid_id(id: &str) -> Result<()> {
     Ok(())
 }
 fn native_command(launch: &Launch, resume: Option<&str>, prompt: Option<&str>) -> AgentCommand {
-    let mut command = crate::agent_environment::command(&launch.binary);
+    let mut command = crate::agent_environment::configured_command(
+        &launch.binary,
+        Some(std::path::Path::new(&launch.cwd)),
+        &launch.config.environment,
+    );
     command
         .current_dir(&launch.cwd)
         .envs(&launch.config.environment.0);
@@ -137,11 +141,11 @@ impl AgentAdapter for Cursor {
                 validate_prompt(prompt)?;
                 let launch = self.launch.as_ref().context("Cursor launch 尚未准备")?;
                 self.decoder.start()?;
-                Ok(vec![Action::SpawnTurn(native_command(
+                Ok(vec![Action::SpawnTurn(Box::new(native_command(
                     launch,
                     self.decoder.session(),
                     Some(prompt),
-                ))])
+                )))])
             }
             Input::Message(line) => self.decoder.message(line),
             Input::Interrupt => bail!("Cursor 无原生 interrupt RPC；由 Host 停止本轮进程"),

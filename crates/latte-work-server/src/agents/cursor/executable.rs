@@ -19,15 +19,34 @@ pub(super) fn resolve<'a>(
             .is_some_and(|parent| !parent.as_os_str().is_empty());
     let bound = (valid && explicit).then(|| cwd.join(candidate));
     let path = path.filter(|_| valid && !explicit);
-    bound.into_iter().chain(
+    let paths = bound.into_iter().chain(
         path.into_iter()
             .flat_map(std::env::split_paths)
             // Empty and relative PATH entries have the same meaning as at spawn.
             .map(move |directory| cwd.join(directory).join(candidate)),
-    )
+    );
+    paths.flat_map(|path| {
+        #[cfg(unix)]
+        {
+            vec![path]
+        }
+        #[cfg(windows)]
+        {
+            if path.extension().is_some() {
+                vec![path]
+            } else {
+                vec![
+                    path.with_extension("exe"),
+                    path.with_extension("cmd"),
+                    path.with_extension("ps1"),
+                    path,
+                ]
+            }
+        }
+    })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::{

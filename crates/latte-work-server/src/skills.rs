@@ -61,8 +61,10 @@ impl Warnings {
 }
 impl Skills {
     pub fn new(directory: &Path) -> Result<Self> {
-        let home =
-            PathBuf::from(crate::agent_environment::variable("HOME").context("无法确定主目录")?);
+        let home = match crate::agent_environment::variable("HOME") {
+            Some(home) => PathBuf::from(home),
+            None => latte_work_platform::dirs::home_dir().context("无法确定主目录")?,
+        };
         let claude = crate::agent_environment::variable("CLAUDE_CONFIG_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".claude"));
@@ -88,7 +90,7 @@ impl Skills {
         let path = self.directory.join("skills.json");
         match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Preferences::default()),
-            Ok(m) if m.file_type().is_symlink() => bail!("Skill 设置不能是符号链接"),
+            Ok(m) if latte_work_platform::fs::is_link(&m) => bail!("Skill 设置不能是符号链接"),
             Ok(_) => Ok(serde_json::from_str(&read(&path, FILE_LIMIT)?)?),
             Err(e) => Err(e.into()),
         }
@@ -154,7 +156,7 @@ impl Skills {
             let root = parent.join(root.file_name().context("Skill 根目录无效")?);
             let root = if root
                 .symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_symlink())
+                .is_ok_and(|m| latte_work_platform::fs::is_link(&m))
             {
                 match root.canonicalize() {
                     Ok(path) => path,
@@ -177,7 +179,7 @@ impl Skills {
                 let folder = state_root(&root, state)?;
                 if folder
                     .symlink_metadata()
-                    .is_ok_and(|m| m.file_type().is_symlink())
+                    .is_ok_and(|m| latte_work_platform::fs::is_link(&m))
                 {
                     warnings.push(format!("技能状态目录不能是符号链接：{}", folder.display()));
                     continue;
@@ -366,7 +368,7 @@ impl Skills {
             safe_folder(&destination_root)?;
             let destination = destination_root.join(&entry.slug);
             require_absent(&destination)?;
-            if source.symlink_metadata()?.file_type().is_symlink() {
+            if latte_work_platform::fs::is_link(&source.symlink_metadata()?) {
                 let link = std::fs::read_link(&source)?;
                 if link.is_relative()
                     && destination
@@ -403,7 +405,6 @@ impl Skills {
         files: &[latte_work_protocol::SkillImportFile],
     ) -> Result<()> {
         use std::io::{Read, Write};
-        use std::os::unix::fs::OpenOptionsExt;
         self.check_budget()?;
         if !component(name) {
             bail!(
@@ -420,6 +421,7 @@ impl Skills {
         let mut names = HashSet::new();
         let mut directories = HashSet::new();
         for item in files {
+            latte_work_platform::paths::relative(Path::new(&item.path))?;
             let parts: Vec<_> = item.path.split('/').collect();
             if item.path.len() > 1024
                 || parts.len() > 9
@@ -463,10 +465,8 @@ impl Skills {
         let mut total = 0u64;
         for item in files {
             self.check_budget()?;
-            let mut input = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-                .open(&item.attachment)?;
+            let mut input =
+                latte_work_platform::fs::open_regular_file(Path::new(&item.attachment))?;
             let metadata = input.metadata()?;
             total = total.saturating_add(metadata.len());
             if !metadata.is_file()
@@ -484,17 +484,19 @@ impl Skills {
                     )
                 },
             )?;
-            let mut output = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&target)
-                .with_context(|| {
-                    format!(
-                        "无法写入技能文件，请核对大小写冲突或目标文件系统的名称限制：{}",
-                        item.path
-                    )
-                })?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut output = options.open(&target).with_context(|| {
+                format!(
+                    "无法写入技能文件，请核对大小写冲突或目标文件系统的名称限制：{}",
+                    item.path
+                )
+            })?;
             let mut remaining = metadata.len();
             while remaining > 0 {
                 self.check_budget()?;
@@ -569,6 +571,7 @@ pub(crate) fn component(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
         && !s.starts_with('.')
+        && latte_work_platform::paths::file_name(s).is_ok()
 }
 fn identity(root: &Path, slug: &str) -> String {
     format!(
@@ -611,7 +614,7 @@ fn require_absent(path: &Path) -> Result<()> {
 fn safe_folder(path: &Path) -> Result<()> {
     for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
         match ancestor.symlink_metadata() {
-            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+            Ok(m) if m.is_dir() && !latte_work_platform::fs::is_link(&m) => {}
             Ok(_) => bail!("Skill 安装位置不是普通目录：{}", ancestor.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(ancestor)?,
             Err(e) => return Err(e.into()),
@@ -669,7 +672,9 @@ fn copy_tree(
         }
         let item = item?;
         let meta = item.path().symlink_metadata()?;
-        if meta.is_dir() {
+        if latte_work_platform::fs::is_link(&meta) {
+            bail!("Skill 包含符号链接或重解析点");
+        } else if meta.is_dir() {
             copy_tree(
                 &item.path(),
                 &target.join(item.file_name()),
@@ -683,12 +688,8 @@ fn copy_tree(
                 bail!("Skill 文件总量超过 16 MiB");
             }
             // Bounded nonblocking regular-file read also fences special-file replacement.
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-                .open(item.path())?;
+            let file = latte_work_platform::fs::open_regular_file(&item.path())?;
             use std::io::{Read, Write};
-            use std::os::unix::fs::OpenOptionsExt;
             if !file.metadata()?.is_file() {
                 bail!("Skill 包含非普通文件");
             }
@@ -754,15 +755,45 @@ pub fn platform_instructions(directory: &Path) -> String {
     }
 }
 fn builtin_body() -> &'static str {
-    BUILTIN
-        .strip_prefix("---\n")
-        .and_then(|text| text.split_once("\n---\n"))
-        .map_or(BUILTIN, |(_, body)| body.trim_start())
+    without_frontmatter(BUILTIN)
+}
+fn without_frontmatter(text: &str) -> &str {
+    let mut lines = text.split_inclusive('\n');
+    let Some(first) = lines.next() else {
+        return text;
+    };
+    if first
+        .trim_end_matches(['\r', '\n'])
+        .trim_start_matches('\u{feff}')
+        != "---"
+    {
+        return text;
+    }
+    let mut offset = first.len();
+    for line in lines {
+        offset += line.len();
+        if line.trim_end_matches(['\r', '\n']) == "---" {
+            return text[offset..].trim_start();
+        }
+    }
+    text
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn platform_frontmatter_accepts_lf_crlf_and_bom_without_exposing_metadata() {
+        for newline in ["\n", "\r\n"] {
+            for bom in ["", "\u{feff}"] {
+                let document = format!(
+                    "{bom}---{newline}description: metadata{newline}---{newline}# Body{newline}"
+                );
+                assert_eq!(without_frontmatter(&document), format!("# Body{newline}"));
+            }
+        }
+        assert_eq!(without_frontmatter("# Body\n"), "# Body\n");
+    }
     fn setup() -> (tempfile::TempDir, Skills, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -783,6 +814,7 @@ mod tests {
         std::fs::write(path.join("SKILL.md"), "---\nname: Example\ndescription: >-\n  Bounded skill\n  metadata\n---\n# Body\n!`touch MUST_NOT_EXIST`\n").unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn corrupt_preferences_skip_only_platform_injection_and_preserve_native_inventory() {
         for case in ["json", "oversize", "symlink"] {
@@ -862,6 +894,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn imports_resolve_trusted_home_aliases_but_refuse_destination_symlinks() {
         let (temp, manager, home) = setup();
@@ -896,6 +929,7 @@ mod tests {
         assert!(manager.install(None, SkillScope::System, &source).is_err());
         assert!(!home.join(".agents").exists());
     }
+    #[cfg(unix)]
     #[test]
     fn non_utf8_and_invalid_installation_names_are_reported_with_paths() {
         #[cfg(target_os = "linux")]
@@ -1005,6 +1039,7 @@ mod tests {
         );
         assert!(manager.detail(None, "../../secret").is_err());
     }
+    #[cfg(unix)]
     #[test]
     fn moves_skill_links_without_modifying_shared_target_and_rejects_escaping_markdown() {
         let (temp, manager, _) = setup();
@@ -1042,6 +1077,7 @@ mod tests {
         assert_eq!(catalog.skills.len(), 2);
         assert_eq!(catalog.warnings.len(), 1);
     }
+    #[cfg(unix)]
     #[test]
     fn conflicts_symlink_destinations_and_oversize_files_are_explicit() {
         let (_temp, manager, home) = setup();
@@ -1081,6 +1117,7 @@ mod tests {
                 .is_err()
         );
     }
+    #[cfg(unix)]
     #[test]
     fn import_preserves_resources_and_original_and_rejects_unsafe_packages() {
         let (temp, manager, home) = setup();
@@ -1195,6 +1232,37 @@ mod tests {
             attachment: attachments.finish(&id).unwrap().path,
         }
     }
+    #[cfg(windows)]
+    #[test]
+    fn uploaded_skills_reject_windows_streams_devices_and_ambiguous_names() {
+        let (_temp, manager, home) = setup();
+        let skill = uploaded(&manager, "SKILL.md", b"Body");
+        for path in [
+            "name:stream",
+            "NUL",
+            "COM1.txt",
+            "resource.",
+            "dir /file.txt",
+        ] {
+            let mut bad = skill.clone();
+            bad.path = path.into();
+            assert!(
+                manager
+                    .import_files("unsafe", &[skill.clone(), bad])
+                    .is_err(),
+                "{path}"
+            );
+            assert!(!home.join(".agents/skills/unsafe").exists());
+        }
+        for name in ["CON", "COM1", "skill."] {
+            assert!(
+                manager
+                    .import_files(name, std::slice::from_ref(&skill))
+                    .is_err(),
+                "{name}"
+            );
+        }
+    }
     #[test]
     fn uploaded_skill_validation_explains_name_empty_and_excessive_packages() {
         let (_temp, manager, _) = setup();
@@ -1257,6 +1325,7 @@ mod tests {
         assert!(files.iter().all(|f| Path::new(&f.attachment).is_file()));
         assert!(!home.join(".claude/skills/uploaded").exists());
     }
+    #[cfg(unix)]
     #[test]
     fn uploaded_skills_reject_paths_foreign_files_and_symlinks_without_partial_installation() {
         let (temp, manager, home) = setup();
@@ -1333,6 +1402,7 @@ mod tests {
             SkillState::Uninstalled
         );
     }
+    #[cfg(unix)]
     #[test]
     fn aliases_do_not_duplicate_global_inventory() {
         let (_temp, manager, _) = setup();
@@ -1363,22 +1433,25 @@ mod tests {
         let catalog = manager.list(None).unwrap();
         assert!(catalog.truncated);
         assert_eq!(catalog.skills.len(), LIMIT);
-        let fifo = manager.claude.join("skills/fifo");
-        std::fs::create_dir_all(&fifo).unwrap();
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg(fifo.join("SKILL.md"))
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            manager
-                .list(None)
-                .unwrap()
-                .warnings
-                .iter()
-                .any(|s| s.contains("fifo"))
-        );
+        #[cfg(unix)]
+        {
+            let fifo = manager.claude.join("skills/fifo");
+            std::fs::create_dir_all(&fifo).unwrap();
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(fifo.join("SKILL.md"))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                manager
+                    .list(None)
+                    .unwrap()
+                    .warnings
+                    .iter()
+                    .any(|s| s.contains("fifo"))
+            );
+        }
     }
 }

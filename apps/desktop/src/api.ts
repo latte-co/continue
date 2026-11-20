@@ -10,6 +10,7 @@ export interface Host {
   name: string;
   ssh: string | null;
   server_path: string | null;
+  platform?: "unix" | "windows";
   auth?: "none" | "identity_file" | "password";
   identity_file?: string | null;
   port?: number | null;
@@ -69,7 +70,11 @@ export function disconnect(hostId: string): Promise<void> {
   );
   return invoke("disconnect_host", { hostId });
 }
-export function chooseProjectFolder(): Promise<string | null> {
+export interface ProjectFolder {
+  path: string;
+  name: string;
+}
+export function chooseProjectFolder(): Promise<ProjectFolder | null> {
   return invoke("choose_project_folder");
 }
 export function chooseReferencePath(
@@ -172,8 +177,14 @@ export function saveAgentEnvironment(
   hostId: string,
   agent: string,
   environment: import("./protocol").AgentEnvironment,
+  platform?: Host["platform"],
 ): Promise<import("./protocol").AgentEnvironment> {
-  return invoke("save_agent_environment", { hostId, agent, environment });
+  return invoke("save_agent_environment", {
+    hostId,
+    agent,
+    environment,
+    ...(platform ? { platform } : {}),
+  });
 }
 
 export type ProviderRequest = Extract<

@@ -129,6 +129,55 @@ pub fn now() -> f64 {
         .as_millis() as f64
 }
 impl Store {
+    #[cfg(windows)]
+    pub fn windows_undo_stores(&self) -> Result<Vec<crate::managed_recovery::Registration>> {
+        let mut statement = self.db.prepare("SELECT substr(store_id,1,257),substr(project_path,1,32769),substr(data,1,65537) FROM windows_undo_stores LIMIT 1001")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.len() > 1000 {
+            bail!("Undo store registry exceeds the capture limit");
+        }
+        rows.into_iter()
+            .map(|(store_id, project_path, data)| {
+                if store_id.len() > 256 || project_path.len() > 32768 || data.len() > 64 * 1024 {
+                    bail!("Undo registration exceeds the limit");
+                }
+                let record: crate::managed_recovery::Registration = serde_json::from_str(&data)?;
+                if store_id != record.store_uuid || Path::new(&project_path) != record.project_path
+                {
+                    bail!("Undo registry keys do not match the registered identities");
+                }
+                Ok(record)
+            })
+            .collect()
+    }
+    #[cfg(windows)]
+    pub fn register_windows_undo_store(
+        &mut self,
+        record: &crate::managed_recovery::Registration,
+    ) -> Result<()> {
+        let transaction = self.db.transaction()?;
+        transaction.execute(
+            "INSERT INTO windows_undo_stores(store_id,project_path,data) VALUES(?1,?2,?3)",
+            params![
+                record.store_uuid,
+                record
+                    .project_path
+                    .to_str()
+                    .context("project path is not UTF-8")?,
+                serde_json::to_string(record)?
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
@@ -153,6 +202,7 @@ impl Store {
         CREATE TABLE IF NOT EXISTS subagent_native_transcripts(session_id TEXT NOT NULL,task_id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(session_id,task_id),FOREIGN KEY(session_id,task_id) REFERENCES subagents(session_id,id));
         CREATE INDEX IF NOT EXISTS events_session ON events(session_id,seq);
         CREATE TABLE IF NOT EXISTS turn_changes(session_id TEXT NOT NULL REFERENCES sessions(id), request_id TEXT NOT NULL REFERENCES requests(id), baseline TEXT, data TEXT, PRIMARY KEY(session_id,request_id));
+        CREATE TABLE IF NOT EXISTS windows_undo_stores(store_id TEXT PRIMARY KEY, project_path TEXT NOT NULL UNIQUE, data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS task_baselines(session_id TEXT PRIMARY KEY REFERENCES sessions(id), data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS task_sources(session_id TEXT NOT NULL REFERENCES sessions(id), id TEXT NOT NULL, data TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(session_id,id));
         CREATE TABLE IF NOT EXISTS observed_tools(session_id TEXT NOT NULL REFERENCES sessions(id), id TEXT NOT NULL, PRIMARY KEY(session_id,id));
@@ -295,6 +345,7 @@ impl Store {
                         interrupted: true,
                         background_pending: false,
                         undo: latte_work_protocol::TurnUndoStatus::Unknown,
+                        undo_unavailable: None,
                     },
                 },
             )?;
@@ -414,6 +465,7 @@ impl Store {
         if !path.is_absolute() {
             bail!("项目路径必须是绝对路径");
         }
+        latte_work_platform::paths::absolute(path)?;
         let canonical = path.canonicalize().context("项目目录不存在或无法访问")?;
         if !canonical.is_dir() {
             bail!("请选择目录");
@@ -432,8 +484,9 @@ impl Store {
                 canonical
                     .file_name()
                     .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
+                    .to_str()
+                    .expect("canonical path checked as UTF-8")
+                    .to_owned()
             }),
             path,
         };
@@ -1544,6 +1597,7 @@ impl Store {
         let mut turn: crate::task_changes::FrozenTurn =
             serde_json::from_str(&data.context("此轮尚未结束或没有保存变更快照")?)?;
         turn.attach(&self.snapshot_dir);
+        turn.refresh_undo_availability();
         Ok(turn)
     }
     pub fn last_turn_changes(&self, id: &str) -> Result<Option<crate::task_changes::FrozenTurn>> {
@@ -2139,7 +2193,7 @@ impl Store {
         Ok(source_user_seq)
     }
     fn presentation_event(&self, id: &str, data: &str) -> Result<EventKind> {
-        let event: EventKind = serde_json::from_str(data)?;
+        let event = self.event_for_display(id, data)?;
         if matches!(event, EventKind::ToolResult { .. }) && data.contains("\"source\"") {
             return Ok(crate::agents::normalize_history_event(
                 &self.session(id)?.agent,
@@ -2270,6 +2324,21 @@ impl Store {
         }
         let chunk = payload[offset..end].to_owned();
         Ok((entry.encoding, chunk, total, (end < total).then_some(end)))
+    }
+    fn event_for_display(&self, session: &str, data: &str) -> Result<EventKind> {
+        let mut event: EventKind = serde_json::from_str(data)?;
+        if let EventKind::TurnChanges { changes } = &mut event
+            && changes.undo_unavailable.is_none()
+            && changes.undo == latte_work_protocol::TurnUndoStatus::Ready
+        {
+            // Project old Windows events without loading their byte snapshots into
+            // the history response. Durable events themselves remain unchanged.
+            changes.undo_unavailable = self.db.query_row(
+                "SELECT CASE WHEN json_type(data,'$.before.root_identity.windows_v1') IS NOT NULL AND json_type(data,'$.before.windows_files_v1') IS NULL AND json_type(data,'$.after.windows_files_v1') IS NULL THEN '此历史快照缺少 Windows 文件权限元数据，不能撤销' ELSE json_extract(data,'$.changes.undo_unavailable') END FROM turn_changes WHERE session_id=?1 AND request_id=?2 AND data IS NOT NULL",
+                params![session, changes.request_id], |row| row.get::<_, Option<String>>(0),
+            ).optional()?.flatten();
+        }
+        Ok(event)
     }
     /// Reverse pages avoid replaying every historical tool output to show the latest reply.
     pub fn history(
@@ -5267,11 +5336,16 @@ mod large_snapshot_tests {
         store
             .begin(&session.id, "large-turn", "edit", None, None, None, None)
             .unwrap();
-        let mut file = std::fs::File::create(root.join("large.bin")).unwrap();
+        let file = std::fs::File::create(root.join("large.bin")).unwrap();
         file.set_len(32 * 1024 * 1024).unwrap();
-        let before = Snapshot::capture_stored(root, &store.snapshot_dir)
-            .await
-            .unwrap();
+        drop(file);
+        let before = Snapshot::capture_stored(
+            root,
+            &store.snapshot_dir,
+            &crate::managed_recovery::ManagedRecoveryExclusions::empty(),
+        )
+        .await
+        .unwrap();
         assert!(serde_json::to_string(&before).unwrap().len() < 1024);
         store.save_baseline(&session.id, &before).unwrap();
         store
@@ -5284,12 +5358,21 @@ mod large_snapshot_tests {
             })
             .unwrap();
         assert!(baseline_bytes < 1024);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("large.bin"))
+            .unwrap();
         file.seek(SeekFrom::End(-1)).unwrap();
         file.write_all(b"x").unwrap();
         file.sync_all().unwrap();
-        let after = Snapshot::capture_stored(root, &store.snapshot_dir)
-            .await
-            .unwrap();
+        drop(file);
+        let after = Snapshot::capture_stored(
+            root,
+            &store.snapshot_dir,
+            &crate::managed_recovery::ManagedRecoveryExclusions::empty(),
+        )
+        .await
+        .unwrap();
         let turn = FrozenTurn::freeze("large-turn".into(), before, after, false, false)
             .await
             .unwrap();
@@ -5312,7 +5395,7 @@ mod large_snapshot_tests {
         let turn = store.turn_changes(&session.id, "large-turn").unwrap();
         turn.validate_undo(root).unwrap();
         assert!(turn.patch("large.bin").await.unwrap().0.contains("Binary"));
-        turn.restore(root).unwrap();
+        turn.restore(root).await.unwrap();
         let mut restored = std::fs::File::open(root.join("large.bin")).unwrap();
         restored.seek(SeekFrom::End(-1)).unwrap();
         let mut byte = [1];
@@ -5457,13 +5540,16 @@ mod legacy_snapshot_compatibility {
             .baseline(&session.id)
             .unwrap()
             .unwrap()
-            .summary(project.path())
+            .summary(
+                project.path(),
+                &crate::managed_recovery::ManagedRecoveryExclusions::empty(),
+            )
             .await
             .unwrap();
         assert_eq!(summary.entries[0].path, "source.txt");
         assert!(summary.unavailable.is_none());
         turn.validate_undo(project.path()).unwrap();
-        turn.restore(project.path()).unwrap();
+        turn.restore(project.path()).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(project.path().join("source.txt")).unwrap(),
             old

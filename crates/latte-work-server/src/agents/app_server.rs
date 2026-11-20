@@ -1113,7 +1113,11 @@ impl AgentAdapter for AppServer {
             })
             .transpose()?;
         self.config = Some(resolved);
-        let mut command = crate::agent_environment::command(binary);
+        let mut command = crate::agent_environment::configured_command(
+            binary,
+            Some(std::path::Path::new(cwd)),
+            &config.environment,
+        );
         command.envs(&config.environment.0);
         command.args(["app-server", "--stdio"]).current_dir(cwd);
         if let Some(provider) = &config.provider {

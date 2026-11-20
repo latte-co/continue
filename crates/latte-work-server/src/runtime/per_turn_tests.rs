@@ -29,7 +29,7 @@ impl agents::AgentAdapter for OneShot {
     ) -> Result<AgentCommand> {
         self.resume = resume.map(str::to_owned);
         Ok(AgentCommand {
-            command: tokio::process::Command::new("/must-not-spawn"),
+            command: tokio::process::Command::new("/must-not-spawn").into(),
             _settings: None,
             sideband: None,
         })
@@ -40,11 +40,11 @@ impl agents::AgentAdapter for OneShot {
             Input::Start { .. } => {
                 let mut command = tokio::process::Command::new("/bin/sh");
                 command.arg("-c").arg(&self.script).envs(&self.environment);
-                Ok(vec![Action::SpawnTurn(AgentCommand {
-                    command,
+                Ok(vec![Action::SpawnTurn(Box::new(AgentCommand {
+                    command: command.into(),
                     _settings: None,
                     sideband: None,
-                })])
+                }))])
             }
             Input::Message("init") => {
                 self.resume = Some("native-test".into());

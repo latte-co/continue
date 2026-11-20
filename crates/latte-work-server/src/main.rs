@@ -1,11 +1,13 @@
-//! A single host daemon; `connect` is a disposable local/SSH byte bridge.
+// A single host daemon; `connect` is a disposable local/SSH byte bridge.
 mod admission;
 mod agent_environment;
 mod agents;
 mod attachments;
 mod files;
 mod git_review;
+mod host_paths;
 mod image_preview;
+mod managed_recovery;
 mod message_queue;
 mod predictions;
 mod providers;
@@ -24,22 +26,20 @@ mod terminal;
 mod upgrade;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
+use latte_work_platform::{
+    fs::prepare_state_dir,
+    ipc::{self, Endpoint, Stream},
+    process::{self, Shutdown},
+};
 use latte_work_protocol::{AgentInfo, MAX_FRAME, Request, Response, VERSION};
 use runtime::{Control, Database, Runs, db};
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
-    os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{
-    io::AsyncWriteExt,
-    net::{UnixListener, UnixStream},
-    sync::oneshot,
-};
+use tokio::{io::AsyncWriteExt, sync::oneshot};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 #[derive(Clone)]
@@ -126,34 +126,92 @@ impl Service {
         Ok(binary)
     }
 }
-#[tokio::main]
-async fn main() {
-    if let Err(error) = entry().await {
+fn main() -> std::process::ExitCode {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "__terminal")
+    {
+        return match terminal::helper() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("terminal helper: {error:#}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    let bridge = std::env::args_os().nth(1).is_some_and(|command| {
+        command == "connect" || command == "connect-local" || command == "connect-existing"
+    });
+    let runtime = if bridge {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+    };
+    let runtime = match runtime {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("latte-work-server: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(entry());
+    if bridge {
+        // Tokio stdin's blocking read cannot be cancelled when IPC reaches EOF.
+        // All bridge futures/streams are already dropped; bound runtime shutdown
+        // before immediately returning from this disposable process. At most one
+        // pending stdin read remains until OS process exit, with no runtime reuse.
+        runtime.shutdown_timeout(Duration::from_millis(250));
+    } else {
+        // The daemon retains normal runtime shutdown after its owned cleanup.
+        drop(runtime);
+    }
+    if let Err(error) = result {
         eprintln!("latte-work-server: {error:#}");
-        std::process::exit(1);
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
     }
 }
 async fn entry() -> Result<()> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.is_empty() || args[0] == "--help" {
         println!(
-            "latte-work-server 0.1.0\nUsage: latte-work-server <serve|connect|connect-local> [--state-dir PATH]\nOne daemon per host user; connect starts it if absent.\nLATTE_WORK_CLAUDE / LATTE_WORK_TRAEX / LATTE_WORK_CODEX: CLI path overrides (default auto-detected claude / traex / codex)."
+            "latte-work-server 0.1.0\nUsage: latte-work-server <serve|connect|connect-local|connect-existing> [--state-dir PATH]\nOne daemon per host user; connect starts it if absent; connect-existing never starts it.\nLATTE_WORK_CLAUDE / LATTE_WORK_TRAEX / LATTE_WORK_CODEX: CLI path overrides (default auto-detected claude / traex / codex)."
         );
         return Ok(());
     }
     let dir = if args.len() == 3 && args[1] == "--state-dir" {
         PathBuf::from(&args[2])
     } else if args.len() == 1 {
-        PathBuf::from(std::env::var_os("HOME").context("HOME missing")?)
-            .join(".local/share/latte-work")
+        host_paths::default_state_dir().context("无法确定状态目录")?
     } else {
         bail!("无效参数；使用 --help 查看用法");
     };
     let dir = prepare_dir(&dir)?;
-    match args[0].as_str() {
-        "serve" => serve(&dir).await,
-        "connect" => bridge(&dir).await,
-        "connect-local" => match upgrade::connect_local(&dir).await {
+    let endpoint = Endpoint::prepare(&dir)?;
+    match args[0].to_str().context("命令名称不是 UTF-8")? {
+        "serve" => serve(&endpoint).await,
+        "connect" => bridge(&endpoint).await,
+        "connect-existing" => match endpoint.connect(Duration::from_secs(3)).await {
+            Ok(stream) => forward(stream).await,
+            Err(error) => {
+                let response = Response::Error {
+                    code: "server_unavailable".into(),
+                    message: format!(
+                        "无法连接独立运行的 Server；请先在远端同一用户的本机终端运行 latte-work-server.exe serve 并保持运行（不要在 SSH 会话内启动）：{error}"
+                    ),
+                };
+                let mut bytes = serde_json::to_vec(&response)?;
+                bytes.push(b'\n');
+                tokio::io::stdout().write_all(&bytes).await?;
+                Ok(())
+            }
+        },
+        "connect-local" => match upgrade::connect_local(&endpoint).await {
             Ok(stream) => forward(stream).await,
             Err(error) => {
                 let response = Response::Error {
@@ -162,7 +220,9 @@ async fn entry() -> Result<()> {
                 };
                 let mut bytes = serde_json::to_vec(&response)?;
                 bytes.push(b'\n');
-                tokio::io::stdout().write_all(&bytes).await?;
+                let mut output = tokio::io::stdout();
+                output.write_all(&bytes).await?;
+                output.flush().await?;
                 Ok(())
             }
         },
@@ -170,74 +230,69 @@ async fn entry() -> Result<()> {
     }
 }
 fn prepare_dir(dir: &Path) -> Result<PathBuf> {
-    if dir.exists() && dir.symlink_metadata()?.file_type().is_symlink() {
-        bail!("状态目录不能是符号链接");
+    Ok(prepare_state_dir(dir)?)
+}
+async fn bridge(endpoint: &Endpoint) -> Result<()> {
+    forward(connect_server(endpoint).await?).await
+}
+async fn connect_server(endpoint: &Endpoint) -> Result<Stream> {
+    match endpoint.connect(Duration::from_secs(3)).await {
+        Ok(stream) => return Ok(stream),
+        Err(error) if ipc::daemon_absent(&error) => {}
+        Err(error) => return Err(error).context("无法验证或连接 Host Server"),
     }
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    Ok(dir.canonicalize()?)
-}
-fn lock(dir: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(dir.join("server.lock"))?;
-    file.try_lock().context("此 Host 的 Server 已运行")?;
-    Ok(file)
-}
-async fn bridge(dir: &Path) -> Result<()> {
-    forward(connect_socket(dir).await?).await
-}
-async fn connect_socket(dir: &Path) -> Result<UnixStream> {
-    let socket = dir.join("control.sock");
-    let stream = match UnixStream::connect(&socket).await {
-        Ok(s) => s,
-        Err(_) => {
-            let mut command = std::process::Command::new(std::env::current_exe()?);
-            use std::os::unix::process::CommandExt;
-            command
-                .arg("serve")
-                .arg("--state-dir")
-                .arg(dir)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .process_group(0);
-            let mut daemon = command.spawn().context("无法启动 Host Server")?;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-            loop {
-                if let Ok(s) = UnixStream::connect(&socket).await {
-                    break s;
-                }
-                if tokio::time::Instant::now() > deadline {
-                    bail!("无法连接 Server；请运行 latte-work-server serve 查看诊断");
-                }
-                // A concurrent bridge may win the singleton lock; still wait for its socket.
-                let _ = daemon.try_wait();
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+    let mut command = tokio::process::Command::new(std::env::current_exe()?);
+    command
+        .arg("serve")
+        .arg("--state-dir")
+        .arg(endpoint.state_dir());
+    let mut daemon = process::spawn_daemon(&mut command).context("无法启动 Host Server")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("无法连接 Server；请运行 latte-work-server serve 查看诊断");
         }
-    };
-    Ok(stream)
+        match endpoint
+            .connect(remaining.min(Duration::from_secs(3)))
+            .await
+        {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if ipc::daemon_absent(&error) || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => return Err(error).context("无法验证或连接 Host Server"),
+        }
+        // A concurrent bridge may win the singleton lock; wait for its endpoint.
+        let _ = daemon.try_wait();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
-async fn forward(stream: UnixStream) -> Result<()> {
+async fn forward(stream: Stream) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let mut input = tokio::io::stdin();
     let mut output = tokio::io::stdout();
-    tokio::select! {result=tokio::io::copy(&mut input,&mut writer)=>{result?;},result=tokio::io::copy(&mut reader,&mut output)=>{result?;}}
+    let result = tokio::select! {
+        result = tokio::io::copy(&mut input, &mut writer) => result,
+        result = tokio::io::copy(&mut reader, &mut output) => result,
+    };
+    // Close both IPC halves before the binary bounds its stdio runtime lifetime.
+    drop(reader);
+    drop(writer);
+    drop(input);
+    result?;
+    tokio::time::timeout(Duration::from_secs(1), output.flush())
+        .await
+        .context("bridge stdout flush timed out")??;
     Ok(())
 }
-async fn serve(dir: &Path) -> Result<()> {
-    let _lock = lock(dir)?;
-    let socket = dir.join("control.sock");
-    if let Ok(metadata) = socket.symlink_metadata() {
-        if !metadata.file_type().is_socket() {
-            bail!("control.sock 被非 socket 文件占用");
-        }
-        std::fs::remove_file(&socket)?;
-    }
+async fn serve(endpoint: &Endpoint) -> Result<()> {
+    let mut shutdown = Shutdown::new().context("无法注册 Host 退出通知")?;
+    // Binding owns the singleton lease and validates transport before recovery/probes.
+    let listener = endpoint
+        .bind()
+        .await
+        .context("无法绑定 Host Server 控制通道")?;
+    let dir = endpoint.state_dir();
     let database = Arc::new(Mutex::new(store::Store::open(&dir.join("state.sqlite"))?));
     let environment_warning = agent_environment::initialize().await;
     let mut agents = agents::discover().await;
@@ -261,38 +316,56 @@ async fn serve(dir: &Path) -> Result<()> {
         agents,
         server_id: uuid::Uuid::new_v4().to_string(),
     };
-    let listener = UnixListener::bind(&socket)?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     eprintln!(
         "Latte Work server {} listening at {}",
         service.server_id,
-        socket.display()
+        endpoint.address()
     );
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    loop {
+    let mut clients = tokio::task::JoinSet::new();
+    let accept_result: Result<()> = loop {
         tokio::select! {
-            result=listener.accept()=>{let (stream,_)=result?;let service=service.clone();tokio::spawn(async move {if let Err(e)=connection(stream,service).await {eprintln!("client disconnected: {e}");}});},
-            _=tokio::signal::ctrl_c()=>break,
-        _=terminate.recv()=>break,
-        _=service.lifecycle.shutdown.notified()=>break,
+            result=listener.accept()=>{
+                match result {
+                    Ok(stream) => {
+                        let service=service.clone();
+                        clients.spawn(async move {if let Err(e)=connection(stream,service).await {eprintln!("client disconnected: {e}");}});
+                    }
+                    Err(error) if matches!(error.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset) => {
+                        eprintln!("IPC connection rejected: {error}");
+                    }
+                    Err(error) => break Err(error.into()),
+                }
+            },
+            _=clients.join_next(), if !clients.is_empty()=>{},
+            _=shutdown.recv()=>break Ok(()),
+            _=service.lifecycle.shutdown.notified()=>break Ok(()),
         }
+    };
+    // Fence requests on existing connections as well as new accepts. If an
+    // in-flight dispatch will not yield, cancel its connection before fencing.
+    if let Ok(mut admission) =
+        tokio::time::timeout(Duration::from_secs(2), service.lifecycle.draining.write()).await
+    {
+        *admission = true;
+    } else {
+        clients.shutdown().await;
+        *service.lifecycle.draining.write().await = true;
     }
-    drain_service(&service).await?;
-    std::fs::remove_file(socket)?;
-    Ok(())
+    let cleanup = drain_service(&service).await;
+    clients.shutdown().await;
+    drop(listener);
+    cleanup?;
+    accept_result
 }
 async fn drain_service(service: &Service) -> Result<()> {
     let jobs = agents::codex_jobs::registry();
     jobs.begin_drain();
     *service.lifecycle.draining.write().await = true;
-    match service.terminals.lock() {
-        Ok(mut terminals) => terminals.close_all(),
-        Err(error) => eprintln!("Terminal shutdown remains unconfirmed: {error}"),
-    }
+    let mut failures = Vec::new();
     let controls: Vec<_> = match service.runs.lock() {
         Ok(runs) => runs.values().map(|run| run.control.clone()).collect(),
         Err(error) => {
-            eprintln!("Agent shutdown inventory unavailable: {error}");
+            failures.push(format!("Agent shutdown inventory unavailable: {error}"));
             Vec::new()
         }
     };
@@ -315,7 +388,7 @@ async fn drain_service(service: &Service) -> Result<()> {
         .collect();
     while let Some(result) = closing.next().await {
         if let Err(error) = result {
-            eprintln!("Agent shutdown remains unconfirmed: {error}");
+            failures.push(format!("Agent shutdown remains unconfirmed: {error}"));
         }
     }
     // An observation deadline cannot destroy a resource owner. Keep the runtime
@@ -323,9 +396,15 @@ async fn drain_service(service: &Service) -> Result<()> {
     while !jobs.wait_drained(Duration::from_secs(5)).await {
         eprintln!("Codex auxiliary cleanup remains unconfirmed; continuing drain");
     }
+    if let Err(error) = terminal::close_all(&service.terminals).await {
+        failures.push(format!("Terminal shutdown remains unconfirmed: {error}"));
+    }
+    if !failures.is_empty() {
+        bail!(failures.join("; "));
+    }
     Ok(())
 }
-async fn connection(stream: UnixStream, service: Service) -> Result<()> {
+async fn connection(stream: Stream, service: Service) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(MAX_FRAME));
     let mut ready = false;
@@ -366,6 +445,7 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
                         Response::Hello {
                             version: VERSION,
                             server_id: service.server_id.clone(),
+                            path_syntax: Some(host_paths::PATH_SYNTAX),
                             agents: service
                                 .agents
                                 .iter()
@@ -380,6 +460,8 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
                             change_preview: true,
                             side_chat_controls: true,
                             claude_side_chat: true,
+                            terminal: terminal::SUPPORTED,
+                            undo: task_changes::UNDO_SUPPORTED,
                         }
                     } else {
                         Response::Error {
@@ -511,7 +593,7 @@ async fn dispatch_reserved(
             | Request::RenameSession { .. }
     );
     let _exclusive_guard = if exclusive {
-        Some(s.file_admission.write().await)
+        Some(s.file_admission.clone().write_owned().await)
     } else {
         None
     };
@@ -566,8 +648,8 @@ async fn dispatch_reserved(
         claims,
         allow_queue,
         admission,
-        closed_resource,
-        closing_claim,
+        (closed_resource, closing_claim),
+        _exclusive_guard,
     )
     .await;
     if let Some(resource) = admitted_resource {
@@ -582,9 +664,10 @@ async fn dispatch_admitted(
     claims: &mut upgrade::ConnectionClaims,
     allow_queue: bool,
     admission: Option<admission::Guard>,
-    mut closed_resource: Option<upgrade::Resource>,
-    closing_claim: Option<uuid::Uuid>,
+    close_tracking: (Option<upgrade::Resource>, Option<uuid::Uuid>),
+    _exclusive_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
 ) -> Result<Response> {
+    let (mut closed_resource, closing_claim) = close_tracking;
     let mut response = match request {
         Request::Hello { .. } => unreachable!(),
         Request::ComposerPrediction { session_id } => {
@@ -754,7 +837,10 @@ async fn dispatch_admitted(
             provider,
             environment,
         } => {
-            latte_work_config::validate_agent_environment(&environment)?;
+            latte_work_config::validate_agent_environment_for(
+                &environment,
+                crate::host_paths::PATH_SYNTAX,
+            )?;
             let project = project_id
                 .map(|id| db(&s.database, |d| d.project(&id)))
                 .transpose()?;
@@ -810,20 +896,15 @@ async fn dispatch_admitted(
             rows,
         } => {
             let project = db(&s.database, |d| d.project(&project_id))?;
-            let terminals = s.terminals.clone();
-            tokio::task::spawn_blocking(move || {
-                terminals
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("终端锁异常"))?
-                    .create(
-                        project_id,
-                        Path::new(&project.path),
-                        terminal_id,
-                        cols,
-                        rows,
-                    )
-            })
-            .await??
+            terminal::create(
+                &s.terminals,
+                project_id,
+                Path::new(&project.path),
+                terminal_id,
+                cols,
+                rows,
+            )
+            .await?
         }
         Request::Terminals { project_id } => {
             db(&s.database, |d| d.project(&project_id))?;
@@ -841,16 +922,10 @@ async fn dispatch_admitted(
             terminal_id,
             cols,
             rows,
-        } => s
-            .terminals
-            .lock()
-            .map_err(|_| anyhow::anyhow!("终端锁异常"))?
-            .resize(&terminal_id, cols, rows)?,
-        Request::CloseTerminal { terminal_id } => s
-            .terminals
-            .lock()
-            .map_err(|_| anyhow::anyhow!("终端锁异常"))?
-            .close(&terminal_id),
+        } => terminal::resize(&s.terminals, &terminal_id, cols, rows).await?,
+        Request::CloseTerminal { terminal_id } => {
+            terminal::close(&s.terminals, &terminal_id).await?
+        }
         Request::Projects => Response::Projects {
             projects: db(&s.database, |d| d.projects())?,
         },
@@ -1667,8 +1742,13 @@ async fn dispatch_admitted(
         }
         Request::Files { project_id, path } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
+            let exclusions = managed_recovery::ManagedRecoveryExclusions::load_live(
+                &s.database,
+                Path::new(&p.path),
+            )
+            .await?;
             Response::Files {
-                entries: files::list(Path::new(&p.path), &path)?,
+                entries: files::list_excluding(Path::new(&p.path), &path, &exclusions)?,
             }
         }
         Request::BeginAttachment { name, size } => Response::AttachmentUpload {
@@ -1816,9 +1896,19 @@ async fn dispatch_admitted(
                         "此任务没有记录文件基线，请查看工作区改动".into(),
                     )
                 });
-                baseline.summary(Path::new(&p.path)).await?
+                let exclusions = managed_recovery::ManagedRecoveryExclusions::load_live(
+                    &s.database,
+                    Path::new(&p.path),
+                )
+                .await?;
+                baseline.summary(Path::new(&p.path), &exclusions).await?
             } else {
-                task_changes::workspace_summary(Path::new(&p.path)).await?
+                let exclusions = managed_recovery::ManagedRecoveryExclusions::load_live(
+                    &s.database,
+                    Path::new(&p.path),
+                )
+                .await?;
+                task_changes::workspace_summary(Path::new(&p.path), &exclusions).await?
             };
             Response::ChangeSummary {
                 summary: task_changes::summary_page(
@@ -1888,23 +1978,38 @@ async fn dispatch_admitted(
                 let session = db(&s.database, |d| d.session(&id))?;
                 let other = db(&s.database, |d| d.project(&session.project_id))?;
                 let other = Path::new(&other.path);
-                if root.starts_with(other) || other.starts_with(root) {
+                if latte_work_platform::paths::overlap(root, other)? {
                     runtime::close(&s.database, &s.runs, &session.id, true).await?;
                 }
             }
             turn = turn.check_undo(root.to_owned(), false).await?;
             db(&s.database, |d| d.check_no_unconfirmed_closes())?;
-            turn.changes.undo = TurnUndoStatus::Unknown;
-            db(&s.database, |d| d.update_turn(&session_id, &turn))?;
-            turn = turn
-                .check_undo(root.to_owned(), true)
-                .await
-                .context("撤销未能全部完成，状态待核对；请检查工作区，系统不会自动重试")?;
-            turn.changes.undo = TurnUndoStatus::Reverted;
-            db(&s.database, |d| d.update_turn(&session_id, &turn))?;
-            Response::TurnChanges {
-                changes: turn.changes,
-            }
+            #[cfg(windows)]
+            let git_dir = task_changes::windows_undo_git_dir(root).await?;
+            let root = root.to_owned();
+            let database = s.database.clone();
+            // The blocking worker owns admission and prepared guards through all
+            // mutations and the durable result, even if this connection is cancelled.
+            let changes = tokio::task::spawn_blocking(move || {
+                let _admission = _exclusive_guard;
+                let prepared = turn.prepare_undo_blocking(
+                    &root,
+                    &database,
+                    #[cfg(windows)]
+                    git_dir.as_deref(),
+                )?;
+                prepared.record_intent(&mut turn)?;
+                turn.changes.undo = TurnUndoStatus::Unknown;
+                db(&database, |d| d.update_turn(&session_id, &turn))?;
+                let _restored = prepared
+                    .restore()
+                    .context("撤销未能全部完成，状态待核对；请检查工作区，系统不会自动重试")?;
+                turn.changes.undo = TurnUndoStatus::Reverted;
+                db(&database, |d| d.update_turn(&session_id, &turn))?;
+                Ok::<_, anyhow::Error>(turn.changes)
+            })
+            .await??;
+            Response::TurnChanges { changes }
         }
         Request::LastTurnChanges {
             session_id,
@@ -1946,7 +2051,14 @@ async fn dispatch_admitted(
             let project = db(&s.database, |d| d.project(&session.project_id))?;
             let baseline =
                 db(&s.database, |d| d.baseline(&session_id))?.context("此任务没有记录文件基线")?;
-            let (text, truncated) = baseline.patch(Path::new(&project.path), &path).await?;
+            let exclusions = managed_recovery::ManagedRecoveryExclusions::load_live(
+                &s.database,
+                Path::new(&project.path),
+            )
+            .await?;
+            let (text, truncated) = baseline
+                .patch(Path::new(&project.path), &path, &exclusions)
+                .await?;
             Response::Content { text, truncated }
         }
         Request::PreviewChange {
@@ -2003,6 +2115,21 @@ async fn dispatch_admitted(
                         head,
                     } => {
                         let project = db(&s.database, |d| d.project(&project_id))?;
+                        let exclusions = if matches!(
+                            scope,
+                            latte_work_protocol::GitReviewScope::Branch
+                                | latte_work_protocol::GitReviewScope::Commit
+                        ) {
+                            None
+                        } else {
+                            Some(
+                                managed_recovery::ManagedRecoveryExclusions::load_live(
+                                    &s.database,
+                                    Path::new(&project.path),
+                                )
+                                .await?,
+                            )
+                        };
                         git_review::image_chunk(
                             Path::new(&project.path),
                             scope,
@@ -2011,6 +2138,7 @@ async fn dispatch_admitted(
                             &path,
                             before,
                             offset,
+                            exclusions.as_ref(),
                         )
                         .await
                     }
@@ -2031,6 +2159,7 @@ async fn dispatch_admitted(
                 bail!("来源路径无效");
             }
             let requested = if Path::new(&path).is_absolute() {
+                latte_work_platform::paths::absolute(Path::new(&path))?;
                 std::path::PathBuf::from(&path)
             } else {
                 files::resolve(Path::new(&p.path), &path)?
@@ -2108,12 +2237,24 @@ async fn dispatch_admitted(
         }
         Request::ReadFile { project_id, path } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
+            let exclusions = managed_recovery::ManagedRecoveryExclusions::load_live(
+                &s.database,
+                Path::new(&p.path),
+            )
+            .await?;
+            exclusions.require_visible(Path::new(&p.path), &path)?;
             let (text, truncated) = files::read(Path::new(&p.path), &path).await?;
             Response::Content { text, truncated }
         }
         Request::Changes { project_id } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
-            let (entries, truncated) = files::changes(Path::new(&p.path)).await?;
+            let exclusions = managed_recovery::ManagedRecoveryExclusions::load_live(
+                &s.database,
+                Path::new(&p.path),
+            )
+            .await?;
+            let (entries, truncated) =
+                files::changes_excluding(Path::new(&p.path), &exclusions).await?;
             Response::Changes { entries, truncated }
         }
         Request::GitInfo { project_id } => {
@@ -2142,8 +2283,29 @@ async fn dispatch_admitted(
             base,
         } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
+            let exclusions = if matches!(
+                scope,
+                latte_work_protocol::GitReviewScope::Branch
+                    | latte_work_protocol::GitReviewScope::Commit
+            ) {
+                None
+            } else {
+                Some(
+                    managed_recovery::ManagedRecoveryExclusions::load_live(
+                        &s.database,
+                        Path::new(&p.path),
+                    )
+                    .await?,
+                )
+            };
             Response::GitReview {
-                review: git_review::review(Path::new(&p.path), scope, base.as_deref()).await?,
+                review: git_review::review_excluding(
+                    Path::new(&p.path),
+                    scope,
+                    base.as_deref(),
+                    exclusions.as_ref(),
+                )
+                .await?,
             }
         }
         Request::GitReviewDiff {
@@ -2155,13 +2317,29 @@ async fn dispatch_admitted(
             full_context,
         } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
-            let (text, truncated) = git_review::diff(
+            let exclusions = if matches!(
+                scope,
+                latte_work_protocol::GitReviewScope::Branch
+                    | latte_work_protocol::GitReviewScope::Commit
+            ) {
+                None
+            } else {
+                Some(
+                    managed_recovery::ManagedRecoveryExclusions::load_live(
+                        &s.database,
+                        Path::new(&p.path),
+                    )
+                    .await?,
+                )
+            };
+            let (text, truncated) = git_review::diff_excluding(
                 Path::new(&p.path),
                 scope,
                 base.as_deref(),
                 head.as_deref(),
                 &path,
                 full_context,
+                exclusions.as_ref(),
             )
             .await?;
             Response::Content { text, truncated }
@@ -2172,12 +2350,27 @@ async fn dispatch_admitted(
             section,
         } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
-            let (text, truncated) = files::change_diff(Path::new(&p.path), &path, section).await?;
+            let (text, truncated) = files::change_diff_excluding(
+                Path::new(&p.path),
+                &managed_recovery::ManagedRecoveryExclusions::load_live(
+                    &s.database,
+                    Path::new(&p.path),
+                )
+                .await?,
+                &path,
+                section,
+            )
+            .await?;
             Response::Content { text, truncated }
         }
         Request::Diff { project_id } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
-            let (text, truncated) = files::diff(Path::new(&p.path)).await?;
+            let exclusions = managed_recovery::ManagedRecoveryExclusions::load_live(
+                &s.database,
+                Path::new(&p.path),
+            )
+            .await?;
+            let (text, truncated) = files::diff_excluding(Path::new(&p.path), &exclusions).await?;
             Response::Content { text, truncated }
         }
     };
@@ -2211,6 +2404,35 @@ async fn dispatch_admitted(
 }
 
 #[cfg(test)]
+fn test_fixture_binary(_directory: &Path, name: &str) -> String {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    #[cfg(unix)]
+    {
+        fixture.to_string_lossy().into_owned()
+    }
+    #[cfg(windows)]
+    {
+        let python = which::which("python.exe").expect("native fixture tests require Python 3");
+        let directory = _directory.join("fixture-bin");
+        std::fs::create_dir_all(&directory).unwrap();
+        let launcher = directory.join("agent.ps1");
+        let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "''"));
+        std::fs::write(
+            &launcher,
+            format!(
+                "$env:PYTHONUTF8='1'\n& {} -u {} @args\nexit $LASTEXITCODE\n",
+                quote(&python),
+                quote(&fixture)
+            ),
+        )
+        .unwrap();
+        launcher.to_string_lossy().into_owned()
+    }
+}
+
+#[cfg(test)]
 mod send_admission_tests {
     use super::*;
 
@@ -2229,10 +2451,7 @@ mod send_admission_tests {
             command_probes: Arc::new(tokio::sync::Semaphore::new(2)),
             file_admission: Arc::new(tokio::sync::RwLock::new(())),
             agents: vec![(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/codex.py")
-                    .to_string_lossy()
-                    .into_owned(),
+                test_fixture_binary(dir, "codex.py"),
                 AgentInfo {
                     id: "codex".into(),
                     name: "Fixture".into(),
@@ -2254,6 +2473,30 @@ mod send_admission_tests {
         }
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_model_environment_rejects_windows_case_aliases_before_any_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = service(directory.path());
+        let environment = latte_work_protocol::AgentEnvironment(std::collections::BTreeMap::from(
+            [("hOmE".into(), "unsafe".into())],
+        ));
+        assert!(
+            dispatch(
+                &service,
+                Request::ModelsForProvider {
+                    agent: "codex".into(),
+                    model: None,
+                    project_id: None,
+                    provider: None,
+                    environment
+                },
+                &mut upgrade::ConnectionClaims::default()
+            )
+            .await
+            .is_err()
+        );
+    }
     async fn decoded_send_is_owned_before_gate(lifecycle: bool) {
         let root = tempfile::tempdir().unwrap();
         let service = service(root.path());
@@ -2262,7 +2505,11 @@ mod send_admission_tests {
             store.create_session(project.id, "codex".into())
         })
         .unwrap();
-        let (server_socket, socket) = UnixStream::pair().unwrap();
+        let endpoint = Endpoint::prepare(root.path()).unwrap();
+        let listener = endpoint.bind().await.unwrap();
+        let (server_socket, socket) =
+            tokio::join!(listener.accept(), endpoint.connect(Duration::from_secs(2)));
+        let (server_socket, socket) = (server_socket.unwrap(), socket.unwrap());
         let server = tokio::spawn(connection(server_socket, service.clone()));
         let (reader, mut writer) = socket.into_split();
         let mut responses = FramedRead::new(reader, LinesCodec::new());
@@ -2321,10 +2568,11 @@ mod send_admission_tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert!(matches!(
-            serde_json::from_str::<Response>(&response).unwrap(),
-            Response::Accepted { duplicate: false }
-        ));
+        let response: Response = serde_json::from_str(&response).unwrap();
+        assert!(
+            matches!(&response, Response::Accepted { duplicate: false }),
+            "{response:?}"
+        );
         assert!(
             !db(&service.database, |store| store
                 .request_identity_absent("gate-held"))
@@ -2614,6 +2862,7 @@ mod send_admission_tests {
 #[cfg(test)]
 mod skill_admission_tests {
     use super::*;
+    #[cfg(unix)]
     #[tokio::test]
     async fn cursor_native_model_route_never_probes_traex_or_a_real_agent() {
         use std::os::unix::fs::PermissionsExt;
@@ -2698,10 +2947,7 @@ mod skill_admission_tests {
             command_probes: Arc::new(tokio::sync::Semaphore::new(2)),
             file_admission: Arc::new(tokio::sync::RwLock::new(())),
             agents: vec![(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/claude.py")
-                    .to_string_lossy()
-                    .into(),
+                test_fixture_binary(dir, "claude.py"),
                 AgentInfo {
                     id: "claude".into(),
                     name: "Fixture".into(),

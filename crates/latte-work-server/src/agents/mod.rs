@@ -2,6 +2,8 @@
 mod adapter;
 mod app_server;
 pub(crate) mod claude;
+#[cfg(windows)]
+mod claude_binary;
 mod claude_models;
 mod claude_sessions;
 pub(crate) mod claude_skills;

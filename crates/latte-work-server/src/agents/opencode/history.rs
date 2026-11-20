@@ -86,7 +86,12 @@ async fn export(
     if !plausible_session_id(id) {
         return Ok(None);
     }
-    let process = crate::agent_environment::command(binary)
+    let mut command = crate::agent_environment::configured_command(
+        binary,
+        allowed.first().map(PathBuf::as_path),
+        &config.environment,
+    );
+    command
         .envs(&config.environment.0)
         .current_dir(
             allowed
@@ -97,15 +102,8 @@ async fn export(
         .args(["session", "export", "--standalone", id])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .process_group(0)
-        .spawn()?;
-    let pid = process.id().context("OpenCode export PID missing")? as i32;
-    let mut group = Group {
-        child: process,
-        pid,
-    };
+        .stderr(Stdio::null());
+    let mut group = Group::spawn(&mut command)?;
     let stdout = group
         .child
         .stdout
@@ -259,7 +257,11 @@ mod tests {
 
     fn fixture_binary() -> String {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/opencode.py")
+            .join(if cfg!(windows) {
+                "src/agents/opencode/fixtures/agent.ps1"
+            } else {
+                "tests/fixtures/opencode.py"
+            })
             .to_string_lossy()
             .into_owned()
     }

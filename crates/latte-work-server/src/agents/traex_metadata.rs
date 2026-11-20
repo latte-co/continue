@@ -8,16 +8,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 pub(in crate::agents) async fn output(binary: &str, args: &[&str]) -> Result<String> {
-    let child = crate::agent_environment::command(binary)
+    let mut command = crate::agent_environment::command(binary);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0)
-        .spawn()?;
-    let pid = child.id().context("App-server PID missing")? as i32;
-    let mut group = crate::runtime::Group { child, pid };
+        .stderr(Stdio::piped());
+    let mut group = crate::runtime::Group::spawn(&mut command)?;
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -44,18 +41,43 @@ pub(in crate::agents) async fn output(binary: &str, args: &[&str]) -> Result<Str
     })
     .await
     .context("App-server 元数据读取超时")?;
-    let _ = nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGKILL,
-    );
-    let _ = group.child.wait().await;
+    if !crate::runtime::close_group(
+        &mut group,
+        tokio::time::Instant::now() + Duration::from_secs(4),
+        std::future::ready(true),
+    )
+    .await
+    {
+        bail!("App-server 探针清理未确认");
+    }
     result
 }
 
 pub(crate) async fn discover() -> (String, AgentInfo) {
     let binary = std::env::var("LATTE_WORK_TRAEX").unwrap_or_else(|_| {
-        let path =
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/bin/traex");
+        #[cfg(windows)]
+        if let Some(local) = crate::agent_environment::variable("LOCALAPPDATA") {
+            for location in [
+                "Programs/TraeX/bin/traex.exe",
+                "Programs/TraeCLI/bin/traex.exe",
+            ] {
+                let path = PathBuf::from(&local).join(location);
+                if path.is_file() {
+                    return path.to_string_lossy().into_owned();
+                }
+            }
+        }
+        let path = PathBuf::from(
+            crate::agent_environment::variable("HOME")
+                .or_else(|| {
+                    latte_work_platform::dirs::home_dir()
+                        .ok()
+                        .map(|p| p.into_os_string())
+                })
+                .unwrap_or_default(),
+        )
+        .join(".local/bin")
+        .join(if cfg!(windows) { "traex.exe" } else { "traex" });
         if path.is_file() {
             path.to_string_lossy().into_owned()
         } else {
@@ -152,21 +174,21 @@ pub(in crate::agents) async fn models_for_agent(
     codex: bool,
     environment: &latte_work_protocol::AgentEnvironment,
 ) -> Result<Response> {
-    let mut command = crate::agent_environment::command(binary);
+    let mut command = crate::agent_environment::configured_command(
+        binary,
+        path.map(std::path::Path::new),
+        environment,
+    );
     command.envs(&environment.0);
     command.args(["app-server", "--stdio"]);
     if let Some(path) = path {
         command.current_dir(path);
     }
-    let child = command
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .process_group(0)
-        .spawn()?;
-    let pid = child.id().context("App-server PID missing")? as i32;
-    let mut group = crate::runtime::Group { child, pid };
+        .stderr(Stdio::null());
+    let mut group = crate::runtime::Group::spawn(&mut command)?;
     let mut input = group
         .child
         .stdin
@@ -250,11 +272,15 @@ pub(in crate::agents) async fn models_for_agent(
     })
     .await
     .context("读取 App-server 模型超时")?;
-    let _ = nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGKILL,
-    );
-    let _ = group.child.wait().await;
+    if !crate::runtime::close_group(
+        &mut group,
+        tokio::time::Instant::now() + Duration::from_secs(4),
+        std::future::ready(true),
+    )
+    .await
+    {
+        bail!("App-server 探针清理未确认");
+    }
     result
 }
 fn codex_catalog(mut entries: Vec<Value>, selected: Option<&str>) -> Result<Response> {

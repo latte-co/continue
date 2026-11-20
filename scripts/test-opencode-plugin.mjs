@@ -5,6 +5,7 @@ import { createServer } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import plugin from "../crates/latte-work-server/src/agents/opencode/index.mjs";
 const step = {
   type: "session.step.started",
@@ -16,6 +17,9 @@ const end = {
 };
 async function probe(version, sequence, lookup, expected, interrupt = false) {
   const directory = await mkdtemp(join(tmpdir(), "lw-plugin-"));
+  const endpoint = process.platform === "win32"
+    ? `\\\\.\\pipe\\latte-opencode-plugin-${randomUUID()}`
+    : join(directory, "events");
   const messages = [];
   let socket,
     cleanup,
@@ -50,14 +54,15 @@ async function probe(version, sequence, lookup, expected, interrupt = false) {
       }
     });
   });
-  await new Promise((resolve) =>
-    server.listen(join(directory, "events"), resolve),
-  );
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(endpoint, resolve);
+  });
   const domain = { list: async () => lookup(++calls) };
   try {
     cleanup = await plugin.setup({
       app: { version },
-      options: { socket: join(directory, "events") },
+      options: { socket: endpoint },
       location: { directory },
       ...(version === "2.0.0"
         ? { catalog: { model: domain } }

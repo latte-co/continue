@@ -5,6 +5,7 @@ use super::{
 use crate::runtime::Group;
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::StreamExt;
+use latte_work_platform::process::PreparedCommand;
 use latte_work_protocol::{
     AgentEnvironment, AgentInfo, AgentPermissionMode, AgentSlashCommand, Effort, Response,
 };
@@ -12,12 +13,20 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, process::Stdio, time::Duration};
 use tokio::{
     io::AsyncWriteExt,
-    process::{ChildStdin, ChildStdout, Command},
+    process::{ChildStdin, ChildStdout},
 };
 use tokio_util::codec::{FramedRead, LinesCodec};
 
-pub(super) fn command(binary: &str, cwd: Option<&str>, environment: &AgentEnvironment) -> Command {
-    let mut command = crate::agent_environment::command(binary);
+pub(super) fn command(
+    binary: &str,
+    cwd: Option<&str>,
+    environment: &AgentEnvironment,
+) -> PreparedCommand {
+    let mut command = crate::agent_environment::configured_command(
+        binary,
+        cwd.map(std::path::Path::new),
+        environment,
+    );
     command.arg("acp").envs(&environment.0);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -78,9 +87,15 @@ pub(in crate::agents) fn skill_info(
     project: &std::path::Path,
     name: &str,
 ) -> Result<Option<latte_work_protocol::SkillInfo>> {
+    skill_info_with_home(project, name, crate::agent_environment::home_dir())
+}
+pub(in crate::agents) fn skill_info_with_home(
+    project: &std::path::Path,
+    name: &str,
+    home: Option<std::path::PathBuf>,
+) -> Result<Option<latte_work_protocol::SkillInfo>> {
     use std::path::PathBuf;
     ensure!(crate::skills::component(name), "Skill 名称无效");
-    let home = crate::agent_environment::variable("HOME").map(PathBuf::from);
     let config = crate::agent_environment::variable("OPENCODE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| {
@@ -135,17 +150,12 @@ struct Probe {
 }
 
 impl Probe {
-    fn spawn(mut command: tokio::process::Command) -> Result<Self> {
-        let child = command
+    fn spawn(mut command: PreparedCommand) -> Result<Self> {
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .process_group(0)
-            .spawn()
-            .context("无法启动 OpenCode ACP 探针")?;
-        let pid = child.id().context("OpenCode ACP PID missing")? as i32;
-        let mut group = Group { child, pid };
+            .stderr(Stdio::null());
+        let mut group = Group::spawn(&mut command).context("无法启动 OpenCode ACP 探针")?;
         let input = group
             .child
             .stdin

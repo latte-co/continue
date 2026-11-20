@@ -19,6 +19,8 @@ mod resume;
 mod tests;
 pub(super) use history::read as child_history;
 pub(crate) use metadata::commands;
+#[cfg(all(test, windows))]
+pub(super) use metadata::skill_info_with_home;
 pub(super) use metadata::{discover, models, permission_modes, skill_info};
 pub(in crate::agents) use resume::directory as resume_directory;
 
@@ -1882,14 +1884,20 @@ impl AgentAdapter for OpenCode {
         self.effort = config.effort;
         self.managed_provider = config.provider.is_some();
         let mut command = metadata::command(binary, Some(cwd), &config.environment);
+        #[cfg(unix)]
         let directory = tempfile::Builder::new()
             .prefix("lw-oc-")
             .tempdir_in("/tmp")?;
+        #[cfg(windows)]
+        let directory = tempfile::Builder::new().prefix("lw-oc-").tempdir()?;
         std::fs::write(
             directory.path().join("index.mjs"),
             include_str!("opencode/index.mjs"),
         )?;
+        #[cfg(unix)]
         let listener = tokio::net::UnixListener::bind(directory.path().join("events"))?;
+        #[cfg(windows)]
+        let listener = latte_work_platform::pipe::PrivatePipe::bind("opencode-events")?;
         let sideband = super::Sideband {
             listener,
             _directory: directory,
