@@ -152,6 +152,8 @@ export function TurnChangesCard({
   const undoable =
     canUndo &&
     changes.undo === "ready" &&
+    !changes.undo_unavailable &&
+    summary.entries.length > 0 &&
     !summary.truncated &&
     !summary.unavailable &&
     !changes.background_pending;
@@ -174,7 +176,7 @@ export function TurnChangesCard({
       if (mounted.current) setBusy(false);
     }
   }
-  if (!hasTurnChangeFiles(changes)) return null;
+  if (!hasTurnChangeFiles(changes) && !changes.undo_unavailable) return null;
   return (
     <section className="turn-changes-card" aria-label="本轮文件变更">
       <header>
@@ -185,9 +187,11 @@ export function TurnChangesCard({
           <strong>
             {summary.unavailable
               ? "本轮变更未能记录"
-              : `已编辑 ${total} 个文件`}
+              : total === 0
+                ? "本轮修改无法撤销"
+                : `已编辑 ${total} 个文件`}
           </strong>
-          {!summary.unavailable && (
+          {summary.entries.length > 0 && !summary.unavailable && (
             <span className="change-totals">
               <b>+{summary.added}</b>
               <em>-{summary.removed}</em>
@@ -207,7 +211,8 @@ export function TurnChangesCard({
                     ? "本轮文件修改已撤销"
                     : changes.undo === "unknown"
                       ? "撤销未能确认，请核对工作区"
-                      : "仅可在本轮结束后撤销最近一轮的完整快照"
+                      : changes.undo_unavailable ||
+                        "仅可在本轮结束后撤销最近一轮的完整快照"
               }
               onClick={() => void undo()}
             >
@@ -313,6 +318,9 @@ export function TurnChangesCard({
             <ChevronDown size={14} aria-hidden="true" />
           )}
         </button>
+      )}
+      {changes.undo_unavailable && (
+        <p className="turn-changes-note">{changes.undo_unavailable}</p>
       )}
     </section>
   );

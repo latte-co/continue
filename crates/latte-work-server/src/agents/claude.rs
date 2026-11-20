@@ -99,14 +99,14 @@ const PERMISSION_PROBE: &str = "latteWorkPermissionProbe";
 async fn permission_output(binary: &str, args: &[&str]) -> Result<(bool, String, String)> {
     use tokio::io::AsyncReadExt;
     const LIMIT: u64 = 128 * 1024;
-    let mut child = crate::agent_environment::command(binary)
+    let mut command = crate::agent_environment::command(binary);
+    command
         .args(args)
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
+        .stderr(Stdio::piped());
+    let mut child = latte_work_platform::process::ManagedChild::spawn(&mut command)
         .context("无法读取 Agent 权限选项")?;
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         let mut stdout = child
@@ -136,11 +136,10 @@ async fn permission_output(binary: &str, args: &[&str]) -> Result<(bool, String,
     .await
     .context("读取 Agent 权限选项超时")
     .and_then(|result| result);
-    // Also reap on oversized output, protocol errors and timeout.
-    if result.is_err() {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-    }
+    child
+        .close(Duration::ZERO)
+        .await
+        .context("Agent 权限探针清理未确认")?;
     result
 }
 
@@ -359,21 +358,40 @@ enum Phase {
 }
 
 pub(super) async fn discover() -> (String, latte_work_protocol::AgentInfo) {
+    #[cfg(windows)]
+    let resolved = super::claude_binary::resolve().and_then(|path| {
+        path.into_os_string()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("Claude CLI 路径不是 UTF-8"))
+    });
+    #[cfg(windows)]
+    let binary = match resolved {
+        Ok(binary) => binary,
+        Err(error) => {
+            return (
+                binary(),
+                latte_work_protocol::AgentInfo {
+                    id: "claude".into(),
+                    name: "Claude Code".into(),
+                    available: false,
+                    detail: format!("Claude CLI 不可用：{error:#}"),
+                    provider_protocols: super::provider_protocols("claude").unwrap().to_vec(),
+                },
+            );
+        }
+    };
+    #[cfg(unix)]
     let binary = binary();
-    let probe = tokio::time::timeout(
+    let probe = latte_work_platform::process::output(
+        crate::agent_environment::command(&binary).arg("--version"),
         Duration::from_secs(5),
-        crate::agent_environment::command(&binary)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output(),
+        16 * 1024,
     )
     .await;
     let (available, detail) = match probe {
-        Ok(Ok(result)) if result.status.success() => (
-            true,
-            String::from_utf8_lossy(&result.stdout).trim().to_owned(),
-        ),
+        Ok((status, stdout)) if status.success() => {
+            (true, String::from_utf8_lossy(&stdout).trim().to_owned())
+        }
         _ => (
             false,
             "未找到 Claude Code；在此 Host 安装并登录后重启 Server。".into(),
@@ -394,8 +412,18 @@ fn binary() -> String {
     if let Ok(value) = std::env::var("LATTE_WORK_CLAUDE") {
         return value;
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let path = PathBuf::from(home).join(".local/bin/claude");
+    if let Some(home) = crate::agent_environment::variable("HOME").or_else(|| {
+        latte_work_platform::dirs::home_dir()
+            .ok()
+            .map(|p| p.into_os_string())
+    }) {
+        let path = PathBuf::from(home)
+            .join(".local/bin")
+            .join(if cfg!(windows) {
+                "claude.exe"
+            } else {
+                "claude"
+            });
         if path.is_file() {
             return path.to_string_lossy().into_owned();
         }
@@ -488,7 +516,11 @@ impl AgentAdapter for Claude {
                 .clone()
                 .or_else(|| config.provider.as_ref().map(|p| p.metadata.model.clone())),
         );
-        let mut command = crate::agent_environment::command(binary);
+        let mut command = crate::agent_environment::configured_command(
+            binary,
+            Some(std::path::Path::new(cwd)),
+            &config.environment,
+        );
         command.envs(&config.environment.0);
         let mut instructions = crate::skills::platform_instructions(&config.settings_dir);
         if let Some(parent) = self.side_parent {
@@ -578,10 +610,10 @@ impl AgentAdapter for Claude {
         // An absent override leaves native environment/settings resolution intact.
         // Settings env overrides inherited env. Keep turn-specific effort and
         // credentials in a private file; never change the user's CLI settings.
-        let mut file = tempfile::Builder::new()
-            .prefix("claude-launch-")
-            .suffix(".json")
-            .tempfile_in(&config.settings_dir)?;
+        let directory = latte_work_platform::fs::PrivateDir::prepare(
+            &crate::host_paths::launch_directory(&config.settings_dir),
+        )?;
+        let mut file = directory.tempfile("claude-launch-", ".json")?;
         file.write_all(&serde_json::to_vec(&settings)?)?;
         file.flush()?;
         command.arg("--settings").arg(file.path());
@@ -3706,7 +3738,7 @@ mod tests {
             ..Default::default()
         };
         let echo = json!({"type":"user","isReplay":true,"message":{"content":"<command-message>tech-article-writer</command-message>\n<command-name>/tech-article-writer</command-name>\n<command-args>去 AI 味</command-args>"}});
-        let context = json!({"type":"user","isSynthetic":true,"message":{"content":[{"type":"text","text":"Base directory for this skill: /home/user/.claude/skills/tech-article-writer\n\nPRIVATE_SKILL_BODY"}]}});
+        let context = json!({"type":"user","isSynthetic":true,"message":{"content":[{"type":"text","text":if cfg!(windows) {"Base directory for this skill: C:/Users/user/.claude/skills/tech-article-writer\n\nPRIVATE_SKILL_BODY"} else {"Base directory for this skill: /home/user/.claude/skills/tech-article-writer\n\nPRIVATE_SKILL_BODY"}}]}});
         assert!(message(&mut adapter, context.clone()).unwrap().is_empty());
         assert!(
             message(
@@ -3768,7 +3800,7 @@ mod tests {
                 .is_empty()
             );
         }
-        let context = json!({"type":"user","isMeta":true,"message":{"content":"Base directory for this skill: /tmp/skill\n\nbody"}});
+        let context = json!({"type":"user","isMeta":true,"message":{"content":if cfg!(windows) {"Base directory for this skill: C:/Temp/skill\n\nbody"} else {"Base directory for this skill: /tmp/skill\n\nbody"}}});
         message(&mut adapter, json!({"type":"user","message":{"content":"<command-message>missing</command-message>\n<command-name>/missing</command-name>"}})).unwrap();
         assert!(message(&mut adapter, context.clone()).unwrap().is_empty());
         let mut child = context.clone();
@@ -3779,7 +3811,7 @@ mod tests {
             matches!(&message(&mut adapter, context).unwrap()[..], [Action::Event(EventKind::Notice { text })] if text == "已加载 Skill：plugin:writer")
         );
         adapter.phase = Phase::Discovering;
-        assert!(adapter.skill_load(&json!({"isMeta":true,"message":{"content":"Base directory for this skill: /tmp/skill\n\nbody"}})).is_none());
+        assert!(adapter.skill_load(&json!({"isMeta":true,"message":{"content":if cfg!(windows) {"Base directory for this skill: C:/Temp/skill\n\nbody"} else {"Base directory for this skill: /tmp/skill\n\nbody"}}})).is_none());
     }
 
     #[test]
@@ -3834,7 +3866,6 @@ mod tests {
     fn provider_settings_are_private_ephemeral_and_default_is_unchanged() {
         use crate::providers::ResolvedProvider;
         use latte_work_protocol::{Provider, ProviderAuth, ProviderProtocol};
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let mut config = LaunchConfig {
             environment: Default::default(),
@@ -3899,10 +3930,7 @@ mod tests {
         );
         config.provider.as_mut().unwrap().metadata.auth = ProviderAuth::Bearer;
         let path = prepared._settings.as_ref().unwrap().path().to_owned();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        latte_work_platform::fs::verify_private_file(&std::fs::File::open(&path).unwrap()).unwrap();
         let settings: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(
             settings["env"]["ANTHROPIC_AUTH_TOKEN"],

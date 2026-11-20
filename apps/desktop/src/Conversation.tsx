@@ -74,6 +74,7 @@ interface Props {
   selectAgent?: (id: string) => void;
   session?: Session;
   hostId: string;
+  supportsUndo?: boolean;
   settingsOpen: boolean;
   events: Event[];
   historyLoading?: boolean;
@@ -128,6 +129,7 @@ export function Conversation({
   selectAgent,
   session,
   hostId,
+  supportsUndo = true,
   settingsOpen,
   events,
   historyLoading = false,
@@ -827,6 +829,7 @@ export function Conversation({
                                 hostId={hostId}
                                 sessionId={session?.id ?? ""}
                                 canUndo={
+                                  supportsUndo &&
                                   connected &&
                                   !!session &&
                                   !["running", "waiting"].includes(

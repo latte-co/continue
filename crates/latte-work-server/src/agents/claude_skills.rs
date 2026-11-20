@@ -2,7 +2,6 @@
 //! Skill locations: <https://code.claude.com/docs/en/skills#choose-where-skills-load>
 use anyhow::{Context, Result, bail};
 use latte_work_protocol::SkillInfo;
-use std::os::unix::fs::OpenOptionsExt;
 use std::{
     io::Read,
     path::{Path, PathBuf},
@@ -10,10 +9,7 @@ use std::{
 const FILE_LIMIT: u64 = 64 * 1024;
 
 pub(crate) fn read(path: &Path, limit: u64) -> Result<String> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW)
-        .open(path)?;
+    let file = latte_work_platform::fs::open_regular_file(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() || meta.len() > limit {
         bail!("Skill 元数据超出读取范围");
@@ -101,12 +97,16 @@ pub(super) fn inspect(directory: &Path, requested: &str) -> Result<Option<SkillI
 }
 
 pub fn find(project: &Path, name: &str) -> Result<Option<SkillInfo>> {
+    find_with_home(project, name, crate::agent_environment::home_dir())
+}
+pub(in crate::agents) fn find_with_home(
+    project: &Path,
+    name: &str,
+    home: Option<PathBuf>,
+) -> Result<Option<SkillInfo>> {
     let config = crate::agent_environment::variable("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .or_else(|| {
-            crate::agent_environment::variable("HOME")
-                .map(|home| PathBuf::from(home).join(".claude"))
-        })
+        .or_else(|| home.map(|home| home.join(".claude")))
         .context("无法确定 Agent 配置目录")?;
     find_in(project, &config, name)
 }
@@ -183,6 +183,141 @@ mod tests {
         std::fs::create_dir_all(directory).unwrap();
         std::fs::write(directory.join("SKILL.md"), contents).unwrap();
     }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_home_absent_skill_metadata_keeps_project_and_user_lookups_and_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        for (relative, name) in [
+            ("project/.claude/skills/claude-project", "Claude project"),
+            (
+                "project/.opencode/skills/opencode-project",
+                "OpenCode project",
+            ),
+            ("profile/.claude/skills/claude-user", "Claude user"),
+            (
+                "profile/.config/opencode/skills/opencode-user",
+                "OpenCode user",
+            ),
+            ("profile/.claude/skills/home-choice", "Wrong profile"),
+            ("profile/.agents/skills/agent-home-choice", "Wrong profile"),
+            ("explicit-home/.claude/skills/home-choice", "Explicit HOME"),
+            (
+                "explicit-home/.agents/skills/agent-home-choice",
+                "Explicit HOME",
+            ),
+            (
+                "claude-config/skills/config-choice",
+                "Explicit Claude config",
+            ),
+            (
+                "opencode-config/skills/config-choice",
+                "Explicit OpenCode config",
+            ),
+        ] {
+            skill(
+                &root.path().join(relative),
+                &format!("---\nname: {name}\n---\nBody"),
+            );
+        }
+        for mode in ["native", "home", "config"] {
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "agents::claude_skills::tests::windows_skill_metadata_fixture",
+                    "--ignored",
+                ])
+                .env_remove("HOME")
+                .env_remove("CLAUDE_CONFIG_DIR")
+                .env_remove("OPENCODE_CONFIG_DIR")
+                .env_remove("XDG_CONFIG_HOME")
+                .env("LATTE_TEST_SKILL_ROOT", root.path())
+                .env("LATTE_TEST_SKILL_MODE", mode);
+            if mode != "native" {
+                command.env("HOME", root.path().join("explicit-home"));
+            }
+            if mode == "config" {
+                command
+                    .env("CLAUDE_CONFIG_DIR", root.path().join("claude-config"))
+                    .env("OPENCODE_CONFIG_DIR", root.path().join("opencode-config"));
+            }
+            let (status, output) = latte_work_platform::process::output(
+                &mut command,
+                std::time::Duration::from_secs(15),
+                16 * 1024,
+            )
+            .await
+            .unwrap();
+            assert!(status.success(), "{}", String::from_utf8_lossy(&output));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "isolated HOME/profile fixture launched by native skill regression"]
+    async fn windows_skill_metadata_fixture() {
+        let root = PathBuf::from(std::env::var_os("LATTE_TEST_SKILL_ROOT").unwrap());
+        let project = root.join("project");
+        let mode = std::env::var("LATTE_TEST_SKILL_MODE").unwrap();
+        if mode == "native" {
+            assert!(std::env::var_os("HOME").is_none());
+            assert_eq!(
+                crate::agent_environment::home_dir().unwrap(),
+                latte_work_platform::dirs::home_dir().unwrap()
+            );
+        } else {
+            assert_eq!(
+                crate::agent_environment::home_dir().unwrap(),
+                root.join("explicit-home")
+            );
+        }
+        let expected = if mode == "config" {
+            vec![
+                ("claude", "config-choice", "Explicit Claude config"),
+                ("opencode", "config-choice", "Explicit OpenCode config"),
+                ("opencode", "agent-home-choice", "Explicit HOME"),
+            ]
+        } else if mode == "home" {
+            vec![
+                ("claude", "home-choice", "Explicit HOME"),
+                ("opencode", "agent-home-choice", "Explicit HOME"),
+            ]
+        } else {
+            assert!(std::env::var_os("HOME").is_none());
+            vec![
+                ("claude", "claude-project", "Claude project"),
+                ("opencode", "opencode-project", "OpenCode project"),
+                ("claude", "claude-user", "Claude user"),
+                ("opencode", "opencode-user", "OpenCode user"),
+            ]
+        };
+        for (agent, name, title) in expected {
+            let found = if mode == "native" && name.ends_with("-user") {
+                // The real Windows known-folder profile must not be rewritten by
+                // this test. Exercise the same lookup with a disposable profile.
+                if agent == "claude" {
+                    find_with_home(&project, name, Some(root.join("profile")))
+                } else {
+                    crate::agents::opencode::skill_info_with_home(
+                        &project,
+                        name,
+                        Some(root.join("profile")),
+                    )
+                }
+                .unwrap()
+                .unwrap()
+            } else {
+                crate::agents::skill_info(agent, project.clone(), name.into())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(found.name, title);
+        }
+    }
+
     #[test]
     fn dotted_names_match_the_manager_without_loosening_path_boundaries() {
         let directory = tempfile::tempdir().unwrap();
@@ -236,6 +371,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg(unix)]
     fn rejects_traversal_oversize_and_symlinked_entry_escape_but_accepts_skill_folder_links() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();

@@ -1,7 +1,7 @@
 //! Bounded raster preview ranges shared by live files and saved comparisons.
 use anyhow::{Context, Result, ensure};
 use latte_work_protocol::ImagePreviewChunk;
-use std::{os::unix::fs::MetadataExt, path::Path};
+use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 pub const LIMIT: u64 = 16 * 1024 * 1024;
 pub fn raster(mime: &str) -> bool {
@@ -51,26 +51,17 @@ pub async fn file(
 ) -> Result<ImagePreviewChunk> {
     let metadata = tokio::fs::symlink_metadata(path).await?;
     ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
+        metadata.is_file() && !latte_work_platform::fs::is_link(&metadata),
         "图片预览仅支持普通文件"
     );
     ensure!(
         metadata.len() <= LIMIT && offset <= metadata.len(),
         "图片过大或预览偏移无效"
     );
-    let identity = |m: &std::fs::Metadata| {
-        format!(
-            "{}:{}:{}:{}:{}",
-            m.dev(),
-            m.ino(),
-            m.mtime(),
-            m.mtime_nsec(),
-            m.len()
-        )
-    };
-    let mut file = tokio::fs::File::open(path).await?;
+    let native = latte_work_platform::fs::open_regular_file(path)?;
+    let mut file = tokio::fs::File::from_std(native.try_clone()?);
     ensure!(
-        identity(&metadata) == identity(&file.metadata().await?),
+        identity(&metadata, &native)? == identity(&file.metadata().await?, &native)?,
         "图片在读取期间发生变化，请刷新"
     );
     let mut header = [0; 512];
@@ -79,7 +70,7 @@ pub async fn file(
     let mut data = Vec::new();
     (&mut file).take(65536).read_to_end(&mut data).await?;
     ensure!(
-        identity(&metadata) == identity(&file.metadata().await?),
+        identity(&metadata, &native)? == identity(&file.metadata().await?, &native)?,
         "图片在读取期间发生变化，请刷新"
     );
     chunk(
@@ -87,9 +78,36 @@ pub async fn file(
         &header[..count],
         metadata.len(),
         offset,
-        version.unwrap_or_else(|| identity(&metadata)),
+        version.unwrap_or(identity(&metadata, &native)?),
         sha256,
     )
+}
+fn identity(metadata: &std::fs::Metadata, _file: &std::fs::File) -> Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!(
+            "{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.len()
+        ))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let id = latte_work_platform::fs::file_identity(_file)?;
+        Ok(format!(
+            "{}:{:?}:{}:{}:{}",
+            id.volume,
+            id.file_id,
+            metadata.last_write_time(),
+            metadata.file_attributes(),
+            metadata.len()
+        ))
+    }
 }
 pub fn permit() -> Result<tokio::sync::OwnedSemaphorePermit> {
     static READS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
@@ -121,7 +139,10 @@ mod tests {
         let huge = std::fs::File::create(dir.path().join("huge")).unwrap();
         huge.set_len(LIMIT + 1).unwrap();
         assert!(file(&dir.path().join("huge"), 0, None, None).await.is_err());
-        std::os::unix::fs::symlink(&path, dir.path().join("link")).unwrap();
-        assert!(file(&dir.path().join("link"), 0, None, None).await.is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&path, dir.path().join("link")).unwrap();
+            assert!(file(&dir.path().join("link"), 0, None, None).await.is_err());
+        }
     }
 }

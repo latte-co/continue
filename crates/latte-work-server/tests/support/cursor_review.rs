@@ -39,7 +39,15 @@ async fn discovery_host(binary: &Path, incompatible: bool, explicit: bool) -> Ho
         &["LATTE_WORK_CURSOR"][..]
     };
     let process = Host::spawn_with_removed_environment(directory.path(), &environment, removed);
-    let host = Host { directory, process };
+    let environment = environment
+        .iter()
+        .map(|(key, value)| ((*key).into(), (*value).to_owned()))
+        .collect();
+    let host = Host {
+        directory,
+        process,
+        environment,
+    };
     host.wait_ready().await;
     host
 }
@@ -587,7 +595,15 @@ async fn cursor_review_permission_denied_path_entry_does_not_hide_later_cli() {
         &environment,
         &["LATTE_WORK_CURSOR"],
     );
-    let host = Host { directory, process };
+    let environment = environment
+        .iter()
+        .map(|(key, value)| ((*key).into(), (*value).to_owned()))
+        .collect();
+    let host = Host {
+        directory,
+        process,
+        environment,
+    };
     host.wait_ready().await;
     let mut client = host.client().await;
     assert!(

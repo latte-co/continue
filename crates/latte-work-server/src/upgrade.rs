@@ -1,14 +1,14 @@
 //! Local lifecycle handshake, intentionally independent of the application wire version.
 //! SSH continues to use `connect`, which never replaces a running daemon.
-use crate::{Service, connect_socket, db, lock};
+use crate::{Service, connect_server, db};
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
+use latte_work_platform::ipc::{Endpoint, Stream};
 pub use latte_work_protocol::lifecycle::{Request, Resource, Response};
 use sha2::{Digest, Sha256};
-use std::{fs::OpenOptions, io::Read, path::Path, time::Duration};
+use std::{io::Read, time::Duration};
 use tokio::{
     io::AsyncWriteExt,
-    net::UnixStream,
     sync::{Notify, RwLock},
 };
 use tokio_util::codec::{FramedRead, LinesCodec};
@@ -438,11 +438,7 @@ async fn close_owned(service: &Service, owner_id: &str, resources: Vec<Resource>
                     }
                 }
                 Resource::Terminal(id) => {
-                    service
-                        .terminals
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("终端锁异常"))?
-                        .close(id);
+                    crate::terminal::close(&service.terminals, id).await?;
                 }
             }
             close.confirm();
@@ -469,7 +465,7 @@ fn validate_resources(owner: &str, resources: &[Resource]) -> Result<()> {
     }
     Ok(())
 }
-async fn exchange(stream: UnixStream, request: &Request) -> Result<Response> {
+async fn exchange(stream: Stream, request: &Request) -> Result<Response> {
     tokio::time::timeout(Duration::from_secs(3), async {
         let (reader, mut writer) = stream.into_split();
         let mut bytes = serde_json::to_vec(request)?;
@@ -484,10 +480,11 @@ async fn exchange(stream: UnixStream, request: &Request) -> Result<Response> {
 }
 // A daemon can close the first control connection while a desktop is reopening.
 // Retry only the read-only status query; never retry upgrade admission or user work.
-async fn server_status(dir: &Path) -> Result<Response> {
+async fn server_status(endpoint: &Endpoint) -> Result<Response> {
     for attempt in 0..3 {
-        let result =
-            async { exchange(connect_socket(dir).await?, &Request::ServerStatus).await }.await;
+        // Transport/security failure is not a reason to retry daemon startup.
+        let stream = connect_server(endpoint).await?;
+        let result = exchange(stream, &Request::ServerStatus).await;
         match result {
             Ok(response) => return Ok(response),
             Err(error) if attempt == 2 => return Err(error),
@@ -500,29 +497,23 @@ const LEGACY: &str = "检测到旧版本机后台，无法安全确认其任务�
 
 /// Serialize local coordinators, ask the owning daemon to drain atomically, then wait for
 /// its singleton lock. Never kill a daemon, remove its socket, or replay application requests.
-pub async fn connect_local(dir: &Path) -> Result<UnixStream> {
-    tokio::time::timeout(Duration::from_secs(20), connect_local_inner(dir))
+pub async fn connect_local(endpoint: &Endpoint) -> Result<Stream> {
+    tokio::time::timeout(Duration::from_secs(20), connect_local_inner(endpoint))
         .await
         .context("本机后台切换超时，请稍后重新连接；任务不会自动重发")?
 }
-async fn connect_local_inner(dir: &Path) -> Result<UnixStream> {
-    let coordinator = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(dir.join("upgrade.lock"))?;
-    loop {
-        match coordinator.try_lock() {
-            Ok(()) => break,
+async fn connect_local_inner(endpoint: &Endpoint) -> Result<Stream> {
+    let _coordinator = loop {
+        match endpoint.try_lock_upgrade() {
+            Ok(guard) => break guard,
             Err(std::fs::TryLockError::WouldBlock) => {
                 tokio::time::sleep(Duration::from_millis(50)).await
             }
             Err(error) => return Err(error.into()),
         }
-    }
+    };
     let build_id = executable_id()?;
-    let (server_id, accepted_build) = match server_status(dir)
+    let (server_id, accepted_build) = match server_status(endpoint)
         .await
         .context("无法确认本机后台版本，请稍后重新连接；后台未被停止")?
     {
@@ -537,7 +528,7 @@ async fn connect_local_inner(dir: &Path) -> Result<UnixStream> {
             draining,
         } => {
             if !draining {
-                let stream = UnixStream::connect(dir.join("control.sock")).await?;
+                let stream = endpoint.connect(Duration::from_secs(3)).await?;
                 match exchange(
                     stream,
                     &Request::PrepareUpgrade {
@@ -550,21 +541,26 @@ async fn connect_local_inner(dir: &Path) -> Result<UnixStream> {
                     Response::Error { code, .. } if code == "upgrade_blocked" => {
                         // Keep this exact live instance available. The client still
                         // performs the regular versioned Hello before using it.
-                        return connect_verified(dir, &server_id, &current).await;
+                        return connect_verified(endpoint, &server_id, &current).await;
                     }
                     Response::Error { message, .. } => bail!("{message}"),
                     _ => bail!("后台升级响应不兼容，请重新连接"),
                 }
             }
-            // The lock is released only after the old daemon has removed its own socket.
+            // Listener and all accepted streams release before the singleton lease.
             loop {
-                if let Ok(guard) = lock(dir) {
-                    drop(guard);
-                    break;
+                match endpoint.try_lock_server() {
+                    Ok(guard) => {
+                        drop(guard);
+                        break;
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            let stream = connect_socket(dir).await?;
+            let stream = connect_server(endpoint).await?;
             match exchange(stream, &Request::ServerStatus).await? {
                 Response::ServerStatus {
                     server_id,
@@ -576,13 +572,13 @@ async fn connect_local_inner(dir: &Path) -> Result<UnixStream> {
         }
         _ => bail!("{LEGACY}"),
     };
-    connect_verified(dir, &server_id, &accepted_build).await
+    connect_verified(endpoint, &server_id, &accepted_build).await
 }
 
-async fn connect_verified(dir: &Path, server_id: &str, build_id: &str) -> Result<UnixStream> {
+async fn connect_verified(endpoint: &Endpoint, server_id: &str, build_id: &str) -> Result<Stream> {
     // Return this exact, verified instance's socket. Recheck after reconnect because a
     // concurrent external shutdown/start may otherwise attach us to a different build.
-    let mut stream = UnixStream::connect(dir.join("control.sock")).await?;
+    let mut stream = endpoint.connect(Duration::from_secs(3)).await?;
     let mut bytes = serde_json::to_vec(&Request::ServerStatus)?;
     bytes.push(b'\n');
     stream.write_all(&bytes).await?;
@@ -612,7 +608,7 @@ async fn connect_verified(dir: &Path, server_id: &str, build_id: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::{io::AsyncReadExt, net::UnixListener};
+    use tokio::io::AsyncReadExt;
     #[test]
     fn close_cleanup_requires_the_captured_claim_version() {
         let lifecycle = Lifecycle::new().unwrap();
@@ -744,10 +740,11 @@ mod tests {
     #[tokio::test]
     async fn status_retries_a_closed_connection_without_requesting_upgrade() {
         let directory = tempfile::tempdir().unwrap();
-        let listener = UnixListener::bind(directory.path().join("control.sock")).unwrap();
+        let endpoint = Endpoint::prepare(directory.path()).unwrap();
+        let listener = endpoint.bind().await.unwrap();
         let service = tokio::spawn(async move {
             for attempt in 0..2 {
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut stream = listener.accept().await.unwrap();
                 let mut bytes = vec![];
                 loop {
                     let byte = stream.read_u8().await.unwrap();
@@ -772,11 +769,10 @@ mod tests {
                 }
             }
         });
-        let response =
-            tokio::time::timeout(Duration::from_secs(2), server_status(directory.path()))
-                .await
-                .unwrap()
-                .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), server_status(&endpoint))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(
             response,
             Response::ServerStatus {

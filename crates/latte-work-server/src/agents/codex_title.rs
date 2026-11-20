@@ -225,7 +225,11 @@ async fn structured(
     schema: Value,
 ) -> Result<Value> {
     // The detached owner retains the child and permits across all setup failures.
-    let mut command = crate::agent_environment::command(binary);
+    let mut command = crate::agent_environment::configured_command(
+        binary,
+        Some(std::path::Path::new(cwd)),
+        &config.environment,
+    );
     command.args(["app-server", "--stdio"]).current_dir(cwd);
     command.envs(&config.environment.0);
     let provider_id = format!("latte-title-{}", uuid::Uuid::new_v4());

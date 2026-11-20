@@ -1,5 +1,5 @@
 //! Prompt-free Cursor metadata; no status/login/empty-chat/model turns.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "metadata_permission_tests.rs"]
 mod permission_tests;
 use anyhow::{Context, Result, bail};
@@ -72,15 +72,17 @@ async fn spawn_output(
         if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             bail!("Cursor 元数据读取超时");
         }
-        let mut command = crate::agent_environment::command(binary);
+        let mut command = crate::agent_environment::configured_command(
+            binary,
+            path.as_deref().map(std::path::Path::new),
+            &environment,
+        );
         command
             .args(args)
             .envs(&environment.0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0);
+            .stderr(Stdio::piped());
         if let Some(path) = path {
             command.current_dir(path);
         }
@@ -92,10 +94,8 @@ async fn spawn_output(
         if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             bail!("Cursor 元数据读取超时");
         }
-        let child = command.spawn().map_err(SpawnFailure)?;
-        let pid = i32::try_from(child.id().context("Cursor 元数据 PID 缺失")?)
-            .context("Cursor PID 无效")?;
-        Ok((crate::runtime::Group { child, pid }, redactor))
+        let group = crate::runtime::Group::spawn(&mut command).map_err(SpawnFailure)?;
+        Ok((group, redactor))
     })
     .await
     .context("Cursor 元数据进程准备任务失败")?
@@ -111,7 +111,6 @@ async fn output_until(
     // Models/permissions retain their original five-second post-spawn read
     // window; discovery shares one deadline across every candidate and step.
     let deadline = deadline.unwrap_or_else(|| tokio::time::Instant::now() + PROBE_TIMEOUT);
-    let pid = group.pid;
     let result = tokio::time::timeout_at(deadline, async {
         let mut stdout = group
             .child
@@ -143,23 +142,15 @@ async fn output_until(
     })
     .await;
     // Do not return through '?' until the owned process group is terminated and reaped.
-    let signal = nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGKILL,
-    );
-    if let Err(error) = signal
-        && error != nix::errno::Errno::ESRCH
+    if !crate::runtime::close_group(
+        &mut group,
+        tokio::time::Instant::now() + Duration::from_secs(4),
+        std::future::ready(true),
+    )
+    .await
     {
-        return Err(
-            anyhow::anyhow!("Cursor 元数据进程组清理未确认：{error}").context(CleanupUnconfirmed)
-        );
+        return Err(anyhow::anyhow!("Cursor 元数据进程清理未确认").context(CleanupUnconfirmed));
     }
-    tokio::time::timeout(Duration::from_secs(2), group.child.wait())
-        .await
-        .context("Cursor 元数据进程回收超时")
-        .context(CleanupUnconfirmed)?
-        .context("Cursor 元数据进程回收失败")
-        .context(CleanupUnconfirmed)?;
     Ok((result.context("Cursor 元数据读取超时")??, deadline))
 }
 fn binary_candidates(
@@ -174,6 +165,13 @@ fn binary_candidates(
     let home = home.map(PathBuf::from);
     let mut candidates = Vec::new();
     for name in ["cursor-agent", "agent"] {
+        #[cfg(windows)]
+        if let Some(local) = crate::agent_environment::variable("LOCALAPPDATA") {
+            let installed = PathBuf::from(local).join("cursor-agent").join(name);
+            if let Some(installed) = installed.to_str() {
+                candidates.push(installed.to_owned());
+            }
+        }
         if let Some(home) = &home {
             let installed = home.join(".local/bin").join(name);
             // Construct all priorities without touching the filesystem. Only
@@ -189,7 +187,11 @@ fn binary_candidates(
 pub(crate) async fn discover() -> (String, AgentInfo) {
     discover_candidates(binary_candidates(
         std::env::var_os("LATTE_WORK_CURSOR"),
-        crate::agent_environment::variable("HOME"),
+        crate::agent_environment::variable("HOME").or_else(|| {
+            latte_work_platform::dirs::home_dir()
+                .ok()
+                .map(|p| p.into_os_string())
+        }),
     ))
     .await
 }
@@ -330,9 +332,10 @@ async fn probe_binary(binary: &str, cwd: &str, deadline: tokio::time::Instant) -
     )
     .await
     .map_err(|error| {
-        if error.downcast_ref::<SpawnFailure>().is_some_and(|failure| {
-            failure.0.raw_os_error() == Some(nix::errno::Errno::EACCES as i32)
-        }) {
+        if error
+            .downcast_ref::<SpawnFailure>()
+            .is_some_and(|failure| failure.0.kind() == std::io::ErrorKind::PermissionDenied)
+        {
             error.context(RetryPathCandidate)
         } else {
             error
@@ -564,9 +567,9 @@ pub(super) fn catalog(output: &str, _selected: Option<&str>) -> Result<Response>
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "metadata_lookup_tests.rs"]
 mod lookup_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "metadata_tests.rs"]
 mod tests;

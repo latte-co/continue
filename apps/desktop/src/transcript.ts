@@ -2,7 +2,7 @@ import type { Event, TurnChanges, QuestionAnswer } from "./protocol";
 
 /** Match the change card's visibility before creating transcript boundaries. */
 export function hasTurnChangeFiles(changes: TurnChanges): boolean {
-  return changes.summary.entries.length > 0;
+  return changes.summary.entries.length > 0 || !!changes.undo_unavailable;
 }
 /** Undo/status events for older turns must not replace the latest turn. */
 export function latestTurnChanges(events: Event[]): TurnChanges | undefined {

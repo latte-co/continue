@@ -60,21 +60,16 @@ async fn export(
     id: &str,
     config: &LaunchConfig,
 ) -> Result<Option<Value>> {
-    let process = crate::agent_environment::command(binary)
+    let mut command =
+        crate::agent_environment::configured_command(binary, Some(project), &config.environment);
+    command
         .envs(&config.environment.0)
         .current_dir(project)
         .args(["session", "export", "--standalone", id])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .process_group(0)
-        .spawn()?;
-    let pid = process.id().context("OpenCode 探测进程 PID 缺失")? as i32;
-    let mut group = Group {
-        child: process,
-        pid,
-    };
+        .stderr(Stdio::null());
+    let mut group = Group::spawn(&mut command)?;
     let stdout = group.child.stdout.take().context("OpenCode 探测输出缺失")?;
     let Ok(bytes) = bounded(stdout).await else {
         // An oversized export is dropped; kill_on_drop reaps the group.
@@ -118,7 +113,11 @@ mod tests {
 
     fn fixture_binary() -> String {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/opencode.py")
+            .join(if cfg!(windows) {
+                "src/agents/opencode/fixtures/agent.ps1"
+            } else {
+                "tests/fixtures/opencode.py"
+            })
             .to_string_lossy()
             .into_owned()
     }

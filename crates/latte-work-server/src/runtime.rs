@@ -8,6 +8,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use latte_work_protocol::{EventKind, Response, Session, Status};
+#[cfg(unix)]
 use nix::{
     errno::Errno,
     sys::signal::{Signal, killpg},
@@ -25,12 +26,13 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    process::Child,
     sync::{mpsc, oneshot},
 };
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 mod transport;
+#[cfg(all(test, windows))]
+mod windows_tests;
 use transport::Transport;
 
 pub type Database = Arc<Mutex<Store>>;
@@ -696,8 +698,12 @@ fn control_for(
     session: Session,
     path: String,
 ) -> Result<mpsc::Sender<Control>> {
+    let retained = runs
+        .lock()
+        .map_err(|_| anyhow::anyhow!("执行状态锁异常"))?
+        .contains_key(&session.id);
     if db(&database, |s| {
-        if let Some(reason) = s.unconfirmed_agent_close(&session.id)? {
+        if !retained && let Some(reason) = s.unconfirmed_agent_close(&session.id)? {
             bail!(reason);
         }
         if let Some((parent, _)) = s.side_parent(&session.id)?
@@ -787,18 +793,20 @@ pub async fn archive(
 /// Returns whether an actor acknowledged closure.
 pub async fn close(database: &Database, runs: &Runs, id: &str, only_if_idle: bool) -> Result<bool> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    db(database, |s| {
-        s.session(id)?;
-        if let Some(reason) = s.unconfirmed_agent_close(id)? {
-            bail!(reason);
-        }
-        Ok(())
-    })?;
     let control = runs
         .lock()
         .map_err(|_| anyhow::anyhow!("执行状态锁异常"))?
         .get(id)
         .map(|r| r.control.clone());
+    db(database, |s| {
+        s.session(id)?;
+        if control.is_none()
+            && let Some(reason) = s.unconfirmed_agent_close(id)?
+        {
+            bail!(reason);
+        }
+        Ok(())
+    })?;
     let actor_closed = control.is_some();
     if let Some(control) = control {
         let (reply, receive) = oneshot::channel();
@@ -1188,9 +1196,45 @@ impl TurnState {
     }
 }
 pub(crate) struct Group {
-    pub(crate) child: Child,
+    #[cfg(unix)]
+    pub(crate) child: tokio::process::Child,
+    #[cfg(windows)]
+    pub(crate) child: latte_work_platform::process::ManagedChild,
+    #[cfg(unix)]
     pub(crate) pid: i32,
+    #[cfg(unix)]
+    _launch_directory: Option<tempfile::TempDir>,
 }
+impl Group {
+    pub(crate) fn spawn(
+        command: &mut impl latte_work_platform::process::SpawnCommand,
+    ) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            let child = command
+                .command_mut()
+                .kill_on_drop(true)
+                .process_group(0)
+                .spawn()?;
+            let pid = child
+                .id()
+                .ok_or_else(|| std::io::Error::other("Agent PID missing"))?
+                as i32;
+            Ok(Self {
+                child,
+                pid,
+                _launch_directory: command.take_directory(),
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                child: latte_work_platform::process::ManagedChild::spawn(command)?,
+            })
+        }
+    }
+}
+#[cfg(unix)]
 impl Drop for Group {
     fn drop(&mut self) {
         // A reaped child's numeric PGID is no longer a signalling authority.
@@ -1210,6 +1254,9 @@ struct Process {
     /// A failed journal write leaves this handle managed for an explicit retry.
     close_blocked: bool,
     close_started: bool,
+    /// Native shutdown evidence survives physical cleanup and explicit retries.
+    native_close_evidence: Option<bool>,
+    close_cleanup_complete: bool,
     adapter: Box<dyn agents::AgentAdapter>,
     binary: String,
     title_job: Option<tokio::task::JoinHandle<()>>,
@@ -1250,19 +1297,28 @@ struct PendingApprovalReply {
     deadline: tokio::time::Instant,
     allow: bool,
 }
+#[cfg(unix)]
+type SidebandStream = tokio::net::UnixStream;
+#[cfg(windows)]
+type SidebandStream = latte_work_platform::pipe::PrivateStream;
 struct AgentSideband {
     listener: agents::Sideband,
-    stream: Option<FramedRead<tokio::net::UnixStream, LinesCodec>>,
+    stream: Option<FramedRead<SidebandStream, LinesCodec>>,
 }
 
 impl AgentSideband {
     async fn read(&mut self) -> Result<String> {
         if self.stream.is_none() {
+            #[cfg(unix)]
             let (stream, _) = self.listener.listener.accept().await?;
-            self.stream = Some(FramedRead::new(
-                stream,
-                LinesCodec::new_with_max_length(1024 * 1024),
-            ));
+            #[cfg(windows)]
+            let (stream, prefix) = self.listener.listener.accept_with_prefix().await?;
+            let framed = FramedRead::new(stream, LinesCodec::new_with_max_length(1024 * 1024));
+            #[cfg(windows)]
+            let mut framed = framed;
+            #[cfg(windows)]
+            framed.read_buffer_mut().extend_from_slice(&[prefix]);
+            self.stream = Some(framed);
         }
         Ok(self
             .stream
@@ -1471,6 +1527,8 @@ impl Process {
         Ok(Self {
             close_blocked: false,
             close_started: false,
+            native_close_evidence: None,
+            close_cleanup_complete: false,
             adapter,
             binary: binary.into(),
             title_job: None,
@@ -1562,7 +1620,7 @@ impl Process {
                     database,
                     id,
                     &session.agent,
-                    prepared,
+                    *prepared,
                     self.adapter.frame_limit(),
                     &self.config,
                     None,
@@ -1957,6 +2015,9 @@ impl Process {
         }
     }
     fn begin_close(&mut self, database: &Database, id: &str) -> Result<()> {
+        if self.close_started {
+            return Ok(());
+        }
         let journal = db(database, |s| {
             if let Some(reason) = s.unconfirmed_agent_close(id)? {
                 bail!(reason);
@@ -1977,7 +2038,9 @@ impl Process {
         // Even a prepared/retired PerTurn actor can own detached auxiliary jobs.
         self.begin_close(database, id)?;
         let confirmed = self.close().await;
-        finish_native_close(database, id, confirmed)
+        let result = finish_native_close(database, id, confirmed);
+        self.close_blocked = result.is_err();
+        result
     }
     async fn retire_per_turn(&mut self, database: &Database, id: &str) -> Result<()> {
         self.begin_close(database, id)?;
@@ -1990,7 +2053,9 @@ impl Process {
             self.transport = None;
             self.adapter.transport_closed();
         }
-        finish_native_close(database, id, confirmed)
+        let result = finish_native_close(database, id, confirmed);
+        self.close_blocked = result.is_err();
+        result
     }
     async fn close(&mut self) -> bool {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -2012,12 +2077,15 @@ impl Process {
                 .await
         };
         let Some(transport) = &mut self.transport else {
-            return tokio::time::timeout_at(deadline, auxiliary)
+            self.close_cleanup_complete = tokio::time::timeout_at(deadline, auxiliary)
                 .await
                 .unwrap_or(false);
+            return self.close_cleanup_complete && self.native_close_evidence != Some(false);
         };
         let requires_drain = self.adapter.requires_close_drain();
-        let background_confirmed = if requires_drain {
+        let background_confirmed = if let Some(confirmed) = self.native_close_evidence {
+            confirmed
+        } else if requires_drain {
             matches!(
                 tokio::time::timeout(
                     Duration::from_secs(2),
@@ -2050,60 +2118,109 @@ impl Process {
         let confirmed = transport
             .terminate_with_auxiliary(
                 self.adapter.transport_lifetime() == agents::TransportLifetime::PerTurn,
-                requires_drain && background_confirmed,
+                requires_drain && background_confirmed && self.native_close_evidence.is_none(),
                 deadline,
                 auxiliary,
             )
             .await;
-        if confirmed {
+        if requires_drain && self.native_close_evidence.is_none() {
+            self.native_close_evidence = Some(background_confirmed && transport.close_exit_success);
+        }
+        self.close_cleanup_complete = transport.close_cleanup_complete;
+        if self.close_cleanup_complete {
             self.transport = None;
             self.adapter.transport_closed();
         }
-        confirmed && background_confirmed
+        confirmed && self.native_close_evidence != Some(false)
     }
 }
-async fn close_group(
+/// Physical cleanup and native settlement are different facts. An auxiliary-only
+/// failure can be retried without manufacturing a missing native close receipt.
+struct GroupClose {
+    closed: bool,
+    clean_exit: bool,
+}
+pub(crate) async fn close_group(
+    group: &mut Group,
+    deadline: tokio::time::Instant,
+    auxiliary: impl std::future::Future<Output = bool>,
+) -> bool {
+    close_group_with_status(group, deadline, false, auxiliary)
+        .await
+        .closed
+}
+#[cfg(unix)]
+async fn close_group_with_status(
     group: &mut Group,
     deadline: tokio::time::Instant,
     expect_clean_exit: bool,
     auxiliary: impl std::future::Future<Output = bool>,
-) -> bool {
+) -> GroupClose {
     let pid = Pid::from_raw(group.pid);
     let owned = group.child.id().is_some();
     if owned && !expect_clean_exit {
         let _ = killpg(pid, Signal::SIGTERM);
     }
-    // Keep the native PID owned while auxiliary cleanup may suspend. Waiting
-    // after reap would let Group::drop signal a reused numeric process group.
+    // Keep the native PID owned while auxiliary cleanup may suspend. Never
+    // authorize a signal from a numeric PGID whose leader was already reaped.
     let auxiliary_reaped = tokio::time::timeout_at(deadline, auxiliary)
         .await
         .unwrap_or(false);
-    // Per-turn transports can already have reaped their native leader. Never
-    // signal that numeric process group after an auxiliary await.
     if !owned {
-        return auxiliary_reaped && !expect_clean_exit;
+        return GroupClose {
+            closed: auxiliary_reaped,
+            clean_exit: false,
+        };
     }
     let exit = tokio::time::timeout_at(
         deadline.min(tokio::time::Instant::now() + Duration::from_secs(2)),
         group.child.wait(),
     )
     .await;
+    // No await between reap and final group retirement.
     let group_signaled = matches!(killpg(pid, Signal::SIGKILL), Ok(()) | Err(Errno::ESRCH));
-    let native_confirmed = match exit {
-        Ok(Ok(status)) => !expect_clean_exit || status.success(),
-        _ => {
-            let reaped = matches!(
+    let (reaped, clean_exit) = match exit {
+        Ok(Ok(status)) => (true, status.success()),
+        _ => (
+            matches!(
                 tokio::time::timeout_at(
                     deadline.min(tokio::time::Instant::now() + Duration::from_secs(2)),
                     group.child.wait(),
                 )
                 .await,
                 Ok(Ok(_))
-            );
-            reaped && !expect_clean_exit
-        }
+            ),
+            false,
+        ),
     };
-    native_confirmed && group_signaled && auxiliary_reaped
+    GroupClose {
+        closed: reaped && group_signaled && auxiliary_reaped,
+        clean_exit,
+    }
+}
+#[cfg(windows)]
+async fn close_group_with_status(
+    group: &mut Group,
+    deadline: tokio::time::Instant,
+    expect_clean_exit: bool,
+    auxiliary: impl std::future::Future<Output = bool>,
+) -> GroupClose {
+    // Reaping the root does not release its Job. Observe the unforced native
+    // status before terminating descendants; Job termination is not an ack.
+    let clean_exit = expect_clean_exit
+        && matches!(
+            tokio::time::timeout_at(
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(2)),
+                group.child.wait(),
+            ).await, Ok(Ok(status)) if status.success()
+        );
+    let closed = tokio::time::timeout_at(deadline, async {
+        let (native, auxiliary) = tokio::join!(group.child.close(Duration::ZERO), auxiliary);
+        native.is_ok() && auxiliary
+    })
+    .await
+    .unwrap_or(false);
+    GroupClose { closed, clean_exit }
 }
 fn finish_native_close(database: &Database, id: &str, confirmed: bool) -> Result<()> {
     if !confirmed {
@@ -2122,6 +2239,10 @@ async fn finish_turn(
         let after = crate::task_changes::Snapshot::capture_stored(
             std::path::Path::new(path),
             &db(database, |s| Ok(s.snapshot_dir.clone()))?,
+            &crate::managed_recovery::ManagedRecoveryExclusions::load(
+                database,
+                std::path::Path::new(path),
+            )?,
         )
         .await
         .unwrap_or_else(|e| crate::task_changes::Snapshot::unavailable(e.to_string()));
@@ -2194,6 +2315,9 @@ async fn accept_turn(
     })? {
         return Ok(false);
     }
+    if let Some(reason) = db(database, |store| store.unconfirmed_agent_close(&session.id))? {
+        return Err(reject_turn(admission, &turn.request_id, reason));
+    }
     if session.agent == "cursor" {
         agents::cursor::validate_prompt(&turn.text)
             .map_err(|error| reject_turn(admission, &turn.request_id, error.to_string()))?;
@@ -2247,10 +2371,8 @@ async fn accept_turn(
             ));
         }
         let closed = current.close_confirmed(database, &session.id).await;
-        if current.close_started {
-            *process = None;
-        }
         closed?;
+        *process = None;
     }
     let Some(source_user_seq) = db(database, |s| {
         s.begin_with_source(
@@ -2287,6 +2409,10 @@ async fn accept_turn(
             let baseline = crate::task_changes::Snapshot::capture_stored(
                 std::path::Path::new(path),
                 &db(database, |s| Ok(s.snapshot_dir.clone()))?,
+                &crate::managed_recovery::ManagedRecoveryExclusions::load(
+                    database,
+                    std::path::Path::new(path),
+                )?,
             )
             .await
             .unwrap_or_else(|e| crate::task_changes::Snapshot::unavailable(e.to_string()));
@@ -2365,7 +2491,10 @@ async fn accept_turn(
         let message = if let Some(p) = process.as_mut() {
             let message = p.config.redact(&error.to_string());
             let closed = p.close_confirmed(database, &session.id).await;
-            if closed.is_err() && !p.close_started {
+            if closed.is_err() {
+                db(database, |s| {
+                    s.state(&session.id, Status::Unknown, Some(CLOSE_PENDING.into()))
+                })?;
                 return Ok(true);
             }
             message
@@ -2413,6 +2542,16 @@ async fn receive_turn(
         )
     })? {
         return Ok(Response::Accepted { duplicate: true });
+    }
+    if process.as_ref().is_some_and(|p| p.close_blocked) {
+        return Err(reject_turn(
+            admission,
+            &turn.request_id,
+            CLOSE_PENDING.into(),
+        ));
+    }
+    if let Some(reason) = db(database, |store| store.unconfirmed_agent_close(&session.id))? {
+        return Err(reject_turn(admission, &turn.request_id, reason));
     }
     if session.agent == "cursor" {
         agents::cursor::validate_prompt(&turn.text)
@@ -2530,7 +2669,7 @@ async fn actor(
                 }
                 Some(Control::RenameTitle {title,reply}) => {
                     safe_to_close.store(false, Ordering::SeqCst);
-                    if let Some(p)=process.as_mut().filter(|p|p.state.ready) {
+                    if let Some(p)=process.as_mut().filter(|p|!p.close_blocked && p.state.ready) {
                         if p.rename_reply.is_some() {let _=reply.send(Err("标题修改结果待确认，请稍后重试".into()));Ok(())}
                         else {
                             let id=uuid::Uuid::new_v4().to_string();
@@ -2549,7 +2688,7 @@ async fn actor(
                     let result = async {
                         if process.is_none() {
                             let current = db(&database, |s| s.session(&session.id))?;
-                            let mut p = Process::launch(
+                            process = Some(Process::launch(
                                 &database,
                                 &binary,
                                 &current,
@@ -2558,10 +2697,10 @@ async fn actor(
                                 session_open.clone(),
                                 None,
                             )
-                            .await?;
+                            .await?);
+                            let p = process.as_mut().context("Agent process missing")?;
                             let actions = p.adapter.advance(Input::Open)?;
                             p.apply(actions, &database, &session.id).await?;
-                            process = Some(p);
                         }
                         Ok::<_, anyhow::Error>(())
                     }
@@ -2569,15 +2708,17 @@ async fn actor(
                     match result {
                         Ok(()) if process.as_ref().is_some_and(Process::host_prepared) => {
                             let _ = reply.send(Ok(()));
+                            Ok(())
                         }
-                        Ok(()) => opening.push(reply),
+                        Ok(()) => { opening.push(reply); Ok(()) },
                         Err(error) => {
                             let _ = reply.send(Err(error.to_string()));
+                            Err(error)
                         }
                     }
-                    Ok(())
                 }
                 Some(Control::Interrupt { reply }) => async {
+                    if process.as_ref().is_some_and(|p| p.close_blocked) { let _ = reply.send(Err(CLOSE_PENDING.into())); return Ok(()); }
                     if let Some(p) = process.as_mut().filter(|p| p.adapter.transport_lifetime() == agents::TransportLifetime::PerTurn && p.turn_active) {
                         db(&database, |d| d.pause_queue(&session.id, Some("当前执行已停止，队列已暂停")))?;
                         let result = p.stop_per_turn(&database, &session.id).await;
@@ -2786,7 +2927,7 @@ async fn actor(
                 }
                 Some(Control::Cancel { reply, only_if_idle }) => {
                     if !only_if_idle { forwarded.clear(); let _=db(&database,|d|d.uncertain_forwarded(&session.id)); }
-                    if only_if_idle && (immediate.is_some() || !forwarded.is_empty() || process.as_ref().is_some_and(|p| p.turn_active || p.interrupt_ack_pending || !p.state.pending.is_empty() || !p.adapter.can_reconfigure()) || db(&database,|d|Ok(!d.queue_state(&session.id)?.0 && !d.queued(&session.id)?.is_empty())).unwrap_or(true)) {
+                    if only_if_idle && (immediate.is_some() || !forwarded.is_empty() || process.as_ref().is_some_and(|p| p.close_blocked || p.turn_active || p.interrupt_ack_pending || !p.state.pending.is_empty() || !p.adapter.can_reconfigure()) || db(&database,|d|Ok(!d.queue_state(&session.id)?.0 && !d.queued(&session.id)?.is_empty())).unwrap_or(true)) {
                         if let Some(reply) = reply { let _ = reply.send(Err("会话有运行任务、审批或后台任务，请确认后关闭".into())); }
                         continue;
                     }
@@ -2799,9 +2940,15 @@ async fn actor(
                         .is_some_and(|p| p.turn_active && p.background_at_start);
                     let close_unconfirmed = if let Some(p) = process.as_mut() {
                         let result = p.close_confirmed(&database, &session.id).await;
-                        if let Err(error) = &result && !p.close_started {
+                        if let Err(error) = &result {
                             safe_to_close.store(false, Ordering::SeqCst);
+                            let _ = db(&database, |s| s.state(&session.id, Status::Unknown, Some(CLOSE_PENDING.into())));
                             if let Some(reply) = reply { let _ = reply.send(Err(error.to_string())); }
+                            if p.close_cleanup_complete {
+                                process = None;
+                                if let Ok(mut map) = runs.lock() { map.remove(&session.id); }
+                                break;
+                            }
                             continue;
                         }
                         result.is_err()
@@ -2842,6 +2989,7 @@ async fn actor(
                     break;
                 }
                 Some(Control::AnswerQuestion { id, answers, reply }) => {
+                    if process.as_ref().is_some_and(|p| p.close_blocked) { let _ = reply.send(Err(CLOSE_PENDING.into())); continue; }
                     let validation = process.as_ref().and_then(|p| p.state.pending.get(&id)).and_then(|(_, _, questions)| questions.as_ref()).context("问题已过期或不属于当前执行").and_then(|questions| match &answers { Some(answers) => crate::questions::validate(questions, answers), None => Ok(()) });
                     if let Err(error) = validation {
                         let _ = reply.send(Err(error.to_string()));
@@ -2864,7 +3012,7 @@ async fn actor(
                 }
                 Some(Control::Approval { id, allow, reply }) => {
                     async {
-                        let Some(p) = process.as_mut().filter(|p| !p.stopping) else {
+                        let Some(p) = process.as_mut().filter(|p| !p.stopping && !p.close_blocked) else {
                             let _ = reply.send(Err("审批已过期或不属于当前执行".into()));
                             return Ok(());
                         };
@@ -2968,12 +3116,20 @@ async fn actor(
                     let _ = reply.send(Err(text.clone()));
                 }
                 let closed = p.close_confirmed(&database, &session.id).await;
-                if let Err(error) = closed
-                    && !p.close_started
-                {
+                if let Err(error) = closed {
                     safe_to_close.store(false, Ordering::SeqCst);
+                    let _ = db(&database, |s| {
+                        s.state(&session.id, Status::Unknown, Some(CLOSE_PENDING.into()))
+                    });
                     for reply in opening.drain(..) {
                         let _ = reply.send(Err(error.to_string()));
+                    }
+                    if p.close_cleanup_complete {
+                        process = None;
+                        if let Ok(mut map) = runs.lock() {
+                            map.remove(&session.id);
+                        }
+                        break;
                     }
                     continue;
                 }
@@ -2999,23 +3155,29 @@ async fn actor(
             {
                 let restore = async {
                     let current = db(&database, |s| s.session(&session.id))?;
-                    let mut p = Process::launch(
-                        &database,
-                        &binary,
-                        &current,
-                        &path,
-                        config,
-                        session_open.clone(),
-                        None,
-                    )
-                    .await?;
+                    process = Some(
+                        Process::launch(
+                            &database,
+                            &binary,
+                            &current,
+                            &path,
+                            config,
+                            session_open.clone(),
+                            None,
+                        )
+                        .await?,
+                    );
+                    let p = process.as_mut().context("Agent process missing")?;
                     let actions = p.adapter.advance(Input::Open)?;
                     p.apply(actions, &database, &session.id).await?;
-                    Ok::<_, anyhow::Error>(p)
+                    Ok::<_, anyhow::Error>(())
                 }
                 .await;
-                if let Ok(p) = restore {
-                    process = Some(p);
+                if restore.is_err()
+                    && let Some(p) = process.as_mut()
+                    && p.close_confirmed(&database, &session.id).await.is_ok()
+                {
+                    process = None;
                 }
             }
         }
@@ -3030,11 +3192,14 @@ async fn actor(
             for reply in opening.drain(..) {
                 let _ = reply.send(Err(CLOSE_PENDING.into()));
             }
+            if let Some(p) = process.as_mut() {
+                p.close_blocked = true;
+                safe_to_close.store(false, Ordering::SeqCst);
+                continue;
+            }
             if let Ok(mut map) = runs.lock() {
                 map.remove(&session.id);
             }
-            // Retain durable uncertainty; do not retry close or spawn a replacement.
-            process = None;
             break;
         }
         if process.as_ref().is_some_and(Process::host_prepared) {
@@ -3197,17 +3362,12 @@ pub async fn commands(
     let mut adapter = agents::create(agent)?;
     let start = adapter.advance(Input::DiscoverCommands)?;
     let mut prepared = adapter.command(binary, path, None, config)?;
-    let child = prepared
+    prepared
         .command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .process_group(0)
-        .spawn()
-        .context("无法启动 Agent 读取命令列表")?;
-    let pid = child.id().context("Agent PID missing")? as i32;
-    let mut group = Group { child, pid };
+        .stderr(Stdio::null());
+    let mut group = Group::spawn(&mut prepared.command).context("无法启动 Agent 读取命令列表")?;
     let mut input = group.child.stdin.take().context("Agent stdin missing")?;
     let mut output = FramedRead::new(
         group.child.stdout.take().context("Agent stdout missing")?,
@@ -3237,15 +3397,22 @@ pub async fn commands(
         bail!("Agent 命令发现消息超出限制")
     })
     .await;
-    let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
-    let _ = group.child.wait().await;
+    if !close_group(
+        &mut group,
+        tokio::time::Instant::now() + Duration::from_secs(4),
+        std::future::ready(true),
+    )
+    .await
+    {
+        bail!("Agent 命令探针清理未确认");
+    }
     result.context("读取 Agent 命令超时，请重试")?
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod per_turn_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "runtime_auxiliary_tests.rs"]
 mod auxiliary_tests;
 
@@ -3254,6 +3421,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn auxiliary_close_barrier_runs_before_native_pid_is_reaped() {
         for (command, expect_clean_exit, expected) in [
             ("exec sleep 60", false, true),
@@ -3270,10 +3438,14 @@ mod tests {
                 .spawn()
                 .unwrap();
             let pid = i32::try_from(child.id().unwrap()).unwrap();
-            let mut group = Group { child, pid };
+            let mut group = Group {
+                child,
+                pid,
+                _launch_directory: None,
+            };
             let owned_during_barrier = Arc::new(AtomicBool::new(false));
             let observed = owned_during_barrier.clone();
-            let confirmed = close_group(
+            let confirmed = close_group_with_status(
                 &mut group,
                 tokio::time::Instant::now() + Duration::from_secs(5),
                 expect_clean_exit,
@@ -3286,7 +3458,10 @@ mod tests {
                 },
             )
             .await;
-            assert_eq!(confirmed, expected);
+            assert_eq!(
+                confirmed.closed && (!expect_clean_exit || confirmed.clean_exit),
+                expected
+            );
             assert!(
                 owned_during_barrier.load(Ordering::SeqCst),
                 "auxiliary await must not retain a reusable native PID"
@@ -3518,6 +3693,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn failed_native_reap_blocks_every_replacement_spawn_until_reconciled() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.sqlite")).unwrap();

@@ -308,26 +308,54 @@ impl<T> Drop for JobHandle<T> {
 
 #[derive(Default)]
 pub(crate) struct ChildOwner {
+    #[cfg(unix)]
     child: Option<tokio::process::Child>,
+    #[cfg(windows)]
+    child: Option<latte_work_platform::process::ManagedChild>,
+    #[cfg(unix)]
     pid: Option<i32>,
+    #[cfg(unix)]
+    _launch_directory: Option<tempfile::TempDir>,
     #[cfg(test)]
     test_gate: Option<Arc<ReapGate>>,
 }
 impl ChildOwner {
+    #[cfg(unix)]
     pub(crate) fn spawn(
         &mut self,
-        mut command: tokio::process::Command,
+        command: impl Into<latte_work_platform::process::PreparedCommand>,
     ) -> Result<&mut tokio::process::Child> {
+        let mut command = command.into();
         if self.child.is_some() {
             bail!("辅助 owner 已持有子进程，拒绝覆盖");
         }
         // Store child before fallible PID/stdin/stdout setup.
         self.child = Some(command.kill_on_drop(true).process_group(0).spawn()?);
+        self._launch_directory =
+            latte_work_platform::process::SpawnCommand::take_directory(&mut command);
         self.pid = self
             .child
             .as_ref()
             .and_then(tokio::process::Child::id)
             .map(|pid| pid as i32);
+        #[cfg(test)]
+        if let Some(gate) = &self.test_gate {
+            gate.started.notify_one();
+        }
+        self.child.as_mut().context("辅助进程缺失")
+    }
+    #[cfg(windows)]
+    pub(crate) fn spawn(
+        &mut self,
+        command: impl Into<latte_work_platform::process::PreparedCommand>,
+    ) -> Result<&mut latte_work_platform::process::ManagedChild> {
+        let mut command = command.into();
+        if self.child.is_some() {
+            bail!("辅助 owner 已持有子进程，拒绝覆盖");
+        }
+        self.child = Some(latte_work_platform::process::ManagedChild::spawn(
+            &mut command,
+        )?);
         #[cfg(test)]
         if let Some(gate) = &self.test_gate {
             gate.started.notify_one();
@@ -351,13 +379,24 @@ impl ChildOwner {
                 bail!("injected kill failure");
             }
         }
-        let pid = self.pid.context("辅助进程无 PID，无法确认进程组清理")?;
-        match nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGKILL,
-        ) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
-            Err(error) => Err(anyhow::Error::from(error).context("辅助进程组终止失败")),
+        #[cfg(windows)]
+        {
+            self.child
+                .as_ref()
+                .context("辅助进程缺失")?
+                .kill_tree()
+                .context("辅助进程树终止失败")
+        }
+        #[cfg(unix)]
+        {
+            let pid = self.pid.context("辅助进程无 PID，无法确认进程组清理")?;
+            match nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            ) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+                Err(error) => Err(anyhow::Error::from(error).context("辅助进程组终止失败")),
+            }
         }
     }
     async fn wait_direct(&mut self) -> Result<()> {
@@ -374,12 +413,20 @@ impl ChildOwner {
         {
             bail!("injected wait failure");
         }
+        #[cfg(unix)]
         self.child
             .as_mut()
             .context("辅助直接子进程缺失")?
             .wait()
             .await
             .context("辅助直接子进程 wait 失败")?;
+        #[cfg(windows)]
+        self.child
+            .as_mut()
+            .context("辅助直接子进程缺失")?
+            .close(Duration::ZERO)
+            .await
+            .context("辅助 Job 清理未确认")?;
         Ok(())
     }
     async fn cleanup(&mut self, registry: &Registry, id: uuid::Uuid) -> Option<anyhow::Error> {
@@ -403,7 +450,7 @@ impl ChildOwner {
                     }
                 }
             }
-            if !reaped {
+            if !reaped && (cfg!(unix) || signalled) {
                 match self.wait_direct().await {
                     Ok(()) => reaped = true,
                     Err(error) => {
@@ -464,9 +511,24 @@ impl ReapGate {
 }
 #[cfg(test)]
 fn test_command() -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("/bin/sh");
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 60"]);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "agents::codex_jobs::tests::owned_windows_fixture",
+            "--ignored",
+            "--nocapture",
+        ]);
+        command
+    };
     command
-        .args(["-c", "exec sleep 60"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

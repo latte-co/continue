@@ -18,9 +18,20 @@ pub async fn save_agent_environment(
     host_id: String,
     agent: String,
     environment: latte_work_protocol::AgentEnvironment,
+    platform: Option<latte_work_client::SshPlatform>,
 ) -> Result<latte_work_protocol::AgentEnvironment, String> {
+    let windows = if host_id == "local" {
+        cfg!(windows)
+    } else {
+        platform == Some(latte_work_client::SshPlatform::Windows)
+    };
+    let syntax = if windows {
+        latte_work_protocol::PathSyntax::Windows
+    } else {
+        latte_work_protocol::PathSyntax::Posix
+    };
     with_store(app, move |store| {
-        store.save_environment(&host_id, &agent, environment)
+        store.save_environment_for(&host_id, &agent, environment, syntax)
     })
     .await
 }

@@ -340,3 +340,46 @@ it("refreshes clean ENV while retaining dirty input against the latest saved bas
   expect(field.value).toBe("TOKEN=keep-this-draft");
   expect(saveButton(field).disabled).toBe(false);
 });
+
+it.each(["windows", "unix"] as const)(
+  "validates ENV against the selected %s host and forwards its platform",
+  async (platform) => {
+    setup();
+    const target = { ...host, platform };
+    render(
+      <AgentSettings
+        state={{ ...state, host: target, hosts: [target] }}
+        active
+        onBusy={vi.fn()}
+      />,
+    );
+    const field = await screen.findByLabelText("Claude Code 环境变量");
+    fireEvent.change(field, {
+      target: { value: "home=custom\nPATH=one\nPath=two" },
+    });
+    fireEvent.click(saveButton(field));
+    if (platform === "windows") {
+      await screen.findByRole("alert");
+      expect(
+        invoke.mock.calls.some(
+          ([command]) => command === "save_agent_environment",
+        ),
+      ).toBe(false);
+      fireEvent.change(field, {
+        target: { value: "HTTPS_PROXY=http://proxy.test" },
+      });
+      fireEvent.click(saveButton(field));
+    }
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("save_agent_environment", {
+        hostId: host.id,
+        agent: "claude",
+        platform,
+        environment:
+          platform === "windows"
+            ? { HTTPS_PROXY: "http://proxy.test" }
+            : { home: "custom", PATH: "one", Path: "two" },
+      }),
+    );
+  },
+);

@@ -1,5 +1,5 @@
 //! Bounded, read-only Git review. Branch diffs use resolved commit IDs, not live refs.
-use crate::files;
+use crate::{files, managed_recovery::ManagedRecoveryExclusions};
 use anyhow::{Context, Result, bail};
 use latte_work_protocol::{
     ChangeSection, GitCommit, GitInfo, GitRef, GitReview, GitReviewFile, GitReviewScope,
@@ -46,6 +46,7 @@ fn valid_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 fn valid_path(path: &str) -> Result<()> {
+    latte_work_platform::paths::relative(Path::new(path))?;
     if path.is_empty()
         || path.len() > 4096
         || path.contains('\0')
@@ -218,7 +219,16 @@ fn arguments(scope: GitReviewScope, base: Option<&str>, head: Option<&str>) -> R
     }
     Ok(args)
 }
-async fn listing(root: &Path, args: &[String]) -> Result<(Vec<GitReviewFile>, bool)> {
+async fn listing(
+    root: &Path,
+    args: &[String],
+    exclusions: Option<&ManagedRecoveryExclusions>,
+) -> Result<(Vec<GitReviewFile>, bool)> {
+    let veto = if let Some(exclusions) = exclusions {
+        files::private_rename_paths(root, exclusions).await?
+    } else {
+        Default::default()
+    };
     let mut names = args.to_vec();
     names.extend(["--name-status".into(), "-z".into(), "--".into(), ".".into()]);
     let (text, mut truncated) =
@@ -250,6 +260,23 @@ async fn listing(root: &Path, args: &[String]) -> Result<(Vec<GitReviewFile>, bo
             truncated = true;
             continue;
         }
+        if let Some(exclusions) = exclusions
+            && (exclusions.contains(root, path)?
+                || previous_path
+                    .as_deref()
+                    .map(|path| exclusions.contains(root, path))
+                    .transpose()?
+                    .unwrap_or(false))
+        {
+            continue;
+        }
+        if veto.contains(path)
+            || previous_path
+                .as_deref()
+                .is_some_and(|path| veto.contains(path))
+        {
+            continue;
+        }
         if let Some(existing) = entries.iter_mut().find(|entry| entry.path == path) {
             if status.starts_with('U') {
                 existing.status = "U".into();
@@ -275,7 +302,7 @@ async fn listing(root: &Path, args: &[String]) -> Result<(Vec<GitReviewFile>, bo
 async fn untracked_content(root: &Path, path: &str) -> Result<(Vec<u8>, bool)> {
     valid_path(path)?;
     let metadata = tokio::fs::symlink_metadata(root.join(path)).await?;
-    if metadata.file_type().is_symlink() {
+    if latte_work_platform::fs::is_link(&metadata) {
         bail!("未跟踪符号链接不支持内容预览");
     }
     let target = files::resolve(root, path)?;
@@ -291,11 +318,17 @@ async fn untracked_content(root: &Path, path: &str) -> Result<(Vec<u8>, bool)> {
     data.truncate(CONTENT_LIMIT);
     Ok((data, truncated))
 }
-pub async fn review(
+pub async fn review_excluding(
     root: &Path,
     scope: GitReviewScope,
     reference: Option<&str>,
+    exclusions: Option<&ManagedRecoveryExclusions>,
 ) -> Result<GitReview> {
+    let exclusions = if matches!(scope, GitReviewScope::Branch | GitReviewScope::Commit) {
+        None
+    } else {
+        Some(exclusions.context("Live Git review requires managed recovery exclusions")?)
+    };
     tokio::time::timeout(Duration::from_secs(25), async {
         let head = if scope == GitReviewScope::Commit {
             let reference = reference.context("请选择要查看的提交")?;
@@ -337,7 +370,7 @@ pub async fn review(
             None
         };
         let args = arguments(scope, base.as_deref(), head.as_deref())?;
-        let (mut entries, mut truncated) = listing(root, &args).await?;
+        let (mut entries, mut truncated) = listing(root, &args, exclusions).await?;
         let mut stat_args = args;
         stat_args.extend(["--numstat".into(), "-z".into(), "--".into(), ".".into()]);
         let (text, partial) = files::git(
@@ -388,7 +421,11 @@ pub async fn review(
             }
         }
         if matches!(scope, GitReviewScope::Worktree | GitReviewScope::Unstaged) {
-            let (changes, partial) = files::changes(root).await?;
+            let (changes, partial) = files::changes_excluding(
+                root,
+                exclusions.context("Missing live review exclusions")?,
+            )
+            .await?;
             truncated |= partial;
             let mut bytes = 0;
             for change in changes
@@ -447,7 +484,7 @@ pub async fn review(
     .await
     .context("读取变更超时，请缩小项目范围")?
 }
-fn quote_path(path: &str) -> String {
+pub(crate) fn quote_path(path: &str) -> String {
     let mut quoted = String::from("\"");
     for byte in path.bytes() {
         match byte {
@@ -462,23 +499,33 @@ fn quote_path(path: &str) -> String {
     quoted.push('"');
     quoted
 }
-pub async fn diff(
+#[allow(clippy::too_many_arguments)]
+pub async fn diff_excluding(
     root: &Path,
     scope: GitReviewScope,
     base: Option<&str>,
     head: Option<&str>,
     path: &str,
     full_context: bool,
+    exclusions: Option<&ManagedRecoveryExclusions>,
 ) -> Result<(String, bool)> {
+    let exclusions = if matches!(scope, GitReviewScope::Branch | GitReviewScope::Commit) {
+        None
+    } else {
+        Some(exclusions.context("Live Git patch requires managed recovery exclusions")?)
+    };
     tokio::time::timeout(Duration::from_secs(20), async {
         valid_path(path)?;
+        if let Some(exclusions) = exclusions {
+            exclusions.require_visible(root, path)?;
+        }
         if matches!(scope, GitReviewScope::Worktree | GitReviewScope::Staged)
             && commit(root, "HEAD").await.ok().as_deref() != head
         {
             bail!("分支提交已变化，请刷新变更后重试");
         }
         let mut args = arguments(scope, base, head)?;
-        let (entries, _) = listing(root, &args).await?;
+        let (entries, _) = listing(root, &args, exclusions).await?;
         if let Some(entry) = entries.iter().find(|e| e.path == path) {
             args.push(
                 if full_context {
@@ -495,7 +542,11 @@ pub async fn diff(
             return files::git(root, &args.iter().map(String::as_str).collect::<Vec<_>>()).await;
         }
         if matches!(scope, GitReviewScope::Worktree | GitReviewScope::Unstaged) {
-            let (entries, _) = files::changes(root).await?;
+            let (entries, _) = files::changes_excluding(
+                root,
+                exclusions.context("Missing live review exclusions")?,
+            )
+            .await?;
             if entries
                 .iter()
                 .any(|e| e.path == path && e.section == ChangeSection::Untracked)
@@ -527,6 +578,7 @@ pub async fn diff(
     .context("读取 diff 超时")?
 }
 /// Read a blob range without text conversion or external diff commands.
+#[allow(clippy::too_many_arguments)]
 pub async fn image_chunk(
     root: &Path,
     scope: GitReviewScope,
@@ -535,7 +587,16 @@ pub async fn image_chunk(
     path: &str,
     before: bool,
     offset: u64,
+    exclusions: Option<&ManagedRecoveryExclusions>,
 ) -> Result<Option<latte_work_protocol::ImagePreviewChunk>> {
+    let exclusions = if matches!(scope, GitReviewScope::Branch | GitReviewScope::Commit) {
+        None
+    } else {
+        Some(exclusions.context("Live Git preview requires managed recovery exclusions")?)
+    };
+    if let Some(exclusions) = exclusions {
+        exclusions.require_visible(root, path)?;
+    }
     valid_path(path)?;
     if matches!(scope, GitReviewScope::Worktree | GitReviewScope::Staged)
         && commit(root, "HEAD").await.ok().as_deref() != head
@@ -543,12 +604,12 @@ pub async fn image_chunk(
         bail!("分支提交已变化，请刷新变更后重试");
     }
     let args = arguments(scope, base, head)?;
-    let (entries, _) = listing(root, &args).await?;
+    let (entries, _) = listing(root, &args, exclusions).await?;
     let entry = entries.iter().find(|entry| entry.path == path);
     let untracked = if entry.is_none()
         && matches!(scope, GitReviewScope::Worktree | GitReviewScope::Unstaged)
     {
-        files::changes(root)
+        files::changes_excluding(root, exclusions.context("Missing live review exclusions")?)
             .await?
             .0
             .iter()
@@ -573,13 +634,16 @@ pub async fn image_chunk(
         path
     };
     valid_path(path)?;
+    if let Some(exclusions) = exclusions {
+        exclusions.require_visible(root, path)?;
+    }
     if !before && matches!(scope, GitReviewScope::Worktree | GitReviewScope::Unstaged) {
         // Refuse links in every path component, including links contained in root.
         let mut target = root.to_path_buf();
         for part in Path::new(path).components() {
             target.push(part);
             anyhow::ensure!(
-                !target.symlink_metadata()?.file_type().is_symlink(),
+                !latte_work_platform::fs::is_link(&target.symlink_metadata()?),
                 "符号链接不支持图片预览"
             );
         }
@@ -626,7 +690,7 @@ pub async fn image_chunk(
         size <= crate::image_preview::LIMIT && offset <= size,
         "图片过大或预览偏移无效"
     );
-    let mut child = tokio::process::Command::new("git")
+    let mut child = crate::agent_environment::command("git")
         .env("GIT_LITERAL_PATHSPECS", "1")
         .args(["cat-file", "blob", oid])
         .current_dir(root)
@@ -662,7 +726,58 @@ pub async fn image_chunk(
 }
 
 #[cfg(test)]
+async fn review(root: &Path, scope: GitReviewScope, reference: Option<&str>) -> Result<GitReview> {
+    review_excluding(
+        root,
+        scope,
+        reference,
+        Some(&ManagedRecoveryExclusions::empty()),
+    )
+    .await
+}
+#[cfg(test)]
+async fn diff(
+    root: &Path,
+    scope: GitReviewScope,
+    base: Option<&str>,
+    head: Option<&str>,
+    path: &str,
+    full_context: bool,
+) -> Result<(String, bool)> {
+    diff_excluding(
+        root,
+        scope,
+        base,
+        head,
+        path,
+        full_context,
+        Some(&ManagedRecoveryExclusions::empty()),
+    )
+    .await
+}
+#[cfg(test)]
 mod tests {
+    async fn image_chunk(
+        root: &std::path::Path,
+        scope: latte_work_protocol::GitReviewScope,
+        base: Option<&str>,
+        head: Option<&str>,
+        path: &str,
+        before: bool,
+        offset: u64,
+    ) -> anyhow::Result<Option<latte_work_protocol::ImagePreviewChunk>> {
+        super::image_chunk(
+            root,
+            scope,
+            base,
+            head,
+            path,
+            before,
+            offset,
+            Some(&crate::managed_recovery::ManagedRecoveryExclusions::empty()),
+        )
+        .await
+    }
     #[tokio::test]
     async fn image_versions_follow_index_commits_renames_and_reject_links() {
         let root = fixture();
@@ -739,13 +854,16 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        std::os::unix::fs::symlink(sub.join("new.png"), sub.join("link.png")).unwrap();
-        for path in ["link.png", "../outside.png", "/etc/passwd"] {
-            assert!(
-                image_chunk(&sub, GitReviewScope::Unstaged, None, None, path, false, 0)
-                    .await
-                    .is_err()
-            );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(sub.join("new.png"), sub.join("link.png")).unwrap();
+            for path in ["link.png", "../outside.png", "/etc/passwd"] {
+                assert!(
+                    image_chunk(&sub, GitReviewScope::Unstaged, None, None, path, false, 0)
+                        .await
+                        .is_err()
+                );
+            }
         }
         assert!(
             image_chunk(
@@ -1013,6 +1131,7 @@ mod tests {
         assert!(patch.contains("rename from old.txt"));
         run(root.path(), &["checkout", "-q", "feature"]);
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn index_worktree_binary_untracked_and_literal_paths_are_distinct() {
         let root = fixture();
@@ -1146,6 +1265,7 @@ mod tests {
         assert_eq!(snapshot.entries.len(), FILE_LIMIT);
         assert!(snapshot.truncated);
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn untracked_patches_quote_paths_preserve_eof_and_reject_internal_symlinks() {
         let root = fixture();

@@ -49,7 +49,7 @@ fn agent_environment_is_private_persistent_and_isolated_by_host_and_agent() {
             ..
         }
     ));
-    let before = std::fs::read(dir.path().join("providers.json")).unwrap();
+    let before = std::fs::read(config_path(dir.path())).unwrap();
     for invalid in [
         AgentEnvironment(BTreeMap::from([("BAD-NAME".into(), "hidden".into())])),
         AgentEnvironment(BTreeMap::from([("HOME".into(), "/other".into())])),
@@ -67,10 +67,7 @@ fn agent_environment_is_private_persistent_and_isolated_by_host_and_agent() {
         ),
     ] {
         assert!(store.save_environment("devbox", "codex", invalid).is_err());
-        assert_eq!(
-            before,
-            std::fs::read(dir.path().join("providers.json")).unwrap()
-        );
+        assert_eq!(before, std::fs::read(config_path(dir.path())).unwrap());
     }
     store
         .save_environment("devbox", "codex", AgentEnvironment::default())
@@ -93,6 +90,13 @@ fn agent_environment_is_private_persistent_and_isolated_by_host_and_agent() {
         .unwrap();
     store.forget_host("devbox").unwrap();
     assert!(store.environments_for_host("devbox").unwrap().is_empty());
+}
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+fn config_path(directory: &Path) -> PathBuf {
+    #[cfg(windows)]
+    let directory = directory.join("private-providers");
+    directory.join("providers.json")
 }
 fn draft(name: &str) -> ProviderDraft {
     ProviderDraft {
@@ -147,13 +151,13 @@ fn per_model_1m_capabilities_survive_restart_and_remote_snapshots_without_enabli
     assert_eq!(snapshot.provider.model, "first");
     assert_eq!(snapshot.credential, old.credential);
     assert_ne!(snapshot.provider.revision, old.provider.revision);
-    let before = std::fs::read(directory.path().join("providers.json")).unwrap();
+    let before = std::fs::read(config_path(directory.path())).unwrap();
     for invalid in [vec!["missing".into()], vec!["first[1m]".into()]] {
         value.models_1m = invalid;
         assert!(store.save(value.clone()).is_err());
         assert_eq!(
             before,
-            std::fs::read(directory.path().join("providers.json")).unwrap()
+            std::fs::read(config_path(directory.path())).unwrap()
         );
     }
     value.models_1m = vec!["first".into()];
@@ -201,14 +205,14 @@ fn offline_catalog_and_host_choices_survive_restart_without_credentials_in_respo
                 .unwrap()
                 .contains("fixture-private-key")
         );
-        let before = std::fs::read(directory.path().join("providers.json")).unwrap();
+        let before = std::fs::read(config_path(directory.path())).unwrap();
         let mut edit = draft("Changed");
         edit.id = Some(id.clone());
         edit.protocol = ProviderProtocol::OpenaiChat;
         assert!(store.save(edit).is_err());
         assert_eq!(
             before,
-            std::fs::read(directory.path().join("providers.json")).unwrap()
+            std::fs::read(config_path(directory.path())).unwrap()
         );
     }
     let mut store = ProviderStore::open(directory.path(), None).unwrap();
@@ -250,7 +254,7 @@ fn offline_catalog_and_host_choices_survive_restart_without_credentials_in_respo
     }
     #[cfg(unix)]
     assert_eq!(
-        std::fs::metadata(directory.path().join("providers.json"))
+        std::fs::metadata(config_path(directory.path()))
             .unwrap()
             .permissions()
             .mode()
@@ -270,7 +274,7 @@ fn migration_is_read_only_once_and_preserves_local_remote_associations() {
             old.bind("local", "claude", Some(id.clone())).unwrap();
             old.bind("devbox", "claude", Some(id.clone())).unwrap();
         }
-        let path = legacy.path().join("providers.json");
+        let path = config_path(legacy.path());
         if schema == 1 {
             let mut value: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -316,7 +320,7 @@ fn schema_one_incompatible_or_missing_selection_keeps_native_defaults() {
                 provider.protocol = protocol.clone();
                 save(&mut old, provider)
             };
-            let path = legacy.path().join("providers.json");
+            let path = config_path(legacy.path());
             let mut value: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             value["schema"] = 1.into();
@@ -342,7 +346,10 @@ fn schema_one_incompatible_or_missing_selection_keeps_native_defaults() {
 fn invalid_or_oversized_migration_cannot_replace_configuration() {
     let legacy = tempfile::tempdir().unwrap();
     let app = tempfile::tempdir().unwrap();
-    let path = legacy.path().join("providers.json");
+    let path = {
+        let store = ProviderStore::open(legacy.path(), None).unwrap();
+        store.path.clone()
+    };
     for bytes in [
         b"{secret-invalid-json".to_vec(),
         vec![b' '; MAX_CONFIG as usize + 1],
@@ -353,7 +360,7 @@ fn invalid_or_oversized_migration_cannot_replace_configuration() {
             .unwrap()
             .to_string();
         assert!(!error.contains("secret"));
-        assert!(!app.path().join("providers.json").exists());
+        assert!(!config_path(app.path()).exists());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }
@@ -382,7 +389,7 @@ fn symlinked_app_or_legacy_config_is_rejected() {
     let app = tempfile::tempdir().unwrap();
     let private = target.path().join("private");
     std::fs::write(&private, "unchanged").unwrap();
-    let link = app.path().join("providers.json");
+    let link = config_path(app.path());
     std::os::unix::fs::symlink(&private, &link).unwrap();
     assert!(ProviderStore::open(app.path(), None).is_err());
     assert_eq!(std::fs::read_to_string(private).unwrap(), "unchanged");
@@ -403,7 +410,7 @@ fn no_auth_clears_credentials_and_survives_reload() {
     };
     assert!(!providers[0].has_credential);
     assert_eq!(providers[0].auth, ProviderAuth::None);
-    let contents = std::fs::read_to_string(directory.path().join("providers.json")).unwrap();
+    let contents = std::fs::read_to_string(config_path(directory.path())).unwrap();
     assert!(!contents.contains("fixture-private-key"));
     drop(store);
     assert!(ProviderStore::open(directory.path(), None).is_ok());
@@ -467,8 +474,78 @@ fn deleting_provider_removes_only_its_bindings_and_persists() {
         kept
     );
     assert!(
-        !std::fs::read_to_string(directory.path().join("providers.json"))
+        !std::fs::read_to_string(config_path(directory.path()))
             .unwrap()
             .contains(&removed)
+    );
+}
+
+#[cfg(windows)]
+#[path = "tests/windows.rs"]
+mod windows;
+
+#[cfg(unix)]
+#[test]
+fn unix_existing_permissions_and_atomic_replacements_keep_the_original_contract() {
+    let app = tempfile::tempdir().unwrap();
+    let path = config_path(app.path());
+    {
+        let mut store = ProviderStore::open(app.path(), None).unwrap();
+        save(&mut store, draft("Original"));
+    }
+    std::fs::set_permissions(app.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut store = ProviderStore::open(app.path(), None).unwrap();
+    assert_eq!(
+        std::fs::metadata(app.path()).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(store.config.providers[0].credential, "fixture-private-key");
+    save(&mut store, draft("Replacement"));
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let temp = store.directory.tempfile("permission-", ".json").unwrap();
+    assert_eq!(
+        temp.as_file().metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn selected_host_environment_policy_keeps_portable_persistence_and_rejects_windows_aliases() {
+    use latte_work_protocol::PathSyntax;
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = ProviderStore::open(directory.path(), None).unwrap();
+    let unix = AgentEnvironment(BTreeMap::from([
+        ("home".into(), "/unix-custom".into()),
+        ("PATH".into(), "one".into()),
+        ("Path".into(), "two".into()),
+    ]));
+    store
+        .save_environment_for("unix-remote", "codex", unix.clone(), PathSyntax::Posix)
+        .unwrap();
+    let before = std::fs::read(config_path(directory.path())).unwrap();
+    assert!(
+        store
+            .save_environment_for("windows-remote", "codex", unix.clone(), PathSyntax::Windows)
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(config_path(directory.path())).unwrap(),
+        before
+    );
+    drop(store);
+    assert_eq!(
+        ProviderStore::open(directory.path(), None)
+            .unwrap()
+            .environments_for_host("unix-remote")
+            .unwrap()["codex"],
+        unix
     );
 }

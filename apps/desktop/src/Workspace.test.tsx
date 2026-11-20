@@ -24,6 +24,7 @@ const mocks = vi.hoisted(() => ({
   exits: new Map<string, () => void>(),
 }));
 vi.mock("./api", () => ({
+  native: false,
   request: mocks.request,
   message: (e: unknown) => String(e),
 }));

@@ -2,9 +2,9 @@
 //! Adapters own wire encoding and protocol order, never process supervision or storage.
 use crate::providers::LaunchConfig;
 use anyhow::Result;
+use latte_work_platform::process::PreparedCommand;
 use latte_work_protocol::EventKind;
 use serde_json::Value;
-use tokio::process::Command;
 
 /// Physical process lifetime, independent of the durable Host session actor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -15,15 +15,35 @@ pub enum TransportLifetime {
 }
 
 pub struct AgentCommand {
-    pub command: Command,
+    pub command: PreparedCommand,
     /// Keep private launch files alive until the agent exits, including spawn errors.
     pub _settings: Option<tempfile::NamedTempFile>,
     pub sideband: Option<Sideband>,
 }
 
 pub struct Sideband {
+    #[cfg(unix)]
     pub listener: tokio::net::UnixListener,
+    #[cfg(windows)]
+    pub listener: latte_work_platform::pipe::PrivatePipe,
     pub _directory: tempfile::TempDir,
+}
+
+impl Sideband {
+    pub fn address(&self) -> String {
+        #[cfg(unix)]
+        {
+            self._directory
+                .path()
+                .join("events")
+                .to_string_lossy()
+                .into_owned()
+        }
+        #[cfg(windows)]
+        {
+            self.listener.name().to_owned()
+        }
+    }
 }
 
 pub enum Input<'a> {
@@ -66,7 +86,7 @@ pub enum Input<'a> {
 pub enum Action {
     /// A PerTurn adapter starts physical I/O only after durable admission and baseline.
     /// Runtime owns spawn, stderr, termination and confirmation of the owned group.
-    SpawnTurn(AgentCommand),
+    SpawnTurn(Box<AgentCommand>),
     /// Authoritative native session name, including external manual renames.
     NativeName(String),
     /// Optional generated metadata; never supersedes an explicit user name.

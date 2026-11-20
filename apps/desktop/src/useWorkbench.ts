@@ -1742,6 +1742,18 @@ export function useWorkbench() {
     connected,
     supportsSideChat: cachedHello(host)?.side_chat_controls === true,
     supportsClaudeSideChat: cachedHello(host)?.claude_side_chat === true,
+    hostPathSyntax: (id: string) => {
+      const target = hosts.find((host) => host.id === id);
+      return target ? cachedHello(target)?.path_syntax : undefined;
+    },
+    hostSupportsTerminal: (id: string) => {
+      const hello = hostHellos.current.get(id);
+      return !hello || hello.terminal !== false;
+    },
+    hostSupportsUndo: (id: string) => {
+      const hello = hostHellos.current.get(id);
+      return !hello || hello.undo !== false;
+    },
     connectionLost: connectedHosts.current.has(hostId),
     agentSessionTransitions,
     agentSessionState: (target: HostedSession) =>

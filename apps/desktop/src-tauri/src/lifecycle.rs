@@ -309,7 +309,6 @@ mod tests {
         Err("未连接，无法确认会话或终端已关闭".into())
     }
     fn bridge(break_ack: bool) -> (std::path::PathBuf, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -341,7 +340,7 @@ for line in sys.stdin:
 "#
         .replace("BREAK_ACK", if break_ack { "True" } else { "False" });
         std::fs::write(&binary, source).unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = crate::pending_close::tests::fixture_binary(&binary);
         (directory, binary)
     }
     #[tokio::test]
@@ -473,7 +472,6 @@ for line in sys.stdin:
     }
     #[tokio::test]
     async fn quit_closes_completed_agent_sessions_without_polling_away_ownership() {
-        use std::os::unix::fs::PermissionsExt;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -496,7 +494,7 @@ for line in sys.stdin:
         response={'kind':'error','code':'unexpected','message':'completed sessions still require explicit close'}
     print(json.dumps(response),flush=True)
 "#).unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = crate::pending_close::tests::fixture_binary(&binary);
         let client = latte_work_client::Client::local(&binary, Some(&directory))
             .await
             .unwrap();
@@ -519,12 +517,11 @@ for line in sys.stdin:
         );
         std::fs::remove_file(binary).unwrap();
         std::fs::remove_file(directory.join("requests")).unwrap();
-        std::fs::remove_dir(directory).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[tokio::test]
     async fn quit_batches_large_inventories_and_retains_only_unacknowledged_resources() {
         use latte_work_protocol::lifecycle::Resource;
-        use std::os::unix::fs::PermissionsExt;
         for failure in ["none", "last", "mixed"] {
             let directory =
                 std::env::temp_dir().join(format!("lw-quit-batches-{}", uuid::Uuid::new_v4()));
@@ -554,7 +551,7 @@ for line in sys.stdin:
 "#,
             )
             .unwrap();
-            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let binary = crate::pending_close::tests::fixture_binary(&binary);
             let state = Connections::default();
             std::fs::write(directory.join("owner"), state.owner_id()).unwrap();
             std::fs::write(directory.join("failure"), failure).unwrap();

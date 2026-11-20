@@ -43,6 +43,9 @@ pub(super) struct Transport {
     redactor: crate::redaction::Redactor,
     /// Once reaped, only observation is allowed; retries never signal the old PGID.
     retirement_signalled: bool,
+    /// Last strict close observed an unforced successful native root exit.
+    pub close_exit_success: bool,
+    pub close_cleanup_complete: bool,
     _settings: Option<tempfile::NamedTempFile>,
 }
 #[derive(Default)]
@@ -81,7 +84,7 @@ impl Transport {
     ) -> Result<Self> {
         let bidirectional = lifetime == agents::TransportLifetime::Persistent;
         let redactor = stderr_redactor(&prepared.command, std::env::vars_os(), config);
-        let child = prepared
+        prepared
             .command
             .stdin(if bidirectional {
                 Stdio::piped()
@@ -89,24 +92,26 @@ impl Transport {
                 Stdio::null()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0)
-            .spawn()
-            .map_err(|source| {
-                let evidence = match source.raw_os_error() {
-                    Some(code) if code == Errno::ENOENT as i32 => {
-                        crate::store::ConfirmedNotStarted::Enoent
-                    }
-                    Some(code) if code == Errno::E2BIG as i32 => {
-                        crate::store::ConfirmedNotStarted::E2big
-                    }
-                    _ => return anyhow::Error::from(source),
-                };
-                anyhow::Error::new(SpawnNotStarted { evidence, source })
-            })?;
-        let pid = child.id().context("Agent PID missing")? as i32;
-        let mut group = Group { child, pid };
+            .stderr(Stdio::piped());
+        let mut group = Group::spawn(&mut prepared.command).map_err(|source| {
+            #[cfg(windows)]
+            let evidence = match source.raw_os_error() {
+                Some(2 | 3) => crate::store::ConfirmedNotStarted::Enoent,
+                Some(206) => crate::store::ConfirmedNotStarted::E2big,
+                _ => return anyhow::Error::from(source),
+            };
+            #[cfg(unix)]
+            let evidence = match source.raw_os_error() {
+                Some(code) if code == Errno::ENOENT as i32 => {
+                    crate::store::ConfirmedNotStarted::Enoent
+                }
+                Some(code) if code == Errno::E2BIG as i32 => {
+                    crate::store::ConfirmedNotStarted::E2big
+                }
+                _ => return anyhow::Error::from(source),
+            };
+            anyhow::Error::new(SpawnNotStarted { evidence, source })
+        })?;
         let input = if bidirectional {
             Some(group.child.stdin.take().context("Agent stdin missing")?)
         } else {
@@ -143,6 +148,8 @@ impl Transport {
             drain,
             redactor,
             retirement_signalled: false,
+            close_exit_success: false,
+            close_cleanup_complete: false,
             _settings: prepared._settings,
         })
     }
@@ -153,10 +160,18 @@ impl Transport {
             .context("Agent stdout已结束，但进程退出未确认")??;
         // Retire inherited writers immediately at the reap boundary, before any
         // stderr/auxiliary await. Subsequent close retries are observation-only.
-        self.retirement_signalled = matches!(
-            killpg(Pid::from_raw(self.group.pid), Signal::SIGKILL),
-            Ok(()) | Err(Errno::ESRCH)
-        );
+        #[cfg(unix)]
+        {
+            self.retirement_signalled = matches!(
+                killpg(Pid::from_raw(self.group.pid), Signal::SIGKILL),
+                Ok(()) | Err(Errno::ESRCH)
+            );
+        }
+        #[cfg(windows)]
+        {
+            self.group.child.close(Duration::ZERO).await?;
+            self.retirement_signalled = true;
+        }
         let stderr = tokio::time::timeout(REAP_LIMIT, &mut self.drain)
             .await
             .context("Agent stderr尚未排空，进程收尾未确认")???
@@ -206,7 +221,11 @@ impl Transport {
         // close_group signals only while the direct child is still owned, and
         // waits for auxiliary cleanup before reaping it. Already reaped PerTurn
         // children must never be signalled after that wait.
-        let confirmed = close_group(&mut self.group, deadline, expect_clean_exit, auxiliary).await;
+        let outcome =
+            close_group_with_status(&mut self.group, deadline, expect_clean_exit, auxiliary).await;
+        if expect_clean_exit {
+            self.close_exit_success = outcome.clean_exit;
+        }
         if live {
             self.retirement_signalled = true;
         }
@@ -216,8 +235,10 @@ impl Transport {
             true
         };
         self.drain.abort();
-        confirmed && group_confirmed
+        self.close_cleanup_complete = outcome.closed && group_confirmed;
+        self.close_cleanup_complete && (!expect_clean_exit || outcome.clean_exit)
     }
+    #[cfg(unix)]
     async fn observe_group_retirement(&self, deadline: tokio::time::Instant) -> bool {
         tokio::time::timeout_at(deadline, async {
             loop {
@@ -233,12 +254,17 @@ impl Transport {
         .await
         .unwrap_or(false)
     }
+    #[cfg(windows)]
+    async fn observe_group_retirement(&self, _deadline: tokio::time::Instant) -> bool {
+        self.retirement_signalled
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[tokio::test]
+    #[cfg(unix)]
     async fn only_exact_spawn_enoent_and_e2big_produce_not_started_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let config = crate::providers::ProviderStore::open(dir.path())
@@ -264,7 +290,7 @@ mod tests {
             }
             let error = match Transport::spawn(
                 agents::AgentCommand {
-                    command,
+                    command: command.into(),
                     _settings: None,
                     sideband: None,
                 },
@@ -282,6 +308,7 @@ mod tests {
         }
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn per_turn_stop_allows_sigterm_cleanup_before_forced_group_retirement() {
         let dir = tempfile::tempdir().unwrap();
         let config = crate::providers::ProviderStore::open(dir.path())
@@ -295,7 +322,7 @@ mod tests {
             .env("CLEANUP_MARKER", &marker);
         let mut transport = Transport::spawn(
             agents::AgentCommand {
-                command,
+                command: command.into(),
                 _settings: None,
                 sideband: None,
             },
@@ -319,6 +346,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn persistent_transport_retains_bidirectional_stdin() {
         let dir = tempfile::tempdir().unwrap();
         let config = crate::providers::ProviderStore::open(dir.path())
@@ -331,7 +359,7 @@ mod tests {
             .arg("printf 'ready\n'; IFS= read -r line; printf '%s\n' \"$line\"");
         let mut transport = Transport::spawn(
             agents::AgentCommand {
-                command,
+                command: command.into(),
                 _settings: None,
                 sideband: None,
             },
@@ -387,6 +415,7 @@ mod tests {
         );
     }
     #[tokio::test]
+    #[cfg(unix)]
     async fn stderr_redacts_credentials_from_the_actual_command_environment() {
         let dir = tempfile::tempdir().unwrap();
         let config = crate::providers::ProviderStore::open(dir.path())
@@ -401,7 +430,7 @@ mod tests {
         command.env("CURSOR_API_KEY", "synthetic-native-command-token");
         let mut transport = Transport::spawn(
             agents::AgentCommand {
-                command,
+                command: command.into(),
                 _settings: None,
                 sideband: None,
             },

@@ -33,3 +33,22 @@ it.each([
     expect(String(error)).not.toContain(input);
   }
 });
+
+it("applies Windows key identity only to a Windows execution host", () => {
+  for (const name of [
+    "home",
+    "Latte_Work_Server",
+    "userprofile",
+    "HOMEDRIVE",
+    "HomePath",
+    "UserName",
+  ]) {
+    expect(() => parseEnvironment(`${name}=value`, true)).toThrow();
+    expect(parseEnvironment(`${name}=value`)).toEqual({ [name]: "value" });
+  }
+  expect(() => parseEnvironment("PATH=one\nPath=two", true)).toThrow();
+  expect(parseEnvironment("PATH=one\nPath=two")).toEqual({
+    PATH: "one",
+    Path: "two",
+  });
+});

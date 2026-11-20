@@ -7,12 +7,36 @@ pub(crate) fn for_command(
     inherited: impl IntoIterator<Item = (OsString, OsString)>,
     additional: impl IntoIterator<Item = String>,
 ) -> Redactor {
-    let mut values: BTreeMap<_, _> = inherited.into_iter().collect();
+    fn key(name: &std::ffi::OsStr) -> OsString {
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::{OsStrExt, OsStringExt};
+            let units: Vec<_> = name
+                .encode_wide()
+                .map(|unit| {
+                    if (u16::from(b'a')..=u16::from(b'z')).contains(&unit) {
+                        unit - 32
+                    } else {
+                        unit
+                    }
+                })
+                .collect();
+            OsString::from_wide(&units)
+        }
+        #[cfg(unix)]
+        {
+            name.to_owned()
+        }
+    }
+    let mut values: BTreeMap<_, _> = inherited
+        .into_iter()
+        .map(|(name, value)| (key(&name), value))
+        .collect();
     for (name, value) in command.as_std().get_envs() {
         if let Some(value) = value {
-            values.insert(name.to_owned(), value.to_owned());
+            values.insert(key(name), value.to_owned());
         } else {
-            values.remove(name);
+            values.remove(&key(name));
         }
     }
     let secrets = values.into_iter().filter_map(|(name, value)| {
@@ -30,7 +54,38 @@ pub(crate) fn for_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_keys_match_case_without_collapsing_unpaired_native_units() {
+        use std::os::windows::ffi::OsStringExt;
+        let first = OsString::from_wide(&[83, 69, 67, 82, 69, 84, 95, 0xd800]);
+        let second = OsString::from_wide(&[83, 69, 67, 82, 69, 84, 95, 0xd801]);
+        let mut command = tokio::process::Command::new("unused");
+        command
+            .env_remove(&first)
+            .env("API_TOKEN", "new-fixture-value");
+        let redactor = for_command(
+            &command,
+            [
+                (first, OsString::from("removed-fixture-secret")),
+                (second, OsString::from("retained-fixture-secret")),
+                (
+                    OsString::from("api_token"),
+                    OsString::from("old-fixture-value"),
+                ),
+            ],
+            [],
+        );
+        assert_eq!(
+            redactor.text(
+                "removed-fixture-secret retained-fixture-secret old-fixture-value new-fixture-value"
+            ),
+            "removed-fixture-secret [redacted] old-fixture-value [redacted]"
+        );
+    }
 
     #[test]
     fn effective_environment_applies_override_remove_and_private_credentials() {
@@ -55,6 +110,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_unicode_environment_keys_and_values_are_lossily_redacted_without_panic() {
         let key = OsString::from_vec(b"AUTH_\xff_KEY".to_vec());
@@ -67,6 +123,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_unicode_keys_are_removed_before_lossy_conversion() {
         let key = OsString::from_vec(b"SECRET_\xff".to_vec());

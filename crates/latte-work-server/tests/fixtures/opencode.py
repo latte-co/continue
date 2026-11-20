@@ -276,7 +276,7 @@ for line in sys.stdin:
         reply(id, protocolVersion=1, agentInfo={"name": "OpenCode", "version": "2.3.0"},
               agentCapabilities={"sessionCapabilities": {"resume": {}, "close": {}, "delete": {}}})
     elif method in ("session/new", "session/resume"):
-        assert Path(params["cwd"]) == Path.cwd()
+        assert Path(params["cwd"]).samefile(Path.cwd())
         assert params["mcpServers"] == []
         if method == "session/new":
             session = "ses_" + uuid.uuid4().hex

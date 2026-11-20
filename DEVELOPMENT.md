@@ -1,14 +1,114 @@
 # Development
 
-Requires Rust 1.97, Node 22+, macOS Command Line Tools. `make ci` also
-requires actionlint and ShellCheck (install with your package manager). Host server supports macOS
-and Linux; v0.1 desktop is validated on macOS. No Windows runtime claim.
+Requires Rust 1.97 and Node 22+. Native macOS builds need Command Line Tools;
+native Windows builds need the MSVC C/C++ toolchain, PowerShell 7 and WebView2.
+`make ci` also requires actionlint and ShellCheck. The host server supports macOS,
+Linux and Windows. The Windows support profile is Windows 11, native `claude.exe`,
+pwsh ConPTY terminals, local NTFS Undo and unsigned x64 per-user NSIS packaging.
+Windows SSH requires an explicit Server executable path and an independently
+started same-user daemon; see [SSH setup](docs/remote.md).
+
+The Windows branch records a user report that real local Claude, Windows SSH, and
+installation/upgrade acceptance passed. That historical report covers those
+categories without a detailed environment or scenario matrix; it is not acceptance
+of the combined latest-main build or of every integrated agent.
+The integration environment also inspected installed CLI help without a prompt or
+login: Claude Code 2.1.302 (resume/fork/permission flags), codex-cli 0.169.0
+(app-server/sandbox/approval), and OpenCode 2.3.2 (`acp --help`). Traex and Cursor
+were not installed there; these help checks do not establish model execution.
+Deterministic fixtures, package inspection,
+ordinary/elevated security gates, native interaction and hosted CI remain distinct
+evidence; no blanket full-CI result is implied.
 
 `make setup`, `make dev` starts the native application. `make ci` runs the local
 gate; `make package` builds an app without Developer ID signing and standalone release host server,
 and on macOS also produces the verified drag-install DMG described below.
-Use `make build` for a debug native app bundle. On macOS, both build modes
-finish with project-owned ad-hoc signing and strict bundle verification. The CLI fixture never calls a model.
+Use `make build` for a native debug build (an app bundle on macOS, desktop/server
+executables on Windows). On macOS, both build modes finish with project-owned
+ad-hoc signing and strict bundle verification. The CLI fixture never calls a model.
+
+`make build`, `make dev`, `make prepare` and `make package` share platform dispatch:
+`OS=Windows_NT` selects `pwsh -NoProfile -File scripts/desktop.ps1`; other platforms
+use `scripts/desktop.sh`. The Make entry points require GNU Make and Bash; Windows
+also requires PowerShell 7 (`pwsh`). Without Make/Bash, invoke the PowerShell script
+directly. `make lint` uses the same platform dispatch through its `prepare` dependency.
+
+On Windows use `scripts/desktop.ps1 <prepare|check|test|build|dev|package>`; it builds the
+locked Server, copies the external sidecar Tauri requires, then runs the selected
+step. Tauri validates `apps/desktop/src-tauri/binaries/latte-work-server-<triple>.exe`
+and `icons/icon.ico` before compiling, so `cargo check -p latte-work-desktop` needs
+that prepare step first, including from an IDE. Windows uses the process user's SID
+for private storage and peer checks, without rejecting elevated tokens. Both ends
+must be the same user; Windows ACL/integrity/access checks remain authoritative. Windows
+MSI, ARM installers, signing/updater publication and PDF thumbnails remain
+unsupported on Windows. Opening links, revealing files, system preview, Explorer
+file paste and SSH password askpass use platform APIs; page find and capture use
+the reviewed `latte-work-windows-webview` WebView2 boundary (with a
+`window.find` fallback), and the undecorated window draws its own
+minimize/maximize/close controls.
+
+`pwsh -NoProfile -File scripts/desktop.ps1 package` builds the locked production
+Server and desktop for `x86_64-pc-windows-msvc`, then an unsigned NSIS installer
+with `currentUser` install scope. WebView2 uses the silent download bootstrapper;
+installation needs network access when the runtime is absent. It creates no Service.
+Use `npm ci` first; the script uses only the local lockfile-matched Tauri CLI.
+Cargo metadata resolves the actual target directory, including Cargo config overrides.
+Release Server features and compiler artifacts are checked; fixture/debug builds
+cannot be staged. Avoid changing Rust/frontend/package inputs during packaging:
+the script records before/after source manifests, HEAD and dirty status, and fails
+if build inputs change. Other documentation edits are recorded separately.
+
+Each successful run preserves its exact installer, `.sha256`, Cargo logs and
+`provenance.json` under `<cargo-target-directory>/windows-package/<unique-run>/`.
+`pwsh -NoProfile -File scripts/verify-windows-package.ps1` discovers the latest
+successful receipt; use `-ProvenancePath <absolute-path-to-provenance.json>` for
+an exact run. Verify before rebuilding the referenced release binaries: provenance
+retains their hashes and paths, not immutable copies of those compiler outputs.
+With 7-Zip installed/on PATH, this extracts into a unique inspection
+directory and compares embedded desktop/Server SHA256 and version against the
+production artifacts. The untripled `latte-work-server.exe` must be adjacent to the
+desktop, matching its release resolver. Neither command executes the installer,
+desktop or daemon; build/extraction evidence is separate from installation/UI acceptance.
+Tauri CLI 2.11.5 temporarily changes the desktop bundle-type marker from `UNK` to
+`NSS` before NSIS compression, then restores its compiler output. Provenance records
+both hashes and the exact offset/27-byte marker transform. Verification hashes the
+entire expected patched executable and rejects every other byte difference. A CLI
+upgrade requires reviewing this pinned transform before package validation is enabled.
+Focused validation: `pwsh -NoProfile -File scripts/test-windows-package.ps1`.
+For standalone Windows Server builds, use `scripts/build-windows-server.ps1`;
+`scripts/package-windows-desktop.ps1` owns installer/provenance production behind
+`desktop.ps1 package`. Keep production builds free of `test-fixture`.
+
+Focused Windows native regression commands:
+
+```powershell
+cargo test -p latte-work-server --bin latte-work-server --locked
+cargo test -p latte-work-server --features test-fixture --test native --test native_upgrade --test stdio_bridge --test runtime_native_agents --locked -- --test-threads=1
+cargo test -p latte-work-platform -p latte-work-windows-security -p latte-work-protocol --lib --locked
+```
+
+These cover explicit session-bound approval, same-ID no-replay, crash/Unknown
+recovery, concurrent idle image replacement, deferred upgrades on a compatible
+busy instance, active-task/terminal upgrade vetoes, bridge EOF, real pwsh and NTFS
+restoration/conflicts/partial failure. Windows native bridge tests also exercise
+a deterministic v1 peer that stops a close batch at its first error, including
+individual receipts and an incompatible Hello. This wire fixture is separate from
+the actual historical `899411e` daemon used by Linux/macOS CI. The
+`native-alternate-server` fixture is independently linked and must have a different
+image hash; copying or renaming a binary is not different-build evidence.
+Cleanup-failure unit regressions separately check retained ownership and failed
+shutdown propagation. These fixtures do not establish real model or installer behavior.
+
+On 2026-11-20, the integration of main `074cf95` and the Windows changes passed
+`test-windows-host.ps1 -Suite Host` under a non-elevated token: 865 passing test
+executions across 14 emitted executables, zero failures and 21 existing helper or
+opt-in ignores. The 366 server unit cases execute twice in independently linked
+images; this is not a count of unique cases. Native desktop tests passed 39 cases;
+frontend typecheck, 1,298 tests and the production web build passed. Strict native
+workspace and Linux server Clippy passed; Linux x64 and macOS ARM64 server
+all-target fixture cross-checks passed. Cross-checks establish compilation only;
+Unix runtime execution, hosted CI, native UI and live-model acceptance remain
+separate evidence.
 
 ## CI and merge checks
 
@@ -25,10 +125,13 @@ and Rustdoc. `make setup` uses public npm registry URLs recorded in the lockfile
 
 GitHub Actions runs host check/Clippy, UT, final-binary E2E, and release builds
 on Linux and macOS. Frontend UT/build runs on Linux, macOS, and Windows;
-Windows also checks, lints, and tests the portable Rust protocol and client.
-The server uses Unix sockets and process groups, so Windows CI does not claim
-server or native desktop support. A separate macOS job runs `make test-native`
-with a three-minute step deadline before building the native app. The same job
+Windows also checks and lints the Server and portable Rust crates, then runs
+unit and native final-binary tests under a non-elevated test account. The CI-only
+account setup is in scripts/test-windows-host.ps1; local runs must already be
+non-elevated. Unix-specific PTY/Undo tests remain Unix-only; Windows native suites exercise
+ConPTY and NTFS restoration. The elevated gate runs separately through
+`scripts/test-windows-elevated.ps1` and requires an already elevated shell. A separate macOS job runs `make test-native`
+with a bounded step deadline before building the native app. The same job
 runs `make package`, verifies the ad-hoc signed release bundle and remounted drag-install DMG, and uploads the image
 and checksum as CI artifacts. A Linux job runs `make test-ssh-skills` through a
 disposable, host-key-pinned loopback sshd; it exercises the production SSH client,
@@ -51,9 +154,9 @@ caches Cargo dependencies and npm content, separately per OS/toolchain/lockfile.
 
 The server owns projects, sessions, SQLite events and agent children. Exactly
 one daemon holds an exclusive file lock per canonical state directory (the
-standard user state directory is the default). Clients use a private Unix socket;
-SSH runs the same binary's `connect` bridge. The bridge starts the daemon when
-absent, then forwards bytes. Disconnecting a bridge does not stop the daemon.
+standard user state directory is the default). Clients use an authenticated private Unix socket or Windows named pipe.
+Unix SSH runs the same binary's `connect` bridge, starting the daemon when absent;
+Windows SSH uses `connect-existing` for an independently started daemon. Both forward bytes. Disconnecting a bridge does not stop the daemon.
 Native `host_request` failures from a broken client carry the private
 `HOST_CONNECTION_LOST:` prefix (not a wire-protocol change). The WebView reports
 that host as disconnected even for metadata requests, while Server/application
@@ -75,7 +178,9 @@ connection attempt. The normal wire-version handshake and capability checks
 still apply. The App can load projects, open another chat, and reattach to a
 live conversation on the compatible daemon while it is busy.
 Local coordinators serialize via `upgrade.lock` and time out after 20 seconds.
-SSH still uses `connect`, with no automatic remote replacement. Legacy daemons
+SSH still uses `connect` for Unix, with no automatic remote replacement. Windows
+SSH uses `connect-existing` and requires a daemon started outside the SSH session.
+Legacy daemons
 without the lifecycle handshake require a one-time manual restart after tasks
 finish and terminals close. Restarting only the desktop leaves them running.
 
@@ -104,6 +209,16 @@ cannot reopen or send between close and persistence. Archived tasks cannot creat
 actors through queue actions either. Unarchive changes metadata only and does not
 open an Agent; running/waiting tasks must still be stopped before archiving.
 
+Project folder selection returns `{path, name}` from the native picker; remote
+`browse_directories` includes the current directory's native `name` as well as
+entry names. Hello's optional `path_syntax` (`posix` / `windows`) controls only
+manual-path title/placeholder display, using the selected host's declaration.
+The UI never rewrites submitted paths or treats Unix backslashes as separators.
+Older hosts without these additive fields remain usable: entry names are reused
+when available, otherwise the UI shows a generic folder title and leaves an empty
+project name for the Server to derive. This does not change path authorization.
+
+
 `recent_sessions` reads unarchived history across visible projects on the target host,
 100 rows per page with an activity-time/session-ID cursor. Activity comes from saved
 conversation events; opening/reading, lifecycle state and pin metadata do not reorder
@@ -111,6 +226,44 @@ history. Older databases are supported through an indexed event projection. Loca
 SSH use the same request; older servers fail explicitly and should be updated.
 
 Read docs/architecture.md for boundaries and docs/remote.md for SSH installation.
+
+`latte-work-platform` contains shared OS directory lookup, owned file locks and
+private application storage. Product directory policy remains in the Server's
+`host_paths`; platform implementations are selected at module boundaries. Unix
+private storage uses 0700 directories and 0600 files before writing credentials.
+Windows ordinary state inherits parent ACLs; PrivateDir creates protected user-only
+leaves and validates existing directories/files without repair. Host Provider and
+launch settings use dedicated private directories. Windows App Provider configuration
+uses an App-owned `private-providers` child, validates credentials before reading and
+uses private temporary files for replacement. Safe old App/Server files are imported
+once without changing their contents or the mixed-use App root ACL; unsafe legacy
+objects fail closed and remain in place. See docs/providers.md for recovery and precedence.
+The desktop's pending-close journal uses `PrivateDir`/`FileLock` through the same
+platform boundary, and `latte-work-client` marks spawned stdio bridges non-windowed
+on Windows so a GUI parent never flashes a console. A one-shot user-only named pipe
+(`platform::pipe`, shared with the SSH askpass helper) reuses the control-channel
+DACL and peer checks. Browser page find/capture calls the reviewed
+`latte-work-windows-webview` boundary; only its private `win32` module allows unsafe.
+Control-channel policy and Endpoint initialization, authentication, retry, EOF and
+lease contracts are in [docs/ipc.md](docs/ipc.md). Windows ordinary state defaults
+to LocalAppData; control/private leaves require exact user-only ACL validation and
+pinned non-reparse ancestry. Existing unsafe permissions fail without repair.
+See [the security boundary](crates/latte-work-windows-security/SAFETY.md) and
+[architecture](docs/architecture.md) for paths, snapshot compatibility and Undo.
+`process::ManagedChild` owns Agent/probe trees: Unix TERM/KILL groups, Windows
+suspended assignment to kill-on-close Jobs with bounded empty-Job verification.
+`spawn_daemon` is independent of bridge cleanup; `Shutdown` owns platform exit
+notifications. Server fences admission, awaits concurrent Agent cleanup, then reaps
+connection tasks before releasing IPC. Windows inherits Server environment without
+shell initialization. See [docs/process-lifecycle.md](docs/process-lifecycle.md)
+for deadlines, FFI review, native tests and remaining validation limits. Native
+security tests run under ordinary and elevated accounts separately; these are not
+cross-user or mixed-integrity validation. The elevated CI gate is
+`scripts/test-windows-elevated.ps1`; it requires an already elevated shell and
+never requests elevation. Cross-compilation is distinct from native execution; full Server cross-checks
+need a target C compiler for aws-lc-sys.
+Focused checks: `cargo test -p latte-work-windows-security -p latte-work-platform -p latte-work-config --lib --locked`,
+then Unix Server unit and upgrade/attachment/Provider final-binary tests for callers.
 
 The desktop icon source is `apps/desktop/src-tauri/icons/source.svg`. Run
 `make icons` after editing it, and include the generated PNG and macOS ICNS.
@@ -137,6 +290,16 @@ terminal through `close_terminal`. Live output is drained before closing; restor
 exited metadata also retires the tab. Disconnects and read failures keep the tab,
 and exiting a nested shell does not close a still-running parent shell. Failed
 cleanup remains visible for explicit retry rather than automatically replaying it.
+
+Windows 11 ConPTY and NTFS experiments remain available independently of product
+integration: `pwsh -NoLogo -NoProfile -File scripts/test-windows-terminal-undo-experiments.ps1`
+(`-Group ConPty|Ntfs` selects one). Use a non-elevated account, pwsh and a local NTFS
+temp directory. The script records environment and logs under this checkout's
+`target/windows-terminal-undo-experiments/`. Fixtures are ignored tests in the
+private security Win32 boundary. Use `-OutputDirectory <path>` to select another log directory. These opt-in
+experiments investigate ConPTY backpressure/cleanup and NTFS ACL/attribute publication
+and rename races; their measurements do not replace product acceptance. Current
+terminal and Undo contracts are in [architecture](docs/architecture.md).
 
 ## Agent adapter development
 
@@ -369,7 +532,8 @@ The additive `begin_attachment` / `attachment_chunk` / `finish_attachment` /
 `abort_attachment` protocol bounds chunks to 64 KiB, each file to 64 MiB, concurrent
 uploads to 8, and each host's managed cache to 2 GiB / 4,096 entries. Offsets and
 declared sizes must match. Files become visible only after complete writes and
-fsync; private cache directories use 0700 and files 0600. Incomplete in-memory
+fsync. Unix private cache directories use 0700 and files 0600; Windows uses verified
+user-only DACLs through the [private-storage boundary](crates/latte-work-windows-security/SAFETY.md). Incomplete in-memory
 uploads expire after ten minutes on subsequent admissions; completed files remain
 available for saved prompts and retries. They are not automatically deleted on
 session close. Remote servers must be updated before using clipboard transfers.
@@ -452,7 +616,8 @@ close pending even when the process has exited and the observed task set is empt
 The host still reaps the Agent process group within a deadline. An App
 reclaim fences stale closes from an earlier App instance. New requests are blocked
 while quitting; admitted requests cannot send new work after claiming a resource
-if Quit has begun. Prompt input is never replayed.
+if Quit has begun. This includes sends with an uncertain response: reconcile their
+request IDs and ownership rather than assuming rejection or replaying the prompt.
 
 Quit publishes a private, atomic resource record for its own App owner before
 closing. A recovery RPC for an older owner can delay compaction, while the
@@ -572,6 +737,13 @@ history redaction, offline rename and model discovery. `TurnProvider::Configured
 ephemeral snapshot; only its digest enters request/queue identity. Empty overrides
 keep the existing CLI/Snapshot serialization and fingerprints unchanged.
 
+ENV persistence remains portable and preserves Unix case-sensitive keys. Native
+execution validates using the host OS: Windows rejects case aliases of reserved
+keys, profile/identity aliases (`USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `USERNAME`)
+and duplicate case-insensitive names. The native settings save path uses the
+selected host platform; a Windows desktop does not impose Windows key semantics
+on a Unix SSH host. The Server independently enforces its own native policy.
+
 The `custom_agent_environment` Hello capability defaults to false. Both the UI and
 native client reject custom ENV on older hosts before sending the request. Updated
 local and SSH hosts apply overrides after the captured shell environment and before
@@ -623,7 +795,7 @@ and reconnects. Refresh replaces clean fields and preserves dirty or invalid inp
 Focused checks: `agentEnvironment` and `AgentSettings` frontend tests, config and
 protocol tests, `redaction` server tests, and final-binary `environment_e2e` tests.
 
-At daemon startup, the host Server captures exported variables from the user's
+At Unix daemon startup, the host Server captures exported variables from the user's
 default shell (`SHELL`, falling back to the account shell), using `-ilc` in the
 home directory. zsh, bash, sh/dash and fish are supported; each shell follows its
 own startup-file rules (Bash login profiles must source `.bashrc` if desired).
@@ -637,6 +809,15 @@ the explicit per-turn Provider settings apply afterwards. Shell aliases/function
 and project-directory hooks are not imported. New shell configuration is loaded
 on Server restart. For service managers or curated environments, set
 `LATTE_WORK_AGENT_ENV=inherit` before starting Server to skip shell initialization.
+
+Windows v1 inherits the Server environment without loading PowerShell or Git Bash
+profiles. Its snapshot has no shell overlay. Both platforms apply adapter and
+Provider overrides afterwards. The adapter resolves an absolute native CLI path
+once against the effective Agent
+environment and uses that same PathBuf for probes and execution. Resolution first
+checks `LATTE_WORK_CLAUDE` (an absolute override; invalid values fail without fallback),
+then the per-user `.local/bin` installation, then the effective Agent PATH. Windows requires
+an `.exe`; an invalid explicit override is unavailable, never silently replaced.
 
 Capture has a 3-second timeout, a 512 KiB output cap and process-group cleanup.
 Startup output is discarded using a unique NUL-delimited marker, not logged.
@@ -1024,7 +1205,30 @@ change statistics do not share the display preview byte cap. Unknown and symlink
 entries remain partial; old tasks without a baseline never retroactively infer one. Task totals/diffs compare
 this baseline with the current worktree, regardless of staging or later commits.
 This is temporal attribution: other writers in a shared directory can appear in
-these net changes. The UI provides separate task and workspace views.
+these net changes. The unified change review page selects task, saved-turn and Git comparison scopes.
+
+Windows supports Undo of eligible ordinary-file additions, modifications and
+deletions in both Git and non-Git projects on local NTFS. It uses saved before/after
+bytes and requires complete file identity, permission and attribute evidence;
+legacy non-Git snapshots that lack this eligibility evidence remain explicitly
+unverifiable. Ordinary-directory Undo on Unix uses the existing Unix restoration
+backend. See [restoration constraints](docs/architecture.md#per-turn-restoration-and-windows-undo).
+
+For Windows non-Git Undo, the server lazily creates a private project-local
+`.latte-work-undo/<attemptUUID>` recovery area. Its namespace must match a durable
+registration in the original daemon's database and a bounded `owner.json` manifest.
+Registration commits before before-image staging. Verified managed roots are
+excluded from live file capture, listings and diffs, including Git force-tracked
+paths and rename endpoints; frozen historical turn diffs and commit/blob views
+remain unchanged. Existing Git recovery stays in `<gitdir>/latte-work-undo` with
+its existing v1 intent; Git roots are not thereby treated as private managed roots.
+
+The registry and manifest guard against accidental namespace collisions, not a
+malicious process running as the same user. Collisions, mismatches and orphaned
+managed stores fail closed. A lost or alternate database cannot adopt an existing
+namespace. The server does not automatically repair, adopt, delete or garbage-collect
+these stores; attempt directories and displaced originals remain after success or
+failure for inspection.
 
 Explicit user reference manifests and actual native tool calls are indexed durably.
 The compact Composer manifest and legacy expanded manifest are both recognized;
@@ -1150,13 +1354,20 @@ Undo is a host operation for the conversation's latest turn only. It requires a
 complete snapshot, no active host tasks/background work/PTYs, and byte/permission
 matches against every stored after-image. Exclusive host admission prevents new
 Send/Open/Approval/terminal writes during restoration; overlapping idle Agent
-runtimes are closed and can be reopened normally. Symlink paths are refused and
-all files are checked before the first write and again before each atomic replacement.
+runtimes are closed and can be reopened normally. All restoration files are prepared
+before writing targets. An owned admission guard follows the blocking restore worker,
+so disconnect/cancellation cannot release admission while writes continue. Symlink
+paths are refused and all files are checked before the first write and again before
+each atomic replacement.
 Files are restored without touching Git's index or refs. A durable unknown intent
 precedes writes; only full success becomes reverted. Failure/crash stays unknown
 and is never automatically retried. Completed repeated Undo requests reconcile
-idempotently. Independent external writers are not locked; post-turn conflicts
-are rejected and an interrupted restoration requires manual workspace inspection.
+idempotently without writing again. On Windows, source handles remain held while
+originals move to recovery and verified before-images are published without
+overwriting an occupied destination. Independent external writers are not globally
+locked; post-turn conflicts are rejected, and an interrupted restoration requires
+manual inspection. Undo does not recreate deleted directory trees or provide a
+transaction across multiple files.
 
 ## Embedded browser
 
@@ -1230,8 +1441,9 @@ WebView, with bounded payloads and ten-second completion timeouts. Pages cannot
 pass paths or arbitrary commands; Rust remains free of unsafe code. Snapshots
 capture only the current viewport (up to 4096 × 4096 points, 64 MiB PNG), and show
 a save picker only after successful native capture. None of these tools grant
-remote pages the workbench IPC capability. Non-macOS find/snapshot/profile tools
-fail explicitly; no native cross-platform smoke claim is implied.
+remote pages the workbench IPC capability. Windows find/capture uses the reviewed WebView2 boundary described above; macOS
+profile guarantees do not establish an equivalent Windows browser-data profile.
+Unsupported native operations fail explicitly.
 
 Focused checks: `BrowserTools.test.tsx`, `browserHistory.test.ts`, native desktop
 tests, and separate real macOS smoke of find/zoom/PDF/PNG/POST downloads/clear.
