@@ -162,7 +162,10 @@ impl ProviderStore {
             self.config.host_bindings.get(host)
         }
     }
-    fn catalog<'a>(&self, bindings: impl Iterator<Item = (&'a String, &'a String)>) -> Response {
+    fn catalog<'a>(
+        &self,
+        bindings: impl Iterator<Item = (&'a str, &'a String, &'a String)>,
+    ) -> Response {
         Response::Providers {
             providers: self
                 .config
@@ -171,7 +174,8 @@ impl ProviderStore {
                 .map(|r| r.metadata.clone())
                 .collect(),
             bindings: bindings
-                .map(|(agent, id)| AgentProviderBinding {
+                .map(|(host, agent, id)| AgentProviderBinding {
+                    host_id: Some(host.to_owned()),
                     agent: agent.clone(),
                     provider_id: id.clone(),
                     provider_revision: self
@@ -193,12 +197,19 @@ impl ProviderStore {
             self.config
                 .bindings
                 .iter()
-                .chain(self.config.host_bindings.values().flat_map(|b| b.iter())),
+                .map(|(agent, id)| ("local", agent, id))
+                .chain(self.config.host_bindings.iter().flat_map(|(host, b)| {
+                    b.iter().map(move |(agent, id)| (host.as_str(), agent, id))
+                })),
         )
     }
     pub fn list_for_host(&self, host: &str) -> Result<Response> {
         validate_id(host)?;
-        Ok(self.catalog(self.bindings(host).into_iter().flat_map(|b| b.iter())))
+        Ok(self.catalog(
+            self.bindings(host)
+                .into_iter()
+                .flat_map(|b| b.iter().map(move |(agent, id)| (host, agent, id))),
+        ))
     }
     pub fn snapshot_for_host(&self, host: &str, agent: &str) -> Result<Option<ProviderSnapshot>> {
         validate_id(host)?;

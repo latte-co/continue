@@ -1,7 +1,11 @@
 // @vitest-environment jsdom
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
-import { bumpModelConfigVersion } from "./modelConfigVersion";
+import {
+  bumpAgentModelConfigVersion,
+  bumpHostModelConfigVersion,
+  bumpModelConfigVersion,
+} from "./modelConfigVersion";
 import { ModelPicker } from "./ModelPicker";
 import type { Response } from "./protocol";
 const mocks = vi.hoisted(() => ({
@@ -630,6 +634,62 @@ it("keeps the last model list usable after changing selection within its host, p
     undefined,
   );
   expect(props.onReadyChange).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+});
+
+it("preserves another host's validated model cache when a different host or Agent config changes", async () => {
+  const catalog: Response = {
+    kind: "models",
+    models: ["first", "second"],
+    provider: null,
+    default_model: "first",
+    effort_levels: [],
+    model_labels: {},
+  };
+  mocks.request
+    .mockResolvedValueOnce(catalog)
+    .mockRejectedValue(new Error("transient network error"));
+  const ready = vi.fn();
+  const props = {
+    hostId: "remote-stable",
+    projectId: "p",
+    agent: "codex",
+    connected: true,
+    settingsOpen: false,
+    value: "first",
+    onChange: vi.fn(),
+    effort: null,
+    onEffortChange: vi.fn(),
+    disabled: false,
+    onReadyChange: ready,
+  };
+  const view = render(<ModelPicker {...props} />);
+  await act(async () => {});
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  // Config mutations on other hosts or other Agents do not invalidate remote-stable/codex.
+  act(() => {
+    bumpHostModelConfigVersion("other-ssh");
+    bumpAgentModelConfigVersion("remote-stable", "claude");
+  });
+  expect(mocks.request).toHaveBeenCalledTimes(1);
+
+  // Even if remote-stable later experiences a transient refresh failure on model switch,
+  // its validated catalog remains usable and sending stays unblocked.
+  view.rerender(<ModelPicker {...props} value="second" />);
+  await act(async () => {});
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  // Mutating remote-stable itself invalidates its cache, so a failed refresh blocks unverified sends.
+  await act(async () => {
+    bumpHostModelConfigVersion("remote-stable");
+  });
+  expect(ready).toHaveBeenLastCalledWith(
     expect.objectContaining({ ready: false }),
   );
 });

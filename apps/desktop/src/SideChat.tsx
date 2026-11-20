@@ -18,6 +18,10 @@ import { UserMessage } from "./UserMessage";
 import { WorkingStatus } from "./WorkingStatus";
 import { executionStatus } from "./executionStatus";
 import type { Effort, Event, Request, Session } from "./protocol";
+import {
+  clearSideWriteConfirmation,
+  useSideWriteConfirmationRequested,
+} from "./sideWritePrompts";
 import { LIVE_POLL_MS } from "./usePollingSnapshot";
 import { readWorkspace, setSideChatDraft, sideChatId } from "./workspaceState";
 
@@ -110,6 +114,7 @@ export function SideChat({
   active,
   connected,
   supported,
+  supportsInheritPermission = true,
 }: {
   parent: Session;
   sideId: string;
@@ -120,6 +125,7 @@ export function SideChat({
   active: boolean;
   connected: boolean;
   supported: boolean;
+  supportsInheritPermission?: boolean;
 }) {
   const key = sideDraftKey(hostId, parent.id, sideId);
   const draft = useDraft(drafts, key);
@@ -128,8 +134,28 @@ export function SideChat({
   const [readError, setReadError] = useState("");
   const [error, setError] = useState("");
   const [confirming, setConfirming] = useState<string>();
+  const writeConfirmRequested = useSideWriteConfirmationRequested(
+    hostId,
+    sideId,
+  );
   const closePending = session?.agent_close_pending;
-  const showingConfirmation = !!confirming && confirming === closePending;
+  const sideWritePending =
+    !closePending &&
+    session?.side_write_pending &&
+    (session.status === "unknown" || writeConfirmRequested)
+      ? session.side_write_pending
+      : undefined;
+  const pendingToken = closePending
+    ? `close:${closePending}`
+    : sideWritePending
+      ? `write:${sideWritePending}`
+      : undefined;
+  const showingConfirmation = !!confirming && confirming === pendingToken;
+  useEffect(() => {
+    if (session && !session.side_write_pending && writeConfirmRequested) {
+      clearSideWriteConfirmation(hostId, sideId);
+    }
+  }, [hostId, sideId, session, writeConfirmRequested]);
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState(false);
   const [revision, refresh] = useState(0);
@@ -160,13 +186,18 @@ export function SideChat({
   const hadDraft = useRef(isDraft);
   if (isDraft) hadDraft.current = true;
   if (session) hadDraft.current = false;
-  const permission = selection
+  const rawPermission = selection
     ? selection.permission
     : session
       ? (session.permission_mode ?? null)
       : hadDraft.current
-        ? (parent.permission_mode ?? "inherit")
+        ? (parent.permission_mode ??
+          (supportsInheritPermission ? "inherit" : null))
         : null;
+  const permission =
+    !session && !supportsInheritPermission && rawPermission === "inherit"
+      ? null
+      : rawPermission;
   const quotes = draft.quotes ?? [];
   const annotations = draft.annotations ?? [];
   function saveAnnotation(entry: Annotation) {
@@ -287,13 +318,29 @@ export function SideChat({
 
   const canInteract = enabled && (ready || isDraft);
   function confirmEnd() {
-    if (!confirming || confirming !== closePending) return;
+    if (!confirming || confirming !== pendingToken) return;
     setConfirming(undefined);
-    void perform({
-      method: "confirm_agent_closed",
-      session_id: sideId,
-      close_id: confirming,
-    });
+    if (closePending && confirming === `close:${closePending}`) {
+      void perform(
+        {
+          method: "confirm_agent_closed",
+          session_id: sideId,
+          close_id: closePending,
+        },
+        () => clearSideWriteConfirmation(hostId, sideId),
+      );
+      return;
+    }
+    if (sideWritePending && confirming === `write:${sideWritePending}`) {
+      void perform(
+        {
+          method: "confirm_side_writes_ended",
+          session_id: sideId,
+          request_id: sideWritePending,
+        },
+        () => clearSideWriteConfirmation(hostId, sideId),
+      );
+    }
   }
   function perform(action: Request, accepted?: () => void) {
     const pending = sideOperations(drafts);
@@ -322,11 +369,13 @@ export function SideChat({
         const expected =
           action.method === "send"
             ? "accepted"
-            : action.method === "confirm_agent_closed"
+            : action.method === "confirm_agent_closed" ||
+                action.method === "confirm_side_writes_ended"
               ? "session"
               : "ok";
         if (response.kind !== expected)
           throw new Error("操作结果待确认，请核对侧边聊天的记录");
+        if (response.kind === "session") setSession(response.session);
         accepted?.();
         setReady(false);
         refresh((v) => v + 1);
@@ -547,11 +596,15 @@ export function SideChat({
         </div>
       </div>
       <div className="side-chat-compose">
-        {closePending && !running && (
+        {pendingToken && !running && (
           <div className="notice" role="status">
-            {showingConfirmation
-              ? "请核对主机上的原生进程、后台任务和外部工具均已停止。"
-              : "原生会话关闭待确认。"}
+            {closePending
+              ? showingConfirmation
+                ? "请核对主机上的原生进程、后台任务和外部工具均已停止。"
+                : "原生会话关闭待确认。"
+              : showingConfirmation
+                ? "请核对侧边聊天启动的后台进程和外部工具均已停止写入工作区。"
+                : "侧边聊天后台写入待确认。"}
             {showingConfirmation && (
               <button
                 className="secondary small"
@@ -562,12 +615,20 @@ export function SideChat({
             )}
             <button
               className="secondary small"
-              disabled={!canInteract || busy || session?.agent_session_busy}
+              disabled={
+                !canInteract ||
+                busy ||
+                (!!closePending && !!session?.agent_session_busy)
+              }
               onClick={() =>
-                showingConfirmation ? confirmEnd() : setConfirming(closePending)
+                showingConfirmation ? confirmEnd() : setConfirming(pendingToken)
               }
             >
-              {showingConfirmation ? "我已核对，确认结束" : "核对原生会话关闭"}
+              {showingConfirmation
+                ? "我已核对，确认结束"
+                : closePending
+                  ? "核对原生会话关闭"
+                  : "核对后台写入已结束"}
             </button>
           </div>
         )}
@@ -668,6 +729,7 @@ export function SideChat({
                 }
                 disabled={disabled || running || (!isDraft && !session)}
                 sideChat
+                allowInherit={supportsInheritPermission}
               />
               <ModelPicker
                 ref={picker}

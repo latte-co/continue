@@ -4,8 +4,12 @@ import {
   HostConnectionError,
 } from "./connectionErrors";
 import { invoke } from "@tauri-apps/api/core";
-import { bumpModelConfigVersion } from "./modelConfigVersion";
-import type { Request, Response } from "./protocol";
+import {
+  bumpAgentModelConfigVersion,
+  bumpHostModelConfigVersion,
+  bumpModelConfigVersion,
+} from "./modelConfigVersion";
+import type { AgentProviderBinding, Request, Response } from "./protocol";
 export interface Host {
   id: string;
   name: string;
@@ -125,12 +129,84 @@ export async function request(
     throw new ServerRequestError(response.code, response.message);
   return response;
 }
+let knownRemoteHosts: Map<string, string> | null = null;
+let allProviderBindingsLoaded = false;
+const providerBindings = new Map<
+  string,
+  { hostId: string; agent: string; providerId: string }
+>();
+
+function snapshotRemoteHosts(hosts: Host[]) {
+  return new Map(
+    hosts
+      .filter((host) => host.id !== "local")
+      .map((host) => [host.id, JSON.stringify(host)]),
+  );
+}
+
+function diffRemoteHosts(
+  previous: Map<string, string> | null,
+  next: Map<string, string>,
+) {
+  if (!previous) return Array.from(next.keys());
+  const changed = new Set<string>();
+  for (const [id, serialized] of previous) {
+    if (next.get(id) !== serialized) changed.add(id);
+  }
+  for (const [id, serialized] of next) {
+    if (previous.get(id) !== serialized) changed.add(id);
+  }
+  return Array.from(changed);
+}
+
+function recordBindings(
+  bindings: AgentProviderBinding[],
+  fallbackHostId?: string,
+) {
+  if (fallbackHostId === undefined) {
+    providerBindings.clear();
+    allProviderBindingsLoaded = true;
+  } else {
+    for (const [key, entry] of Array.from(providerBindings.entries())) {
+      if (entry.hostId === fallbackHostId) providerBindings.delete(key);
+    }
+  }
+  for (const binding of bindings) {
+    const hostId = binding.host_id ?? fallbackHostId ?? "local";
+    providerBindings.set(JSON.stringify([hostId, binding.agent]), {
+      hostId,
+      agent: binding.agent,
+      providerId: binding.provider_id,
+    });
+  }
+}
+
+function collectBoundAgents(providerId: string) {
+  const targets = new Map<string, { hostId: string; agent: string }>();
+  for (const [key, entry] of providerBindings) {
+    if (entry.providerId === providerId) {
+      targets.set(key, { hostId: entry.hostId, agent: entry.agent });
+    }
+  }
+  return targets;
+}
+
 export async function loadHosts(): Promise<Host[]> {
-  return [localHost, ...(await invoke<Host[]>("load_hosts"))];
+  const remoteHosts = await invoke<Host[]>("load_hosts");
+  knownRemoteHosts = snapshotRemoteHosts(remoteHosts);
+  return [localHost, ...remoteHosts];
 }
 export async function saveHosts(hosts: Host[]): Promise<void> {
-  await invoke("save_hosts", { hosts: hosts.filter((h) => h.id !== "local") });
-  bumpModelConfigVersion();
+  const remoteHosts = hosts.filter((h) => h.id !== "local");
+  const nextSnapshot = snapshotRemoteHosts(remoteHosts);
+  const changed = await invoke<string[] | undefined>("save_hosts", {
+    hosts: remoteHosts,
+  });
+  const affectedHostIds = Array.isArray(changed)
+    ? changed
+    : diffRemoteHosts(knownRemoteHosts, nextSnapshot);
+  knownRemoteHosts = nextSnapshot;
+  for (const hostId of affectedHostIds) bumpHostModelConfigVersion(hostId);
 }
 export function message(error: unknown): string {
   const value = error instanceof Error ? error.message : String(error);
@@ -155,13 +231,26 @@ export async function bindAgentProvider(
     providerId,
   });
   if (response.kind === "error") throw new Error(response.message);
-  bumpModelConfigVersion();
+  if (response.kind === "providers") {
+    recordBindings(response.bindings, hostId);
+  } else {
+    const key = JSON.stringify([hostId, agent]);
+    if (providerId) {
+      providerBindings.set(key, { hostId, agent, providerId });
+    } else {
+      providerBindings.delete(key);
+    }
+  }
+  bumpAgentModelConfigVersion(hostId, agent);
   return response;
 }
 
 export async function agentProviders(hostId: string): Promise<Response> {
   const response = await invoke<Response>("agent_providers", { hostId });
   if (response.kind === "error") throw new Error(response.message);
+  if (response.kind === "providers") {
+    recordBindings(response.bindings, hostId);
+  }
   return response;
 }
 
@@ -180,7 +269,7 @@ export async function saveAgentEnvironment(
     "save_agent_environment",
     { hostId, agent, environment },
   );
-  bumpModelConfigVersion();
+  bumpAgentModelConfigVersion(hostId, agent);
   return saved;
 }
 
@@ -191,9 +280,39 @@ export type ProviderRequest = Extract<
 export async function providerRequest(
   request: ProviderRequest,
 ): Promise<Response> {
+  const targetProviderId =
+    request.method === "save_provider"
+      ? request.provider.id
+      : request.method === "delete_provider"
+        ? request.id
+        : null;
+  const hadFullBindingsSnapshot = allProviderBindingsLoaded;
+  const before = targetProviderId
+    ? collectBoundAgents(targetProviderId)
+    : new Map<string, { hostId: string; agent: string }>();
   const response = await invoke<Response>("provider_request", { request });
   if (response.kind === "error") throw new Error(response.message);
-  if (request.method !== "providers") bumpModelConfigVersion();
+  if (response.kind === "providers") {
+    recordBindings(response.bindings);
+  }
+  if (request.method !== "providers" && targetProviderId) {
+    const affected = new Map(before);
+    for (const [key, value] of collectBoundAgents(targetProviderId)) {
+      affected.set(key, value);
+    }
+    if (affected.size > 0) {
+      for (const { hostId, agent } of affected.values()) {
+        bumpAgentModelConfigVersion(hostId, agent);
+      }
+    } else if (
+      (request.method === "delete_provider" && !hadFullBindingsSnapshot) ||
+      (request.method === "save_provider" &&
+        response.kind !== "providers" &&
+        !hadFullBindingsSnapshot)
+    ) {
+      bumpModelConfigVersion();
+    }
+  }
   return response;
 }
 

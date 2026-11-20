@@ -507,6 +507,9 @@ export default function App() {
                     }
                     connected={connected}
                     supported={supportsSide}
+                    supportsInheritPermission={
+                      workbench.supportsSideChatInheritPermission
+                    }
                   />
                 )
               : undefined

@@ -164,6 +164,7 @@ impl ProviderStore {
             bindings: bindings
                 .iter()
                 .map(|(agent, id)| AgentProviderBinding {
+                    host_id: None,
                     agent: agent.clone(),
                     provider_id: id.clone(),
                     provider_revision: self

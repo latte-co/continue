@@ -37,6 +37,7 @@ pub type Database = Arc<Mutex<Store>>;
 pub type Runs = Arc<Mutex<HashMap<String, Run>>>;
 const TURN_LIMIT: Duration = Duration::from_secs(24 * 3600);
 const CLOSE_PENDING: &str = "原生会话的关闭状态待确认，请核对主机上的 Agent 和后台任务。";
+const SIDE_CLOSE_PENDING: &str = "本地侧边聊天已关闭，后台写入待确认。";
 const RECONFIGURE_BLOCKED: &str = "当前会话仍有后台任务或待确认状态，无法更换模型、Provider、权限或思考强度；请沿用当前配置发送，消息未发送";
 
 #[derive(Debug)]
@@ -1243,7 +1244,6 @@ struct Process {
     stop_reply: Option<oneshot::Sender<Result<(), String>>>,
     init_deadline: tokio::time::Instant,
     turn_deadline: tokio::time::Instant,
-    side_chat: bool,
 }
 struct PendingApprovalReply {
     reply: Option<oneshot::Sender<Result<(), String>>>,
@@ -1448,7 +1448,6 @@ impl Process {
         request_id: Option<&str>,
         mut adapter: Box<dyn agents::AgentAdapter>,
     ) -> Result<Self> {
-        let side_chat = db(database, |s| Ok(s.side_parent(&session.id)?.is_some()))?;
         let prepared = adapter.command(binary, agent_cwd, session.native_id.as_deref(), &config)?;
         let transport = if adapter.transport_lifetime() == agents::TransportLifetime::Persistent {
             Some(Self::spawn_transport(
@@ -1495,7 +1494,6 @@ impl Process {
             stop_reply: None,
             init_deadline: tokio::time::Instant::now() + Duration::from_secs(18),
             turn_deadline: tokio::time::Instant::now() + TURN_LIMIT,
-            side_chat,
         })
     }
     #[allow(clippy::too_many_arguments)]
@@ -1596,7 +1594,7 @@ impl Process {
         if !batch.is_empty() {
             self.apply_batch(batch, database, id).await?;
         }
-        self.finish_settled_side_writes(database, id)
+        Ok(())
     }
     async fn apply_batch(
         &mut self,
@@ -1833,7 +1831,7 @@ impl Process {
             self.apply_state(actions, database, id).await?;
         }
         self.session_open.store(self.state.ready, Ordering::SeqCst);
-        self.finish_settled_side_writes(database, id)
+        Ok(())
     }
     async fn apply_state(
         &mut self,
@@ -1933,20 +1931,7 @@ impl Process {
                 .clone()
                 .unwrap_or((Status::Completed, None))
         };
-        db(database, |s| s.state(id, status, message))?;
-        self.finish_settled_side_writes(database, id)
-    }
-    fn finish_settled_side_writes(&self, database: &Database, id: &str) -> Result<()> {
-        if self.side_chat
-            && !self.turn_active
-            && self.pending_result.is_none()
-            && !self.adapter.has_background_work()
-            && self.state.pending.is_empty()
-            && (self.state.ready || self.transport.is_none())
-        {
-            db(database, |s| s.finish_side_writes(id))?;
-        }
-        Ok(())
+        db(database, |s| s.state(id, status, message))
     }
     fn request_prediction_cancel(&mut self) {
         crate::predictions::invalidate(&self.prediction_owner);
@@ -2141,10 +2126,7 @@ fn finish_native_close(database: &Database, id: &str, confirmed: bool) -> Result
     if !confirmed {
         bail!(CLOSE_PENDING);
     }
-    db(database, |s| {
-        s.clear_unconfirmed_agent_close(id)?;
-        s.finish_side_writes(id)
-    })
+    db(database, |s| s.clear_unconfirmed_agent_close(id))
 }
 async fn finish_turn(
     database: &Database,
@@ -2849,9 +2831,12 @@ async fn actor(
                     }
                     // Preserve completed history when merely closing an idle runtime.
                     let result = db(&database, |s| {
+                        let writes_pending = s.pending_side_write(&session.id)?.is_some();
                         let (status, subagent_status, message) = if close_unconfirmed {
                             (Status::Unknown, latte_work_protocol::SubagentStatus::Unknown,
                              CLOSE_PENDING)
+                        } else if writes_pending {
+                            (Status::Unknown, latte_work_protocol::SubagentStatus::Unknown, SIDE_CLOSE_PENDING)
                         } else {
                             (Status::Stopped, latte_work_protocol::SubagentStatus::Stopped,
                              "已停止；已执行的文件改动不会撤销。")
@@ -3602,7 +3587,7 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        for _ in 0..2 {
+        for request_id in [None, Some("replacement")] {
             let result = Process::launch(
                 &database,
                 probe.to_string_lossy().as_ref(),
@@ -3610,7 +3595,7 @@ mod tests {
                 dir.path().to_str().unwrap(),
                 config.clone(),
                 Arc::new(AtomicBool::new(false)),
-                None,
+                request_id,
             )
             .await;
             assert!(matches!(result, Err(error) if error.to_string() == CLOSE_PENDING));

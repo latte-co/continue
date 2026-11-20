@@ -80,10 +80,18 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_session_busy: Option<bool>,
+    /// Latest side write operation (turn or native launch) awaiting confirmation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub side_write_pending: Option<String>,
     /// ID of the native close which still needs host-side verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_close_pending: Option<String>,
+    /// Close acknowledgement carried only on a side-write confirmation response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_closed_by_confirmation: Option<bool>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -335,6 +343,9 @@ pub struct ProviderTarget {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct AgentProviderBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub host_id: Option<String>,
     pub agent: String,
     pub provider_id: String,
     pub provider_revision: String,
@@ -668,6 +679,12 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         only_if_idle: Option<bool>,
+    },
+    /// The user has verified that the side chat's background writes have stopped.
+    ConfirmSideWritesEnded {
+        session_id: String,
+        /// Latest side_write_pending operation ID observed during verification.
+        request_id: String,
     },
     /// The user has verified that the native process and its work stopped.
     ConfirmAgentClosed {
@@ -1291,6 +1308,8 @@ pub enum Response {
         side_chat_controls: bool,
         #[serde(default)]
         claude_side_chat: bool,
+        #[serde(default)]
+        side_chat_inherit_permission: bool,
     },
     Projects {
         projects: Vec<Project>,
@@ -1470,6 +1489,7 @@ mod tests {
                 skill_management: false,
                 skill_file_import: false,
                 change_preview: false,
+                side_chat_inherit_permission: false,
                 ..
             }
         ));
@@ -1477,12 +1497,14 @@ mod tests {
         current["skill_management"] = serde_json::json!(true);
         current["skill_file_import"] = serde_json::json!(true);
         current["change_preview"] = serde_json::json!(true);
+        current["side_chat_inherit_permission"] = serde_json::json!(true);
         assert!(matches!(
             serde_json::from_value::<Response>(current).unwrap(),
             Response::Hello {
                 skill_management: true,
                 skill_file_import: true,
                 change_preview: true,
+                side_chat_inherit_permission: true,
                 ..
             }
         ));

@@ -828,6 +828,7 @@ export function Conversation({
                                 key={`${hostId}:${session?.id}:${item.key}`}
                                 hostId={hostId}
                                 sessionId={session?.id ?? ""}
+                                workspaceId={conversationKey}
                                 canUndo={
                                   connected &&
                                   !!session &&

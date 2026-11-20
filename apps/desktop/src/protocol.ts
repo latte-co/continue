@@ -60,9 +60,17 @@ export type Session = {
    */
   agent_session_busy?: boolean;
   /**
+   * Latest side write operation (turn or native launch) awaiting confirmation.
+   */
+  side_write_pending?: string;
+  /**
    * ID of the native close which still needs host-side verification.
    */
   agent_close_pending?: string;
+  /**
+   * Close acknowledgement carried only on a side-write confirmation response.
+   */
+  agent_closed_by_confirmation?: boolean;
 };
 export type RecentCursor = { updated_at: number; id: string };
 export type RecentSession = { session: Session; updated_at: number };
@@ -363,6 +371,7 @@ export type ProviderDraft = {
 };
 export type ProviderTarget = { ssh: string; server_path: string };
 export type AgentProviderBinding = {
+  host_id?: string;
   agent: string;
   provider_id: string;
   provider_revision: string;
@@ -485,6 +494,14 @@ export type Request =
        * Idle bulk close must recheck atomically in the session actor.
        */
       only_if_idle?: boolean;
+    }
+  | {
+      method: "confirm_side_writes_ended";
+      session_id: string;
+      /**
+       * Latest side_write_pending operation ID observed during verification.
+       */
+      request_id: string;
     }
   | { method: "confirm_agent_closed"; session_id: string; close_id: string }
   | {
@@ -807,6 +824,7 @@ export type Response =
       change_preview: boolean;
       side_chat_controls: boolean;
       claude_side_chat: boolean;
+      side_chat_inherit_permission: boolean;
     }
   | { kind: "projects"; projects: Array<Project> }
   | { kind: "project"; project: Project }

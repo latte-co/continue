@@ -316,23 +316,6 @@ impl Store {
                 },
             )?;
         }
-        store.db.execute(
-            "UPDATE requests
-             SET side_write_verified_end=COALESCE((SELECT MAX(seq) FROM events),0),
-                 side_write_end=COALESCE((SELECT MAX(seq) FROM events),0)
-             WHERE permission_mode IS NOT NULL
-               AND side_write_end IS NOT 0
-               AND side_write_verified_end IS NULL
-               AND session_id NOT IN (SELECT session_id FROM unconfirmed_agent_closes)",
-            [],
-        )?;
-        store.db.execute(
-            "UPDATE side_launch_writes
-             SET verified_end=COALESCE((SELECT MAX(seq) FROM events),0)
-             WHERE verified_end IS NULL
-               AND session_id NOT IN (SELECT session_id FROM unconfirmed_agent_closes)",
-            [],
-        )?;
         if let Err(error) = store.collect_snapshot_garbage() {
             eprintln!("snapshot cleanup skipped: {error}");
         }
@@ -588,7 +571,9 @@ impl Store {
             archived: false,
             agent_session_open: None,
             agent_session_busy: None,
+            side_write_pending: None,
             agent_close_pending: None,
+            agent_closed_by_confirmation: None,
         };
         self.db.execute(
             "INSERT INTO sessions VALUES (?1,?2,?3)",
@@ -1573,7 +1558,103 @@ impl Store {
             .map(|request_id| self.turn_changes(id, &request_id))
             .transpose()
     }
+    /// Called before any native operation that may write. Zero is reserved for
+    /// an admitted side request that has not reached this point.
+    pub fn start_side_write(&self, request_id: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE requests SET side_write_start=COALESCE((SELECT MAX(seq) FROM events),0),
+                 side_write_end=NULL WHERE id=?1 AND side_write_end=0",
+            [request_id],
+        )?;
+        Ok(())
+    }
+    /// Open/recovery has no user request, but native startup hooks can still write.
+    /// Keep a separate identity instead of reopening an already verified interval.
+    pub fn start_side_launch_write(&self, session_id: &str) -> Result<Option<String>> {
+        if self.side_parent(session_id)?.is_none() {
+            return Ok(None);
+        }
+        let id = Uuid::new_v4().to_string();
+        self.db.execute(
+            "INSERT INTO side_launch_writes(id,session_id,start_seq)
+             VALUES (?1,?2,COALESCE((SELECT MAX(seq) FROM events),0))",
+            params![id, session_id],
+        )?;
+        Ok(Some(id))
+    }
+    pub fn pending_side_write(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT id FROM (
+                 SELECT r.id,COALESCE(r.side_write_start,
+                    (SELECT MIN(seq) FROM events WHERE session_id=r.session_id
+                     AND json_extract(data,'$.kind')='user'
+                     AND json_extract(data,'$.request_id')=r.id),0) AS start_seq,
+                    0 AS launch_order
+                 FROM side_chats c JOIN requests r ON r.session_id=c.session_id
+                 WHERE c.session_id=?1 AND r.permission_mode IS NOT NULL
+                 AND r.side_write_end IS NOT 0 AND r.side_write_verified_end IS NULL
+                 UNION ALL
+                 SELECT id,start_seq,rowid AS launch_order FROM side_launch_writes
+                 WHERE session_id=?1 AND verified_end IS NULL)
+                 ORDER BY start_seq DESC,launch_order DESC LIMIT 1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+    pub fn check_side_write_confirmation(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<bool> {
+        if self.side_parent(session_id)?.is_none() {
+            bail!("此操作仅适用于侧边聊天");
+        }
+        if self.session(session_id)?.status.active() {
+            bail!("请先停止侧边聊天，再确认后台写入已结束");
+        }
+        let pending = self.pending_side_write(session_id)?;
+        if pending.as_deref() == Some(request_id) {
+            return Ok(true);
+        }
+        if pending.is_none()
+            && self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM requests WHERE id=?1 AND session_id=?2
+                        AND side_write_verified_end IS NOT NULL
+                    UNION ALL SELECT 1 FROM side_launch_writes WHERE id=?1 AND session_id=?2
+                        AND verified_end IS NOT NULL)",
+                params![request_id, session_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Ok(false);
+        }
+        bail!("后台写入记录已变化，请重新核对后确认");
+    }
+    pub fn confirm_side_writes_ended(&self, session_id: &str, request_id: &str) -> Result<Session> {
+        if !self.check_side_write_confirmation(session_id, request_id)? {
+            return self.session(session_id);
+        }
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE requests SET side_write_verified_end=COALESCE((SELECT MAX(seq) FROM events),0),
+                side_write_end=COALESCE((SELECT MAX(seq) FROM events),0)
+             WHERE session_id=?1 AND permission_mode IS NOT NULL
+                AND side_write_end IS NOT 0 AND side_write_verified_end IS NULL",
+            [session_id],
+        )?;
+        tx.execute(
+            "UPDATE side_launch_writes SET verified_end=COALESCE((SELECT MAX(seq) FROM events),0)
+             WHERE session_id=?1 AND verified_end IS NULL",
+            [session_id],
+        )?;
+        tx.commit()?;
+        self.session(session_id)
+    }
     pub fn project_session_recovery(&self, session: &mut Session) -> Result<()> {
+        session.side_write_pending = self.pending_side_write(&session.id)?;
         session.agent_close_pending = self
             .db
             .query_row(
@@ -1635,51 +1716,7 @@ impl Store {
         {
             bail!("关闭记录已变化，请重新核对");
         }
-        self.finish_side_writes(id)?;
         Ok(session)
-    }
-    /// Called before any native operation that may write. Zero is reserved for
-    /// an admitted side request that has not reached this point.
-    pub fn start_side_write(&self, request_id: &str) -> Result<()> {
-        self.db.execute(
-            "UPDATE requests SET side_write_start=COALESCE((SELECT MAX(seq) FROM events),0),
-                 side_write_end=NULL WHERE id=?1 AND side_write_end=0",
-            [request_id],
-        )?;
-        Ok(())
-    }
-    /// Open/recovery has no user request, but native startup hooks can still write.
-    /// Keep a separate identity instead of reopening an already verified interval.
-    pub fn start_side_launch_write(&self, session_id: &str) -> Result<Option<String>> {
-        if self.side_parent(session_id)?.is_none() {
-            return Ok(None);
-        }
-        let id = Uuid::new_v4().to_string();
-        self.db.execute(
-            "INSERT INTO side_launch_writes(id,session_id,start_seq)
-             VALUES (?1,?2,COALESCE((SELECT MAX(seq) FROM events),0))",
-            params![id, session_id],
-        )?;
-        Ok(Some(id))
-    }
-    pub fn finish_side_writes(&self, session_id: &str) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE requests
-             SET side_write_verified_end=COALESCE((SELECT MAX(seq) FROM events),0),
-                 side_write_end=COALESCE((SELECT MAX(seq) FROM events),0)
-             WHERE session_id=?1 AND permission_mode IS NOT NULL
-               AND side_write_end IS NOT 0 AND side_write_verified_end IS NULL",
-            [session_id],
-        )?;
-        tx.execute(
-            "UPDATE side_launch_writes
-             SET verified_end=COALESCE((SELECT MAX(seq) FROM events),0)
-             WHERE session_id=?1 AND verified_end IS NULL",
-            [session_id],
-        )?;
-        tx.commit()?;
-        Ok(())
     }
     pub fn mark_side_write_not_started(&self, request_id: &str) -> Result<()> {
         self.db.execute(
@@ -2664,6 +2701,208 @@ mod tests {
         assert!(store.events(&parent.id, 0.0).unwrap().0.is_empty());
     }
 
+    #[tokio::test]
+    async fn side_write_confirmation_survives_restart_and_preserves_earlier_overlap() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        for interrupted in [false, true] {
+            let db_path = path.with_extension(if interrupted {
+                "interrupted"
+            } else {
+                "finished"
+            });
+            let mut store = Store::open(&db_path).unwrap();
+            let project = store.add_project(directory.path()).unwrap();
+            let mut parent = store.create_session(project.id, "codex".into()).unwrap();
+            parent.native_id = Some("native-main".into());
+            store.save(&parent).unwrap();
+            let side = store.open_side_chat(&parent.id, None).unwrap();
+            store
+                .begin(
+                    &side.id,
+                    "original",
+                    "edit",
+                    None,
+                    None,
+                    None,
+                    Some("default"),
+                )
+                .unwrap();
+            store.start_side_write("original").unwrap();
+            if !interrupted {
+                store.state(&side.id, Status::Completed, None).unwrap();
+                store
+                    .confirm_side_writes_ended(&side.id, "original")
+                    .unwrap();
+            }
+            drop(store);
+
+            let mut store = Store::open(&db_path).unwrap();
+            assert_eq!(
+                store.pending_side_write(&side.id).unwrap().is_some(),
+                interrupted
+            );
+            store
+                .begin(
+                    &side.id,
+                    "resumed",
+                    "edit again",
+                    None,
+                    None,
+                    None,
+                    Some("default"),
+                )
+                .unwrap();
+            store.start_side_write("resumed").unwrap();
+            store.state(&side.id, Status::Completed, None).unwrap();
+            assert_eq!(
+                store.pending_side_write(&side.id).unwrap().as_deref(),
+                Some("resumed")
+            );
+            assert!(
+                store
+                    .confirm_side_writes_ended(&side.id, "original")
+                    .is_err()
+            );
+
+            store
+                .begin(&parent.id, "main", "edit", None, None, None, None)
+                .unwrap();
+            let before = crate::task_changes::Snapshot::unavailable("fixture".into());
+            store
+                .save_turn_baseline(&parent.id, "main", &before)
+                .unwrap();
+            let turn = crate::task_changes::FrozenTurn::freeze(
+                "main".into(),
+                before,
+                crate::task_changes::Snapshot::unavailable("fixture".into()),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+            store.finish_turn(&parent.id, &turn).unwrap();
+            assert_eq!(
+                store.overlapping_side_chat(&parent.id, "main").unwrap(),
+                Some((side.id.clone(), true))
+            );
+            store
+                .confirm_side_writes_ended(&side.id, "resumed")
+                .unwrap();
+            assert!(
+                store
+                    .confirm_side_writes_ended(&side.id, "resumed")
+                    .unwrap()
+                    .side_write_pending
+                    .is_none()
+            );
+            assert_eq!(
+                store.overlapping_side_chat(&parent.id, "main").unwrap(),
+                Some((side.id, false))
+            );
+        }
+    }
+
+    #[test]
+    fn older_side_write_boundaries_require_verification_even_after_downgrade() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let mut store = Store::open(&path).unwrap();
+        let project = store.add_project(directory.path()).unwrap();
+        let mut parent = store.create_session(project.id, "codex".into()).unwrap();
+        parent.native_id = Some("native-main".into());
+        store.save(&parent).unwrap();
+        let side = store.open_side_chat(&parent.id, None).unwrap();
+        for id in ["finished", "never-started"] {
+            store
+                .begin(&side.id, id, "edit", None, None, None, Some("default"))
+                .unwrap();
+            store.state(&side.id, Status::Completed, None).unwrap();
+        }
+        store
+            .db
+            .execute_batch(
+                "CREATE INDEX pending_side_writes ON requests(session_id);
+                 UPDATE requests SET side_write_end=2 WHERE id='finished';",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.pending_side_write(&side.id).unwrap().as_deref(),
+            Some("finished")
+        );
+        store
+            .confirm_side_writes_ended(&side.id, "finished")
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert!(store.pending_side_write(&side.id).unwrap().is_none());
+        store.db.execute(
+            "INSERT INTO requests(id,session_id,text,permission_mode,side_write_start,side_write_end)
+             VALUES ('after-downgrade',?1,'edit','default',3,4)", [&side.id],
+        ).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.pending_side_write(&side.id).unwrap().as_deref(),
+            Some("after-downgrade")
+        );
+        let verified: i64 = store
+            .db
+            .query_row(
+                "SELECT side_write_verified_end FROM requests WHERE id='finished'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(verified > 0);
+    }
+
+    #[test]
+    fn side_launch_writes_survive_restart_without_changing_the_request_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let mut store = Store::open(&path).unwrap();
+        let project = store.add_project(directory.path()).unwrap();
+        let mut parent = store.create_session(project.id, "claude".into()).unwrap();
+        parent.native_id = Some(uuid::Uuid::new_v4().to_string());
+        store.save(&parent).unwrap();
+        assert!(store.start_side_launch_write(&parent.id).unwrap().is_none());
+        let side = store.open_side_chat(&parent.id, None).unwrap();
+        store
+            .begin(&side.id, "sent", "hello", None, None, None, Some("default"))
+            .unwrap();
+        store.start_side_write("sent").unwrap();
+        store.state(&side.id, Status::Completed, None).unwrap();
+        store.confirm_side_writes_ended(&side.id, "sent").unwrap();
+        let first = store.start_side_launch_write(&side.id).unwrap().unwrap();
+        let latest = store.start_side_launch_write(&side.id).unwrap().unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.pending_side_write(&side.id).unwrap().as_deref(),
+            Some(latest.as_str())
+        );
+        assert!(store.confirm_side_writes_ended(&side.id, &first).is_err());
+        assert!(store.confirm_side_writes_ended(&side.id, "sent").is_err());
+        store.confirm_side_writes_ended(&side.id, &latest).unwrap();
+        assert!(
+            !store
+                .check_side_write_confirmation(&side.id, &latest)
+                .unwrap()
+        );
+        assert_eq!(store.latest_request(&side.id).unwrap(), "sent");
+        let missing = store.start_side_launch_write(&side.id).unwrap().unwrap();
+        store.mark_side_write_not_started(&missing).unwrap();
+        assert!(store.pending_side_write(&side.id).unwrap().is_none());
+        assert!(
+            !store
+                .check_side_write_confirmation(&side.id, &latest)
+                .unwrap()
+        );
+    }
+
     #[test]
     fn open_side_chat_inherits_for_new_chats_and_preserves_legacy_readonly_records() {
         let directory = tempfile::tempdir().unwrap();
@@ -2703,10 +2942,10 @@ mod tests {
     }
 
     #[test]
-    fn undo_fences_overlapping_and_unsettled_writable_side_intervals() {
+    fn undo_checks_pending_writes_independently_of_the_captured_turn_interval() {
         for launch in [false, true] {
             let directory = tempfile::tempdir().unwrap();
-            let mut store = super::Store::open(&directory.path().join("state.sqlite")).unwrap();
+            let mut store = Store::open(&directory.path().join("state.sqlite")).unwrap();
             let project = store.add_project(directory.path()).unwrap();
             let mut main = store.create_session(project.id, "codex".into()).unwrap();
             main.native_id = Some("native-main".into());
@@ -2715,6 +2954,7 @@ mod tests {
             store
                 .begin(&main.id, "main", "edit", None, None, None, None)
                 .unwrap();
+            // The query consumes the persisted temporal markers, not file bytes.
             store
                 .db
                 .execute(
@@ -2723,29 +2963,26 @@ mod tests {
                     [&main.id],
                 )
                 .unwrap();
-            store
-                .state(&main.id, super::Status::Completed, None)
-                .unwrap();
-            if launch {
-                store.start_side_launch_write(&side.id).unwrap().unwrap();
+            store.state(&main.id, Status::Completed, None).unwrap();
+            let write = if launch {
+                store.start_side_launch_write(&side.id).unwrap().unwrap()
             } else {
                 store
                     .begin(&side.id, "side", "edit", None, None, None, Some("default"))
                     .unwrap();
                 store.start_side_write("side").unwrap();
-                store
-                    .state(&side.id, super::Status::Completed, None)
-                    .unwrap();
-            }
+                store.state(&side.id, Status::Completed, None).unwrap();
+                "side".into()
+            };
             assert_eq!(
                 store.overlapping_side_chat(&main.id, "main").unwrap(),
                 Some((side.id.clone(), true))
             );
-            store.finish_side_writes(&side.id).unwrap();
+            store.confirm_side_writes_ended(&side.id, &write).unwrap();
             assert_eq!(
                 store.overlapping_side_chat(&main.id, "main").unwrap(),
                 None,
-                "a settled later interval does not contaminate the historical snapshot"
+                "a verified later interval does not contaminate the historical snapshot"
             );
         }
     }

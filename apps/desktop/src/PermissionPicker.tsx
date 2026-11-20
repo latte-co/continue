@@ -15,6 +15,7 @@ export function PermissionPicker({
   onChange,
   disabled,
   sideChat = false,
+  allowInherit = true,
 }: {
   hostId: string;
   agent: string;
@@ -24,6 +25,7 @@ export function PermissionPicker({
   onChange: (value: string | null) => void;
   disabled: boolean;
   sideChat?: boolean;
+  allowInherit?: boolean;
 }) {
   const scope = JSON.stringify([hostId, agent]);
   const [loaded, setLoaded] = useState<{
@@ -72,7 +74,8 @@ export function PermissionPicker({
     };
   }, [hostId, agent, connected, hidden, retry]);
   const current = modes?.find((mode) => mode.id === value);
-  const known = Boolean(current) || (sideChat && value === "inherit");
+  const known =
+    Boolean(current) || (sideChat && allowInherit && value === "inherit");
   const Icon = current?.elevated ? ShieldAlert : Shield;
   const options: SelectOption[] = [
     ...(sideChat
@@ -82,12 +85,16 @@ export function PermissionPicker({
             label: "只读",
             description: "可以读取文件。禁止写入或请求提权。",
           },
-          {
-            value: "inherit",
-            label: "跟随 Agent",
-            description:
-              "沿用 Agent 自己的权限配置。侧边聊天与主聊使用同一个工作目录。",
-          },
+          ...(allowInherit
+            ? [
+                {
+                  value: "inherit",
+                  label: "跟随 Agent",
+                  description:
+                    "沿用 Agent 自己的权限配置。侧边聊天与主聊使用同一个工作目录。",
+                },
+              ]
+            : []),
         ]
       : [
           {
@@ -111,7 +118,9 @@ export function PermissionPicker({
       value,
       label: modes ? "权限模式不可用" : value,
       description: sideChat
-        ? "此选择尚未验证；可切换为只读或跟随 Agent。"
+        ? allowInherit
+          ? "此选择尚未验证；可切换为只读或跟随 Agent。"
+          : "此选择尚未验证；可切换为只读。"
         : "此选择尚未验证；可切换为跟随 Agent。",
     });
   return (

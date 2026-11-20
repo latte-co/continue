@@ -2121,12 +2121,32 @@ default CLI with an empty Agent environment and leaves the source unverified.
 Codex cold resumes reuse the side thread's Provider key for the same App
 Provider revision.
 The side chat shares the working directory, with an independent request ledger and
-transcript, and inherits the parent conversation's model, effort, and permission mode by default.
+transcript, and inherits the parent conversation's model, effort, and permission mode by default
+(`side_chat_inherit_permission` in `Hello`; older v1 SSH Servers fall back to legacy `null` read-only).
 Side chats do not take undo snapshots because main and side file activity can
-overlap. Main-turn undo refuses while any overlapping runtime, subagent, or
-terminal on the same host is still active or has an unconfirmed native close,
-closes idle overlapping runtimes first, and relies on `turn.check_undo` to detect
-post-turn file conflicts before reverting.
+overlap. The host rejects main-turn undo when write-capable side work on the
+same host overlaps the main turn. Native permissions and approvals can allow
+writes outside the side project's root. The host records possible writes just
+before launching the native process or dispatching to a live process.
+Open-only and recovery launches in a writable mode also journal a fresh interval,
+with its own confirmation ID, because startup hooks can write without a user turn.
+These launch records do not create user messages or change request deduplication.
+Confirmed historical intervals remain closed when a later process is opened.
+Any interval still awaiting confirmation blocks Undo independently of its start
+time, including side work started after the main turn's snapshot completed or across
+a Server restart. Once confirmed, only intervals overlapping the main turn block
+historical Undo; the existing current-file conflict check still protects later edits.
+Detached processes and external tools can keep writing after either normal completion
+or forced close. The host keeps the write interval open until the user verifies
+those tasks have stopped. A confirmed local close returns `SideChatClosed` when
+writes are pending so tabs close quietly and the parent can be archived; ordinary
+completed side chats hide the confirmation prompt unless interrupted (`Status::Unknown`)
+or surfaced by a blocked main-turn Undo. `ConfirmSideWritesEnded` verifies the
+latest pending request ID, closes an idle local runtime when needed, and records
+a verified end separately from legacy inferred boundaries. Its response
+acknowledges whether this request closed an actor. Retrying a verified request
+preserves ownership of a reopened chat so the current App can close it on exit.
+Only verified ends count, including after running an older Server.
 Native resource cleanup captures a claim version before waiting for close.
 Every claim or adoption gets a new version, including by the same App; an older
 close acknowledgement cannot remove that newer ownership.
@@ -2151,11 +2171,16 @@ After eviction the connection requires explicit claims for execution, so a remov
 old claim cannot be mistaken for an unowned legacy request or steal a newer owner.
 A superseded claim fails before execution and never implicitly reclaims or replays
 the request. Adopted resources are already active and do not reserve a future open.
-Side chats accept direct messages without native steering or a message queue.
+Earlier overlapping turns remain protected. Side chats accept direct messages
+without native steering or a message queue.
 If native close itself was unconfirmed, users can verify the process and its
 work on the execution host, then call `ConfirmAgentClosed` with the recorded
 close ID. This works for main and side chats after Server restart, and the
-Server refuses confirmation while a live actor owns the session.
+Server refuses confirmation while a live actor owns the session. Side-write
+verification remains a separate step when a write interval is pending.
+Launch validation failures and Unix `ENOENT` launch errors leave no write
+interval. The undo error identifies the side chat, so users can check its history
+and use the main turn's saved diff to restore individual changes manually.
 `SideChatHistory` pages through a parent's children newest first, with `next` as
 the cursor for the next request. The desktop routes the same protocol through
 local and SSH transports.

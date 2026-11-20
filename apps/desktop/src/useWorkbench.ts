@@ -1741,6 +1741,8 @@ export function useWorkbench() {
     setHostId,
     connected,
     supportsSideChat: cachedHello(host)?.side_chat_controls === true,
+    supportsSideChatInheritPermission:
+      cachedHello(host)?.side_chat_inherit_permission === true,
     supportsClaudeSideChat: cachedHello(host)?.claude_side_chat === true,
     connectionLost: connectedHosts.current.has(hostId),
     agentSessionTransitions,

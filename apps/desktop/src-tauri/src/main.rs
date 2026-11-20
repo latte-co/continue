@@ -571,6 +571,7 @@ async fn host_request(
             | Request::ResumeMessageQueue { .. }
             | Request::OpenAgentSession { .. }
             | Request::CloseAgentSession { .. }
+            | Request::ConfirmSideWritesEnded { .. }
             | Request::ConfirmAgentClosed { .. }
             | Request::ArchiveSession { archived: true, .. }
     ) {
@@ -611,6 +612,7 @@ async fn host_request(
             .entry((host_id.clone(), session_id.clone()))
             .or_insert_with(|| "open".into());
     }
+    let confirms_side_writes = matches!(request, Request::ConfirmSideWritesEnded { .. });
     let archive_targets = if let Request::ArchiveSession {
         session_id,
         archived: true,
@@ -622,6 +624,7 @@ async fn host_request(
     };
     let closed_agent = match &request {
         Request::CloseAgentSession { session_id, .. }
+        | Request::ConfirmSideWritesEnded { session_id, .. }
         | Request::ConfirmAgentClosed { session_id, .. } => {
             Some((host_id.clone(), session_id.clone()))
         }
@@ -721,7 +724,7 @@ async fn host_request(
         ));
     }
     if let Some(key) = closed_agent
-        && acknowledges_agent_close(&response)
+        && acknowledges_agent_close(&response, confirms_side_writes)
     {
         state.turns.lock().await.remove(&key);
         state.owned_instances.lock().await.remove(&(
@@ -785,7 +788,11 @@ async fn forget_archived_sessions(state: &Connections, host: &str, ids: &[String
         ));
     }
 }
-fn acknowledges_agent_close(response: &Response) -> bool {
+fn acknowledges_agent_close(response: &Response, confirms_side_writes: bool) -> bool {
+    if confirms_side_writes {
+        return matches!(response, Response::Session { session }
+            if session.agent_closed_by_confirmation == Some(true));
+    }
     matches!(
         response,
         Response::Ok | Response::SideChatClosed | Response::Session { .. }
@@ -820,9 +827,28 @@ fn load_hosts(app: tauri::AppHandle) -> Result<Vec<Host>, String> {
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     serde_json::from_slice(&data).map_err(|e| e.to_string())
 }
+fn changed_host_ids(previous: &[Host], hosts: &[Host]) -> Vec<String> {
+    let mut changed = std::collections::BTreeSet::new();
+    for old in previous {
+        match hosts.iter().find(|host| host.id == old.id) {
+            Some(next) if next == old => {}
+            _ => {
+                changed.insert(old.id.clone());
+            }
+        }
+    }
+    for next in hosts {
+        if !previous.iter().any(|old| old.id == next.id) {
+            changed.insert(next.id.clone());
+        }
+    }
+    changed.into_iter().collect()
+}
 #[tauri::command]
-async fn save_hosts(app: tauri::AppHandle, hosts: Vec<Host>) -> Result<(), String> {
-    let removed: Vec<_> = load_hosts(app.clone())?
+async fn save_hosts(app: tauri::AppHandle, hosts: Vec<Host>) -> Result<Vec<String>, String> {
+    let previous = load_hosts(app.clone())?;
+    let changed = changed_host_ids(&previous, &hosts);
+    let removed: Vec<_> = previous
         .into_iter()
         .filter(|old| !hosts.iter().any(|host| host.id == old.id))
         .collect();
@@ -843,7 +869,8 @@ async fn save_hosts(app: tauri::AppHandle, hosts: Vec<Host>) -> Result<(), Strin
         serde_json::to_vec_pretty(&hosts).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    std::fs::rename(temp, path).map_err(|e| e.to_string())
+    std::fs::rename(temp, path).map_err(|e| e.to_string())?;
+    Ok(changed)
 }
 #[tauri::command]
 async fn choose_reference_path(
@@ -1258,12 +1285,42 @@ mod reveal_path_tests {
     #[test]
     fn acknowledges_legacy_and_current_side_chat_close_responses() {
         use latte_work_protocol::Response;
-        assert!(super::acknowledges_agent_close(&Response::Ok));
-        assert!(super::acknowledges_agent_close(&Response::SideChatClosed));
-        assert!(!super::acknowledges_agent_close(&Response::Error {
-            code: "busy".into(),
-            message: "busy".into(),
-        }));
+        assert!(super::acknowledges_agent_close(&Response::Ok, false));
+        assert!(super::acknowledges_agent_close(
+            &Response::SideChatClosed,
+            false
+        ));
+        assert!(!super::acknowledges_agent_close(
+            &Response::Error {
+                code: "busy".into(),
+                message: "busy".into(),
+            },
+            false
+        ));
+    }
+    #[test]
+    fn changed_host_ids_reports_only_added_removed_or_modified_hosts() {
+        use super::{Host, SshAuthMode, changed_host_ids};
+        let host = |id: &str, ssh: &str| Host {
+            id: id.into(),
+            name: id.into(),
+            ssh: Some(ssh.into()),
+            server_path: None,
+            auth: SshAuthMode::None,
+            identity_file: None,
+            port: None,
+        };
+        let previous = vec![host("alpha", "dev@alpha"), host("beta", "dev@beta")];
+        let next = vec![
+            host("alpha", "dev@alpha"),
+            host("beta", "ops@beta"),
+            host("gamma", "dev@gamma"),
+        ];
+        assert_eq!(changed_host_ids(&previous, &next), vec!["beta", "gamma"]);
+        assert_eq!(
+            changed_host_ids(&next, &[host("alpha", "dev@alpha")]),
+            vec!["beta", "gamma"]
+        );
     }
 }
 fn main() {
@@ -1497,6 +1554,39 @@ for line in sys.stdin:
         assert_eq!(ids[129], "side-128");
         drop(client);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn side_write_confirmation_releases_ownership_only_with_a_close_acknowledgement() {
+        let response: Response = serde_json::from_value(serde_json::json!({
+            "kind": "session",
+            "session": {
+                "id": "side", "project_id": "project", "title": "Side", "agent": "codex",
+                "status": "completed", "created_at": 0,
+            },
+        }))
+        .unwrap();
+        let Response::Session { mut session } = response else {
+            panic!("session response");
+        };
+        assert!(!acknowledges_agent_close(
+            &Response::Session {
+                session: session.clone()
+            },
+            true
+        ));
+        session.agent_closed_by_confirmation = Some(false);
+        assert!(!acknowledges_agent_close(
+            &Response::Session {
+                session: session.clone()
+            },
+            true
+        ));
+        session.agent_closed_by_confirmation = Some(true);
+        assert!(acknowledges_agent_close(
+            &Response::Session { session },
+            true
+        ));
     }
 
     #[test]

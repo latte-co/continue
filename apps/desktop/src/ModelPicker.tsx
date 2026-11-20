@@ -59,7 +59,7 @@ export function ModelPicker({
   ref?: Ref<ModelPickerHandle>;
 }) {
   const selector = useRef<ModelSelectorHandle>(null);
-  const configVersion = useModelConfigVersion();
+  const configVersion = useModelConfigVersion(hostId, agent);
   const scope = JSON.stringify([hostId, projectId, agent]);
   const conversationScope = JSON.stringify([scope, conversationKey ?? ""]);
   const [loaded, setCatalog] = useState<{
@@ -109,20 +109,23 @@ export function ModelPicker({
       action: { label: "重新加载模型", run: () => setRetry((v) => v + 1) },
     },
   ]);
-  const initialConfigVersion = useRef(configVersion);
+  const agentConfigKey = JSON.stringify([hostId, agent]);
+  const seenConfigVersions = useRef(new Map<string, number>());
+  if (!seenConfigVersions.current.has(agentConfigKey)) {
+    seenConfigVersions.current.set(agentConfigKey, configVersion);
+  }
   useEffect(() => {
-    if (
-      (!settingsOpen && configVersion === initialConfigVersion.current) ||
-      !value
-    )
-      return;
+    const previousVersion = seenConfigVersions.current.get(agentConfigKey);
+    const configChanged = previousVersion !== configVersion;
+    seenConfigVersions.current.set(agentConfigKey, configVersion);
+    if ((!settingsOpen && !configChanged) || !value) return;
     setSettledScopes((current) => {
       if (current.has(conversationScope)) return current;
       const next = new Set(current);
       next.add(conversationScope);
       return next;
     });
-  }, [settingsOpen, configVersion, value, conversationScope]);
+  }, [agentConfigKey, settingsOpen, configVersion, value, conversationScope]);
   useEffect(() => {
     if (!connected || settingsOpen) return;
     let disposed = false;

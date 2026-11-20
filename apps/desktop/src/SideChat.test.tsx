@@ -765,3 +765,128 @@ it.each(["ok", "side_chat_closed"] as const)(
     ).toHaveLength(1);
   },
 );
+
+it("falls back to legacy read-only permission on older SSH Servers that do not advertise inherit", async () => {
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  const legacyDraftId = "draft-legacy-server";
+  openSideChatTab(workspaceId, legacyDraftId, true);
+  drafts.update(sideDraftKey("legacy-ssh", parent.id, legacyDraftId), {
+    text: "run on old v1 server",
+  });
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method === "agent_permissions")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.method === "open_side_chat")
+      return {
+        kind: "session",
+        session: { ...child, id: action.side_id, permission_mode: null },
+      };
+    if (action.method === "send") return { kind: "accepted" };
+    if (action.method === "poll")
+      return {
+        kind: "events",
+        session: { ...child, id: legacyDraftId, permission_mode: null },
+        events: [],
+        has_more: false,
+      };
+    throw new Error("unexpected request");
+  });
+  render(
+    <ChatTab
+      parent={{ ...parent, permission_mode: null }}
+      workspaceId={workspaceId}
+      sideId={legacyDraftId}
+      hostId="legacy-ssh"
+      drafts={drafts}
+      active
+      connected
+      supported
+      supportsInheritPermission={false}
+    />,
+  );
+  const send = screen.getByRole<HTMLButtonElement>("button", {
+    name: "发送侧边聊天消息",
+  });
+  await waitFor(() => expect(send.disabled).toBe(false));
+  expect(
+    screen.getByRole("combobox", { name: "侧边聊天权限" }).textContent,
+  ).toContain("只读");
+  fireEvent.click(send);
+  await waitFor(() =>
+    expect(request).toHaveBeenCalledWith(
+      "legacy-ssh",
+      expect.objectContaining({
+        method: "send",
+        session_id: legacyDraftId,
+        text: "run on old v1 server",
+        permission_mode: null,
+      }),
+    ),
+  );
+});
+
+it("keeps ordinary completed writable side chats banner-free until undo conflict or unknown status requires confirmation", async () => {
+  const { requestSideWriteConfirmation } = await import("./sideWritePrompts");
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  let sideWritePending: string | undefined = "write-1";
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method === "confirm_side_writes_ended") {
+      sideWritePending = undefined;
+      return {
+        kind: "session",
+        session: { ...child, status: "completed", permission_mode: "inherit" },
+      };
+    }
+    if (action.method === "poll")
+      return {
+        kind: "events",
+        session: {
+          ...child,
+          status: "completed",
+          permission_mode: "inherit",
+          side_write_pending: sideWritePending,
+        },
+        events: [],
+        has_more: false,
+      };
+    return { kind: "agent_permissions", modes: [] };
+  });
+  render(
+    <SideChat
+      parent={parent}
+      workspaceId={workspaceId}
+      sideId={child.id}
+      hostId="local"
+      drafts={drafts}
+      active
+      connected
+      supported
+    />,
+  );
+  await waitFor(() =>
+    expect(request).toHaveBeenCalledWith(
+      "local",
+      expect.objectContaining({ method: "poll" }),
+    ),
+  );
+  expect(screen.queryByText(/侧边聊天后台写入待确认/)).toBeNull();
+
+  // When main-turn undo hits an unconfirmed side-write interval, the confirmation bar appears on demand.
+  requestSideWriteConfirmation("local", child.id);
+  fireEvent.click(
+    await screen.findByRole("button", { name: "核对后台写入已结束" }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "我已核对，确认结束" }));
+  await waitFor(() =>
+    expect(request).toHaveBeenCalledWith("local", {
+      method: "confirm_side_writes_ended",
+      session_id: child.id,
+      request_id: "write-1",
+    }),
+  );
+  await waitFor(() =>
+    expect(screen.queryByText(/侧边聊天后台写入待确认/)).toBeNull(),
+  );
+});

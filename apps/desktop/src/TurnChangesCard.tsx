@@ -8,19 +8,26 @@ import {
   Undo2,
 } from "lucide-react";
 import type { TurnChanges } from "./protocol";
+import {
+  parsePendingSideWriteSessionId,
+  requestSideWriteConfirmation,
+} from "./sideWritePrompts";
 import { useStatusIssues } from "./statusNotices";
 import { hasTurnChangeFiles } from "./transcript";
+import { openSideChatTab } from "./workspaceState";
 
 export function TurnChangesCard({
   changes: saved,
   open,
   hostId,
   sessionId,
+  workspaceId,
   canUndo,
 }: {
   changes: TurnChanges;
   hostId: string;
   sessionId: string;
+  workspaceId?: string;
   canUndo: boolean;
   open: (path?: string) => void;
 }) {
@@ -66,13 +73,20 @@ export function TurnChangesCard({
     setPageError("");
     setPageBusy(null);
   }, [scope]);
+  const pendingSideId = parsePendingSideWriteSessionId(error);
   useStatusIssues([
     {
       id: `turn-undo:${hostId}:${sessionId}:${saved.request_id}`,
       title: "撤销本轮修改未完成",
       error: changes.undo === "reverted" ? "" : error,
       pending: busy,
-      action: { label: "查看变更", run: () => open() },
+      action:
+        pendingSideId && workspaceId
+          ? {
+              label: "核对侧边聊天",
+              run: () => openSideChatTab(workspaceId, pendingSideId, false),
+            }
+          : { label: "查看变更", run: () => open() },
     },
   ]);
   const mounted = useRef(false);
@@ -169,7 +183,10 @@ export function TurnChangesCard({
         throw new Error("Server 不支持按轮次撤销，请更新后重试");
       if (mounted.current) setChanges(response.changes);
     } catch (cause) {
-      if (mounted.current) setError(message(cause));
+      const detail = message(cause);
+      const sideId = parsePendingSideWriteSessionId(detail);
+      if (sideId) requestSideWriteConfirmation(hostId, sideId);
+      if (mounted.current) setError(detail);
     } finally {
       if (mounted.current) setBusy(false);
     }
