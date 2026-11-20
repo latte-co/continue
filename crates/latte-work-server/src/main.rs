@@ -88,6 +88,17 @@ impl Service {
             .await?;
             return Ok(());
         }
+        if agent == "cursor" {
+            agents::cursor::validate_selection(
+                self.agent_binary(agent)?,
+                Some(path),
+                config.model.as_deref(),
+                config.effort,
+                &config.environment,
+            )
+            .await?;
+            return Ok(());
+        }
         config.traex_model = agents::traex::validate_selection(
             self.agent_binary(agent)?,
             Some(path),
@@ -986,8 +997,21 @@ async fn dispatch_admitted(
                         .contains(level)
             });
             config.permission_mode = session.permission_mode.clone();
-            s.resolve_native_model(&session.agent, &path, &mut config)
+            if session.agent == "cursor" {
+                // Open preserves historical model/native ID even after catalog removal.
+                // Send still validates current membership before accepting a new turn.
+                agents::cursor::validate_selection(
+                    binary,
+                    Some(&path),
+                    None,
+                    config.effort,
+                    &config.environment,
+                )
                 .await?;
+            } else {
+                s.resolve_native_model(&session.agent, &path, &mut config)
+                    .await?;
+            }
             runtime::open(
                 s.database.clone(),
                 s.runs.clone(),
@@ -1096,6 +1120,46 @@ async fn dispatch_admitted(
                 return Ok(Response::Accepted { duplicate: true });
             }
             let agent_id = db(&s.database, |d| Ok(d.session(&session_id)?.agent))?;
+            if agent_id == "cursor" && allow_queue {
+                // Edited queue data may differ from the original accepted payload.
+                // Reconcile that admission before the executed requests ledger or
+                // current model catalog; neither identity check sends native input.
+                let original = runtime::SendTurn {
+                    request_id: request_id.clone(),
+                    text: text.clone(),
+                    model: model.clone(),
+                    fingerprint: fingerprint.clone(),
+                    // This value is identity-only and is never submitted to Runtime.
+                    // Queue comparison consumes only effort and permission_mode.
+                    config: providers::LaunchConfig {
+                        environment: latte_work_protocol::AgentEnvironment::default(),
+                        provider: None,
+                        settings_dir: std::path::PathBuf::new(),
+                        model: None,
+                        traex_model: None,
+                        effort,
+                        permission_mode: permission_mode.clone(),
+                    },
+                };
+                if let Some(response) =
+                    db(&s.database, |d| d.queued_duplicate(&session_id, &original))?
+                {
+                    return Ok(response);
+                }
+                if db(&s.database, |d| {
+                    d.already_accepted(
+                        &session_id,
+                        &request_id,
+                        &text,
+                        model.as_deref(),
+                        effort,
+                        fingerprint.as_deref(),
+                        permission_mode.as_deref(),
+                    )
+                })? {
+                    return Ok(Response::Accepted { duplicate: true });
+                }
+            }
             let binary = s.agent_binary(&agent_id)?;
             let launch_config = {
                 let providers = s
@@ -2550,6 +2614,72 @@ mod send_admission_tests {
 #[cfg(test)]
 mod skill_admission_tests {
     use super::*;
+    #[tokio::test]
+    async fn cursor_native_model_route_never_probes_traex_or_a_real_agent() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let binary = dir.join("cursor-fixture");
+        std::fs::write(&binary, "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = models ] || exit 77\nprintf 'Available models\\nfixture-native - Native High 1M (default)\\n'\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let service = Service {
+            attachments: Arc::new(Mutex::new(attachments::Attachments::new(dir).unwrap())),
+            skills: Arc::new(skills::Skills::new(dir).unwrap()),
+            skill_worker: skill_worker::Worker::new(),
+            lifecycle: Arc::new(upgrade::Lifecycle::new().unwrap()),
+            terminals: Arc::new(Mutex::new(terminal::Terminals::default())),
+            database: Arc::new(Mutex::new(
+                store::Store::open(&dir.join("state.sqlite")).unwrap(),
+            )),
+            runs: Arc::new(Mutex::new(HashMap::new())),
+            title_refresh: Arc::new(Mutex::new(runtime::TitleRefreshCache::default())),
+            command_probes: Arc::new(tokio::sync::Semaphore::new(2)),
+            file_admission: Arc::new(tokio::sync::RwLock::new(())),
+            agents: vec![(
+                binary.to_string_lossy().into_owned(),
+                AgentInfo {
+                    id: "cursor".into(),
+                    name: "Fixture".into(),
+                    available: true,
+                    provider_protocols: vec![],
+                    detail: "fixture".into(),
+                },
+            )],
+            server_id: "fixture".into(),
+            providers: Arc::new(Mutex::new(providers::ProviderStore::open(dir).unwrap())),
+        };
+        let mut config = service
+            .providers
+            .lock()
+            .unwrap()
+            .turn_config(
+                "cursor",
+                Some("fixture-native"),
+                Some(latte_work_protocol::TurnProvider::Cli),
+            )
+            .unwrap();
+        service
+            .resolve_native_model("cursor", dir.to_str().unwrap(), &mut config)
+            .await
+            .unwrap();
+        assert!(config.traex_model.is_none());
+        config.model = Some("unreported-model".into());
+        assert!(
+            service
+                .resolve_native_model("cursor", dir.to_str().unwrap(), &mut config)
+                .await
+                .is_err()
+        );
+        config.model = None;
+        config.effort = Some(latte_work_protocol::Effort::High);
+        assert!(
+            service
+                .resolve_native_model("cursor", dir.to_str().unwrap(), &mut config)
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn busy_skill_worker_keeps_agent_probe_capacity_available() {
         let root = tempfile::tempdir().unwrap();

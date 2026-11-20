@@ -33,6 +33,21 @@ const CHUNK_WIRE: usize = latte_work_protocol::MAX_FRAME - 768 * 1024;
 const ROW_READ_BYTES: i64 = 2 * 1024 * 1024;
 const PRESENTATION_MARKER: &str = "…（内容过大，已截断）";
 
+/// Exact Command::spawn failures proving that no native process started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfirmedNotStarted {
+    Enoent,
+    E2big,
+}
+impl ConfirmedNotStarted {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enoent => "enoent",
+            Self::E2big => "e2big",
+        }
+    }
+}
+
 /// The streamable payload of an event plus how a client should reassemble it:
 /// `Text` chunks concatenate into displayable prose, `Json` must be parsed
 /// once fully received.
@@ -187,6 +202,12 @@ impl Store {
         }
         if !columns.iter().any(|name| name == "permission_mode") {
             migration.execute("ALTER TABLE requests ADD COLUMN permission_mode TEXT", [])?;
+        }
+        if !columns.iter().any(|name| name == "confirmed_not_started") {
+            migration.execute(
+                "ALTER TABLE requests ADD COLUMN confirmed_not_started TEXT",
+                [],
+            )?;
         }
         if !columns.iter().any(|name| name == "side_write_start") {
             migration.execute(
@@ -1777,6 +1798,40 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    /// Durable admission evidence survives stop, close and daemon restart.
+    #[cfg(test)]
+    pub fn has_admitted_request(&self, id: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM requests WHERE session_id=?1)",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
+    pub fn record_confirmed_not_started(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        evidence: ConfirmedNotStarted,
+    ) -> Result<()> {
+        let changed = self.db.execute(
+            "UPDATE requests SET confirmed_not_started=?3 WHERE session_id=?1 AND id=?2
+             AND confirmed_not_started IS NULL",
+            params![session_id, request_id, evidence.as_str()],
+        )?;
+        if changed != 1 {
+            bail!("Agent 未启动证据未能保存到当前请求；不能确认安全重试");
+        }
+        Ok(())
+    }
+    /// NULL and unrecognized evidence remain conservative, including old rows.
+    pub fn has_possibly_started_request(&self, id: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM requests WHERE session_id=?1
+             AND confirmed_not_started IS NOT 'enoent' AND confirmed_not_started IS NOT 'e2big')",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
     pub fn first_request(&self, id: &str) -> Result<bool> {
         Ok(self.db.query_row(
             "SELECT COUNT(*) FROM requests WHERE session_id=?1",
@@ -2498,6 +2553,83 @@ fn index_source(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn confirmed_not_started_is_request_bound_durable_and_unknown_is_conservative() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let mut store = super::Store::open(&path).unwrap();
+        let project = store.add_project(directory.path()).unwrap();
+        let session = store
+            .create_session(project.id.clone(), "cursor".into())
+            .unwrap();
+        let other = store.create_session(project.id, "cursor".into()).unwrap();
+        store
+            .begin(&session.id, "failed-spawn", "hello", None, None, None, None)
+            .unwrap();
+        assert!(store.has_possibly_started_request(&session.id).unwrap());
+        assert!(
+            store
+                .record_confirmed_not_started(
+                    &other.id,
+                    "failed-spawn",
+                    super::ConfirmedNotStarted::Enoent
+                )
+                .is_err()
+        );
+        store.db.execute_batch("PRAGMA query_only=ON").unwrap();
+        assert!(
+            store
+                .record_confirmed_not_started(
+                    &session.id,
+                    "failed-spawn",
+                    super::ConfirmedNotStarted::Enoent
+                )
+                .is_err()
+        );
+        assert!(store.has_possibly_started_request(&session.id).unwrap());
+        store.db.execute_batch("PRAGMA query_only=OFF").unwrap();
+        store
+            .record_confirmed_not_started(
+                &session.id,
+                "failed-spawn",
+                super::ConfirmedNotStarted::Enoent,
+            )
+            .unwrap();
+        assert!(!store.has_possibly_started_request(&session.id).unwrap());
+        assert!(store.has_admitted_request(&session.id).unwrap());
+        drop(store);
+        let store = super::Store::open(&path).unwrap();
+        assert!(!store.has_possibly_started_request(&session.id).unwrap());
+        assert!(
+            store
+                .already_accepted(&session.id, "failed-spawn", "hello", None, None, None, None)
+                .unwrap()
+        );
+        store
+            .db
+            .execute(
+                "INSERT INTO requests(id,session_id,text) VALUES ('legacy',?1,'old')",
+                [&session.id],
+            )
+            .unwrap();
+        assert!(store.has_possibly_started_request(&session.id).unwrap());
+        store
+            .db
+            .execute(
+                "UPDATE requests SET confirmed_not_started='future-unrecognized' WHERE id='legacy'",
+                [],
+            )
+            .unwrap();
+        assert!(store.has_possibly_started_request(&session.id).unwrap());
+        store
+            .db
+            .execute(
+                "UPDATE requests SET confirmed_not_started='e2big' WHERE id='legacy'",
+                [],
+            )
+            .unwrap();
+        assert!(!store.has_possibly_started_request(&session.id).unwrap());
+    }
     #[test]
     fn admission_returns_source_user_sequence_without_replaying_duplicates() {
         let directory = tempfile::tempdir().unwrap();

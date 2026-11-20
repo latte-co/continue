@@ -90,6 +90,75 @@ it("groups a declared Provider 1M mode as 默认 / 1M, restores it, and drops it
     expect.objectContaining({ ready: false }),
   );
 });
+it("uses Cursor native model metadata without guessing effort, context, aliases or Provider defaults", async () => {
+  mocks.request.mockResolvedValue({
+    kind: "models",
+    models: ["cursor-native-opus"],
+    provider: null,
+    default_model: null,
+    effort_levels: [],
+    model_labels: { "cursor-native-opus": "Native Cursor Model" },
+  });
+  const invalid = vi.fn(),
+    change = vi.fn(),
+    effortChange = vi.fn(),
+    ready = vi.fn();
+  const props = {
+    hostId: "cursor-remote",
+    projectId: "p",
+    agent: "cursor",
+    connected: true,
+    settingsOpen: false,
+    value: "cursor-native-opus",
+    onChange: change,
+    effort: "high" as const,
+    onEffortChange: effortChange,
+    onEffortInvalid: invalid,
+    disabled: false,
+    onReadyChange: ready,
+  };
+  const view = render(<ModelPicker {...props} />);
+  await act(async () => {});
+  expect(mocks.request).toHaveBeenCalledWith("cursor-remote", {
+    method: "models",
+    agent: "cursor",
+    model: "cursor-native-opus",
+    project_id: "p",
+  });
+  const selected = mocks.selector.mock.calls.at(-1)![0] as {
+    levels: string[];
+    options: {
+      value: string;
+      label: string;
+      description?: string;
+      contextWindow?: number;
+      variants?: unknown;
+    }[];
+  };
+  expect(selected.levels).toEqual([]);
+  expect(selected.options).toEqual([
+    expect.objectContaining({ value: "", label: "default" }),
+    expect.objectContaining({
+      value: "cursor-native-opus",
+      label: "Native Cursor Model",
+      description: undefined,
+      contextWindow: undefined,
+      variants: undefined,
+    }),
+  ]);
+  expect(invalid).toHaveBeenCalled();
+  expect(effortChange).not.toHaveBeenCalled();
+  expect(change).not.toHaveBeenCalled();
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+  view.rerender(<ModelPicker {...props} effort={null} />);
+  await act(async () => {});
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+});
+
 it("presents Traex native names and sends the unchanged native ID when selected", async () => {
   mocks.request.mockResolvedValue({
     kind: "models",
