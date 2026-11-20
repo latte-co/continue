@@ -24,6 +24,7 @@ struct Ownership {
     claim_id: uuid::Uuid,
     version: uuid::Uuid,
     pending_admission: bool,
+    closing: bool,
 }
 impl Ownership {
     fn new(owner_id: String, pending_admission: bool) -> Self {
@@ -32,6 +33,29 @@ impl Ownership {
             claim_id: uuid::Uuid::new_v4(),
             version: uuid::Uuid::new_v4(),
             pending_admission,
+            closing: false,
+        }
+    }
+}
+struct OwnedClose<'a> {
+    lifecycle: &'a Lifecycle,
+    resource: Resource,
+    confirmed: bool,
+}
+impl OwnedClose<'_> {
+    fn confirm(mut self) {
+        self.confirmed = true;
+    }
+}
+
+impl Drop for OwnedClose<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut owners) = self.lifecycle.owners.lock() {
+            if self.confirmed {
+                owners.remove(&self.resource);
+            } else if let Some(owner) = owners.get_mut(&self.resource) {
+                owner.closing = false;
+            }
         }
     }
 }
@@ -76,16 +100,19 @@ impl Lifecycle {
         resource: &Resource,
         claims: &ConnectionClaims,
     ) -> Result<Option<uuid::Uuid>> {
+        let mut owners = self
+            .owners
+            .lock()
+            .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?;
+        if owners.get(resource).is_some_and(|owner| owner.closing) {
+            bail!("此会话或终端正在关闭，请稍后重试；请求未执行");
+        }
         let Some(claim_id) = claims.claims.get(resource) else {
             if claims.requires_claim {
                 bail!("资源认领已变化，请重新认领后重试；请求未执行");
             }
             return Ok(None);
         };
-        let mut owners = self
-            .owners
-            .lock()
-            .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?;
         let ownership = owners
             .get_mut(resource)
             .filter(|owner| &owner.claim_id == claim_id)
@@ -141,7 +168,8 @@ impl Lifecycle {
             .lock()
             .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?;
         if owners.get(resource).is_some_and(|ownership| {
-            Some(ownership.version) == version
+            !ownership.closing
+                && Some(ownership.version) == version
                 && (!ownership.pending_admission
                     || claims.claims.get(resource) == Some(&ownership.claim_id))
         }) {
@@ -201,6 +229,7 @@ async fn handle_inner(
                 .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?;
             claims.prune(&owners);
             claims.check_capacity(&resources)?;
+            check_not_closing(&owners, &resources)?;
             let new = resources
                 .iter()
                 .filter(|r| !owners.contains_key(*r))
@@ -244,6 +273,7 @@ async fn handle_inner(
                 .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?;
             claims.prune(&owners);
             claims.check_capacity(&resources)?;
+            check_not_closing(&owners, &resources)?;
             let mut adopted = Vec::new();
             for resource in resources {
                 let live = match &resource {
@@ -278,59 +308,7 @@ async fn handle_inner(
             if server_id != service.server_id {
                 return Ok(Response::ResourcesClosed);
             }
-            let _admission =
-                tokio::time::timeout(Duration::from_secs(2), service.lifecycle.draining.write())
-                    .await
-                    .context("后台正在处理请求")?;
-            for resource in resources {
-                let owned = service
-                    .lifecycle
-                    .owners
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?
-                    .get(&resource)
-                    .is_some_and(|ownership| ownership.owner_id == owner_id);
-                if !owned {
-                    continue;
-                }
-                match &resource {
-                    Resource::AgentSession(id) => {
-                        // Missing actors also cover uncertain native closes. A
-                        // durable unknown close must retain the owner's quit intent.
-                        db(&service.database, |d| {
-                            if let Some(reason) = d.unconfirmed_agent_close(id)? {
-                                bail!(reason);
-                            }
-                            Ok(())
-                        })?;
-                        let exists = service
-                            .runs
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("执行状态锁异常"))?
-                            .contains_key(id);
-                        if exists
-                            || !crate::agents::codex_jobs::registry()
-                                .scope_confirmed(&crate::agents::codex_jobs::JobScope::session(id))
-                        {
-                            crate::runtime::close(&service.database, &service.runs, id, false)
-                                .await?;
-                        }
-                    }
-                    Resource::Terminal(id) => {
-                        service
-                            .terminals
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("终端锁异常"))?
-                            .close(id);
-                    }
-                }
-                service
-                    .lifecycle
-                    .owners
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?
-                    .remove(&resource);
-            }
+            close_owned(service, &owner_id, resources).await?;
             Ok(Response::ResourcesClosed)
         }
         Request::ServerStatus => Ok(Response::ServerStatus {
@@ -357,9 +335,17 @@ async fn handle_inner(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("终端锁异常"))?
                 .is_empty();
+            let closing = service
+                .lifecycle
+                .owners
+                .lock()
+                .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?
+                .values()
+                .any(|owner| owner.closing);
             let auxiliary = !crate::agents::codex_jobs::registry().inventory().is_empty();
             if running
                 || terminals
+                || closing
                 || auxiliary
                 || db(&service.database, |d| d.has_active_sessions())?
             {
@@ -371,6 +357,105 @@ async fn handle_inner(
             Ok(Response::UpgradeReady)
         }
     }
+}
+fn check_not_closing(
+    owners: &std::collections::HashMap<Resource, Ownership>,
+    resources: &[Resource],
+) -> Result<()> {
+    if resources
+        .iter()
+        .any(|resource| owners.get(resource).is_some_and(|owner| owner.closing))
+    {
+        bail!("此会话或终端正在关闭，请稍后重试；请求未执行");
+    }
+    Ok(())
+}
+
+async fn close_owned(service: &Service, owner_id: &str, resources: Vec<Resource>) -> Result<()> {
+    let mut retry = false;
+    let reservations = {
+        // Wait out admitted requests, then fence only the resources being
+        // closed. Slow native shutdown must leave Hello and other chats usable.
+        let admission =
+            tokio::time::timeout(Duration::from_secs(2), service.lifecycle.draining.write())
+                .await
+                .context("后台正在处理请求")?;
+        if *admission {
+            bail!("后台正在停止，请重新连接");
+        }
+        let mut owners = service
+            .lifecycle
+            .owners
+            .lock()
+            .map_err(|_| anyhow::anyhow!("资源归属锁异常"))?;
+        let mut seen = std::collections::HashSet::new();
+        let mut reservations = Vec::new();
+        for resource in resources {
+            if !seen.insert(resource.clone()) {
+                continue;
+            }
+            if let Some(owner) = owners
+                .get_mut(&resource)
+                .filter(|owner| owner.owner_id == owner_id)
+            {
+                if owner.closing {
+                    retry = true;
+                    continue;
+                }
+                owner.closing = true;
+                reservations.push(OwnedClose {
+                    lifecycle: &service.lifecycle,
+                    resource,
+                    confirmed: false,
+                });
+            }
+        }
+        reservations
+    };
+    let results =
+        futures_util::future::join_all(reservations.into_iter().map(|close| async move {
+            match &close.resource {
+                Resource::AgentSession(id) => {
+                    let _admission = service.file_admission.read().await;
+                    let exists = service
+                        .runs
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("执行状态锁异常"))?
+                        .contains_key(id);
+                    if exists
+                        || !crate::agents::codex_jobs::registry()
+                            .scope_confirmed(&crate::agents::codex_jobs::JobScope::session(id))
+                    {
+                        crate::runtime::close(&service.database, &service.runs, id, false).await?;
+                    } else {
+                        // An actor can be gone while its native close is still unknown.
+                        db(&service.database, |store| {
+                            if let Some(reason) = store.unconfirmed_agent_close(id)? {
+                                bail!(reason);
+                            }
+                            Ok(())
+                        })?;
+                    }
+                }
+                Resource::Terminal(id) => {
+                    service
+                        .terminals
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("终端锁异常"))?
+                        .close(id);
+                }
+            }
+            close.confirm();
+            Ok::<_, anyhow::Error>(())
+        }))
+        .await;
+    for result in results {
+        result?;
+    }
+    if retry {
+        bail!("部分资源仍在关闭，请稍后重试");
+    }
+    Ok(())
 }
 fn validate_resources(owner: &str, resources: &[Resource]) -> Result<()> {
     if owner.is_empty()
@@ -437,24 +522,36 @@ async fn connect_local_inner(dir: &Path) -> Result<UnixStream> {
         }
     }
     let build_id = executable_id()?;
-    match server_status(dir)
+    let (server_id, accepted_build) = match server_status(dir)
         .await
         .context("无法确认本机后台版本，请稍后重新连接；后台未被停止")?
     {
         Response::ServerStatus {
+            server_id,
             build_id: current,
             draining: false,
-            ..
-        } if current == build_id => {}
+        } if current == build_id => (server_id, current),
         Response::ServerStatus {
             server_id,
+            build_id: current,
             draining,
-            ..
         } => {
             if !draining {
                 let stream = UnixStream::connect(dir.join("control.sock")).await?;
-                match exchange(stream, &Request::PrepareUpgrade { server_id }).await? {
+                match exchange(
+                    stream,
+                    &Request::PrepareUpgrade {
+                        server_id: server_id.clone(),
+                    },
+                )
+                .await?
+                {
                     Response::UpgradeReady => {}
+                    Response::Error { code, .. } if code == "upgrade_blocked" => {
+                        // Keep this exact live instance available. The client still
+                        // performs the regular versioned Hello before using it.
+                        return connect_verified(dir, &server_id, &current).await;
+                    }
                     Response::Error { message, .. } => bail!("{message}"),
                     _ => bail!("后台升级响应不兼容，请重新连接"),
                 }
@@ -470,15 +567,19 @@ async fn connect_local_inner(dir: &Path) -> Result<UnixStream> {
             let stream = connect_socket(dir).await?;
             match exchange(stream, &Request::ServerStatus).await? {
                 Response::ServerStatus {
+                    server_id,
                     build_id: current,
                     draining: false,
-                    ..
-                } if current == build_id => {}
+                } if current == build_id => (server_id, current),
                 _ => bail!("另一个版本的后台已启动，请关闭其他版本应用后重新连接"),
             }
         }
         _ => bail!("{LEGACY}"),
-    }
+    };
+    connect_verified(dir, &server_id, &accepted_build).await
+}
+
+async fn connect_verified(dir: &Path, server_id: &str, build_id: &str) -> Result<UnixStream> {
     // Return this exact, verified instance's socket. Recheck after reconnect because a
     // concurrent external shutdown/start may otherwise attach us to a different build.
     let mut stream = UnixStream::connect(dir.join("control.sock")).await?;
@@ -500,10 +601,10 @@ async fn connect_local_inner(dir: &Path) -> Result<UnixStream> {
     }
     match serde_json::from_slice::<Response>(&response)? {
         Response::ServerStatus {
+            server_id: instance,
             build_id: current,
             draining: false,
-            ..
-        } if current == build_id => Ok(stream),
+        } if instance == server_id && current == build_id => Ok(stream),
         _ => bail!("后台实例已变化，请重新连接"),
     }
 }

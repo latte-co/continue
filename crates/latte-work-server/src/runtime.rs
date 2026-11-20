@@ -2016,27 +2016,41 @@ impl Process {
                 .await
                 .unwrap_or(false);
         };
-        if let Ok(Some(bytes)) = self.adapter.close_request()
-            && let Some(input) = transport.input.as_mut()
-        {
-            let (adapter, output) = (&mut self.adapter, &mut transport.output);
-            let _ = tokio::time::timeout(Duration::from_millis(750), async move {
-                write(input, &bytes).await?;
-                for _ in 0..64 {
-                    let Some(Ok(line)) = output.next().await else {
-                        break;
-                    };
-                    if adapter.close_ack(&line) {
-                        break;
+        let requires_drain = self.adapter.requires_close_drain();
+        let background_confirmed = if requires_drain {
+            matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    transport.drain_native_close(self.adapter.as_mut()),
+                )
+                .await,
+                Ok(Ok(true))
+            )
+        } else {
+            if let Ok(Some(bytes)) = self.adapter.close_request()
+                && let Some(input) = transport.input.as_mut()
+            {
+                let (adapter, output) = (&mut self.adapter, &mut transport.output);
+                let _ = tokio::time::timeout(Duration::from_millis(750), async move {
+                    write(input, &bytes).await?;
+                    for _ in 0..64 {
+                        let Some(Ok(line)) = output.next().await else {
+                            break;
+                        };
+                        if adapter.close_ack(&line) {
+                            break;
+                        }
                     }
-                }
-                Ok::<_, anyhow::Error>(())
-            })
-            .await;
-        }
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+            }
+            true
+        };
         let confirmed = transport
             .terminate_with_auxiliary(
                 self.adapter.transport_lifetime() == agents::TransportLifetime::PerTurn,
+                requires_drain && background_confirmed,
                 deadline,
                 auxiliary,
             )
@@ -2045,47 +2059,51 @@ impl Process {
             self.transport = None;
             self.adapter.transport_closed();
         }
-        confirmed
+        confirmed && background_confirmed
     }
 }
 async fn close_group(
     group: &mut Group,
     deadline: tokio::time::Instant,
+    expect_clean_exit: bool,
     auxiliary: impl std::future::Future<Output = bool>,
 ) -> bool {
     let pid = Pid::from_raw(group.pid);
-    if group.child.id().is_some() {
+    let owned = group.child.id().is_some();
+    if owned && !expect_clean_exit {
         let _ = killpg(pid, Signal::SIGTERM);
     }
-    // Keep the native child owned while whole-session auxiliary cleanup suspends.
-    // If already reaped, no later signal may use this numeric PGID.
+    // Keep the native PID owned while auxiliary cleanup may suspend. Waiting
+    // after reap would let Group::drop signal a reused numeric process group.
     let auxiliary_reaped = tokio::time::timeout_at(deadline, auxiliary)
         .await
         .unwrap_or(false);
-    let owned = group.child.id().is_some();
-    // Give TERM handlers a bounded chance to finish native cleanup. Waiting on
-    // auxiliary owners already happened while the direct child was still owned.
-    let reaped = !owned
-        || matches!(
-            tokio::time::timeout_at(
-                deadline.min(tokio::time::Instant::now() + Duration::from_secs(2)),
-                group.child.wait(),
-            )
-            .await,
-            Ok(Ok(_))
-        );
-    if owned {
-        // This synchronous reap boundary also retires inherited writers. There
-        // is no auxiliary await between reap and this final group signal, and
-        // an already-reaped child on entry never authorizes another signal.
-        let _ = killpg(pid, Signal::SIGKILL);
+    // Per-turn transports can already have reaped their native leader. Never
+    // signal that numeric process group after an auxiliary await.
+    if !owned {
+        return auxiliary_reaped && !expect_clean_exit;
     }
-    let native_reaped = reaped
-        || matches!(
-            tokio::time::timeout_at(deadline, group.child.wait()).await,
-            Ok(Ok(_))
-        );
-    native_reaped && auxiliary_reaped
+    let exit = tokio::time::timeout_at(
+        deadline.min(tokio::time::Instant::now() + Duration::from_secs(2)),
+        group.child.wait(),
+    )
+    .await;
+    let group_signaled = matches!(killpg(pid, Signal::SIGKILL), Ok(()) | Err(Errno::ESRCH));
+    let native_confirmed = match exit {
+        Ok(Ok(status)) => !expect_clean_exit || status.success(),
+        _ => {
+            let reaped = matches!(
+                tokio::time::timeout_at(
+                    deadline.min(tokio::time::Instant::now() + Duration::from_secs(2)),
+                    group.child.wait(),
+                )
+                .await,
+                Ok(Ok(_))
+            );
+            reaped && !expect_clean_exit
+        }
+    };
+    native_confirmed && group_signaled && auxiliary_reaped
 }
 fn finish_native_close(database: &Database, id: &str, confirmed: bool) -> Result<()> {
     if !confirmed {
@@ -3237,37 +3255,44 @@ mod tests {
 
     #[tokio::test]
     async fn auxiliary_close_barrier_runs_before_native_pid_is_reaped() {
-        let child = tokio::process::Command::new("/bin/sh")
-            .args(["-c", "exec sleep 60"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pid = i32::try_from(child.id().unwrap()).unwrap();
-        let mut group = Group { child, pid };
-        let owned_during_barrier = Arc::new(AtomicBool::new(false));
-        let observed = owned_during_barrier.clone();
-        let confirmed = close_group(
-            &mut group,
-            tokio::time::Instant::now() + Duration::from_secs(5),
-            async move {
-                observed.store(
-                    nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok(),
-                    Ordering::SeqCst,
-                );
-                true
-            },
-        )
-        .await;
-        assert!(confirmed);
-        assert!(
-            owned_during_barrier.load(Ordering::SeqCst),
-            "auxiliary await must not retain a reusable native PID"
-        );
-        assert!(group.child.id().is_none());
+        for (command, expect_clean_exit, expected) in [
+            ("exec sleep 60", false, true),
+            ("exit 0", true, true),
+            ("exit 17", true, false),
+        ] {
+            let child = tokio::process::Command::new("/bin/sh")
+                .args(["-c", command])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = i32::try_from(child.id().unwrap()).unwrap();
+            let mut group = Group { child, pid };
+            let owned_during_barrier = Arc::new(AtomicBool::new(false));
+            let observed = owned_during_barrier.clone();
+            let confirmed = close_group(
+                &mut group,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                expect_clean_exit,
+                async move {
+                    observed.store(
+                        nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok(),
+                        Ordering::SeqCst,
+                    );
+                    true
+                },
+            )
+            .await;
+            assert_eq!(confirmed, expected);
+            assert!(
+                owned_during_barrier.load(Ordering::SeqCst),
+                "auxiliary await must not retain a reusable native PID"
+            );
+            assert!(group.child.id().is_none());
+        }
     }
 
     #[tokio::test(start_paused = true)]

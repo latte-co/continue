@@ -166,10 +166,30 @@ impl Transport {
         }
         Ok(format!("Agent进程退出 ({status})：{stderr}"))
     }
+    pub async fn drain_native_close(
+        &mut self,
+        adapter: &mut dyn agents::AgentAdapter,
+    ) -> Result<bool> {
+        let request = adapter.close_request()?.context("缺少原生关闭请求")?;
+        let input = self.input.as_mut().context("缺少原生会话输入")?;
+        write(input, &request).await?;
+        let mut acknowledged = false;
+        for _ in 0..1024 {
+            let Some(line) = self.output.next().await else {
+                // A detached shell may have started before its first task event.
+                return Ok(acknowledged && adapter.background_close_complete());
+            };
+            let line = line?;
+            acknowledged |= adapter.close_ack(&line);
+            adapter.observe_close_output(&line)?;
+        }
+        bail!("原生会话关闭输出超出限制")
+    }
     /// Physical retirement does not cancel or await auxiliary session owners.
     pub async fn terminate(&mut self, confirm_group: bool) -> bool {
         self.terminate_with_auxiliary(
             confirm_group,
+            false,
             tokio::time::Instant::now() + REAP_LIMIT * 2,
             std::future::ready(true),
         )
@@ -178,6 +198,7 @@ impl Transport {
     pub async fn terminate_with_auxiliary(
         &mut self,
         confirm_group: bool,
+        expect_clean_exit: bool,
         deadline: tokio::time::Instant,
         auxiliary: impl std::future::Future<Output = bool>,
     ) -> bool {
@@ -185,7 +206,7 @@ impl Transport {
         // close_group signals only while the direct child is still owned, and
         // waits for auxiliary cleanup before reaping it. Already reaped PerTurn
         // children must never be signalled after that wait.
-        let confirmed = close_group(&mut self.group, deadline, auxiliary).await;
+        let confirmed = close_group(&mut self.group, deadline, expect_clean_exit, auxiliary).await;
         if live {
             self.retirement_signalled = true;
         }

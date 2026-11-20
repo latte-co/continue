@@ -196,12 +196,23 @@ pub trait AgentAdapter: Send {
     fn metadata_ready(&self) -> bool {
         true
     }
-    /// Optional JSON-RPC detach request for an owned process. Shutdown stays bounded.
+    /// Optional native shutdown or detach request. Shutdown stays bounded.
     fn close_request(&self) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
     fn close_ack(&self, _line: &str) -> bool {
         false
+    }
+    /// Require the native shutdown acknowledgement, drained stdout and the
+    /// child's exit to confirm cleanup of work outside the process group.
+    fn requires_close_drain(&self) -> bool {
+        false
+    }
+    fn observe_close_output(&mut self, _line: &str) -> Result<()> {
+        Ok(())
+    }
+    fn background_close_complete(&self) -> bool {
+        true
     }
     /// Whether this adapter can cancel a pending prompt before startup completes.
     fn can_interrupt_startup(&self) -> bool {

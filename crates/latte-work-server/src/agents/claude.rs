@@ -417,6 +417,42 @@ impl AgentAdapter for Claude {
     fn has_background_work(&self) -> bool {
         !self.tasks.is_empty() || !self.foreground_agents.is_empty()
     }
+    fn close_request(&self) -> Result<Option<Vec<u8>>> {
+        let mut request = serde_json::to_vec(&json!({
+            "type": "control_request",
+            "request_id": "latte-end-session",
+            "request": { "subtype": "end_session", "reason": "client_quit" },
+        }))?;
+        request.push(b'\n');
+        Ok(Some(request))
+    }
+    fn close_ack(&self, line: &str) -> bool {
+        serde_json::from_str::<Value>(line).is_ok_and(|m| {
+            m["type"] == "control_response"
+                && m["response"]["request_id"] == "latte-end-session"
+                && m["response"]["subtype"] == "success"
+        })
+    }
+    fn requires_close_drain(&self) -> bool {
+        true
+    }
+    fn background_close_complete(&self) -> bool {
+        self.tasks.is_empty()
+    }
+    fn observe_close_output(&mut self, line: &str) -> Result<()> {
+        let message: Value = serde_json::from_str(line)?;
+        // Only task lifecycle frames can settle a task. A control receipt
+        // acknowledges the request, and unrelated output cannot restart a turn.
+        if message["type"] == "system"
+            && matches!(
+                message["subtype"].as_str(),
+                Some("task_started" | "task_updated" | "task_notification")
+            )
+        {
+            self.decode(message)?;
+        }
+        Ok(())
+    }
     fn knows_subagent(&self, native_id: &str) -> bool {
         self.agent_tasks.contains_key(native_id)
     }

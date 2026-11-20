@@ -101,7 +101,17 @@ jobs:
         with:
           toolchain: 1.97.0
       - uses: Swatinem/rust-cache@v2
+      - name: Check out the v1 Server that stops a close batch at its first error
+        uses: actions/checkout@v4
+        with:
+          ref: 899411ed927fbd5779dbaab563d4605acf452a9a
+          path: .legacy-server
+          persist-credentials: false
+      - name: Build the legacy daemon separately from the client under test
+        run: cargo build --manifest-path .legacy-server/Cargo.toml -p latte-work-server --locked --target-dir "$RUNNER_TEMP/legacy-target"
       - run: cargo test -p latte-work-server --test e2e --locked -- --test-threads=1
+        env:
+          LATTE_WORK_TEST_LEGACY_SERVER: ${{ runner.temp }}/legacy-target/debug/latte-work-server
 
   ssh-skills:
     name: Skills over real OpenSSH
