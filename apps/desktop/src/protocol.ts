@@ -60,17 +60,9 @@ export type Session = {
    */
   agent_session_busy?: boolean;
   /**
-   * Latest side write operation (turn or native launch) awaiting confirmation.
-   */
-  side_write_pending?: string;
-  /**
    * ID of the native close which still needs host-side verification.
    */
   agent_close_pending?: string;
-  /**
-   * Close acknowledgement carried only on a side-write confirmation response.
-   */
-  agent_closed_by_confirmation?: boolean;
 };
 export type RecentCursor = { updated_at: number; id: string };
 export type RecentSession = { session: Session; updated_at: number };
@@ -481,14 +473,6 @@ export type Request =
        */
       only_if_idle?: boolean;
     }
-  | {
-      method: "confirm_side_writes_ended";
-      session_id: string;
-      /**
-       * Latest side_write_pending operation ID observed during verification.
-       */
-      request_id: string;
-    }
   | { method: "confirm_agent_closed"; session_id: string; close_id: string }
   | {
       method: "send_queued";
@@ -691,7 +675,6 @@ export type Request =
       section: ChangeSection;
     };
 export type Response =
-  | { kind: "side_chat_closed" }
   | {
       kind: "recent_sessions";
       sessions: Array<RecentSession>;

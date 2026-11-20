@@ -8,7 +8,6 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use latte_work_protocol::{EventKind, Response, Session, Status};
 use nix::{
-    errno::Errno,
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
@@ -33,7 +32,6 @@ pub type Database = Arc<Mutex<Store>>;
 pub type Runs = Arc<Mutex<HashMap<String, Run>>>;
 const TURN_LIMIT: Duration = Duration::from_secs(24 * 3600);
 const CLOSE_PENDING: &str = "原生会话的关闭状态待确认，请核对主机上的 Agent 和后台任务。";
-const SIDE_CLOSE_PENDING: &str = "本地侧边聊天已关闭，后台写入待确认。";
 const RECONFIGURE_BLOCKED: &str = "当前会话仍有后台任务或待确认状态，无法更换模型、Provider、权限或思考强度；请沿用当前配置发送，消息未发送";
 
 #[derive(Debug)]
@@ -370,7 +368,6 @@ pub async fn rename_title(
                 &path,
                 config,
                 Arc::new(AtomicBool::new(false)),
-                None,
             )
             .await?;
             let result = tokio::time::timeout(Duration::from_secs(8), async {
@@ -1225,7 +1222,6 @@ impl Process {
         path: &str,
         config: LaunchConfig,
         session_open: Arc<AtomicBool>,
-        request_id: Option<&str>,
     ) -> Result<Self> {
         // Gate the launch before any native helper runs: an unconfirmed
         // close must block the export probe exactly as it blocks the agent.
@@ -1257,10 +1253,8 @@ impl Process {
             &agent_cwd,
             config,
             session_open,
-            request_id,
         )
     }
-    #[allow(clippy::too_many_arguments)]
     fn spawn(
         database: &Database,
         binary: &str,
@@ -1269,7 +1263,6 @@ impl Process {
         agent_cwd: &str,
         config: LaunchConfig,
         session_open: Arc<AtomicBool>,
-        request_id: Option<&str>,
     ) -> Result<Self> {
         db(database, |s| {
             if let Some(reason) = s.unconfirmed_agent_close(&session.id)? {
@@ -1301,35 +1294,12 @@ impl Process {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .process_group(0);
-        // A launch may fail after starting the native process. Record the
-        // possible write before calling spawn, after all launch validation.
-        let write_id = db(database, |s| {
-            if let Some(id) = request_id {
-                s.start_side_write(id)?;
-                Ok(Some(id.to_owned()))
-            } else {
-                s.start_side_launch_write(&session.id)
-            }
+        let child = command.spawn().with_context(|| {
+            format!(
+                "无法启动 Agent {}，请检查此 Host 的 CLI 安装和登录状态",
+                session.agent
+            )
         })?;
-        let child = command
-            .spawn()
-            .or_else(|error| -> Result<Child> {
-                // On Unix, ENOENT from spawn is a launch failure (executable,
-                // interpreter or cwd missing). Other errors can come from Tokio
-                // setting up child I/O or the reaper after a successful launch.
-                if error.raw_os_error() == Some(Errno::ENOENT as i32)
-                    && let Some(id) = write_id.as_deref()
-                {
-                    db(database, |s| s.mark_side_write_not_started(id))?;
-                }
-                Err(error.into())
-            })
-            .with_context(|| {
-                format!(
-                    "无法启动 Agent {}，请检查此 Host 的 CLI 安装和登录状态",
-                    session.agent
-                )
-            })?;
         let pid = child.id().context("Agent PID missing")? as i32;
         let mut group = Group { child, pid };
         let input = group.child.stdin.take().context("Agent stdin missing")?;
@@ -1838,9 +1808,7 @@ async fn accept_turn(
                 db(database, |s| s.save_baseline(&session.id, &task_baseline))?;
             }
         }
-        if process.is_some() {
-            db(database, |s| s.start_side_write(&turn.request_id))?;
-        } else {
+        if process.is_none() {
             let current = db(database, |s| s.session(&session.id))?;
             *process = Some(
                 Process::launch(
@@ -1850,7 +1818,6 @@ async fn accept_turn(
                     path,
                     turn.config,
                     session_open.clone(),
-                    Some(&turn.request_id),
                 )
                 .await?,
             );
@@ -2053,7 +2020,6 @@ async fn actor(
                                 &path,
                                 config,
                                 session_open.clone(),
-                                None,
                             )
                             .await?;
                             let actions = p.adapter.advance(Input::Open)?;
@@ -2292,12 +2258,9 @@ async fn actor(
                     }
                     // Preserve completed history when merely closing an idle runtime.
                     let result = db(&database, |s| {
-                        let writes_pending = s.pending_side_write(&session.id)?.is_some();
                         let (status, subagent_status, message) = if close_unconfirmed {
                             (Status::Unknown, latte_work_protocol::SubagentStatus::Unknown,
                              CLOSE_PENDING)
-                        } else if writes_pending {
-                            (Status::Unknown, latte_work_protocol::SubagentStatus::Unknown, SIDE_CLOSE_PENDING)
                         } else {
                             (Status::Stopped, latte_work_protocol::SubagentStatus::Stopped,
                              "已停止；已执行的文件改动不会撤销。")
@@ -2481,7 +2444,6 @@ async fn actor(
                         &path,
                         config,
                         session_open.clone(),
-                        None,
                     )
                     .await?;
                     let actions = p.adapter.advance(Input::Open)?;
@@ -2830,7 +2792,7 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        for request_id in [None, Some("replacement")] {
+        for _ in 0..2 {
             let result = Process::launch(
                 &database,
                 probe.to_string_lossy().as_ref(),
@@ -2838,7 +2800,6 @@ mod tests {
                 dir.path().to_str().unwrap(),
                 config.clone(),
                 Arc::new(AtomicBool::new(false)),
-                request_id,
             )
             .await;
             assert!(matches!(result, Err(error) if error.to_string() == CLOSE_PENDING));

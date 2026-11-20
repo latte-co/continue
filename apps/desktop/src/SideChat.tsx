@@ -75,7 +75,6 @@ export async function closeSideChat(
     await previous;
     const tab = readWorkspace(workspaceId).tabs.find((tab) => tab.id === id);
     if (tab?.kind !== "sideChat") return;
-    let notice: string | undefined;
     if (!tab.draft) {
       try {
         const result = await request(hostId, {
@@ -83,11 +82,7 @@ export async function closeSideChat(
           session_id: sideId,
           only_if_idle: false,
         });
-        if (result.kind === "side_chat_closed")
-          notice =
-            "本地侧边聊天已关闭，后台写入待确认。可从历史重新打开并确认。";
-        else if (result.kind !== "ok")
-          throw new Error("无法确认侧边聊天已关闭");
+        if (result.kind !== "ok") throw new Error("无法确认侧边聊天已关闭");
       } catch (cause) {
         if (!missingSession(cause)) throw cause;
       }
@@ -95,7 +90,6 @@ export async function closeSideChat(
     drafts.clear(key, drafts.get(key));
     admissions.get(drafts)?.delete(key);
     selections.get(drafts)?.delete(key);
-    return notice;
   })();
   pending.set(key, closing);
   try {
@@ -134,9 +128,7 @@ export function SideChat({
   const [error, setError] = useState("");
   const [confirming, setConfirming] = useState<string>();
   const closePending = session?.agent_close_pending;
-  const pendingVerification = closePending ?? session?.side_write_pending;
-  const showingConfirmation =
-    !!confirming && confirming === pendingVerification;
+  const showingConfirmation = !!confirming && confirming === closePending;
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState(false);
   const [revision, refresh] = useState(0);
@@ -287,21 +279,13 @@ export function SideChat({
 
   const canInteract = enabled && (ready || isDraft);
   function confirmEnd() {
-    if (!confirming || confirming !== pendingVerification) return;
+    if (!confirming || confirming !== closePending) return;
     setConfirming(undefined);
-    void perform(
-      closePending
-        ? {
-            method: "confirm_agent_closed",
-            session_id: sideId,
-            close_id: confirming,
-          }
-        : {
-            method: "confirm_side_writes_ended",
-            session_id: sideId,
-            request_id: confirming,
-          },
-    );
+    void perform({
+      method: "confirm_agent_closed",
+      session_id: sideId,
+      close_id: confirming,
+    });
   }
   function perform(action: Request, accepted?: () => void) {
     const pending = sideOperations(drafts);
@@ -330,8 +314,7 @@ export function SideChat({
         const expected =
           action.method === "send"
             ? "accepted"
-            : action.method === "confirm_side_writes_ended" ||
-                action.method === "confirm_agent_closed"
+            : action.method === "confirm_agent_closed"
               ? "session"
               : "ok";
         if (response.kind !== expected)
@@ -556,13 +539,11 @@ export function SideChat({
         </div>
       </div>
       <div className="side-chat-compose">
-        {pendingVerification && !running && (
+        {closePending && !running && (
           <div className="notice" role="status">
             {showingConfirmation
               ? "请核对主机上的原生进程、后台任务和外部工具均已停止。"
-              : closePending
-                ? "原生会话关闭待确认。"
-                : "后台写入待确认。确认前，主对话的撤销保护会继续生效。"}
+              : "原生会话关闭待确认。"}
             {showingConfirmation && (
               <button
                 className="secondary small"
@@ -575,16 +556,10 @@ export function SideChat({
               className="secondary small"
               disabled={!canInteract || busy || session?.agent_session_busy}
               onClick={() =>
-                showingConfirmation
-                  ? confirmEnd()
-                  : setConfirming(pendingVerification)
+                showingConfirmation ? confirmEnd() : setConfirming(closePending)
               }
             >
-              {showingConfirmation
-                ? "我已核对，确认结束"
-                : closePending
-                  ? "核对原生会话关闭"
-                  : "确认后台写入已结束"}
+              {showingConfirmation ? "我已核对，确认结束" : "核对原生会话关闭"}
             </button>
           </div>
         )}

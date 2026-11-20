@@ -881,8 +881,7 @@ export function useWorkbench() {
   async function sessionAction(targetHostId: string, action: Request) {
     const result = await request(targetHostId, action);
     if (
-      (action.method === "close_agent_session" &&
-        (result.kind === "ok" || result.kind === "side_chat_closed")) ||
+      (action.method === "close_agent_session" && result.kind === "ok") ||
       (action.method === "archive_session" &&
         action.archived &&
         result.kind === "session" &&
@@ -928,8 +927,7 @@ export function useWorkbench() {
       }
     }
     if (result.kind === "session") updateSession(targetHostId, result.session);
-    else if (result.kind !== "ok" && result.kind !== "side_chat_closed")
-      throw new Error("会话操作失败");
+    else if (result.kind !== "ok") throw new Error("会话操作失败");
     return result;
   }
   function openSession(target: HostedSession) {

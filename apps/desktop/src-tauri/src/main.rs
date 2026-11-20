@@ -539,7 +539,6 @@ async fn host_request(
             | Request::ResumeMessageQueue { .. }
             | Request::OpenAgentSession { .. }
             | Request::CloseAgentSession { .. }
-            | Request::ConfirmSideWritesEnded { .. }
             | Request::ConfirmAgentClosed { .. }
             | Request::ArchiveSession { archived: true, .. }
     ) {
@@ -561,7 +560,6 @@ async fn host_request(
             .entry((host_id.clone(), session_id.clone()))
             .or_insert_with(|| "open".into());
     }
-    let confirms_side_writes = matches!(request, Request::ConfirmSideWritesEnded { .. });
     let archive_targets = if let Request::ArchiveSession {
         session_id,
         archived: true,
@@ -573,7 +571,6 @@ async fn host_request(
     };
     let closed_agent = match &request {
         Request::CloseAgentSession { session_id, .. }
-        | Request::ConfirmSideWritesEnded { session_id, .. }
         | Request::ConfirmAgentClosed { session_id, .. } => {
             Some((host_id.clone(), session_id.clone()))
         }
@@ -692,7 +689,7 @@ async fn host_request(
         ));
     }
     if let Some(key) = closed_agent
-        && acknowledges_agent_close(&response, confirms_side_writes)
+        && acknowledges_agent_close(&response)
     {
         state.turns.lock().await.remove(&key);
         state.owned_instances.lock().await.remove(&(
@@ -756,15 +753,8 @@ async fn forget_archived_sessions(state: &Connections, host: &str, ids: &[String
         ));
     }
 }
-fn acknowledges_agent_close(response: &Response, confirms_side_writes: bool) -> bool {
-    if confirms_side_writes {
-        return matches!(response, Response::Session { session }
-            if session.agent_closed_by_confirmation == Some(true));
-    }
-    matches!(
-        response,
-        Response::Ok | Response::SideChatClosed | Response::Session { .. }
-    )
+fn acknowledges_agent_close(response: &Response) -> bool {
+    matches!(response, Response::Ok | Response::Session { .. })
 }
 fn ui_response(response: Response) -> Result<Response, String> {
     if matches!(response, Response::ProviderSnapshot { .. }) {
@@ -1462,39 +1452,6 @@ for line in sys.stdin:
         assert_eq!(ids[129], "side-128");
         drop(client);
         std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn side_write_confirmation_releases_ownership_only_with_a_close_acknowledgement() {
-        let response: Response = serde_json::from_value(serde_json::json!({
-            "kind": "session",
-            "session": {
-                "id": "side", "project_id": "project", "title": "Side", "agent": "codex",
-                "status": "completed", "created_at": 0,
-            },
-        }))
-        .unwrap();
-        let Response::Session { mut session } = response else {
-            panic!("session response");
-        };
-        assert!(!acknowledges_agent_close(
-            &Response::Session {
-                session: session.clone()
-            },
-            true
-        ));
-        session.agent_closed_by_confirmation = Some(false);
-        assert!(!acknowledges_agent_close(
-            &Response::Session {
-                session: session.clone()
-            },
-            true
-        ));
-        session.agent_closed_by_confirmation = Some(true);
-        assert!(acknowledges_agent_close(
-            &Response::Session { session },
-            true
-        ));
     }
 
     #[test]

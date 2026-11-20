@@ -80,18 +80,10 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_session_busy: Option<bool>,
-    /// Latest side write operation (turn or native launch) awaiting confirmation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub side_write_pending: Option<String>,
     /// ID of the native close which still needs host-side verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_close_pending: Option<String>,
-    /// Close acknowledgement carried only on a side-write confirmation response.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub agent_closed_by_confirmation: Option<bool>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -652,12 +644,6 @@ pub enum Request {
         #[ts(optional)]
         only_if_idle: Option<bool>,
     },
-    /// The user has verified that the side chat's background writes have stopped.
-    ConfirmSideWritesEnded {
-        session_id: String,
-        /// Latest side_write_pending operation ID observed during verification.
-        request_id: String,
-    },
     /// The user has verified that the native process and its work stopped.
     ConfirmAgentClosed {
         session_id: String,
@@ -1121,8 +1107,6 @@ pub struct TaskSource {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
-    /// The local side chat closed with writes still awaiting confirmation.
-    SideChatClosed,
     RecentSessions {
         sessions: Vec<RecentSession>,
         next: Option<RecentCursor>,

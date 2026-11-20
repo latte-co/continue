@@ -409,7 +409,6 @@ async fn dispatch(
     // a later ClaimResources/AdoptResources, including one from the same App.
     let closing_resource = match &request {
         Request::CloseAgentSession { session_id, .. }
-        | Request::ConfirmSideWritesEnded { session_id, .. }
         | Request::ConfirmAgentClosed { session_id, .. }
         | Request::ArchiveSession {
             session_id,
@@ -425,13 +424,12 @@ async fn dispatch(
         .map(|resource| s.lifecycle.claim_version(resource))
         .transpose()?
         .flatten();
-    // Undo, archive, and write confirmation hold exclusive admission through their durable result.
+    // Undo, archive, and close confirmation hold exclusive admission through their durable result.
     // Archive must not race a new open/send between closing and saving metadata.
     // Ordinary turns retain concurrent admission; no request is replayed.
     let exclusive = matches!(
         &request,
         Request::UndoTurnChanges { .. }
-            | Request::ConfirmSideWritesEnded { .. }
             | Request::ConfirmAgentClosed { .. }
             | Request::CloseTerminal { .. }
             | Request::ArchiveSession { archived: true, .. }
@@ -507,7 +505,7 @@ async fn dispatch_admitted(
     request: Request,
     claims: &mut upgrade::ConnectionClaims,
     allow_queue: bool,
-    mut closed_resource: Option<upgrade::Resource>,
+    closed_resource: Option<upgrade::Resource>,
     closing_claim: Option<uuid::Uuid>,
 ) -> Result<Response> {
     let mut response = match request {
@@ -926,24 +924,6 @@ async fn dispatch_admitted(
             .await?;
             Response::Ok
         }
-        Request::ConfirmSideWritesEnded {
-            session_id,
-            request_id,
-        } => {
-            let needs_confirmation = db(&s.database, |d| {
-                d.check_side_write_confirmation(&session_id, &request_id)
-            })?;
-            let actor_closed = needs_confirmation
-                && runtime::close(&s.database, &s.runs, &session_id, true).await?;
-            let mut session = db(&s.database, |d| {
-                d.confirm_side_writes_ended(&session_id, &request_id)
-            })?;
-            if actor_closed {
-                closed_resource = Some(upgrade::Resource::AgentSession(session_id));
-            }
-            session.agent_closed_by_confirmation = Some(actor_closed);
-            Response::Session { session }
-        }
         Request::ConfirmAgentClosed {
             session_id,
             close_id,
@@ -972,11 +952,7 @@ async fn dispatch_admitted(
                 only_if_idle.unwrap_or(false),
             )
             .await?;
-            if db(&s.database, |d| d.pending_side_write(&session_id))?.is_some() {
-                Response::SideChatClosed
-            } else {
-                Response::Ok
-            }
+            Response::Ok
         }
         Request::SendQueued { .. } => unreachable!(),
         Request::Send {
@@ -1680,18 +1656,6 @@ async fn dispatch_admitted(
                     .is_empty()
             {
                 bail!("此主机仍有运行任务、后台 Agent 或终端；请结束后再撤销");
-            }
-            if let Some((side_id, unknown)) = db(&s.database, |d| {
-                d.overlapping_side_chat(&session_id, &request_id)
-            })? {
-                let reason = if unknown {
-                    "的写入结束时间待确认"
-                } else {
-                    "与本轮同时执行"
-                };
-                bail!(
-                    "具备写权限的侧边聊天（{side_id}）{reason}，无法安全撤销。请核对侧边聊天记录，并按本轮差异手动调整文件。"
-                );
             }
             let session = db(&s.database, |d| d.session(&session_id))?;
             let project = db(&s.database, |d| d.project(&session.project_id))?;

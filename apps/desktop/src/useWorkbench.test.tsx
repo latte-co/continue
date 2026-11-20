@@ -5,7 +5,6 @@ import {
   HOST_DISCONNECTED_EVENT,
   HostConnectionError,
 } from "./connectionErrors";
-import { updateWorkspace } from "./workspaceState";
 import { useWorkbench } from "./useWorkbench";
 import type { Request, Session } from "./protocol";
 const mocks = vi.hoisted(() => ({
@@ -546,13 +545,13 @@ it("retains history and an ambiguous send request ID without automatically repla
   expect(hook.result.current.admissionNotice).toBeUndefined();
 });
 
-it("returns a side close acknowledgement without clearing the selected main conversation", async () => {
+it("closes a side chat session without clearing the selected main conversation", async () => {
   const { result } = renderHook(() => useWorkbench());
   await act(async () => {});
   await act(async () =>
     result.current.openSession({ ...session(), hostId: "local" }),
   );
-  mocks.request.mockResolvedValueOnce({ kind: "side_chat_closed" });
+  mocks.request.mockResolvedValueOnce({ kind: "ok" });
   await act(async () => {
     expect(
       await result.current.sessionAction("local", {
@@ -560,7 +559,7 @@ it("returns a side close acknowledgement without clearing the selected main conv
         session_id: "side",
         only_if_idle: false,
       }),
-    ).toEqual({ kind: "side_chat_closed" });
+    ).toEqual({ kind: "ok" });
   });
   expect(result.current.sessionId).toBe("s");
 });

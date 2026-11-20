@@ -31,7 +31,6 @@ export function ProjectActions({
   const [closeResult, setCloseResult] = useState<CloseProjectResult>({
     closed: [],
     failed: [],
-    pendingWrites: [],
   });
   const [name, setName] = useState(project.name);
   const [busy, setBusy] = useState(false);
@@ -79,14 +78,8 @@ export function ProjectActions({
       setCloseResult((old) => ({
         closed: [...old.closed, ...result.closed],
         failed: result.failed,
-        pendingWrites: [...old.pendingWrites, ...result.pendingWrites],
       }));
-      if (
-        !result.failed.length &&
-        !result.pendingWrites.length &&
-        !closeResult.pendingWrites.length
-      )
-        close();
+      if (!result.failed.length) close();
       else setView("close-result");
     } catch (cause) {
       setError(message(cause));
@@ -339,12 +332,6 @@ export function ProjectActions({
               {closeResult.failed.map((item) => (
                 <p key={item.session.id}>
                   {item.session.title}：{item.error}
-                </p>
-              ))}
-              {closeResult.pendingWrites.map((session) => (
-                <p key={session.id}>
-                  {session.title}
-                  ：本地会话已关闭，后台写入待确认。请从主会话的侧边聊天历史重新打开并核对。
                 </p>
               ))}
             </div>
