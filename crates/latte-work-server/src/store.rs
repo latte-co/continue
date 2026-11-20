@@ -33,6 +33,21 @@ const CHUNK_WIRE: usize = latte_work_protocol::MAX_FRAME - 768 * 1024;
 const ROW_READ_BYTES: i64 = 2 * 1024 * 1024;
 const PRESENTATION_MARKER: &str = "…（内容过大，已截断）";
 
+/// Exact Command::spawn failures proving that no native process started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfirmedNotStarted {
+    Enoent,
+    E2big,
+}
+impl ConfirmedNotStarted {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enoent => "enoent",
+            Self::E2big => "e2big",
+        }
+    }
+}
+
 /// The streamable payload of an event plus how a client should reassemble it:
 /// `Text` chunks concatenate into displayable prose, `Json` must be parsed
 /// once fully received.
@@ -122,6 +137,8 @@ impl Store {
         CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS unconfirmed_agent_closes(session_id TEXT PRIMARY KEY REFERENCES sessions(id), reason TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS side_chats(parent_id TEXT NOT NULL REFERENCES sessions(id), session_id TEXT PRIMARY KEY REFERENCES sessions(id), parent_native_id TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS side_launch_writes(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), start_seq INTEGER NOT NULL, verified_end INTEGER);
+        CREATE INDEX IF NOT EXISTS side_launch_writes_session ON side_launch_writes(session_id);
         CREATE TABLE IF NOT EXISTS native_title_secrets(session_id TEXT NOT NULL REFERENCES sessions(id), native_id TEXT NOT NULL, secret_hash BLOB NOT NULL, secret_bytes INTEGER NOT NULL, PRIMARY KEY(session_id,native_id,secret_hash));
         CREATE TABLE IF NOT EXISTS native_session_contexts(session_id TEXT NOT NULL REFERENCES sessions(id), native_id TEXT NOT NULL, fingerprint TEXT, environment_proof TEXT, PRIMARY KEY(session_id,native_id));
         CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id), at REAL NOT NULL, data TEXT NOT NULL);
@@ -186,10 +203,33 @@ impl Store {
         if !columns.iter().any(|name| name == "permission_mode") {
             migration.execute("ALTER TABLE requests ADD COLUMN permission_mode TEXT", [])?;
         }
+        if !columns.iter().any(|name| name == "confirmed_not_started") {
+            migration.execute(
+                "ALTER TABLE requests ADD COLUMN confirmed_not_started TEXT",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|name| name == "side_write_start") {
+            migration.execute(
+                "ALTER TABLE requests ADD COLUMN side_write_start INTEGER",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|name| name == "side_write_end") {
+            migration.execute("ALTER TABLE requests ADD COLUMN side_write_end INTEGER", [])?;
+        }
+        if !columns.iter().any(|name| name == "side_write_verified_end") {
+            migration.execute(
+                "ALTER TABLE requests ADD COLUMN side_write_verified_end INTEGER",
+                [],
+            )?;
+        }
+        // Older versions can still write inferred side_write_end values after a
+        // downgrade. Only zero (never started) and verified ends carry evidence.
         migration.execute_batch(
-            "DROP INDEX IF EXISTS unverified_side_writes;
-             DROP INDEX IF EXISTS unverified_side_writes_v2;
-             DROP INDEX IF EXISTS side_launch_writes_session;",
+            "DROP INDEX IF EXISTS unverified_side_writes_v2;
+             CREATE INDEX IF NOT EXISTS unverified_side_writes ON requests(session_id)
+             WHERE permission_mode IS NOT NULL AND side_write_end IS NOT 0 AND side_write_verified_end IS NULL;",
         )?;
         if !migration.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('unconfirmed_agent_closes') WHERE name='close_id')",
@@ -276,6 +316,23 @@ impl Store {
                 },
             )?;
         }
+        store.db.execute(
+            "UPDATE requests
+             SET side_write_verified_end=COALESCE((SELECT MAX(seq) FROM events),0),
+                 side_write_end=COALESCE((SELECT MAX(seq) FROM events),0)
+             WHERE permission_mode IS NOT NULL
+               AND side_write_end IS NOT 0
+               AND side_write_verified_end IS NULL
+               AND session_id NOT IN (SELECT session_id FROM unconfirmed_agent_closes)",
+            [],
+        )?;
+        store.db.execute(
+            "UPDATE side_launch_writes
+             SET verified_end=COALESCE((SELECT MAX(seq) FROM events),0)
+             WHERE verified_end IS NULL
+               AND session_id NOT IN (SELECT session_id FROM unconfirmed_agent_closes)",
+            [],
+        )?;
         if let Err(error) = store.collect_snapshot_garbage() {
             eprintln!("snapshot cleanup skipped: {error}");
         }
@@ -628,7 +685,7 @@ impl Store {
         side.title = "侧边聊天".into();
         side.model = parent.model;
         side.effort = parent.effort;
-        side.permission_mode = parent.permission_mode;
+        side.permission_mode = Some(parent.permission_mode.unwrap_or_else(|| "inherit".into()));
         self.save(&side)?;
         tx.execute(
             "INSERT INTO side_chats(parent_id,session_id,parent_native_id) VALUES (?1,?2,?3)",
@@ -1578,7 +1635,106 @@ impl Store {
         {
             bail!("关闭记录已变化，请重新核对");
         }
+        self.finish_side_writes(id)?;
         Ok(session)
+    }
+    /// Called before any native operation that may write. Zero is reserved for
+    /// an admitted side request that has not reached this point.
+    pub fn start_side_write(&self, request_id: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE requests SET side_write_start=COALESCE((SELECT MAX(seq) FROM events),0),
+                 side_write_end=NULL WHERE id=?1 AND side_write_end=0",
+            [request_id],
+        )?;
+        Ok(())
+    }
+    /// Open/recovery has no user request, but native startup hooks can still write.
+    /// Keep a separate identity instead of reopening an already verified interval.
+    pub fn start_side_launch_write(&self, session_id: &str) -> Result<Option<String>> {
+        if self.side_parent(session_id)?.is_none() {
+            return Ok(None);
+        }
+        let id = Uuid::new_v4().to_string();
+        self.db.execute(
+            "INSERT INTO side_launch_writes(id,session_id,start_seq)
+             VALUES (?1,?2,COALESCE((SELECT MAX(seq) FROM events),0))",
+            params![id, session_id],
+        )?;
+        Ok(Some(id))
+    }
+    pub fn finish_side_writes(&self, session_id: &str) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE requests
+             SET side_write_verified_end=COALESCE((SELECT MAX(seq) FROM events),0),
+                 side_write_end=COALESCE((SELECT MAX(seq) FROM events),0)
+             WHERE session_id=?1 AND permission_mode IS NOT NULL
+               AND side_write_end IS NOT 0 AND side_write_verified_end IS NULL",
+            [session_id],
+        )?;
+        tx.execute(
+            "UPDATE side_launch_writes
+             SET verified_end=COALESCE((SELECT MAX(seq) FROM events),0)
+             WHERE session_id=?1 AND verified_end IS NULL",
+            [session_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn mark_side_write_not_started(&self, request_id: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE requests SET side_write_start=NULL,side_write_end=0
+             WHERE id=?1 AND side_write_start IS NOT NULL AND side_write_end IS NULL",
+            [request_id],
+        )?;
+        self.db.execute(
+            "DELETE FROM side_launch_writes WHERE id=?1 AND verified_end IS NULL",
+            [request_id],
+        )?;
+        Ok(())
+    }
+    /// Native permissions can allow writes outside the project's canonical root.
+    /// Unknown ends block restoration now, even when they started after capture.
+    /// Verified ends still protect historically overlapping changes host-wide.
+    pub fn overlapping_side_chat(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<Option<(String, bool)>> {
+        Ok(self.db.query_row(
+            "WITH main_turn AS (
+                SELECT
+                    (SELECT MIN(seq) FROM events WHERE session_id=?1 AND json_extract(data,'$.kind')='user'
+                        AND json_extract(data,'$.request_id')=?2) AS start_seq,
+                    (SELECT MIN(seq) FROM events WHERE session_id=?1 AND json_extract(data,'$.kind')='turn_changes'
+                        AND json_extract(data,'$.changes.request_id')=?2) AS end_seq
+            ), writes AS (
+            SELECT side.session_id, COALESCE(r.side_write_start, admitted.seq) AS start_seq,
+                r.side_write_verified_end AS verified_end FROM side_chats side
+                JOIN events admitted ON admitted.session_id=side.session_id AND json_extract(admitted.data,'$.kind')='user'
+                JOIN requests r ON r.session_id=side.session_id AND r.id=json_extract(admitted.data,'$.request_id')
+                WHERE r.permission_mode IS NOT NULL AND r.side_write_end IS NOT 0
+            UNION ALL SELECT session_id,start_seq,verified_end FROM side_launch_writes)
+            SELECT writes.session_id, writes.verified_end IS NULL FROM writes CROSS JOIN main_turn
+                WHERE writes.session_id!=?1 AND (writes.verified_end IS NULL
+                    OR (writes.start_seq < main_turn.end_seq AND writes.verified_end >= main_turn.start_seq))
+                LIMIT 1",
+            params![session_id, request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?)
+    }
+    /// Checks both durable admission ledgers globally in one SQLite read snapshot.
+    /// Queue tombstones and unknown statuses still reserve the request identity.
+    /// This is only a point-in-time absence check, not proof of a timed-out send's outcome.
+    pub fn request_identity_absent(&mut self, request_id: &str) -> Result<bool> {
+        self.db
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM requests WHERE id=?1)
+                    AND NOT EXISTS(SELECT 1 FROM message_queue WHERE request_id=?1)",
+                [request_id],
+                |row| row.get(0),
+            )
+            .context("读取请求持久化身份失败")
     }
     pub fn latest_request(&self, id: &str) -> Result<String> {
         self.db
@@ -1605,6 +1761,40 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+    /// Durable admission evidence survives stop, close and daemon restart.
+    #[cfg(test)]
+    pub fn has_admitted_request(&self, id: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM requests WHERE session_id=?1)",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
+    pub fn record_confirmed_not_started(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        evidence: ConfirmedNotStarted,
+    ) -> Result<()> {
+        let changed = self.db.execute(
+            "UPDATE requests SET confirmed_not_started=?3 WHERE session_id=?1 AND id=?2
+             AND confirmed_not_started IS NULL",
+            params![session_id, request_id, evidence.as_str()],
+        )?;
+        if changed != 1 {
+            bail!("Agent 未启动证据未能保存到当前请求；不能确认安全重试");
+        }
+        Ok(())
+    }
+    /// NULL and unrecognized evidence remain conservative, including old rows.
+    pub fn has_possibly_started_request(&self, id: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM requests WHERE session_id=?1
+             AND confirmed_not_started IS NOT 'enoent' AND confirmed_not_started IS NOT 'e2big')",
+            [id],
+            |row| row.get(0),
+        )?)
     }
     pub fn first_request(&self, id: &str) -> Result<bool> {
         Ok(self.db.query_row(
@@ -1796,6 +1986,7 @@ impl Store {
         Ok(false)
     }
     /// Returns false for an exact already-accepted request; conflicting reuse fails.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn begin(
         &mut self,
@@ -1807,6 +1998,30 @@ impl Store {
         provider_fingerprint: Option<&str>,
         permission_mode: Option<&str>,
     ) -> Result<bool> {
+        Ok(self
+            .begin_with_source(
+                id,
+                request_id,
+                text,
+                model,
+                effort,
+                provider_fingerprint,
+                permission_mode,
+            )?
+            .is_some())
+    }
+    /// Capture the source User row at durable admission, without scanning history.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_with_source(
+        &mut self,
+        id: &str,
+        request_id: &str,
+        text: &str,
+        model: Option<&str>,
+        effort: Option<Effort>,
+        provider_fingerprint: Option<&str>,
+        permission_mode: Option<&str>,
+    ) -> Result<Option<f64>> {
         if self.already_accepted(
             id,
             request_id,
@@ -1816,7 +2031,7 @@ impl Store {
             provider_fingerprint,
             permission_mode,
         )? {
-            return Ok(false);
+            return Ok(None);
         }
         let mut session = self.session(id)?;
         if session.status.active() {
@@ -1855,6 +2070,7 @@ impl Store {
             "UPDATE sessions SET data=?2 WHERE id=?1",
             params![id, serde_json::to_string(&session)?],
         )?;
+        let mut source_user_seq = None;
         for event in [
             EventKind::User {
                 text: text.into(),
@@ -1869,11 +2085,22 @@ impl Store {
                 "INSERT INTO events(session_id,at,data) VALUES (?1,?2,?3)",
                 params![id, now(), serde_json::to_string(&event)?],
             )?;
+            if matches!(event, EventKind::User { .. }) {
+                source_user_seq = Some(tx.last_insert_rowid() as f64);
+            }
             index_event(&tx, id, &event)?;
+        }
+        if is_side_chat && permission_mode.is_some() {
+            // Keep the durable admission separate from possible native writes.
+            // Legacy rows have NULL here, so they retain the conservative fence.
+            tx.execute(
+                "UPDATE requests SET side_write_end=0 WHERE id=?1",
+                [request_id],
+            )?;
         }
         tx.execute("UPDATE message_queue SET status='dispatched' WHERE request_id=?1 AND session_id=?2 AND status IN ('pending','forwarded')", params![request_id,id])?;
         tx.commit()?;
-        Ok(true)
+        Ok(source_user_seq)
     }
     fn presentation_event(&self, id: &str, data: &str) -> Result<EventKind> {
         let event: EventKind = serde_json::from_str(data)?;
@@ -2291,6 +2518,114 @@ fn index_source(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn confirmed_not_started_is_request_bound_durable_and_unknown_is_conservative() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let mut store = super::Store::open(&path).unwrap();
+        let project = store.add_project(directory.path()).unwrap();
+        let session = store
+            .create_session(project.id.clone(), "cursor".into())
+            .unwrap();
+        let other = store.create_session(project.id, "cursor".into()).unwrap();
+        store
+            .begin(&session.id, "failed-spawn", "hello", None, None, None, None)
+            .unwrap();
+        assert!(store.has_possibly_started_request(&session.id).unwrap());
+        assert!(
+            store
+                .record_confirmed_not_started(
+                    &other.id,
+                    "failed-spawn",
+                    super::ConfirmedNotStarted::Enoent
+                )
+                .is_err()
+        );
+        store.db.execute_batch("PRAGMA query_only=ON").unwrap();
+        assert!(
+            store
+                .record_confirmed_not_started(
+                    &session.id,
+                    "failed-spawn",
+                    super::ConfirmedNotStarted::Enoent
+                )
+                .is_err()
+        );
+        assert!(store.has_possibly_started_request(&session.id).unwrap());
+        store.db.execute_batch("PRAGMA query_only=OFF").unwrap();
+        store
+            .record_confirmed_not_started(
+                &session.id,
+                "failed-spawn",
+                super::ConfirmedNotStarted::Enoent,
+            )
+            .unwrap();
+        assert!(!store.has_possibly_started_request(&session.id).unwrap());
+        assert!(store.has_admitted_request(&session.id).unwrap());
+        drop(store);
+        let store = super::Store::open(&path).unwrap();
+        assert!(!store.has_possibly_started_request(&session.id).unwrap());
+        assert!(
+            store
+                .already_accepted(&session.id, "failed-spawn", "hello", None, None, None, None)
+                .unwrap()
+        );
+        store
+            .db
+            .execute(
+                "INSERT INTO requests(id,session_id,text) VALUES ('legacy',?1,'old')",
+                [&session.id],
+            )
+            .unwrap();
+        assert!(store.has_possibly_started_request(&session.id).unwrap());
+        store
+            .db
+            .execute(
+                "UPDATE requests SET confirmed_not_started='future-unrecognized' WHERE id='legacy'",
+                [],
+            )
+            .unwrap();
+        assert!(store.has_possibly_started_request(&session.id).unwrap());
+        store
+            .db
+            .execute(
+                "UPDATE requests SET confirmed_not_started='e2big' WHERE id='legacy'",
+                [],
+            )
+            .unwrap();
+        assert!(!store.has_possibly_started_request(&session.id).unwrap());
+    }
+    #[test]
+    fn admission_returns_source_user_sequence_without_replaying_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = super::Store::open(&directory.path().join("state.sqlite")).unwrap();
+        let project = store.add_project(directory.path()).unwrap();
+        let session = store.create_session(project.id, "codex".into()).unwrap();
+        let seq = store
+            .begin_with_source(&session.id, "source", "hello", None, None, None, None)
+            .unwrap()
+            .unwrap();
+        let (events, _) = store.events(&session.id, 0.0).unwrap();
+        let user = events.iter().find(|event| matches!(&event.event, super::EventKind::User { request_id, .. } if request_id == "source")).unwrap();
+        assert_eq!(seq, user.seq);
+        assert!(events.iter().any(|event| event.seq > seq));
+        assert!(
+            store
+                .begin_with_source(&session.id, "source", "hello", None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.events(&session.id, 0.0).unwrap().0.len(),
+            events.len()
+        );
+        assert!(
+            store
+                .begin_with_source(&session.id, "source", "different", None, None, None, None)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn side_chat_relationship_survives_restart_and_an_interrupted_turn_stays_unknown() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.sqlite");
@@ -2330,25 +2665,89 @@ mod tests {
     }
 
     #[test]
-    fn open_side_chat_inherits_parent_model_effort_and_permission_mode() {
+    fn open_side_chat_inherits_for_new_chats_and_preserves_legacy_readonly_records() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.sqlite");
-        let store = Store::open(&path).unwrap();
+        let store = super::Store::open(&path).unwrap();
         let project = store.add_project(directory.path()).unwrap();
         let mut parent = store.create_session(project.id, "codex".into()).unwrap();
         parent.native_id = Some("native-main".into());
+        store.save(&parent).unwrap();
+
+        let default_side = store.open_side_chat(&parent.id, None).unwrap();
+        assert_eq!(default_side.permission_mode.as_deref(), Some("inherit"));
+
+        // Simulate a historical pre-upgrade read-only side chat (`permission_mode: null`).
+        let mut legacy_readonly = default_side;
+        legacy_readonly.permission_mode = None;
+        store.save(&legacy_readonly).unwrap();
+
         parent.model = Some("gpt-5".into());
         parent.effort = Some(latte_work_protocol::Effort::High);
         parent.permission_mode = Some("bypass_permissions".into());
         store.save(&parent).unwrap();
 
-        let inherited = store.open_side_chat(&parent.id, None).unwrap();
+        let restored_legacy = store
+            .open_side_chat(&parent.id, Some(&legacy_readonly.id))
+            .unwrap();
+        assert_eq!(restored_legacy.permission_mode, None);
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let inherited = store.open_side_chat(&parent.id, Some(&new_id)).unwrap();
         assert_eq!(inherited.model.as_deref(), Some("gpt-5"));
         assert_eq!(inherited.effort, Some(latte_work_protocol::Effort::High));
         assert_eq!(
             inherited.permission_mode.as_deref(),
             Some("bypass_permissions")
         );
+    }
+
+    #[test]
+    fn undo_fences_overlapping_and_unsettled_writable_side_intervals() {
+        for launch in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = super::Store::open(&directory.path().join("state.sqlite")).unwrap();
+            let project = store.add_project(directory.path()).unwrap();
+            let mut main = store.create_session(project.id, "codex".into()).unwrap();
+            main.native_id = Some("native-main".into());
+            store.save(&main).unwrap();
+            let side = store.open_side_chat(&main.id, None).unwrap();
+            store
+                .begin(&main.id, "main", "edit", None, None, None, None)
+                .unwrap();
+            store
+                .db
+                .execute(
+                    "INSERT INTO events(session_id,at,data) VALUES (?1,0,
+                '{\"kind\":\"turn_changes\",\"changes\":{\"request_id\":\"main\"}}')",
+                    [&main.id],
+                )
+                .unwrap();
+            store
+                .state(&main.id, super::Status::Completed, None)
+                .unwrap();
+            if launch {
+                store.start_side_launch_write(&side.id).unwrap().unwrap();
+            } else {
+                store
+                    .begin(&side.id, "side", "edit", None, None, None, Some("default"))
+                    .unwrap();
+                store.start_side_write("side").unwrap();
+                store
+                    .state(&side.id, super::Status::Completed, None)
+                    .unwrap();
+            }
+            assert_eq!(
+                store.overlapping_side_chat(&main.id, "main").unwrap(),
+                Some((side.id.clone(), true))
+            );
+            store.finish_side_writes(&side.id).unwrap();
+            assert_eq!(
+                store.overlapping_side_chat(&main.id, "main").unwrap(),
+                None,
+                "a settled later interval does not contaminate the historical snapshot"
+            );
+        }
     }
 
     #[test]
@@ -3883,6 +4282,129 @@ mod tests {
         assert!(session.pinned_at.is_none());
         assert!(session.effort.is_none());
     }
+    #[test]
+    fn request_identity_absent_checks_global_accepted_ids_despite_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("identity.db");
+        let mut store = Store::open(&path).unwrap();
+        let project = store.add_project(tmp.path()).unwrap();
+        let original = store
+            .create_session(project.id.clone(), "claude".into())
+            .unwrap();
+        let other = store.create_session(project.id, "claude".into()).unwrap();
+        assert!(store.request_identity_absent("accepted").unwrap());
+        store
+            .begin(
+                &original.id,
+                "accepted",
+                "hello",
+                None,
+                None,
+                Some("provider-a"),
+                None,
+            )
+            .unwrap();
+        assert!(
+            store
+                .begin(
+                    &other.id,
+                    "accepted",
+                    "hello",
+                    None,
+                    None,
+                    Some("provider-a"),
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .begin(
+                    &original.id,
+                    "accepted",
+                    "different",
+                    None,
+                    None,
+                    Some("provider-a"),
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .begin(
+                    &original.id,
+                    "accepted",
+                    "hello",
+                    None,
+                    None,
+                    Some("provider-b"),
+                    None
+                )
+                .is_err()
+        );
+        assert!(!store.request_identity_absent("accepted").unwrap());
+        assert!(store.request_identity_absent("unused").unwrap());
+        drop(store);
+        let mut reopened = Store::open(&path).unwrap();
+        assert!(!reopened.request_identity_absent("accepted").unwrap());
+    }
+
+    #[test]
+    fn request_identity_absent_includes_every_queue_status_across_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("queue-identity.db");
+        let mut store = Store::open(&path).unwrap();
+        let project = store.add_project(tmp.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        // Identity evidence does not depend on parsing legacy admission/data JSON.
+        store.db.execute("INSERT INTO message_queue(request_id,session_id,admission,data) VALUES ('queued',?1,'invalid','invalid')", [&session.id]).unwrap();
+        for status in [
+            "pending",
+            "dispatched",
+            "forwarded",
+            "taken",
+            "cancelled",
+            "uncertain",
+            "future-status",
+        ] {
+            store
+                .db
+                .execute(
+                    "UPDATE message_queue SET status=?1 WHERE request_id='queued'",
+                    [status],
+                )
+                .unwrap();
+            assert!(
+                !store.request_identity_absent("queued").unwrap(),
+                "{status}"
+            );
+            assert!(store.request_identity_absent("unused").unwrap(), "{status}");
+        }
+        assert!(store.queued(&session.id).unwrap().is_empty());
+        drop(store);
+        let mut reopened = Store::open(&path).unwrap();
+        assert!(!reopened.request_identity_absent("queued").unwrap());
+        assert!(reopened.request_identity_absent("unused").unwrap());
+    }
+
+    #[test]
+    fn request_identity_absent_propagates_failures_from_either_table() {
+        for table in ["requests", "message_queue"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut store = Store::open(&tmp.path().join("broken.db")).unwrap();
+            assert!(store.request_identity_absent("unused").unwrap());
+            store
+                .db
+                .execute_batch(&format!(
+                    "ALTER TABLE {table} RENAME TO unavailable_identity_table"
+                ))
+                .unwrap();
+            let error = store.request_identity_absent("unused").unwrap_err();
+            assert!(format!("{error:#}").contains(table), "{error:#}");
+        }
+    }
+
     #[test]
     fn legacy_request_migration_preserves_duplicate_protection() {
         let tmp = tempfile::tempdir().unwrap();

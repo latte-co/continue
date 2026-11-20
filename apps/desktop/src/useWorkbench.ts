@@ -27,10 +27,12 @@ import {
   localHost,
   native,
   message,
+  ServerRequestError,
   type Host,
 } from "./api";
 import type {
   AgentInfo,
+  ComposerPredictionSnapshot,
   Effort,
   Event,
   Project,
@@ -72,6 +74,17 @@ import {
   readPinnedCache,
   type HostedSession,
 } from "./sessionNavigation";
+
+import {
+  beginPredictionSend,
+  capturePredictionAttempt,
+  consumePredictionSnapshot,
+  observePredictionSource,
+  predictionAfterSend,
+  retirePredictionSend,
+  type PredictionSend,
+  type PredictionSource,
+} from "./predictionSource";
 
 type PasswordChallenge = {
   host: Host;
@@ -202,9 +215,11 @@ export function useWorkbench() {
   const [projectOrder, setProjectOrder] = useState(readProjectOrder);
   useEffect(() => writeProjectOrder(projectOrder), [projectOrder]);
   const [hostErrors, setHostErrors] = useState<Record<string, string>>({});
+  const connectionVersions = useRef(new Map<string, number>());
   const [hostConnectionVersions, setHostConnectionVersions] = useState<
     Record<string, number>
   >({});
+  const currentHostConnectionVersions = useRef<Record<string, number>>({});
   const projects = orderProjects(
     hostedProjects(
       catalog,
@@ -230,6 +245,7 @@ export function useWorkbench() {
   const [viewRevision, setViewRevision] = useState(0);
   const sending = useRef(false);
   function resetConversationView() {
+    invalidatePrediction();
     navigationRevision.current += 1;
     setViewRevision(navigationRevision.current);
   }
@@ -303,6 +319,56 @@ export function useWorkbench() {
     };
   }, [pinnedHosts]);
   const [events, setEvents] = useState<Event[]>([]);
+  const [predictionVisible, setPredictionVisible] = useState(true);
+  const predictionVisibility = useRef(predictionVisible);
+  predictionVisibility.current = predictionVisible;
+  const predictionEpoch = useRef(0);
+  const predictionSources = useRef(new Map<string, PredictionSource>());
+  const predictionSends = useRef(new Map<string, PredictionSend>());
+  const [prediction, setPrediction] = useState<{
+    scope: string;
+    sendScope: string;
+    epoch: number;
+    value: Extract<Response, { kind: "composer_prediction" }> &
+      ComposerPredictionSnapshot;
+  } | null>(null);
+  function invalidatePrediction() {
+    predictionEpoch.current++;
+    setPrediction(null);
+  }
+  function harvestPredictionSend(
+    scope: string,
+    incoming: Event[],
+    targetSession: string,
+  ) {
+    const observed = predictionAfterSend(
+      predictionSends.current.get(scope),
+      incoming,
+      null,
+      targetSession,
+    );
+    storePredictionSend(scope, observed.send, targetSession);
+  }
+  function storePredictionSend(
+    scope: string,
+    send: PredictionSend | undefined,
+    targetSession: string,
+  ) {
+    if (send) predictionSends.current.set(scope, send);
+    // Facts may invalidate a visible suggestion independently of this frame's
+    // publication eligibility. Read the latest facts when React applies the update.
+    setPrediction((old) =>
+      old?.sendScope === scope &&
+      !predictionAfterSend(
+        predictionSends.current.get(scope),
+        [],
+        old.value,
+        targetSession,
+      ).allowed
+        ? null
+        : old,
+    );
+  }
   const [hasEarlierHistory, setHasEarlierHistory] = useState(false);
   const [earlierHistoryLoading, setEarlierHistoryLoading] = useState(false);
   const earlierLoads = useRef(new Set<string>());
@@ -318,7 +384,12 @@ export function useWorkbench() {
   const [agentSessionTransitions, setAgentSessionTransitions] = useState<
     Record<string, AgentSessionTransition>
   >({});
-  const openedEvidence = useRef(new Map<string, number>());
+  // Native-open evidence is reserved for a live Agent process. Cursor Open
+  // prepares only its Host actor; idle per-turn sessions have no native process.
+  const openedEvidence = useRef(new Map<string, string>());
+  const preparedEvidence = useRef(new Map<string, string>());
+  const currentRestoreVersions = useRef(restoreVersions);
+  currentRestoreVersions.current = restoreVersions;
   const [modal, setModal] = useState<"project" | "settings" | "skills" | null>(
     null,
   );
@@ -411,6 +482,7 @@ export function useWorkbench() {
       liveHosts.current.delete(failure.hostId);
       setHostErrors((old) => ({ ...old, [failure.hostId]: failure.message }));
       if (selection.current.hostId === failure.hostId) {
+        invalidatePrediction();
         setError(failure.message);
         setConnected(false);
       }
@@ -458,16 +530,28 @@ export function useWorkbench() {
     const key = JSON.stringify(target);
     const pending = initializingHosts.current.get(key);
     if (pending && !force) return pending;
+    // Fence the old transport immediately, before its pending requests reject.
+    // Publish the generation only after the replacement is initialized.
+    currentHostConnectionVersions.current = Object.fromEntries(
+      Object.entries(currentHostConnectionVersions.current).filter(
+        ([id]) => id !== target.id,
+      ),
+    );
     const promise = (async (): Promise<HostInitialization> => {
       const hello = await connectWithPrompt(target, !force, password);
       if (hello.kind !== "hello")
         throw new Error(hello.kind === "error" ? hello.message : "连接失败");
       const result = await request(target.id, { method: "projects" });
       if (result.kind !== "projects") throw new Error("无法加载主机项目");
-      setHostConnectionVersions((old) => ({
-        ...old,
-        [target.id]: (old[target.id] ?? 0) + 1,
-      }));
+      // Publish both identities synchronously before React commits the new version.
+      const version = (connectionVersions.current.get(target.id) ?? 0) + 1;
+      connectionVersions.current.set(target.id, version);
+      currentHostConnectionVersions.current = {
+        ...currentHostConnectionVersions.current,
+        [target.id]: version,
+      };
+      if (selection.current.hostId === target.id) invalidatePrediction();
+      setHostConnectionVersions((old) => ({ ...old, [target.id]: version }));
       return { hello, projects: result.projects, reused: false };
     })().finally(() => {
       if (initializingHosts.current.get(key) === promise)
@@ -676,6 +760,7 @@ export function useWorkbench() {
     let cursor = cached?.at(-1)?.seq ?? 0;
     let replaying = cached === undefined;
     let replay: Event[] = [];
+    setPrediction(null);
     setHistoryReadyScope(cached ? scope : null);
     setEvents(cached ?? []);
     setHasEarlierHistory(historyCache.hasEarlier(scope));
@@ -683,8 +768,108 @@ export function useWorkbench() {
     const windowed = cachedHello(host)?.history_window === true;
     let initialWindow = replaying && windowed;
     let before: number | null = null;
+    const connectionVersion = hostConnectionVersions[hostId] ?? 0;
+    const sourceServer = hostHellos.current.get(hostId)?.server_id;
+    const predictionScope = JSON.stringify([
+      hostId,
+      projectId,
+      sessionId,
+      connectionVersion,
+    ]);
+    // Durable identity outlives a same-server transport replacement.
+    const predictionSendScope = JSON.stringify([
+      hostId,
+      projectId,
+      sessionId,
+      sourceServer,
+    ]);
+    function currentPredictionFrame(
+      frame: Extract<Response, { kind: "history" | "events" }>,
+    ) {
+      return (
+        !disposed &&
+        liveHosts.current.has(hostId) &&
+        connectionVersions.current.get(hostId) === connectionVersion &&
+        currentHostConnectionVersions.current[hostId] === connectionVersion &&
+        hostHellos.current.get(hostId)?.server_id === sourceServer &&
+        selection.current.hostId === hostId &&
+        selection.current.projectId === projectId &&
+        selectedSessionId.current === sessionId &&
+        frame.session.id === sessionId &&
+        frame.session.project_id === projectId
+      );
+    }
+    function consumePrediction(
+      frame: Extract<Response, { kind: "history" | "events" }>,
+      epoch: number,
+    ) {
+      if (!currentPredictionFrame(frame)) return;
+      harvestPredictionSend(predictionSendScope, frame.events, sessionId);
+      const previous = predictionSources.current.get(predictionScope) ?? null;
+      const observed = observePredictionSource(
+        previous,
+        frame.events,
+        sessionId,
+      );
+      // These durable User facts advance the transcript cursor even if Send has
+      // superseded this request's publication epoch. Never discard their frontier.
+      if (observed) predictionSources.current.set(predictionScope, observed);
+      if (observed !== previous)
+        setPrediction((old) => (old?.scope === predictionScope ? null : old));
+      if (epoch !== predictionEpoch.current) return;
+      const afterSend = predictionAfterSend(
+        predictionSends.current.get(predictionSendScope),
+        frame.events,
+        frame.composer_prediction,
+        sessionId,
+      );
+      storePredictionSend(predictionSendScope, afterSend.send, sessionId);
+      const candidate = consumePredictionSnapshot(
+        observed,
+        frame.composer_prediction,
+      );
+      const consumed =
+        afterSend.allowed || candidate.snapshot === undefined
+          ? candidate
+          : { frontier: observed, snapshot: null };
+      if (consumed.frontier)
+        predictionSources.current.set(predictionScope, consumed.frontier);
+      if (consumed.frontier !== observed)
+        setPrediction((old) => (old?.scope === predictionScope ? null : old));
+      publishPrediction(frame.session, epoch, consumed.snapshot);
+    }
+    function publishPrediction(
+      current: Session,
+      epoch: number,
+      value: ComposerPredictionSnapshot | null | undefined,
+    ) {
+      if (value === undefined) return;
+      if (
+        !value ||
+        sending.current ||
+        current.status !== "completed" ||
+        current.archived ||
+        current.agent === "opencode" ||
+        !predictionVisibility.current ||
+        foregroundPage.current === "settings" ||
+        foregroundPage.current === "skills" ||
+        document.visibilityState === "hidden"
+      ) {
+        setPrediction((old) => (old?.scope === predictionScope ? null : old));
+        return;
+      }
+      setPrediction({
+        scope: predictionScope,
+        sendScope: predictionSendScope,
+        epoch,
+        value: { ...value, kind: "composer_prediction", session_id: sessionId },
+      });
+    }
     const poll = async () => {
       try {
+        // Capture before transport starts: Send may finish while this frame is in flight.
+        const epoch = predictionEpoch.current;
+        const livePredictionFrame = !initialWindow || before === null;
         const r = await request(
           hostId,
           initialWindow
@@ -700,7 +885,14 @@ export function useWorkbench() {
               },
         );
         if (disposed) return;
+        if (
+          (r.kind === "history" || r.kind === "events") &&
+          !currentPredictionFrame(r)
+        )
+          return;
         if (r.kind === "history") {
+          if (livePredictionFrame) consumePrediction(r, epoch);
+          else harvestPredictionSend(predictionSendScope, r.events, sessionId);
           const next = r.before;
           if (
             r.has_more &&
@@ -728,6 +920,7 @@ export function useWorkbench() {
           return;
         }
         if (r.kind === "events") {
+          consumePrediction(r, epoch);
           cursor = r.events.at(-1)?.seq ?? cursor;
           if (replaying) {
             replay = appendEvents(replay, r.events);
@@ -788,11 +981,12 @@ export function useWorkbench() {
       disposed = true;
       clearTimeout(timer);
     };
-  }, [sessionId, hostId, connected]);
+  }, [sessionId, projectId, hostId, connected, hostConnectionVersions[hostId]]);
   useEffect(() => {
     if (
       !native ||
       !connected ||
+      lostHosts.current.has(hostId) ||
       !sessionId ||
       !session ||
       session.archived ||
@@ -804,36 +998,61 @@ export function useWorkbench() {
     const key = agentSessionKey(targetHost, targetId);
     const closeVersion = closedVersions.current.get(key) ?? 0;
     const restoreVersion = restoreVersions[targetHost] ?? 0;
+    const connectionVersion = hostConnectionVersions[targetHost] ?? 0;
+    if (currentHostConnectionVersions.current[targetHost] !== connectionVersion)
+      return;
+    const evidenceVersion = JSON.stringify([restoreVersion, connectionVersion]);
+    const perTurn = session.agent === "cursor";
+    const evidence = perTurn ? preparedEvidence : openedEvidence;
     if (
-      session.agent_session_open === true &&
-      openedEvidence.current.get(key) === restoreVersion
+      (perTurn || session.agent_session_open === true) &&
+      evidence.current.get(key) === evidenceVersion
     )
       return;
     const needsRestore =
-      openedEvidence.current.has(key) &&
-      openedEvidence.current.get(key) !== restoreVersion;
+      evidence.current.has(key) &&
+      evidence.current.get(key) !== evidenceVersion;
     if (session.agent_session_open !== true || needsRestore)
       setAgentSessionTransitions((old) => ({
         ...old,
         [key]: {
-          phase: openedEvidence.current.has(key) ? "restoring" : "opening",
+          phase: evidence.current.has(key) ? "restoring" : "opening",
         },
       }));
+    let disposed = false;
+    const stale = () =>
+      disposed ||
+      !liveHosts.current.has(targetHost) ||
+      lostHosts.current.has(targetHost) ||
+      (currentRestoreVersions.current[targetHost] ?? 0) !== restoreVersion ||
+      currentHostConnectionVersions.current[targetHost] !== connectionVersion ||
+      (closedVersions.current.get(key) ?? 0) !== closeVersion;
     void request(targetHost, {
       method: "open_agent_session",
       session_id: targetId,
     })
-      .then(async () => {
-        if ((closedVersions.current.get(key) ?? 0) !== closeVersion) return;
+      .then(async (acknowledgement) => {
+        if (stale()) return;
+        if (acknowledgement.kind !== "ok")
+          throw new Error(
+            acknowledgement.kind === "error"
+              ? acknowledgement.message
+              : "Agent 会话准备失败，请重试",
+          );
         const result = await request(targetHost, {
           method: "poll",
           session_id: targetId,
           after: Number.MAX_SAFE_INTEGER,
         });
-        if ((closedVersions.current.get(key) ?? 0) !== closeVersion) return;
+        if (stale()) return;
         if (
           result.kind !== "events" ||
-          result.session.agent_session_open !== true
+          result.session.id !== targetId ||
+          result.session.agent !== session.agent ||
+          result.session.archived ||
+          result.session.agent_close_pending ||
+          (result.session.agent_session_open !== true &&
+            !(perTurn && result.session.agent_session_open === false))
         )
           throw new Error(
             result.kind === "events" &&
@@ -841,7 +1060,7 @@ export function useWorkbench() {
               ? "当前 Server 未提供会话状态，请更新 Server"
               : "Agent 会话尚未打开，请重试",
           );
-        openedEvidence.current.set(key, restoreVersion);
+        evidence.current.set(key, evidenceVersion);
         updateSession(targetHost, result.session);
         setAgentSessionTransitions((old) => {
           const next = { ...old };
@@ -850,12 +1069,15 @@ export function useWorkbench() {
         });
       })
       .catch((e) => {
-        if ((closedVersions.current.get(key) ?? 0) !== closeVersion) return;
+        if (stale()) return;
         setAgentSessionTransitions((old) => ({
           ...old,
           [key]: { phase: "error", error: message(e) },
         }));
       });
+    return () => {
+      disposed = true;
+    };
   }, [
     hostId,
     sessionId,
@@ -863,6 +1085,7 @@ export function useWorkbench() {
     session?.archived,
     session?.agent_close_pending,
     restoreVersions[hostId],
+    hostConnectionVersions[hostId],
   ]);
   function updateSession(targetHostId: string, value: Session) {
     setPinCache((old) => ({
@@ -881,7 +1104,8 @@ export function useWorkbench() {
   async function sessionAction(targetHostId: string, action: Request) {
     const result = await request(targetHostId, action);
     if (
-      (action.method === "close_agent_session" && result.kind === "ok") ||
+      (action.method === "close_agent_session" &&
+        (result.kind === "ok" || result.kind === "side_chat_closed")) ||
       (action.method === "archive_session" &&
         action.archived &&
         result.kind === "session" &&
@@ -890,6 +1114,7 @@ export function useWorkbench() {
     ) {
       const key = JSON.stringify([targetHostId, action.session_id]);
       openedEvidence.current.delete(key);
+      preparedEvidence.current.delete(key);
       setAgentSessionTransitions((old) => {
         const next = { ...old };
         delete next[key];
@@ -927,7 +1152,8 @@ export function useWorkbench() {
       }
     }
     if (result.kind === "session") updateSession(targetHostId, result.session);
-    else if (result.kind !== "ok") throw new Error("会话操作失败");
+    else if (result.kind !== "ok" && result.kind !== "side_chat_closed")
+      throw new Error("会话操作失败");
     return result;
   }
   function openSession(target: HostedSession) {
@@ -967,6 +1193,13 @@ export function useWorkbench() {
     const cached = historyCache.get(scope);
     const before = historyCache.before(scope);
     const server = hostHellos.current.get(targetHost)?.server_id;
+    const connectionVersion = connectionVersions.current.get(targetHost);
+    const sendScope = JSON.stringify([
+      targetHost,
+      projectId,
+      targetSession,
+      server,
+    ]);
     if (
       !cached ||
       !before ||
@@ -982,13 +1215,22 @@ export function useWorkbench() {
         session_id: targetSession,
         before,
       });
-      if (hostHellos.current.get(targetHost)?.server_id !== server) return;
+      if (
+        hostHellos.current.get(targetHost)?.server_id !== server ||
+        connectionVersions.current.get(targetHost) !== connectionVersion ||
+        currentHostConnectionVersions.current[targetHost] !== connectionVersion
+      )
+        return;
       if (r.kind !== "history") throw new Error("无法读取之前的对话记录");
       if (
         r.has_more &&
         (!r.events.length || r.before === null || r.before >= before)
       )
         throw new Error("对话分页未前进，请重试");
+      // Valid facts belong to the captured durable scope even after navigation.
+      // Only the transcript publication below depends on the selected page.
+      if (r.session.id === targetSession && r.session.project_id === projectId)
+        harvestPredictionSend(sendScope, r.events, targetSession);
       const updated = appendEvents(r.events, historyCache.get(scope) ?? cached);
       historyCache.set(scope, updated, r.has_more, r.before);
       if (
@@ -1044,6 +1286,7 @@ export function useWorkbench() {
     if (!hosts.some((h) => h.id === targetHostId))
       throw new Error("项目所在主机已移除");
     if (targetHostId === hostId && id === projectId) return;
+    invalidatePrediction();
     pendingSession.current = null;
     draft.current = true;
     selectedSessionId.current = "";
@@ -1139,6 +1382,8 @@ export function useWorkbench() {
     }
     if (!connected || !text.trim() || sending.current) return false;
     sending.current = true;
+    invalidatePrediction();
+    let retireUnadmitted = () => {};
     try {
       const target =
         session ?? (await persistSession(navigationRevision.current));
@@ -1153,6 +1398,21 @@ export function useWorkbench() {
         old.permission_mode === permission_mode
           ? old.id
           : crypto.randomUUID();
+      const predictionSendScope = JSON.stringify([
+        hostId,
+        projectId,
+        target.id,
+        hostHellos.current.get(hostId)?.server_id,
+      ]);
+      predictionSends.current.set(
+        predictionSendScope,
+        beginPredictionSend(
+          predictionSends.current.get(predictionSendScope),
+          id,
+          predictionEpoch.current,
+        ),
+      );
+      retireUnadmitted = capturePredictionRetirement(predictionSendScope, id);
       pendingSend.current = {
         id,
         host: hostId,
@@ -1199,6 +1459,8 @@ export function useWorkbench() {
       setError("");
       return true;
     } catch (e) {
+      if (e instanceof ServerRequestError && e.code === "send_not_admitted")
+        retireUnadmitted();
       if (!(e instanceof HostConnectionError)) setError(message(e));
       return false;
     } finally {
@@ -1287,6 +1549,7 @@ export function useWorkbench() {
     }
   }
   function activateHost(id: string) {
+    invalidatePrediction();
     const target = hosts.find((value) => value.id === id);
     const hello = target ? cachedHello(target) : undefined;
     setConnected(!!hello);
@@ -1407,7 +1670,64 @@ export function useWorkbench() {
     window.addEventListener("pointerup", stop);
     window.addEventListener("pointercancel", stop);
   }
+  const selectedPredictionSendScope = JSON.stringify([
+    hostId,
+    projectId,
+    sessionId,
+    serverId,
+  ]);
+  function capturePredictionRetirement(
+    scope: string,
+    requestId: string,
+    authoritative = false,
+  ): () => void {
+    const captured = authoritative
+      ? capturePredictionAttempt(predictionSends.current.get(scope), requestId)
+      : predictionSends.current.get(scope);
+    return () => {
+      const current = predictionSends.current.get(scope);
+      const retired = retirePredictionSend(
+        captured,
+        current,
+        requestId,
+        authoritative,
+      );
+      if (retired === current) return;
+      const remaining = new Map(predictionSends.current);
+      if (retired) remaining.set(scope, retired);
+      else remaining.delete(scope);
+      predictionSends.current = remaining;
+      // Retire provisional waiting only; never rewind User or handoff facts.
+    };
+  }
+  function captureQueuedPredictionRetirement(requestId: string): () => void {
+    // Capture at queue-operation start, not render time: Send may not trigger a render.
+    return capturePredictionRetirement(
+      selectedPredictionSendScope,
+      requestId,
+      true,
+    );
+  }
   return {
+    captureQueuedPredictionRetirement,
+    setPredictionVisible,
+    composerPrediction:
+      connected &&
+      predictionVisible &&
+      modal !== "settings" &&
+      modal !== "skills" &&
+      session?.status === "completed" &&
+      !session.archived &&
+      prediction?.epoch === predictionEpoch.current &&
+      prediction.scope ===
+        JSON.stringify([
+          hostId,
+          projectId,
+          sessionId,
+          hostConnectionVersions[hostId] ?? 0,
+        ])
+        ? prediction.value
+        : null,
     hosts,
     passwordPrompt,
     admissionNotice:

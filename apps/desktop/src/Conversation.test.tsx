@@ -68,6 +68,7 @@ vi.mock("./ModelPicker", async () => {
 vi.mock("./PermissionPicker", () => ({ PermissionPicker: () => null }));
 vi.mock("./TaskProjectPicker", () => ({ TaskProjectPicker: () => null }));
 beforeEach(() => {
+  mocks.request.mockClear();
   HTMLElement.prototype.scrollTo = vi.fn();
   HTMLElement.prototype.scrollIntoView = vi.fn();
   mocks.request.mockImplementation(async (_, request) =>
@@ -83,6 +84,62 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
+it.each(["cancel", "take"])(
+  "passes authoritative queued %s retirement through Conversation without sending",
+  async (action) => {
+    const p = props();
+    const retire = vi.fn();
+    const capture = vi.fn(() => retire);
+    const entry = {
+      request_id: "queued",
+      text: "Queued instruction",
+      model: null,
+      effort: null,
+      permission_mode: null,
+      revision: 0,
+      created_at: 1,
+    };
+    let pending = true;
+    mocks.request.mockImplementation(async (_, command) => {
+      if (command.method === "take_queued_message") {
+        pending = false;
+        return { kind: "queued_message_taken", entry };
+      }
+      if (command.method === "cancel_queued_message") pending = false;
+      return {
+        kind: "message_queue",
+        entries: pending ? [entry] : [],
+        paused: false,
+        reason: null,
+      };
+    });
+    render(
+      <Conversation
+        {...p}
+        session={session("s")}
+        captureQueuedPredictionRetirement={capture}
+      />,
+    );
+    await screen.findByText("Queued instruction");
+    if (action === "cancel")
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: "删除排队消息：Queued instruction",
+        }),
+      );
+    else {
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: "排队消息更多操作：Queued instruction",
+        }),
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "编辑消息" }));
+    }
+    await waitFor(() => expect(retire).toHaveBeenCalledOnce());
+    expect(capture).toHaveBeenCalledWith("queued");
+    expect(p.send).not.toHaveBeenCalled();
+  },
+);
 it.each(["opening", "restoring"] as const)(
   "places %s feedback in the return-to-latest slot",
   (phase) => {
@@ -150,6 +207,143 @@ const approvalEvents = (id = "a"): Event[] => [
     },
   },
 ];
+const prediction = {
+  kind: "composer_prediction" as const,
+  session_id: "s",
+  status: "ready" as const,
+  source_request_id: "source",
+  generation_id: "generation",
+  suggestion: "补充测试",
+};
+it.each(["claude", "codex", "traex"])(
+  "inserts a server %s prediction into the draft without sending",
+  (agent) => {
+    const p = props();
+    const completed = { ...session("s"), agent, status: "completed" as const };
+    const view = render(
+      <Conversation
+        {...p}
+        session={completed}
+        composerPrediction={prediction}
+      />,
+    );
+    expect(screen.getByText("Tab 插入")).toBeTruthy();
+    expect(input().value).toBe("");
+    fireEvent.keyDown(input(), { key: "Tab" });
+    expect(p.drafts.get(JSON.stringify(["local", "s"])).text).toBe("补充测试");
+    expect(p.send).not.toHaveBeenCalled();
+    fireEvent.change(input(), { target: { value: "" } });
+    view.rerender(
+      <Conversation
+        {...p}
+        session={completed}
+        composerPrediction={{ ...prediction, generation_id: "late-generation" }}
+      />,
+    );
+    expect(screen.queryByText("Tab 插入")).toBeNull();
+  },
+);
+it("keeps Escape suppression for both sources when switching conversations and returning", () => {
+  const p = props();
+  const first = { ...session("s"), status: "completed" as const };
+  const second = { ...session("other"), status: "completed" as const };
+  const view = render(
+    <Conversation {...p} session={first} composerPrediction={prediction} />,
+  );
+  fireEvent.keyDown(input(), { key: "Escape" });
+  view.rerender(
+    <Conversation
+      {...p}
+      session={second}
+      composerPrediction={{ ...prediction, session_id: "other" }}
+    />,
+  );
+  expect(screen.getByText("Tab 插入")).toBeTruthy();
+  fireEvent.keyDown(input(), { key: "Escape" });
+  view.rerender(
+    <Conversation
+      {...p}
+      session={first}
+      composerPrediction={{ ...prediction }}
+    />,
+  );
+  expect(screen.queryByText("Tab 插入")).toBeNull();
+  expect(input().value).toBe("");
+  view.rerender(
+    <Conversation
+      {...p}
+      session={first}
+      composerPrediction={{
+        ...prediction,
+        source_request_id: "new-source",
+        generation_id: "new-generation",
+      }}
+    />,
+  );
+  expect(screen.getByText("Tab 插入")).toBeTruthy();
+});
+it.each(["opencode", "legacy", "unsupported", "failed", "none", "pending"])(
+  "keeps defaults without a ready supported suggestion (%s)",
+  (kind) => {
+    const p = props();
+    render(
+      <Conversation
+        {...p}
+        session={{
+          ...session("s"),
+          agent: kind === "opencode" ? "opencode" : "claude",
+          status: "completed",
+        }}
+        composerPrediction={
+          kind === "legacy"
+            ? null
+            : {
+                ...prediction,
+                status: ["opencode", "legacy"].includes(kind)
+                  ? "ready"
+                  : (kind as typeof prediction.status),
+                suggestion: kind === "opencode" ? "不应出现" : null,
+              }
+        }
+      />,
+    );
+    expect(screen.queryByText("Tab 插入")).toBeNull();
+    expect(input().placeholder).toContain("描述任务");
+    expect(fireEvent.keyDown(input(), { key: "Tab" })).toBe(true);
+    expect(p.send).not.toHaveBeenCalled();
+  },
+);
+it.each(["running", "waiting", "failed", "stopped", "unknown"] as const)(
+  "does not predict in %s sessions",
+  (status) => {
+    render(
+      <Conversation
+        {...props()}
+        session={{ ...session("s"), status }}
+        composerPrediction={prediction}
+      />,
+    );
+    expect(screen.queryByText("Tab 插入")).toBeNull();
+  },
+);
+it("ignores a suggestion from another session and keeps a newer nonempty draft", () => {
+  const p = props();
+  const completed = { ...session("s"), status: "completed" as const };
+  const view = render(
+    <Conversation
+      {...p}
+      session={completed}
+      composerPrediction={{ ...prediction, session_id: "old" }}
+    />,
+  );
+  expect(screen.queryByText("Tab 插入")).toBeNull();
+  fireEvent.change(input(), { target: { value: "新的草稿" } });
+  view.rerender(
+    <Conversation {...p} session={completed} composerPrediction={prediction} />,
+  );
+  expect(input().value).toBe("新的草稿");
+  expect(screen.queryByText("Tab 插入")).toBeNull();
+});
 it("docks approval actions above the composer while history keeps only a record", async () => {
   const p = props();
   const waiting = { ...session("a"), status: "waiting" as const };
@@ -1903,61 +2097,67 @@ it("takes a queued message into the composer, retains existing draft, annotation
   );
 });
 
-it("offers Agent selection only for drafts and preserves draft text", () => {
-  const agents = [
-    {
-      id: "claude",
-      name: "Claude Code",
-      available: true,
-      detail: "",
-      provider_protocols: [],
-    },
-    {
-      id: "traex",
-      name: "Traex",
-      available: true,
-      detail: "",
-      provider_protocols: [],
-    },
-  ];
-  const selectAgent = vi.fn();
-  const draftProps = props();
-  draftProps.drafts.update("new-task", { text: "keep my draft" });
-  const view = render(
-    <Conversation
-      {...draftProps}
-      agent={agents[0]}
-      agents={agents}
-      selectAgent={selectAgent}
-    />,
-  );
-  fireEvent.click(screen.getByRole("combobox", { name: "Code Agent" }));
-  fireEvent.click(screen.getByRole("option", { name: "Traex" }));
-  expect(selectAgent).toHaveBeenCalledWith("traex");
-  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-    "keep my draft",
-  );
-  view.rerender(
-    <Conversation
-      {...draftProps}
-      agent={agents[1]}
-      agents={agents}
-      selectAgent={selectAgent}
-    />,
-  );
-  expect(screen.getByText("在 Test 中与 Traex 一起工作。")).toBeTruthy();
-  view.rerender(
-    <Conversation
-      {...draftProps}
-      agent={agents[1]}
-      agents={agents}
-      selectAgent={selectAgent}
-      session={{ ...session("native"), agent: "traex" }}
-    />,
-  );
-  expect(screen.queryByRole("combobox", { name: "Code Agent" })).toBeNull();
-  expect(screen.getByTitle("Traex")).toBeTruthy();
-});
+it.each([
+  { id: "traex", name: "Traex" },
+  { id: "cursor", name: "Cursor Agent" },
+])(
+  "offers $name selection only for drafts and preserves draft text",
+  ({ id, name }) => {
+    const agents = [
+      {
+        id: "claude",
+        name: "Claude Code",
+        available: true,
+        detail: "",
+        provider_protocols: [],
+      },
+      {
+        id,
+        name,
+        available: true,
+        detail: "",
+        provider_protocols: [],
+      },
+    ];
+    const selectAgent = vi.fn();
+    const draftProps = props();
+    draftProps.drafts.update("new-task", { text: "keep my draft" });
+    const view = render(
+      <Conversation
+        {...draftProps}
+        agent={agents[0]}
+        agents={agents}
+        selectAgent={selectAgent}
+      />,
+    );
+    fireEvent.click(screen.getByRole("combobox", { name: "Code Agent" }));
+    fireEvent.click(screen.getByRole("option", { name }));
+    expect(selectAgent).toHaveBeenCalledWith(id);
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+      "keep my draft",
+    );
+    view.rerender(
+      <Conversation
+        {...draftProps}
+        agent={agents[1]}
+        agents={agents}
+        selectAgent={selectAgent}
+      />,
+    );
+    expect(screen.getByText(`在 Test 中与 ${name} 一起工作。`)).toBeTruthy();
+    view.rerender(
+      <Conversation
+        {...draftProps}
+        agent={agents[1]}
+        agents={agents}
+        selectAgent={selectAgent}
+        session={{ ...session("native"), agent: id }}
+      />,
+    );
+    expect(screen.queryByRole("combobox", { name: "Code Agent" })).toBeNull();
+    expect(screen.getByTitle(name)).toBeTruthy();
+  },
+);
 
 it("preselects a removable Skill Creator preset without sending, and includes it only on explicit submission", async () => {
   const p = props();

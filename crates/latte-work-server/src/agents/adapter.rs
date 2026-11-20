@@ -6,6 +6,14 @@ use latte_work_protocol::EventKind;
 use serde_json::Value;
 use tokio::process::Command;
 
+/// Physical process lifetime, independent of the durable Host session actor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransportLifetime {
+    #[default]
+    Persistent,
+    PerTurn,
+}
+
 pub struct AgentCommand {
     pub command: Command,
     /// Keep private launch files alive until the agent exits, including spawn errors.
@@ -56,6 +64,9 @@ pub enum Input<'a> {
 }
 
 pub enum Action {
+    /// A PerTurn adapter starts physical I/O only after durable admission and baseline.
+    /// Runtime owns spawn, stderr, termination and confirmation of the owned group.
+    SpawnTurn(AgentCommand),
     /// Authoritative native session name, including external manual renames.
     NativeName(String),
     /// Optional generated metadata; never supersedes an explicit user name.
@@ -133,6 +144,12 @@ pub enum Action {
 }
 
 pub trait AgentAdapter: Send {
+    fn transport_lifetime(&self) -> TransportLifetime {
+        TransportLifetime::Persistent
+    }
+    /// Runtime invokes this only after confirming the physical process group is gone.
+    /// PerTurn adapters retire active decoder state without losing native identity.
+    fn transport_closed(&mut self) {}
     /// Only true between turns when replacing the process cannot discard live work.
     fn can_reconfigure(&self) -> bool;
     /// A new turn may reuse a process that still owns background work. This
@@ -167,6 +184,11 @@ pub trait AgentAdapter: Send {
         resume: Option<&str>,
         config: &LaunchConfig,
     ) -> Result<AgentCommand>;
+    /// Effective source-turn configuration for an isolated auxiliary request.
+    /// Unknown native Provider/model/effort must not be guessed.
+    fn prediction_snapshot(&self, _config: &LaunchConfig) -> Option<crate::predictions::Snapshot> {
+        None
+    }
     /// Optional native read bound for one stdio frame.
     fn frame_limit(&self) -> Option<usize> {
         None
@@ -174,12 +196,23 @@ pub trait AgentAdapter: Send {
     fn metadata_ready(&self) -> bool {
         true
     }
-    /// Optional JSON-RPC detach request for an owned process. Shutdown stays bounded.
+    /// Optional native shutdown or detach request. Shutdown stays bounded.
     fn close_request(&self) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
     fn close_ack(&self, _line: &str) -> bool {
         false
+    }
+    /// Require the native shutdown acknowledgement, drained stdout and the
+    /// child's exit to confirm cleanup of work outside the process group.
+    fn requires_close_drain(&self) -> bool {
+        false
+    }
+    fn observe_close_output(&mut self, _line: &str) -> Result<()> {
+        Ok(())
+    }
+    fn background_close_complete(&self) -> bool {
+        true
     }
     /// Whether this adapter can cancel a pending prompt before startup completes.
     fn can_interrupt_startup(&self) -> bool {

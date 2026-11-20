@@ -1,6 +1,7 @@
 //! GUI-independent host connection. An SSH bridge is only a transport, never an agent.
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
+use latte_work_protocol::lifecycle::{RESOURCE_BATCH_LIMIT, Resource};
 use latte_work_protocol::{MAX_FRAME, Request, Response, VERSION};
 use std::{path::Path, process::Stdio, time::Duration};
 use tokio::{
@@ -93,7 +94,7 @@ impl Client {
                 Ok(client)
             }
             Response::Error { code, message } if code == "version_mismatch" => bail!(
-                "远程 Server 与客户端不兼容，请等待远程任务结束并关闭终端后，更新并重启远程 Server：{message}"
+                "Server 与客户端不兼容，请等待任务结束并关闭终端后，更新并重启 Server：{message}"
             ),
             Response::Error { message, .. } => bail!("{message}"),
             other => bail!("不兼容的 Server: {other:?}"),
@@ -198,19 +199,55 @@ impl Client {
         owner_id: String,
         resources: Vec<latte_work_protocol::lifecycle::Resource>,
     ) -> Result<()> {
+        if let Some(message) = self
+            .close_owned_batch(&server_id, &owner_id, &resources)
+            .await?
+        {
+            bail!(message);
+        }
+        Ok(())
+    }
+
+    /// Bind every batch and individual retry to the original daemon and owner.
+    pub fn close_owned_inventory<'a>(
+        &'a mut self,
+        server_id: &'a str,
+        owner_id: &'a str,
+        resources: &'a [Resource],
+    ) -> OwnedCloses<'a> {
+        OwnedCloses {
+            client: self,
+            server_id,
+            owner_id,
+            batches: resources.chunks(RESOURCE_BATCH_LIMIT),
+            singles: [].iter(),
+        }
+    }
+
+    /// Only a framed lifecycle rejection permits isolated retries on this bridge.
+    /// Transport, decode and incompatible-response failures leave the suffix pending.
+    async fn close_owned_batch(
+        &mut self,
+        server_id: &str,
+        owner_id: &str,
+        resources: &[Resource],
+    ) -> Result<Option<String>> {
         use latte_work_protocol::lifecycle;
         if server_id != self.server_id {
-            return Ok(());
+            return Ok(None);
         }
         let response: lifecycle::Response = self
             .exchange(&lifecycle::Request::CloseOwnedResources {
-                server_id,
-                owner_id,
-                resources,
+                server_id: server_id.to_owned(),
+                owner_id: owner_id.to_owned(),
+                resources: resources.to_vec(),
             })
             .await?;
         match response {
-            lifecycle::Response::ResourcesClosed => Ok(()),
+            lifecycle::Response::ResourcesClosed => Ok(None),
+            lifecycle::Response::Error { code, message } if code == "upgrade_blocked" => {
+                Ok(Some(message))
+            }
             lifecycle::Response::Error { message, .. } => bail!("{message}"),
             _ => bail!("资源关闭响应不兼容"),
         }
@@ -263,6 +300,48 @@ impl Client {
                     Ok(Err(error)) => Err(error),
                     _ => bail!("Host 响应超时；请求可能已执行，请重连查看状态"),
                 }
+            }
+        }
+    }
+}
+
+/// Results are available before the next RPC so callers can checkpoint each receipt.
+pub enum CloseReceipt<'a> {
+    Closed(&'a [Resource]),
+    Blocked(&'a Resource, String),
+}
+
+pub struct OwnedCloses<'a> {
+    client: &'a mut Client,
+    server_id: &'a str,
+    owner_id: &'a str,
+    batches: std::slice::Chunks<'a, Resource>,
+    singles: std::slice::Iter<'a, Resource>,
+}
+
+impl<'a> OwnedCloses<'a> {
+    pub async fn next_receipt(&mut self) -> Result<Option<CloseReceipt<'a>>> {
+        loop {
+            let Some(resources) = self
+                .singles
+                .next()
+                .map(std::slice::from_ref)
+                .or_else(|| self.batches.next())
+            else {
+                return Ok(None);
+            };
+            match self
+                .client
+                .close_owned_batch(self.server_id, self.owner_id, resources)
+                .await?
+            {
+                None => return Ok(Some(CloseReceipt::Closed(resources))),
+                Some(message) if resources.len() == 1 => {
+                    return Ok(Some(CloseReceipt::Blocked(&resources[0], message)));
+                }
+                // A v1 daemon may have closed a prefix before the rejection.
+                // Replay the entire batch as idempotent, ownership-guarded singles.
+                Some(_) => self.singles = resources.iter(),
             }
         }
     }

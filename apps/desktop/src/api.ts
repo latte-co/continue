@@ -4,6 +4,7 @@ import {
   HostConnectionError,
 } from "./connectionErrors";
 import { invoke } from "@tauri-apps/api/core";
+import { bumpModelConfigVersion } from "./modelConfigVersion";
 import type { Request, Response } from "./protocol";
 export interface Host {
   id: string;
@@ -128,7 +129,8 @@ export async function loadHosts(): Promise<Host[]> {
   return [localHost, ...(await invoke<Host[]>("load_hosts"))];
 }
 export async function saveHosts(hosts: Host[]): Promise<void> {
-  return invoke("save_hosts", { hosts: hosts.filter((h) => h.id !== "local") });
+  await invoke("save_hosts", { hosts: hosts.filter((h) => h.id !== "local") });
+  bumpModelConfigVersion();
 }
 export function message(error: unknown): string {
   const value = error instanceof Error ? error.message : String(error);
@@ -153,6 +155,7 @@ export async function bindAgentProvider(
     providerId,
   });
   if (response.kind === "error") throw new Error(response.message);
+  bumpModelConfigVersion();
   return response;
 }
 
@@ -168,12 +171,17 @@ export function agentEnvironments(
   return invoke("agent_environments", { hostId });
 }
 
-export function saveAgentEnvironment(
+export async function saveAgentEnvironment(
   hostId: string,
   agent: string,
   environment: import("./protocol").AgentEnvironment,
 ): Promise<import("./protocol").AgentEnvironment> {
-  return invoke("save_agent_environment", { hostId, agent, environment });
+  const saved = await invoke<import("./protocol").AgentEnvironment>(
+    "save_agent_environment",
+    { hostId, agent, environment },
+  );
+  bumpModelConfigVersion();
+  return saved;
 }
 
 export type ProviderRequest = Extract<
@@ -185,6 +193,7 @@ export async function providerRequest(
 ): Promise<Response> {
   const response = await invoke<Response>("provider_request", { request });
   if (response.kind === "error") throw new Error(response.message);
+  if (request.method !== "providers") bumpModelConfigVersion();
   return response;
 }
 

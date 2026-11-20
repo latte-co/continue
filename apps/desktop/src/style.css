@@ -1526,7 +1526,31 @@ button.recent-notice {
   color: var(--color-text);
   outline: none;
 }
-.composer textarea::placeholder {
+.composer-editor {
+  position: relative;
+}
+.composer-prediction {
+  position: absolute;
+  inset: 0;
+  max-height: 200px;
+  overflow: hidden;
+  pointer-events: none;
+  user-select: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-content);
+  font-weight: var(--weight-content);
+  font-size: var(--text-md);
+  line-height: var(--leading-ui);
+}
+.composer-prediction-hint {
+  flex: none;
+  font-size: var(--text-xs);
+  line-height: var(--leading-ui);
+  color: var(--color-text-muted);
+}
+.composer textarea::placeholder,
+.composer-prediction {
   color: color-mix(
     in srgb,
     var(--color-placeholder) 45%,

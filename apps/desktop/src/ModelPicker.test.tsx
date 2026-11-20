@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
+import { bumpModelConfigVersion } from "./modelConfigVersion";
 import { ModelPicker } from "./ModelPicker";
 import type { Response } from "./protocol";
 const mocks = vi.hoisted(() => ({
@@ -150,6 +151,7 @@ it("keeps an already-open draft's model across a Provider update without flashin
   );
   ready.mockClear();
   view.rerender(<ModelPicker {...props} settingsOpen />);
+  act(() => bumpModelConfigVersion());
   expect(ready).toHaveBeenLastCalledWith(
     expect.objectContaining({ ready: false }),
   );
@@ -185,6 +187,137 @@ it("keeps an already-open draft's model across a Provider update without flashin
     expect.objectContaining({ ready: false }),
   );
 });
+
+it("keeps a verified model ready when closing Settings without Provider changes and refresh fails", async () => {
+  const onChange = vi.fn();
+  const onEffortInvalid = vi.fn();
+  const ready = vi.fn();
+  mocks.request.mockResolvedValueOnce({
+    kind: "models",
+    models: ["model-a", "model-b"],
+    provider: "Team",
+    default_model: "model-a",
+    effort_levels: ["high"],
+    model_labels: {},
+  });
+  const props = {
+    hostId: "local",
+    projectId: "p",
+    agent: "claude",
+    connected: true,
+    settingsOpen: false,
+    value: "model-b",
+    onChange,
+    effort: "high" as const,
+    onEffortChange: vi.fn(),
+    onEffortInvalid,
+    disabled: false,
+    onReadyChange: ready,
+  };
+  const view = render(<ModelPicker {...props} />);
+  await act(async () => {});
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  // Open Settings without mutating Provider/Agent config, then close with a transient refresh error.
+  view.rerender(<ModelPicker {...props} settingsOpen />);
+  mocks.request.mockRejectedValueOnce(new Error("transient refresh error"));
+  view.rerender(<ModelPicker {...props} settingsOpen={false} />);
+  await act(async () => {});
+  expect(onChange).not.toHaveBeenCalled();
+  expect(onEffortInvalid).not.toHaveBeenCalled();
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      value: "model-b",
+      notice: "刷新失败，使用上次列表",
+      levels: ["high"],
+    }),
+    undefined,
+  );
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  // Actual Provider config mutations invalidate the cached catalog so failed refreshes block sending.
+  view.rerender(<ModelPicker {...props} settingsOpen />);
+  act(() => bumpModelConfigVersion());
+  mocks.request.mockRejectedValueOnce(new Error("transient refresh error"));
+  view.rerender(<ModelPicker {...props} settingsOpen={false} />);
+  await act(async () => {});
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+});
+it("uses Cursor native model metadata without guessing effort, context, aliases or Provider defaults", async () => {
+  mocks.request.mockResolvedValue({
+    kind: "models",
+    models: ["cursor-native-opus"],
+    provider: null,
+    default_model: null,
+    effort_levels: [],
+    model_labels: { "cursor-native-opus": "Native Cursor Model" },
+  });
+  const invalid = vi.fn(),
+    change = vi.fn(),
+    effortChange = vi.fn(),
+    ready = vi.fn();
+  const props = {
+    hostId: "cursor-remote",
+    projectId: "p",
+    agent: "cursor",
+    connected: true,
+    settingsOpen: false,
+    value: "cursor-native-opus",
+    onChange: change,
+    effort: "high" as const,
+    onEffortChange: effortChange,
+    onEffortInvalid: invalid,
+    disabled: false,
+    onReadyChange: ready,
+  };
+  const view = render(<ModelPicker {...props} />);
+  await act(async () => {});
+  expect(mocks.request).toHaveBeenCalledWith("cursor-remote", {
+    method: "models",
+    agent: "cursor",
+    model: "cursor-native-opus",
+    project_id: "p",
+  });
+  const selected = mocks.selector.mock.calls.at(-1)![0] as {
+    levels: string[];
+    options: {
+      value: string;
+      label: string;
+      description?: string;
+      contextWindow?: number;
+      variants?: unknown;
+    }[];
+  };
+  expect(selected.levels).toEqual([]);
+  expect(selected.options).toEqual([
+    expect.objectContaining({ value: "", label: "default" }),
+    expect.objectContaining({
+      value: "cursor-native-opus",
+      label: "Native Cursor Model",
+      description: undefined,
+      contextWindow: undefined,
+      variants: undefined,
+    }),
+  ]);
+  expect(invalid).toHaveBeenCalled();
+  expect(effortChange).not.toHaveBeenCalled();
+  expect(change).not.toHaveBeenCalled();
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+  view.rerender(<ModelPicker {...props} effort={null} />);
+  await act(async () => {});
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+});
+
 it("presents Traex native names and sends the unchanged native ID when selected", async () => {
   mocks.request.mockResolvedValue({
     kind: "models",

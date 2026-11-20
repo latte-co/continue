@@ -4,7 +4,7 @@ import { TaskOverview } from "./TaskOverview";
 import { useAppLifecycle } from "./appLifecycle";
 import { StatusCenter } from "./StatusCenter";
 import { useStatusNotices, type StatusNotice } from "./statusNotices";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { DraftStore } from "./drafts";
 import { Folder, PanelRight, SquarePen } from "lucide-react";
 import { request, message } from "./api";
@@ -194,6 +194,16 @@ export default function App() {
     statusCenter
   );
   const conversationHidden = merged && !workbench.workspace.conversationActive;
+  useEffect(() => {
+    workbench.setPredictionVisible(
+      !conversationHidden && !skillsOpen && workbench.modal !== "settings",
+    );
+  }, [
+    conversationHidden,
+    skillsOpen,
+    workbench.modal,
+    workbench.setPredictionVisible,
+  ]);
   const supportsSide =
     !!session &&
     workbench.supportsSideChat &&
@@ -341,6 +351,10 @@ export default function App() {
             </div>
           </header>
           <Conversation
+            composerPrediction={workbench.composerPrediction}
+            captureQueuedPredictionRetirement={
+              workbench.captureQueuedPredictionRetirement
+            }
             openSubagents={showSubagents}
             openSideChat={canOpenSide ? showSide : undefined}
             quoteInSideChat={

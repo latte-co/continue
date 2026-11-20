@@ -119,7 +119,7 @@ enum SshAuthMode {
     IdentityFile,
     Password,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct Host {
     id: String,
     name: String,
@@ -150,12 +150,17 @@ async fn connect_host(
         .lock()
         .await
         .insert(host.id.clone(), host.clone());
-    let adopted = pending_close::drain(&app, &state, &host, &mut client).await?;
+    let adopted = if host.ssh.is_some() {
+        pending_close::drain(&app, &state, &host, &mut client).await?
+    } else {
+        Vec::new()
+    };
+    let server_id = client.server_id().to_owned();
     state
         .server_ids
         .lock()
         .await
-        .insert(host.id.clone(), client.server_id().to_owned());
+        .insert(host.id.clone(), server_id.clone());
     let response = client
         .request(Request::Hello {
             version: latte_work_protocol::VERSION,
@@ -174,6 +179,28 @@ async fn connect_host(
         .lock()
         .await
         .insert(host.id.clone(), client.clone());
+    if host.ssh.is_none() {
+        let app = app.clone();
+        let host = host.clone();
+        // Old quit records can contain a slow or uncertain close. Use a
+        // separate bridge so it cannot block the new local connection.
+        tauri::async_runtime::spawn(async move {
+            let state = app.state::<Connections>();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+                let mut cleanup = reconnect_for_cleanup(&app, &state, &host.id).await?;
+                if cleanup.server_id() == server_id && !state.quitting.load(Ordering::SeqCst) {
+                    pending_close::drain(&app, &state, &host, &mut cleanup).await?;
+                }
+                Ok::<_, String>(())
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("恢复本机关闭记录失败：{error}"),
+                Err(_) => eprintln!("恢复本机关闭记录超时，待下次连接处理"),
+            }
+        });
+    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<Connections>();
@@ -242,6 +269,9 @@ async fn connect_host(
             .is_err()
             {
                 continue;
+            }
+            if state.quitting.load(Ordering::SeqCst) {
+                break;
             }
             let target = host.id.clone();
             // Open is idempotent and contains no prompt. A surviving daemon keeps
@@ -405,11 +435,13 @@ async fn claim_resource(
         .get(host)
         .cloned()
         .ok_or("缺少 Server 实例信息")?;
-    state
-        .owned_instances
-        .lock()
-        .await
-        .insert((host.to_owned(), resource.clone()), server_id);
+    {
+        let mut owned = state.owned_instances.lock().await;
+        if state.quitting.load(Ordering::SeqCst) {
+            return Err("正在退出，任务未发送".into());
+        }
+        owned.insert((host.to_owned(), resource.clone()), server_id);
+    }
     let mut client = client.lock().await;
     client
         .claim_resources(state.owner_id().to_owned(), vec![resource])
@@ -549,6 +581,25 @@ async fn host_request(
     if state.quitting.load(Ordering::SeqCst) {
         return Err("正在退出，任务未发送".into());
     }
+    let resource = match &request {
+        Request::OpenAgentSession { session_id, .. }
+        | Request::Send { session_id, .. }
+        | Request::SendQueued { session_id, .. }
+        | Request::DispatchQueuedMessage { session_id, .. }
+        | Request::ResumeMessageQueue { session_id, .. } => Some(
+            latte_work_protocol::lifecycle::Resource::AgentSession(session_id.clone()),
+        ),
+        Request::CreateTerminal { terminal_id, .. } => Some(
+            latte_work_protocol::lifecycle::Resource::Terminal(terminal_id.clone()),
+        ),
+        _ => None,
+    };
+    if let Some(resource) = resource {
+        claim_resource(&state, &host_id, &client, resource).await?;
+        if state.quitting.load(Ordering::SeqCst) {
+            return Err("正在退出，任务未发送".into());
+        }
+    }
     if let Request::OpenAgentSession { session_id, .. }
     | Request::DispatchQueuedMessage { session_id, .. }
     | Request::ResumeMessageQueue { session_id, .. } = &request
@@ -607,25 +658,6 @@ async fn host_request(
     } else {
         None
     };
-    let resource = match &request {
-        Request::OpenAgentSession { session_id, .. }
-        | Request::Send { session_id, .. }
-        | Request::SendQueued { session_id, .. }
-        | Request::DispatchQueuedMessage { session_id, .. }
-        | Request::ResumeMessageQueue { session_id, .. } => Some(
-            latte_work_protocol::lifecycle::Resource::AgentSession(session_id.clone()),
-        ),
-        Request::CreateTerminal { terminal_id, .. } => Some(
-            latte_work_protocol::lifecycle::Resource::Terminal(terminal_id.clone()),
-        ),
-        _ => None,
-    };
-    if let Some(resource) = resource {
-        claim_resource(&state, &host_id, &client, resource).await?;
-        if state.quitting.load(Ordering::SeqCst) {
-            return Err("正在退出，任务未发送".into());
-        }
-    }
     let response = if matches!(&request, Request::AgentCommands { agent, .. } if agent == "opencode")
         || matches!(
             request,
@@ -754,7 +786,10 @@ async fn forget_archived_sessions(state: &Connections, host: &str, ids: &[String
     }
 }
 fn acknowledges_agent_close(response: &Response) -> bool {
-    matches!(response, Response::Ok | Response::Session { .. })
+    matches!(
+        response,
+        Response::Ok | Response::SideChatClosed | Response::Session { .. }
+    )
 }
 fn ui_response(response: Response) -> Result<Response, String> {
     if matches!(response, Response::ProviderSnapshot { .. }) {
@@ -1219,6 +1254,16 @@ mod reveal_path_tests {
         assert_eq!(std::fs::read(&source).unwrap(), b"original");
         let _ = std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn acknowledges_legacy_and_current_side_chat_close_responses() {
+        use latte_work_protocol::Response;
+        assert!(super::acknowledges_agent_close(&Response::Ok));
+        assert!(super::acknowledges_agent_close(&Response::SideChatClosed));
+        assert!(!super::acknowledges_agent_close(&Response::Error {
+            code: "busy".into(),
+            message: "busy".into(),
+        }));
     }
 }
 fn main() {

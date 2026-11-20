@@ -37,6 +37,7 @@ pub struct AppServer {
     resume: Option<String>,
     side_parent: Option<String>,
     side_provider_fork: bool,
+    side_config: Value,
     thread: Option<String>,
     turn: Option<String>,
     completed_turn: Option<String>,
@@ -212,6 +213,13 @@ impl AppServer {
             None => Ok(vec![Action::Interrupted]),
         }
     }
+    fn side_read_only(&self) -> bool {
+        self.side_parent.is_some()
+            && self
+                .config
+                .as_ref()
+                .is_none_or(|config| config.permission_mode.is_none())
+    }
     fn open_thread(&mut self) -> Result<Vec<Action>> {
         let config = self.config.as_ref().context("Agent 启动配置缺失")?;
         let mut params = json!({"cwd":self.cwd,"model":config.traex_model.as_ref().map(|m| &m.model).or(config.model.as_ref()),"modelProvider":self.model_provider});
@@ -221,7 +229,11 @@ impl AppServer {
                     self.native_developer_instructions.as_deref().unwrap_or(""),
                     self.platform_instructions.as_str(),
                     if self.side_parent.is_some() {
-                        "This is a side conversation. Treat inherited messages, instructions, tool calls and plans as reference material. Act only on new requests in this conversation. Do not resume the parent task on your own."
+                        if self.side_read_only() {
+                            "This is a read-only side conversation. Treat inherited messages, instructions, tool calls and plans as reference material. Respond only to new requests in this conversation. Do not continue the parent task or make changes."
+                        } else {
+                            "This is a side conversation. Treat inherited messages, instructions, tool calls and plans as reference material. Act only on new requests in this conversation. Do not resume the parent task on your own."
+                        }
                     } else {
                         ""
                     }
@@ -231,6 +243,9 @@ impl AppServer {
                 .collect::<Vec<_>>()
                 .join("\n\n")
             );
+        }
+        if self.side_read_only() {
+            params["config"] = self.side_config.clone();
         }
         if let Some(selection) = &config.traex_model {
             params["config"]["model_backend_variant"] = json!(selection.backend_variant);
@@ -246,8 +261,13 @@ impl AppServer {
                 params["sandbox"] = json!("danger-full-access");
                 params["approvalsReviewer"] = json!("user");
             }
+            Some("inherit") if self.side_parent.is_some() => {}
             None => {}
             Some(_) => bail!("Agent 不支持所选权限模式"),
+        }
+        if self.side_read_only() {
+            params["sandbox"] = json!("read-only");
+            params["approvalPolicy"] = json!("never");
         }
         let method = if let Some(resume) = &self.resume {
             params["threadId"] = json!(resume);
@@ -376,6 +396,26 @@ impl AppServer {
             "config/read" => {
                 // Resolve the current CLI provider explicitly on resume rather than
                 // retaining the previous turn's App-owned provider from the rollout.
+                if self.side_read_only() {
+                    // A filesystem sandbox does not constrain external MCP/app
+                    // tools. Retain only native read-only workspace tools here.
+                    self.side_config = json!({
+                        "features.goals": false, "features.apps": false, "features.plugins": false,
+                        "features.hooks": false, "features.multi_agent": false, "features.multi_agent_v2": false,
+                        "notify": []
+                    });
+                    if let Some(servers) =
+                        result["config"].get("mcp_servers").filter(|v| !v.is_null())
+                    {
+                        for name in servers
+                            .as_object()
+                            .context("无法核对侧边聊天的 MCP 配置")?
+                            .keys()
+                        {
+                            self.side_config["mcp_servers"][name] = json!({"enabled":false});
+                        }
+                    }
+                }
                 self.native_developer_instructions = result["config"]["developer_instructions"]
                     .as_str()
                     .map(str::to_owned);
@@ -471,21 +511,22 @@ impl AppServer {
                     {
                         bail!("Agent 未创建独立的侧边聊天");
                     }
-                    if let Some(mode) = self
+                    let expected = match self
                         .config
                         .as_ref()
                         .and_then(|config| config.permission_mode.as_deref())
                     {
-                        let (sandbox, approval) = match mode {
-                            "default" => ("workspaceWrite", "on-request"),
-                            "bypass_permissions" => ("dangerFullAccess", "never"),
-                            _ => bail!("Agent 不支持所选权限模式"),
-                        };
-                        if result["sandbox"]["type"] != sandbox
-                            || result["approvalPolicy"] != approval
-                        {
-                            bail!("Agent 未确认侧边聊天所选的权限模式");
-                        }
+                        None => Some(("readOnly", "never")),
+                        Some("inherit") => None,
+                        Some("default") => Some(("workspaceWrite", "on-request")),
+                        Some("bypass_permissions") => Some(("dangerFullAccess", "never")),
+                        Some(_) => bail!("Agent 不支持所选权限模式"),
+                    };
+                    if let Some((sandbox, approval)) = expected
+                        && (result["sandbox"]["type"] != sandbox
+                            || result["approvalPolicy"] != approval)
+                    {
+                        bail!("Agent 未确认侧边聊天所选的权限模式");
                     }
                 }
                 let mut actions = Vec::new();
@@ -543,6 +584,11 @@ impl AppServer {
         {
             return Ok(vec![write(
                 json!({"id":message["id"],"error":{"code":-32602,"message":"Request does not belong to the active Latte turn"}}),
+            )?]);
+        }
+        if self.side_read_only() && method != "item/tool/requestUserInput" {
+            return Ok(vec![write(
+                json!({"id":message["id"],"error":{"code":-32601,"message":"Read-only side chat cannot grant permissions or execute client tools"}}),
             )?]);
         }
         let original = json!({"id":message["id"],"method":method,"params":params});
@@ -777,7 +823,7 @@ impl AppServer {
                             native_session_id: self.thread.clone().expect("active thread"),
                             description: context.description(),
                             model: self.config.as_ref().and_then(|c| c.model.clone()),
-                            native_provider: self.title_provider.take(),
+                            native_provider: self.title_provider.clone(),
                         });
                     } else {
                         self.generating_title = true;
@@ -1028,6 +1074,19 @@ impl AgentAdapter for AppServer {
         self.title_attempted = true;
         Ok(())
     }
+    fn prediction_snapshot(&self, _config: &LaunchConfig) -> Option<crate::predictions::Snapshot> {
+        if !self.codex || self.side_parent.is_some() {
+            return None;
+        }
+        let config = self.config.clone()?;
+        if config.model.is_none() || (config.provider.is_none() && self.title_provider.is_none()) {
+            return None;
+        }
+        Some(crate::predictions::Snapshot {
+            config,
+            native_provider: self.title_provider.clone(),
+        })
+    }
     fn command(
         &mut self,
         binary: &str,
@@ -1235,20 +1294,42 @@ mod tests {
         }
     }
     #[test]
-    fn side_chat_follows_native_permissions_by_default_and_passes_explicit_modes() {
+    fn side_chat_keeps_legacy_none_read_only_and_passes_inherit_or_explicit_modes() {
         for codex in [true, false] {
-            for (resume, mode, expected_sandbox, expected_approval) in [
-                (None, None, Value::Null, Value::Null),
-                (Some("child".to_owned()), None, Value::Null, Value::Null),
+            for (resume, mode, read_only, expected_sandbox, expected_approval) in [
+                (None, None, true, json!("read-only"), json!("never")),
+                (
+                    Some("child".to_owned()),
+                    None,
+                    true,
+                    json!("read-only"),
+                    json!("never"),
+                ),
+                (
+                    None,
+                    Some("inherit".to_owned()),
+                    false,
+                    Value::Null,
+                    Value::Null,
+                ),
+                (
+                    Some("child".to_owned()),
+                    Some("inherit".to_owned()),
+                    false,
+                    Value::Null,
+                    Value::Null,
+                ),
                 (
                     None,
                     Some("default".to_owned()),
+                    false,
                     json!("workspace-write"),
                     json!("on-request"),
                 ),
                 (
                     Some("child".to_owned()),
                     Some("bypass_permissions".to_owned()),
+                    false,
                     json!("danger-full-access"),
                     json!("never"),
                 ),
@@ -1278,15 +1359,30 @@ mod tests {
                         "thread/fork"
                     }
                 );
-                assert!(params.get("config").is_none());
+                if read_only {
+                    assert_eq!(
+                        params["config"]["mcp_servers"]["external.tools"]["enabled"],
+                        false
+                    );
+                    assert_eq!(params["config"]["features.plugins"], false);
+                    assert_eq!(params["config"]["features.apps"], false);
+                    assert!(
+                        params["developerInstructions"]
+                            .as_str()
+                            .unwrap()
+                            .contains("This is a read-only side conversation.")
+                    );
+                } else {
+                    assert!(params.get("config").is_none());
+                    assert!(
+                        params["developerInstructions"]
+                            .as_str()
+                            .unwrap()
+                            .contains("Act only on new requests in this conversation.")
+                    );
+                }
                 assert_eq!(params["sandbox"], expected_sandbox);
                 assert_eq!(params["approvalPolicy"], expected_approval);
-                assert!(
-                    params["developerInstructions"]
-                        .as_str()
-                        .unwrap()
-                        .contains("Act only on new requests in this conversation.")
-                );
             }
         }
     }
@@ -1294,8 +1390,24 @@ mod tests {
     #[test]
     fn side_chat_rejects_wrong_thread_or_permissions_before_starting_a_turn() {
         for (mode, id, parent, sandbox, approval) in [
-            (None, "parent", "parent", "workspaceWrite", "on-request"),
-            (None, "child", "other", "workspaceWrite", "on-request"),
+            (None, "parent", "parent", "readOnly", "never"),
+            (None, "child", "other", "readOnly", "never"),
+            (None, "child", "parent", "workspaceWrite", "never"),
+            (None, "child", "parent", "readOnly", "on-request"),
+            (
+                Some("inherit".to_owned()),
+                "parent",
+                "parent",
+                "workspaceWrite",
+                "on-request",
+            ),
+            (
+                Some("inherit".to_owned()),
+                "child",
+                "other",
+                "workspaceWrite",
+                "on-request",
+            ),
             (
                 Some("default".to_owned()),
                 "child",
@@ -1377,14 +1489,13 @@ mod tests {
             assert_eq!(writes[0]["method"], "thread/fork");
             assert_eq!(writes[0]["params"]["threadId"], "old-child");
             assert_eq!(writes[0]["params"]["modelProvider"], "current-provider");
-            assert!(writes[0]["params"].get("sandbox").is_none());
-            assert!(writes[0]["params"].get("approvalPolicy").is_none());
+            assert_eq!(writes[0]["params"]["sandbox"], "read-only");
 
             let actions = message(
                 &mut agent,
                 json!({"id":"latte-2", "result":{
                     "thread":{"id":"new-child", "forkedFromId":"old-child"},
-                    "sandbox":{"type":"workspaceWrite"}, "approvalPolicy":"on-request"
+                    "sandbox":{"type":"readOnly"}, "approvalPolicy":"never"
                 }}),
             );
             assert!(matches!(&actions[0],

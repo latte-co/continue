@@ -257,6 +257,7 @@ pub struct Claude {
     native_session_id: Option<String>,
     side_parent: Option<uuid::Uuid>,
     expected_side_id: Option<uuid::Uuid>,
+    side_read_only: bool,
     renaming: Option<(String, String)>,
     rename_result_title: Option<String>,
     streamed: bool,
@@ -416,6 +417,42 @@ impl AgentAdapter for Claude {
     fn has_background_work(&self) -> bool {
         !self.tasks.is_empty() || !self.foreground_agents.is_empty()
     }
+    fn close_request(&self) -> Result<Option<Vec<u8>>> {
+        let mut request = serde_json::to_vec(&json!({
+            "type": "control_request",
+            "request_id": "latte-end-session",
+            "request": { "subtype": "end_session", "reason": "client_quit" },
+        }))?;
+        request.push(b'\n');
+        Ok(Some(request))
+    }
+    fn close_ack(&self, line: &str) -> bool {
+        serde_json::from_str::<Value>(line).is_ok_and(|m| {
+            m["type"] == "control_response"
+                && m["response"]["request_id"] == "latte-end-session"
+                && m["response"]["subtype"] == "success"
+        })
+    }
+    fn requires_close_drain(&self) -> bool {
+        true
+    }
+    fn background_close_complete(&self) -> bool {
+        self.tasks.is_empty()
+    }
+    fn observe_close_output(&mut self, line: &str) -> Result<()> {
+        let message: Value = serde_json::from_str(line)?;
+        // Only task lifecycle frames can settle a task. A control receipt
+        // acknowledges the request, and unrelated output cannot restart a turn.
+        if message["type"] == "system"
+            && matches!(
+                message["subtype"].as_str(),
+                Some("task_started" | "task_updated" | "task_notification")
+            )
+        {
+            self.decode(message)?;
+        }
+        Ok(())
+    }
     fn knows_subagent(&self, native_id: &str) -> bool {
         self.agent_tasks.contains_key(native_id)
     }
@@ -453,10 +490,14 @@ impl AgentAdapter for Claude {
         );
         let mut command = crate::agent_environment::command(binary);
         command.envs(&config.environment.0);
+        if self.side_parent.is_none() && config.permission_mode.as_deref() == Some("inherit") {
+            bail!("Agent 不支持所选权限模式");
+        }
         let mut instructions = crate::skills::platform_instructions(&config.settings_dir);
         if let Some(parent) = self.side_parent {
             // Claude reports the fork's identity in the first turn's init event.
             self.native_session_id = None;
+            self.side_read_only = config.permission_mode.is_none();
             let child = if let Some(id) = resume {
                 uuid::Uuid::parse_str(id).context("Claude 侧边聊天 ID 无效")?
             } else {
@@ -475,6 +516,17 @@ impl AgentAdapter for Claude {
             instructions.push_str(
                 "\n\nThis is a side conversation. Treat inherited messages, instructions, tool calls and plans as reference material. Act only on new requests in this conversation. Do not resume the parent task on your own.",
             );
+            if self.side_read_only {
+                instructions.push_str(" This conversation is read-only. Do not make changes.");
+                command.args([
+                    "--permission-mode=plan",
+                    "--safe-mode",
+                    "--strict-mcp-config",
+                    "--no-chrome",
+                    "--tools",
+                    "Read,Glob,Grep",
+                ]);
+            }
             command.arg("--disable-slash-commands");
         }
         if !instructions.is_empty() {
@@ -508,74 +560,27 @@ impl AgentAdapter for Claude {
             .current_dir(cwd)
             .env_remove("CLAUDECODE")
             .env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
-        if let Some(mode) = &config.permission_mode {
+        if let Some(mode) = config
+            .permission_mode
+            .as_deref()
+            .filter(|mode| !(self.side_parent.is_some() && *mode == "inherit"))
+        {
             command.arg(format!("--permission-mode={mode}"));
         }
         if let Some(level) = config.effort {
             command.env("CLAUDE_CODE_EFFORT_LEVEL", level.as_str());
             command.arg(format!("--effort={}", level.as_str()));
         }
-        let mut settings = if let Some(provider) = &config.provider {
-            let metadata = &provider.metadata;
-            let model = config.model.as_deref().unwrap_or(&metadata.model);
-            let mut env = json!({
-                "ANTHROPIC_BASE_URL": metadata.base_url,
-                "ANTHROPIC_MODEL": model,
-                "ANTHROPIC_DEFAULT_MODEL": model,
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
-                "ANTHROPIC_DEFAULT_FABLE_MODEL": model,
-                "ANTHROPIC_SMALL_FAST_MODEL": model,
-                "CLAUDE_CODE_SUBAGENT_MODEL": model,
-                "ANTHROPIC_AUTH_TOKEN": "",
-                "ANTHROPIC_API_KEY": "",
-                "CLAUDE_CODE_OAUTH_TOKEN": "",
-                "ANTHROPIC_CUSTOM_HEADERS": "",
-                "CLAUDE_CODE_USE_BEDROCK": "",
-                "CLAUDE_CODE_USE_VERTEX": "",
-                "CLAUDE_CODE_USE_FOUNDRY": ""
-            });
-            if metadata.protocol != latte_work_protocol::ProviderProtocol::AnthropicMessages {
-                bail!("Claude Code 只支持 Anthropic Messages Provider");
-            }
-            let base = model.strip_suffix("[1m]").unwrap_or(model);
-            if metadata.models_1m.iter().any(|id| id == base) {
-                let extended = base != model;
-                // Native 1M models also need an explicit hold for the 200K mode.
-                // Override both inherited env and settings for this child only.
-                env["CLAUDE_CODE_DISABLE_1M_CONTEXT"] = json!(if extended { "0" } else { "1" });
-                env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] =
-                    json!(if extended { "1000000" } else { "200000" });
-            }
-            let (key, credential) = match metadata.auth {
-                latte_work_protocol::ProviderAuth::Bearer => {
-                    ("ANTHROPIC_AUTH_TOKEN", provider.credential.as_str())
-                }
-                latte_work_protocol::ProviderAuth::ApiKey => {
-                    ("ANTHROPIC_API_KEY", provider.credential.as_str())
-                }
-                // Claude requires a nonempty credential even for unauthenticated gateways.
-                latte_work_protocol::ProviderAuth::None => {
-                    ("ANTHROPIC_AUTH_TOKEN", "latte-work-no-auth")
-                }
-            };
-            env[key] = json!(credential);
-            for (key, value) in env.as_object().expect("env object") {
-                command.env(key, value.as_str().expect("env string"));
-            }
-            command.arg(format!("--model={model}"));
-            json!({"env":env,"model":model,"apiKeyHelper":""})
-        } else {
-            if let Some(model) = &config.model {
-                command.arg(format!("--model={model}"));
-            } else if resume.is_some() || self.side_parent.is_some() {
-                command.arg("--model=default");
-            }
-            json!({"env":{}})
-        };
+        let mut settings = provider_settings(
+            &mut command,
+            config,
+            resume.is_some() || self.side_parent.is_some(),
+        )?;
         if let Some(level) = config.effort {
             settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"] = json!(level.as_str());
+        }
+        if self.side_read_only {
+            settings["disableAllHooks"] = json!(true);
         }
         // An absent override leaves native environment/settings resolution intact.
         // Settings env overrides inherited env. Keep turn-specific effort and
@@ -1120,6 +1125,11 @@ impl Claude {
                 if m["response"]["subtype"] != "success" {
                     bail!("Claude 初始化失败: {}", m["response"]["error"]);
                 }
+                if self.side_read_only
+                    && m["response"]["response"]["current_permission_mode"] != "plan"
+                {
+                    bail!("Claude 未确认侧边聊天的只读权限，请检查 CLI 版本和权限设置");
+                }
                 if matches!(self.phase, Phase::Discovering) {
                     let commands = parse_commands(&m["response"]["response"]["commands"])?;
                     self.phase = Phase::Finished;
@@ -1169,6 +1179,16 @@ impl Claude {
                         .and_then(|id| uuid::Uuid::parse_str(id).ok());
                     if actual != Some(expected) {
                         bail!("Claude 未确认独立的侧边聊天 ID");
+                    }
+                    if self.side_read_only
+                        && (!m["mcp_servers"].as_array().is_some_and(Vec::is_empty)
+                            || !m["tools"].as_array().is_some_and(|tools| {
+                                tools.iter().all(|tool| {
+                                    matches!(tool.as_str(), Some("Read" | "Glob" | "Grep"))
+                                })
+                            }))
+                    {
+                        bail!("Claude 未确认侧边聊天的只读工具范围");
                     }
                 }
                 self.skills = m["skills"]
@@ -1281,6 +1301,9 @@ impl Claude {
                 if request["subtype"] == "can_use_tool" {
                     if id.is_empty() || !request["input"].is_object() {
                         bail!("无效的 Claude 审批请求");
+                    }
+                    if self.side_read_only {
+                        return Ok(vec![write_action(self.approval(&id, Value::Null, false))?]);
                     }
                     if request["tool_name"] == "AskUserQuestion" {
                         match parse_questions(&request["input"]) {
@@ -2106,6 +2129,74 @@ fn parse_commands(value: &Value) -> Result<Vec<latte_work_protocol::AgentSlashCo
         });
     }
     Ok(result)
+}
+
+/// Shared Provider injection only; no platform context, session or ordinary-task launch.
+fn provider_settings(
+    command: &mut tokio::process::Command,
+    config: &LaunchConfig,
+    reset_default: bool,
+) -> Result<Value> {
+    let settings = if let Some(provider) = &config.provider {
+        let metadata = &provider.metadata;
+        let model = config.model.as_deref().unwrap_or(&metadata.model);
+        let mut env = json!({
+            "ANTHROPIC_BASE_URL": metadata.base_url,
+            "ANTHROPIC_MODEL": model,
+            "ANTHROPIC_DEFAULT_MODEL": model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+            "ANTHROPIC_DEFAULT_FABLE_MODEL": model,
+            "ANTHROPIC_SMALL_FAST_MODEL": model,
+            "CLAUDE_CODE_SUBAGENT_MODEL": model,
+            "ANTHROPIC_AUTH_TOKEN": "",
+            "ANTHROPIC_API_KEY": "",
+            "CLAUDE_CODE_OAUTH_TOKEN": "",
+            "ANTHROPIC_CUSTOM_HEADERS": "",
+            "CLAUDE_CODE_USE_BEDROCK": "",
+            "CLAUDE_CODE_USE_VERTEX": "",
+            "CLAUDE_CODE_USE_FOUNDRY": ""
+        });
+        if metadata.protocol != latte_work_protocol::ProviderProtocol::AnthropicMessages {
+            bail!("Claude Code 只支持 Anthropic Messages Provider");
+        }
+        let base = model.strip_suffix("[1m]").unwrap_or(model);
+        if metadata.models_1m.iter().any(|id| id == base) {
+            let extended = base != model;
+            // Native 1M models also need an explicit hold for the 200K mode.
+            // Override both inherited env and settings for this child only.
+            env["CLAUDE_CODE_DISABLE_1M_CONTEXT"] = json!(if extended { "0" } else { "1" });
+            env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] =
+                json!(if extended { "1000000" } else { "200000" });
+        }
+        let (key, credential) = match metadata.auth {
+            latte_work_protocol::ProviderAuth::Bearer => {
+                ("ANTHROPIC_AUTH_TOKEN", provider.credential.as_str())
+            }
+            latte_work_protocol::ProviderAuth::ApiKey => {
+                ("ANTHROPIC_API_KEY", provider.credential.as_str())
+            }
+            // Claude requires a nonempty credential even for unauthenticated gateways.
+            latte_work_protocol::ProviderAuth::None => {
+                ("ANTHROPIC_AUTH_TOKEN", "latte-work-no-auth")
+            }
+        };
+        env[key] = json!(credential);
+        for (key, value) in env.as_object().expect("env object") {
+            command.env(key, value.as_str().expect("env string"));
+        }
+        command.arg(format!("--model={model}"));
+        json!({"env":env,"model":model,"apiKeyHelper":""})
+    } else {
+        if let Some(model) = &config.model {
+            command.arg(format!("--model={model}"));
+        } else if reset_default {
+            command.arg("--model=default");
+        }
+        json!({"env":{}})
+    };
+    Ok(settings)
 }
 
 #[cfg(test)]
@@ -3551,18 +3642,60 @@ mod tests {
                 .get_args()
                 .map(|v| v.to_string_lossy().into_owned())
                 .collect();
-            assert_eq!(
-                side_args
-                    .iter()
-                    .find(|a| a.starts_with("--permission-mode="))
-                    .cloned(),
-                mode.map(|m| format!("--permission-mode={m}"))
-            );
-            assert!(!side_args.iter().any(|a| a == "--safe-mode"
+            if let Some(mode) = mode {
+                assert_eq!(
+                    side_args
+                        .iter()
+                        .find(|a| a.starts_with("--permission-mode="))
+                        .cloned(),
+                    Some(format!("--permission-mode={mode}"))
+                );
+                assert!(!side_args.iter().any(|a| a == "--safe-mode"
+                    || a == "--strict-mcp-config"
+                    || a == "--no-chrome"
+                    || a == "--tools"));
+            } else {
+                assert!(side_args.contains(&"--permission-mode=plan".to_owned()));
+                assert!(side_args.contains(&"--safe-mode".to_owned()));
+                assert!(side_args.contains(&"--strict-mcp-config".to_owned()));
+                assert!(side_args.contains(&"--no-chrome".to_owned()));
+                assert!(side_args.contains(&"--tools".to_owned()));
+                assert!(side_args.contains(&"Read,Glob,Grep".to_owned()));
+            }
+        }
+        config.permission_mode = Some("inherit".into());
+        assert!(
+            super::AgentAdapter::command(
+                &mut super::Claude::default(),
+                "claude",
+                "/tmp",
+                None,
+                &config
+            )
+            .is_err()
+        );
+        let mut side_inherit = super::Claude::default();
+        super::AgentAdapter::set_side_parent(
+            &mut side_inherit,
+            "11111111-1111-4111-8111-111111111111".into(),
+        )
+        .unwrap();
+        let side_launch =
+            super::AgentAdapter::command(&mut side_inherit, "claude", "/tmp", None, &config)
+                .unwrap();
+        let side_args: Vec<_> = side_launch
+            .command
+            .as_std()
+            .get_args()
+            .map(|v| v.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !side_args.iter().any(|a| a.starts_with("--permission-mode=")
+                || a == "--safe-mode"
                 || a == "--strict-mcp-config"
                 || a == "--no-chrome"
-                || a == "--tools"));
-        }
+                || a == "--tools")
+        );
     }
 
     #[test]

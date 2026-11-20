@@ -1,6 +1,24 @@
 #!/usr/bin/env python3
 """Deterministic native-protocol fixture. Never connects to a model."""
 import sys,json,time,os,subprocess,threading,pathlib,re
+
+# Synthetic managed policy: deliberately independent of child settings/safe-mode.
+# Only an explicit test environment enables it; no real managed config is read.
+managed_hook_root = os.environ.get('LATTE_FIXTURE_MANAGED_HOOK_ROOT')
+prediction_process = '--system-prompt' in sys.argv and 'Predict one short' in sys.argv[sys.argv.index('--system-prompt') + 1]
+
+def managed_record(file: str, value: dict) -> None:
+    if managed_hook_root:
+        with (pathlib.Path(managed_hook_root) / file).open('a') as record:
+            record.write(json.dumps(value, ensure_ascii=False) + '\n')
+
+def managed_user_prompt(text: str) -> None:
+    managed_record('managed-hook-inputs', {'event': 'UserPromptSubmit', 'prompt': text})
+
+managed_record('claude-invocations', {
+    'kind': 'prediction' if prediction_process else 'probe' if any(a.startswith('--permission-mode=latteWorkPermissionProbe') for a in sys.argv) else 'help' if '--help' in sys.argv else 'version' if '--version' in sys.argv else 'main',
+    'pid': os.getpid(),
+})
 if '--version' in sys.argv:
     print('fixture-claude 1.0');sys.exit(0)
 if '--help' in sys.argv:
@@ -12,10 +30,32 @@ if '--help' in sys.argv:
                 print("error: unknown option '--permission-mode'",file=sys.stderr)
             sys.exit(1)
         print('Usage: claude [options]\n  -h, --help Display help for command');sys.exit(0)
-    print('--permission-mode <mode> (choices: "default", "acceptEdits", "plan", "dontAsk", "bypassPermissions")');sys.exit(0)
+    print('--permission-mode <mode> (choices: "default", "acceptEdits", "plan", "dontAsk", "bypassPermissions")')
+    print('--safe-mode --tools --strict-mcp-config --mcp-config --disable-slash-commands --no-session-persistence --no-chrome --system-prompt --setting-sources --permission-prompts --prompt-suggestions Use "" to disable all tools; sessions will not be saved')
+    sys.exit(0)
+if prediction_process:
+    # Regression tripwire, not a simulated isolated prediction capability.
+    # A managed hook still sees plaintext stdin even with disableAllHooks.
+    description = sys.stdin.read()
+    managed_user_prompt(description)
+    root = pathlib.Path(os.environ.get('LATTE_FIXTURE_PREDICTION_ROOT', os.getcwd()))
+    with (root / 'prediction-inputs').open('a') as record:
+        record.write(json.dumps({'description': description, 'pid': os.getpid()}) + '\n')
+    raise RuntimeError('Claude composer predictions must fail closed before spawn')
 output_lock=threading.Lock()
+native_tasks=set()
 def emit(value):
-    with output_lock: print(json.dumps(value),flush=True)
+    with output_lock:
+        if value.get('type')=='system':
+            subtype=value.get('subtype')
+            task_id=value.get('task_id')
+            if task_id and subtype=='task_started':
+                native_tasks.add(task_id)
+            elif task_id and subtype in ('task_updated','task_notification'):
+                status=value.get('patch',{}).get('status',value.get('status'))
+                if status in ('completed','failed','stopped','killed'):
+                    native_tasks.discard(task_id)
+        print(json.dumps(value),flush=True)
 native_id='11111111-1111-4111-8111-111111111111'
 resume_id=next((arg.split('=',1)[1] for arg in sys.argv if arg.startswith('--resume=')),None)
 if '--fork-session' in sys.argv:
@@ -44,6 +84,7 @@ def metadata(value):
 turns=0
 child=None
 background=None
+background_mode=None
 native_lock=threading.Lock()
 native_pending=[]
 native_head=False
@@ -53,6 +94,25 @@ resumed=any(arg.startswith('--resume=') for arg in sys.argv)
 for line in sys.stdin:
     value=json.loads(line)
     if value['type']=='control_request':
+        if value['request']['subtype']=='end_session':
+            emit({'type':'control_response','response':{'subtype':'success','request_id':value['request_id']}})
+            if background_mode and background_mode.startswith('background-detached-late'):
+                emit({'type':'system','subtype':'task_started','task_id':'bg-task','task_type':'local_bash'})
+            if background_mode=='background-detached':
+                pathlib.Path('fixture-stop-started').touch()
+                deadline=time.monotonic()+0.8
+                while not pathlib.Path('fixture-stop-release').exists() and time.monotonic()<deadline:
+                    time.sleep(.01)
+            for process in (child,background):
+                if process and process.poll() is None:
+                    process.terminate()
+                    process.wait()
+            with output_lock:
+                stopped=list(native_tasks)
+            for task_id in stopped:
+                if task_id!='bg-task' or background_mode not in ('background-stop-uncertain','background-detached-late-unconfirmed'):
+                    emit({'type':'system','subtype':'task_notification','task_id':task_id,'status':'stopped'})
+            break
         if value['request']['subtype']=='generate_session_title':
             description=value['request']['description'].split('\n\nAssistant reply:', 1)[0]
             if description.startswith('native-auto-title'):
@@ -93,24 +153,33 @@ for line in sys.stdin:
             if native_mode: pathlib.Path('native-interrupt-pending').write_text('received')
             result_first=os.environ.get('LATTE_FIXTURE_INTERRUPT_RESULT_FIRST')=='1'
             if result_first: emit({'type':'result','subtype':'success','is_error':False})
-            time.sleep(min(15,float(os.environ.get('LATTE_FIXTURE_INTERRUPT_DELAY','0'))))
-            with native_lock:
-                native_generation+=1
-                native_head=False
-                native_pending.clear()
-            if native_mode:
-                with pathlib.Path('native-interrupts').open('a') as record: record.write('interrupt\n')
-            if child is not None:
-                child.terminate();child.wait();child=None
-            # Result and control acknowledgement may arrive in either order.
-            if not result_first: emit({'type':'result','subtype':'success','is_error':False})
-            emit({'type':'control_response','response':{'subtype':'success','request_id':value['request_id']}})
+            delay=min(15,float(os.environ.get('LATTE_FIXTURE_INTERRUPT_DELAY','0')))
+            def finish_interrupt(request_id=value['request_id'],result_first=result_first,delay=delay):
+                global native_generation,native_head,child
+                time.sleep(delay)
+                with native_lock:
+                    native_generation+=1
+                    native_head=False
+                    native_pending.clear()
+                if native_mode:
+                    with pathlib.Path('native-interrupts').open('a') as record: record.write('interrupt\n')
+                if child is not None:
+                    child.terminate();child.wait();child=None
+                if not result_first: emit({'type':'result','subtype':'success','is_error':False})
+                emit({'type':'control_response','response':{'subtype':'success','request_id':request_id}})
+            if delay:
+                # Simulate a late receipt while accepting other controls,
+                # including the session-ending request.
+                threading.Thread(target=finish_interrupt,daemon=True).start()
+            else:
+                finish_interrupt()
             continue
         if '--no-session-persistence' not in sys.argv and '--disable-slash-commands' not in sys.argv:
             with open('fixture-agent-pid','w') as f:f.write(str(os.getpid()))
         emit({'type':'control_response','response':{'subtype':'success','request_id':value['request_id'],'response':{'current_permission_mode':'plan' if readonly else 'default','commands':[{'name':'compact','description':'Compact history','argumentHint':'[instructions]'},{'name':'project:check','description':os.path.basename(os.getcwd()),'argumentHint':'<target>'},{'name':'agents','description':'Native child agents','argumentHint':''}]}}})
     elif value['type']=='user':
         text=value['message']['content']
+        managed_user_prompt(text)
         resumed=resumed or turns>0
         turns+=1
         metadata({'type':'user','message':{'content':text},'sessionId':native_id})
@@ -282,6 +351,13 @@ for line in sys.stdin:
             continue
         if text=='malformed': print('this is not json',flush=True);sys.exit(0)
         if text=='exit': sys.exit(2)
+        if text=='background-detached-crash':
+            # The detached process keeps running after native stdout reaches EOF.
+            escaped=subprocess.Popen(['/bin/bash','-c','exec /bin/sleep 15'],
+                stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,start_new_session=True)
+            pathlib.Path('crashed-background-pid').write_text(str(escaped.pid))
+            sys.exit(2)
         if text in ('native-queue-head', 'native-queue-batch-head'):
             batch=text=='native-queue-batch-head'
             native_mode=True
@@ -399,9 +475,17 @@ for line in sys.stdin:
         elif text=='identity':
             emit({'type':'assistant','message':{'content':[{'type':'text','text':json.dumps({'pid':os.getpid(),'turns':turns,'background_pid':background.pid if background else None})}]}})
             emit({'type':'result','subtype':'success','is_error':False})
-        elif text in ('background','background-report','background-held'):
-            background=subprocess.Popen(['sleep','120' if text in ('background','background-held') else '0.5'])
-            emit({'type':'system','subtype':'task_started','task_id':'bg-task','task_type':'local_agent'})
+        elif text in ('background','background-report','background-held','background-detached','background-stop-uncertain','background-detached-late','background-detached-late-unconfirmed'):
+            background_mode=text
+            detached=text.startswith('background-detached')
+            late=text.startswith('background-detached-late')
+            background=subprocess.Popen(['sleep','0.5' if text=='background-report' else '15' if late else '120'],start_new_session=detached)
+            if late:
+                # The shell is live, but the actor cannot receive task_started
+                # until the native shutdown exchange has already acknowledged.
+                pathlib.Path('late-background-pid').write_text(str(background.pid))
+                continue
+            emit({'type':'system','subtype':'task_started','task_id':'bg-task','task_type':'local_bash' if detached else 'local_agent'})
             emit({'type':'assistant','message':{'content':[{'type':'text','text':f'background:{background.pid}'}]}})
             if text=='background-held':
                 pathlib.Path('background-main-waiting').touch()

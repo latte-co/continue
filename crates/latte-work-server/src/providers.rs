@@ -879,6 +879,47 @@ mod tests {
         }
     }
     #[test]
+    fn cursor_provider_is_known_but_all_custom_protocols_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ProviderStore::open(dir.path()).unwrap();
+        assert!(
+            store
+                .turn_config("cursor", None, Some(TurnProvider::Cli))
+                .unwrap()
+                .provider
+                .is_none()
+        );
+        assert!(
+            store
+                .snapshot_for_host("remote", "cursor")
+                .unwrap()
+                .is_none()
+        );
+        for protocol in [
+            ProviderProtocol::AnthropicMessages,
+            ProviderProtocol::OpenaiChat,
+            ProviderProtocol::OpenaiResponses,
+        ] {
+            let id = saved(&mut store, draft(protocol));
+            assert!(store.bind("cursor", Some(id.clone())).is_err());
+            assert!(
+                store
+                    .bind_host("remote", "cursor", Some(id.clone()))
+                    .is_err()
+            );
+            let snapshot = store.snapshot("opencode", &id).unwrap();
+            assert!(
+                store
+                    .turn_config(
+                        "cursor",
+                        None,
+                        Some(TurnProvider::Snapshot(Box::new(snapshot)))
+                    )
+                    .is_err()
+            );
+        }
+    }
+    #[test]
     fn remote_associations_are_local_durable_and_validate_edits() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = ProviderStore::open(dir.path()).unwrap();

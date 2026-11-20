@@ -1,10 +1,20 @@
 //! Final-binary tests: real daemon, real socket/bridge, deterministic native processes.
 #[path = "support/codex.rs"]
 mod codex_e2e;
+#[path = "support/cursor.rs"]
+mod cursor_e2e;
 #[path = "support/environment.rs"]
 mod environment_e2e;
+#[path = "support/fixture_bridge.rs"]
+mod fixture_bridge;
 #[path = "support/opencode.rs"]
 mod opencode_e2e;
+#[path = "support/prediction_admission.rs"]
+mod prediction_admission_e2e;
+#[path = "support/prediction_reads.rs"]
+mod prediction_reads_e2e;
+#[path = "support/predictions.rs"]
+mod predictions_e2e;
 #[path = "support/side_chat.rs"]
 mod side_chat_e2e;
 #[path = "support/ssh.rs"]
@@ -37,14 +47,40 @@ impl Host {
             .prefix("lw-")
             .tempdir_in("/tmp")
             .unwrap();
+        fixture_bridge::prepare(
+            directory.path(),
+            env,
+            Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+        );
         let process = Self::spawn(directory.path(), env);
         let host = Self { directory, process };
         host.wait_ready().await;
         host
     }
     fn spawn(directory: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Child {
+        Self::spawn_with_removed_environment(directory, env, &[])
+    }
+    fn spawn_with_removed_environment(
+        directory: &Path,
+        env: &[(&str, &std::ffi::OsStr)],
+        removed: &[&str],
+    ) -> Child {
+        Self::spawn_binary(
+            Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+            directory,
+            env,
+            removed,
+        )
+    }
+    fn spawn_binary(
+        binary: &Path,
+        directory: &Path,
+        env: &[(&str, &std::ffi::OsStr)],
+        removed: &[&str],
+    ) -> Child {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude.py");
-        Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+        let mut command = Command::new(binary);
+        command
             .env("LATTE_WORK_AGENT_ENV", "inherit")
             .arg("serve")
             .arg("--state-dir")
@@ -62,8 +98,16 @@ impl Host {
                 "LATTE_WORK_OPENCODE",
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opencode.py"),
             )
+            .env(
+                "LATTE_WORK_CURSOR",
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cursor.py"),
+            )
             .env("CLAUDE_CONFIG_DIR", directory.join("claude-config"))
-            .envs(env.iter().copied())
+            .envs(env.iter().copied());
+        for name in removed {
+            command.env_remove(name);
+        }
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -78,12 +122,14 @@ impl Host {
         }
     }
     async fn client(&self) -> Client {
-        Client::local(
+        let bridge = fixture_bridge::prepare(
+            self.directory.path(),
+            &[],
             Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
-            Some(self.directory.path()),
-        )
-        .await
-        .unwrap()
+        );
+        Client::local(&bridge, Some(self.directory.path()))
+            .await
+            .unwrap()
     }
 }
 impl Drop for Host {
@@ -546,15 +592,27 @@ async fn denies_permissions_and_bounds_paths_and_failures() {
             .await,
             Response::Ok
         ));
+        let pid = agent_pid(project.path());
         send(&mut c, &id, text, text).await;
-        let events = wait(&mut c, &id, Status::Failed).await;
-        assert!(events.iter().any(|e| matches!(
-            e.event,
-            EventKind::State {
-                status: Status::Failed,
-                ..
-            }
-        )));
+        wait(&mut c, &id, Status::Unknown).await;
+        assert_gone(pid).await;
+        let Response::Session { session } = ask(
+            &mut c,
+            Request::Session {
+                session_id: id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("session");
+        };
+        let close_id = session
+            .agent_close_pending
+            .expect("native close evidence is missing");
+        assert!(
+            matches!(ask(&mut c, Request::ConfirmAgentClosed { session_id: id.clone(), close_id }).await,
+            Response::Session { session } if session.agent_close_pending.is_none())
+        );
     }
 }
 #[tokio::test]
@@ -2987,15 +3045,16 @@ async fn upgrade_local_coordinator_replaces_idle_build_once_for_concurrent_clien
         std::fs::remove_file(old_dir.join("control.sock")).unwrap();
         drop(guard);
     });
-    // Spawn bridges with a fixture CLI even on machines with a real Claude installation.
-    async fn connect(dir: &Path) -> (tokio::process::Child, serde_json::Value) {
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+    let bridge = fixture_bridge::prepare(
+        &dir,
+        &[],
+        Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+    );
+    // Prepare once before concurrent clients, keeping every CLI deterministic on upgrade.
+    async fn connect(binary: &Path, dir: &Path) -> (tokio::process::Child, serde_json::Value) {
+        let mut child = tokio::process::Command::new(binary)
             .args(["connect-local", "--state-dir"])
             .arg(dir)
-            .env(
-                "LATTE_WORK_CLAUDE",
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude.py"),
-            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -3019,7 +3078,7 @@ async fn upgrade_local_coordinator_replaces_idle_build_once_for_concurrent_clien
         .unwrap();
         (child, serde_json::from_str(&line).unwrap())
     }
-    let ((a, hello_a), (b, hello_b)) = tokio::join!(connect(&dir), connect(&dir));
+    let ((a, hello_a), (b, hello_b)) = tokio::join!(connect(&bridge, &dir), connect(&bridge, &dir));
     old.await.unwrap();
     let status = lifecycle(&dir, json!({"method":"server_status"})).await;
     // Stop the disposable daemon before assertions, including on a failed comparison.
@@ -3038,6 +3097,9 @@ async fn upgrade_local_coordinator_replaces_idle_build_once_for_concurrent_clien
     assert_eq!(hello_a["kind"], "hello", "{hello_a}");
     assert_eq!(hello_a["server_id"], hello_b["server_id"]);
     assert_eq!(hello_a["version"], 1);
+    let agents = hello_a["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 5);
+    assert!(agents.iter().all(|agent| agent["available"] == true));
     assert_ne!(status["build_id"], "old-build");
 }
 
@@ -3082,6 +3144,460 @@ async fn upgrade_legacy_daemon_returns_actionable_error_without_stopping_it() {
             .is_ok()
     );
     drop(listener);
+}
+
+#[tokio::test]
+async fn upgrade_busy_daemon_defers_replacement_and_still_requires_compatible_hello() {
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    for compatible in [true, false] {
+        let directory = tempfile::Builder::new()
+            .prefix("lw-defer-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let listener =
+            tokio::net::UnixListener::bind(directory.path().join("control.sock")).unwrap();
+        let old = tokio::spawn(async move {
+            let status = json!({
+                "kind":"server_status", "server_id":"busy-instance",
+                "build_id":"old-build", "draining":false,
+            });
+            for requests in [
+                vec!["server_status"],
+                vec!["prepare_upgrade"],
+                vec!["server_status", "hello"],
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                for method in requests {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(request["method"], method);
+                    let response = match method {
+                        "server_status" => status.clone(),
+                        "prepare_upgrade" => {
+                            assert_eq!(request["server_id"], "busy-instance");
+                            json!({"kind":"error","code":"upgrade_blocked","message":"conversation busy"})
+                        }
+                        "hello" if compatible => json!({
+                            "kind":"hello","version":VERSION,"server_id":"busy-instance","agents":[],
+                        }),
+                        _ => {
+                            json!({"kind":"error","code":"version_mismatch","message":"fixture protocol mismatch"})
+                        }
+                    };
+                    reader
+                        .get_mut()
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let result = Client::local(
+            Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+            Some(directory.path()),
+        )
+        .await;
+        if compatible {
+            assert_eq!(result.unwrap().server_id(), "busy-instance");
+        } else {
+            let Err(error) = result else {
+                panic!("an incompatible daemon must not serve application requests");
+            };
+            assert!(error.to_string().contains("fixture protocol mismatch"));
+        }
+        old.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn quit_and_reconnect_keep_live_conversations_isolated_from_slow_or_unknown_closes() {
+    use latte_work_protocol::lifecycle::Resource;
+    let host = Host::start().await;
+    let mut app = host.client().await;
+    let server_id = app.server_id().to_owned();
+    let good = tempfile::tempdir().unwrap();
+    let uncertain = tempfile::tempdir().unwrap();
+    let good_id = session(&mut app, good.path()).await;
+    let uncertain_id = session(&mut app, uncertain.path()).await;
+    let resources = vec![
+        Resource::AgentSession(uncertain_id.clone()),
+        Resource::AgentSession(good_id.clone()),
+    ];
+    app.claim_resources("first-app".into(), resources.clone())
+        .await
+        .unwrap();
+    let mut processes = Vec::new();
+    for (id, root, input) in [
+        (&good_id, good.path(), "background-detached"),
+        (&uncertain_id, uncertain.path(), "background-stop-uncertain"),
+    ] {
+        send(&mut app, id, input, input).await;
+        let events = wait(&mut app, id, Status::Completed).await;
+        let pid = events
+            .iter()
+            .find_map(|entry| match &entry.event {
+                EventKind::Text { text } => text.strip_prefix("background:")?.parse::<i32>().ok(),
+                _ => None,
+            })
+            .unwrap();
+        processes.push((agent_pid(root), pid));
+    }
+    drop(app);
+
+    // Reopening from a new client takes over the existing actor with no prompt.
+    let mut reopened = host.client().await;
+    assert_eq!(reopened.server_id(), server_id);
+    assert!(
+        matches!(ask(&mut reopened, Request::Projects).await, Response::Projects { projects } if projects.len() == 2)
+    );
+    reopened
+        .claim_resources("reopened-app".into(), resources.clone())
+        .await
+        .unwrap();
+    for (id, root, (pid, background)) in [
+        (&good_id, good.path(), processes[0]),
+        (&uncertain_id, uncertain.path(), processes[1]),
+    ] {
+        assert!(matches!(
+            ask(
+                &mut reopened,
+                Request::OpenAgentSession {
+                    session_id: id.clone(),
+                    provider: None,
+                }
+            )
+            .await,
+            Response::Ok
+        ));
+        assert_eq!(agent_pid(root), pid);
+        assert!(kill(Pid::from_raw(background), None).is_ok());
+        assert!(matches!(ask(&mut reopened, Request::Poll {
+            session_id: id.clone(), after: 0.0,
+        }).await, Response::Events { session, events, .. }
+            if session.agent_session_busy == Some(true)
+                && events.iter().filter(|e| matches!(e.event, EventKind::User { .. })).count() == 1));
+    }
+
+    let mut cleanup = Client::local_cleanup(
+        Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+        Some(host.directory.path()),
+    )
+    .await
+    .unwrap();
+    let close = tokio::spawn(async move {
+        cleanup
+            .close_owned_resources(server_id, "reopened-app".into(), resources)
+            .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while !good.path().join("fixture-stop-started").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "quit skipped the other conversation"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut another = tokio::time::timeout(Duration::from_millis(600), async {
+        let mut client = Client::local_cleanup(
+            Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+            Some(host.directory.path()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            ask(&mut client, Request::Projects).await,
+            Response::Projects { .. }
+        ));
+        client
+    })
+    .await
+    .expect("one closing conversation blocked access to the daemon");
+    assert!(!close.is_finished());
+    std::fs::write(good.path().join("fixture-stop-release"), "").unwrap();
+    assert!(
+        close
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("待确认")
+    );
+    for &(agent, child) in &processes {
+        assert_gone(agent).await;
+        assert_gone(child).await;
+    }
+    assert!(
+        matches!(ask(&mut another, Request::Session { session_id: uncertain_id }).await,
+        Response::Session { session } if session.agent_close_pending.is_some())
+    );
+    assert!(matches!(
+        ask(
+            &mut another,
+            Request::OpenAgentSession {
+                session_id: good_id,
+                provider: None,
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    assert_ne!(agent_pid(good.path()), processes[0].0);
+}
+
+#[tokio::test]
+async fn busy_server_with_one_pending_close_releases_other_owned_processes() {
+    use latte_work_protocol::lifecycle::Resource;
+    let current = Path::new(env!("CARGO_BIN_EXE_latte-work-server"));
+    let baseline = std::env::var_os("LATTE_WORK_TEST_LEGACY_SERVER").map(PathBuf::from);
+    let binary = baseline.as_deref().unwrap_or(current);
+    let directory = tempfile::Builder::new()
+        .prefix("lw-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let process = Host::spawn_binary(binary, directory.path(), &[], &[]);
+    let host = Host { directory, process };
+    host.wait_ready().await;
+    let mut app = Client::local_cleanup(current, Some(host.directory.path()))
+        .await
+        .unwrap();
+    let server = app.server_id().to_owned();
+    let project = tempfile::tempdir().unwrap();
+    let project_id = terminal_project(&mut app, project.path()).await;
+    let pending_root = tempfile::tempdir().unwrap();
+    let pending = session(&mut app, pending_root.path()).await;
+    let running_project = tempfile::tempdir().unwrap();
+    let running = session(&mut app, running_project.path()).await;
+    let terminal = uuid::Uuid::new_v4().to_string();
+    let reclaimed = uuid::Uuid::new_v4().to_string();
+    let resources = vec![
+        Resource::AgentSession(pending.clone()),
+        Resource::AgentSession(running.clone()),
+        Resource::Terminal(terminal.clone()),
+        Resource::Terminal(reclaimed.clone()),
+    ];
+    app.claim_resources("old-app".into(), resources.clone())
+        .await
+        .unwrap();
+    for id in [&terminal, &reclaimed] {
+        assert!(matches!(
+            ask(
+                &mut app,
+                Request::CreateTerminal {
+                    project_id: project_id.clone(),
+                    terminal_id: id.clone(),
+                    cols: 80,
+                    rows: 24
+                }
+            )
+            .await,
+            Response::Terminal { .. }
+        ));
+    }
+    // Model the durable close left after A lost its actor.
+    rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap().execute(
+        "INSERT INTO unconfirmed_agent_closes(session_id,reason,close_id) VALUES (?1,'close unknown','verify-a')",
+        [&pending]).unwrap();
+    send(&mut app, &running, "run-b", "background").await;
+    let events = wait(&mut app, &running, Status::Completed).await;
+    let child: i32 = events
+        .iter()
+        .find_map(|e| match &e.event {
+            EventKind::Text { text } => text.strip_prefix("background:")?.parse().ok(),
+            _ => None,
+        })
+        .unwrap();
+    let agent = agent_pid(running_project.path());
+    drop(app);
+    let mut reopened = host.client().await;
+    assert_eq!(reopened.server_id(), server);
+    // Reattach on the new bridge. A different App subsequently claims one terminal.
+    reopened
+        .claim_resources("reopened-app".into(), resources.clone())
+        .await
+        .unwrap();
+    let mut other = host.client().await;
+    other
+        .claim_resources(
+            "other-app".into(),
+            vec![Resource::Terminal(reclaimed.clone())],
+        )
+        .await
+        .unwrap();
+    if baseline.is_some() {
+        // Positive control: on the actual legacy build the blocked first item
+        // leaves the later native process and its child running.
+        assert!(
+            reopened
+                .close_owned_resources(server.clone(), "reopened-app".into(), resources.clone())
+                .await
+                .is_err()
+        );
+        assert!(process_is_running(Pid::from_raw(agent)));
+        assert!(process_is_running(Pid::from_raw(child)));
+    }
+    let mut remaining = resources.clone();
+    let mut blocked = Vec::new();
+    let mut closes = reopened.close_owned_inventory(&server, "reopened-app", &resources);
+    while let Some(receipt) = closes.next_receipt().await.unwrap() {
+        match receipt {
+            latte_work_client::CloseReceipt::Closed(closed) => {
+                remaining.retain(|r| !closed.contains(r))
+            }
+            latte_work_client::CloseReceipt::Blocked(resource, reason) => {
+                blocked.push((resource.clone(), reason))
+            }
+        }
+    }
+    assert_eq!(remaining, [Resource::AgentSession(pending.clone())]);
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0].0, remaining[0]);
+    assert!(
+        matches!(ask(&mut reopened, Request::Session { session_id: pending }).await,
+        Response::Session { session } if session.agent_close_pending.as_deref() == Some("verify-a"))
+    );
+    assert_gone(agent).await;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while process_is_running(Pid::from_raw(child)) {
+        assert!(
+            Instant::now() < deadline,
+            "B's background child survived its close"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        matches!(ask(&mut other, Request::Terminals { project_id }).await,
+        Response::Terminals { terminals } if terminals.len() == 1 && terminals[0].id == reclaimed && !terminals[0].exited)
+    );
+}
+
+#[tokio::test]
+async fn quit_drains_late_task_starts_and_preserves_unconfirmed_shutdown() {
+    use latte_work_protocol::lifecycle::Resource;
+    let host = Host::start().await;
+    let mut client = host.client().await;
+    let server = client.server_id().to_owned();
+    for confirmed in [true, false] {
+        let project = tempfile::tempdir().unwrap();
+        let id = session(&mut client, project.path()).await;
+        let resources = vec![Resource::AgentSession(id.clone())];
+        client
+            .claim_resources("app".into(), resources.clone())
+            .await
+            .unwrap();
+        let input = if confirmed {
+            "background-detached-late"
+        } else {
+            "background-detached-late-unconfirmed"
+        };
+        send(&mut client, &id, input, input).await;
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(project.path().join("late-background-pid"))
+                && let Ok(pid) = text.parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "detached task did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let claude = agent_pid(project.path());
+        assert!(kill(Pid::from_raw(pid), None).is_ok());
+        let mut cleanup = host.client().await;
+        let closed = cleanup
+            .close_owned_resources(server.clone(), "app".into(), resources)
+            .await;
+        assert_gone(claude).await;
+        assert_gone(pid).await;
+        assert_eq!(closed.is_ok(), confirmed);
+        assert!(
+            matches!(ask(&mut cleanup, Request::Session { session_id: id }).await,
+            Response::Session { session } if session.agent_session_open == Some(false)
+                && session.agent_close_pending.is_none() == confirmed)
+        );
+    }
+}
+
+#[tokio::test]
+async fn claude_crash_before_task_started_leaves_detached_process_and_fences_reopen() {
+    use latte_work_protocol::lifecycle::Resource;
+    let host = Host::start().await;
+    let project = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let id = session(&mut client, project.path()).await;
+    let server_id = client.server_id().to_owned();
+    let resources = vec![Resource::AgentSession(id.clone())];
+    client
+        .claim_resources("app".into(), resources.clone())
+        .await
+        .unwrap();
+    send(
+        &mut client,
+        &id,
+        "crash-with-detached-shell",
+        "background-detached-crash",
+    )
+    .await;
+    wait(&mut client, &id, Status::Unknown).await;
+    let pid = Pid::from_raw(
+        std::fs::read_to_string(project.path().join("crashed-background-pid"))
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    assert!(
+        process_is_running(pid),
+        "detached fixture must survive the native crash"
+    );
+
+    let Response::Session { session } = ask(
+        &mut client,
+        Request::Session {
+            session_id: id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("session");
+    };
+    let close_id = session
+        .agent_close_pending
+        .expect("crash has no closing receipt");
+    assert!(matches!(ask(&mut client, Request::OpenAgentSession {
+        session_id: id.clone(), provider: None,
+    }).await, Response::Error { message, .. } if message.contains("待确认")));
+    assert!(
+        client
+            .close_owned_resources(server_id, "app".into(), resources)
+            .await
+            .is_err()
+    );
+    assert!(process_is_running(pid));
+
+    // Only the test owns this PID. Model the user's explicit verification
+    // before releasing the durable fence.
+    kill(pid, Signal::SIGTERM).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while process_is_running(pid) {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(matches!(ask(&mut client, Request::ConfirmAgentClosed {
+        session_id: id.clone(), close_id,
+    }).await, Response::Session { session } if session.agent_close_pending.is_none()));
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::OpenAgentSession {
+                session_id: id,
+                provider: None,
+            }
+        )
+        .await,
+        Response::Ok
+    ));
 }
 
 #[tokio::test]
@@ -4494,6 +5010,7 @@ for line in sys.stdin:
     if os.path.exists('fail-init'): sys.exit(1)
     time.sleep(0.4)
     print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':value['request_id'],'response':{}}}),flush=True)
+    if value['request']['subtype']=='end_session': break
 "#).unwrap();
     std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
     let host = Host::start_with_environment(&[("LATTE_WORK_CLAUDE", fixture.as_os_str())]).await;

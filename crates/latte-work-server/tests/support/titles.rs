@@ -506,14 +506,210 @@ async fn codex_title_handles_early_completion_and_close_cancels_pending_generati
             .await,
             Response::Ok
         ));
-        while nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok() {
+        assert_eq!(
+            nix::sys::signal::kill(Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH),
+            "successful close must acknowledge title worker reaping, not just request cancellation"
+        );
+        title(&mut client, &id, prompt).await;
+    }
+}
+
+#[path = "title_prediction_records.rs"]
+mod prediction_records;
+
+// Start held predictions only on later turns of already named sessions. This
+// avoids racing first-turn title generation for the two shared execution slots.
+async fn held_predictions(client: &mut Client) -> Vec<(tempfile::TempDir, String, i32)> {
+    let mut held = Vec::new();
+    for index in 0..2 {
+        let root = tempfile::tempdir().unwrap();
+        let id = create(client, root.path(), "codex").await;
+        let provider: latte_work_protocol::TurnProvider = serde_json::from_value(serde_json::json!({"kind":"snapshot","snapshot":{"provider":{"id":"title-prediction-provider","revision":"fixed","name":"Fixture","protocol":"openai_responses","base_url":"http://localhost:8000/v1","model":"custom-codex","models":[],"auth":"bearer","has_credential":true},"credential":"fixture-title-prediction-key"}})).unwrap();
+        for (request, prompt) in [
+            (format!("named-{index}"), "native-auto-title"),
+            (format!("held-{index}"), "prediction-held"),
+        ] {
+            let response = ask(
+                client,
+                Request::Send {
+                    session_id: id.clone(),
+                    request_id: request,
+                    text: prompt.into(),
+                    model: Some("custom-codex".into()),
+                    effort: None,
+                    permission_mode: None,
+                    provider: Some(provider.clone()),
+                },
+            )
+            .await;
             assert!(
-                Instant::now() < deadline,
-                "title worker still alive after close"
+                matches!(response, Response::Accepted { duplicate: false }),
+                "{response:?}"
             );
+            title(client, &id, "修复附件拖入失败").await;
+        }
+        wait(client, &id, Status::Completed).await;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !root.path().join("prediction-active").exists() {
+            assert!(Instant::now() < deadline, "held prediction never started");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        title(&mut client, &id, prompt).await;
+        // The fixture closes the held record before writing prediction-active;
+        // an optional first-turn prediction may precede it in this NDJSON log.
+        let pid = prediction_records::held_prediction_pid(
+            &std::fs::read_to_string(root.path().join("prediction-inputs")).unwrap(),
+        )
+        .unwrap()
+        .expect("prediction-held record");
+        held.push((root, id, pid));
+    }
+    held
+}
+
+async fn release_predictions(held: &[(tempfile::TempDir, String, i32)]) {
+    for (root, _, _) in held {
+        std::fs::write(root.path().join("prediction-release"), "release").unwrap();
+    }
+    for (_, _, pid) in held {
+        gone(*pid).await;
+    }
+}
+
+async fn queued_title(client: &mut Client, root: &Path) -> String {
+    let id = create(client, root, "codex").await;
+    assert!(matches!(
+        send(client, &id, "queued-first", "native-auto-title").await,
+        Response::Accepted { .. }
+    ));
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let events = wait(client, &id, Status::Completed).await;
+        assert!(
+            !events.iter().any(
+                |e| matches!(&e.event, EventKind::Notice { text } if text.contains("自动命名"))
+            ),
+            "busy predictions must not permanently consume the title chance"
+        );
+        let Response::Session { session } = ask(
+            client,
+            Request::Session {
+                session_id: id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("session")
+        };
+        if session.title_requested {
+            assert_eq!(session.title, "native-auto-title");
+            assert!(
+                !root.join("codex-title-inputs").exists(),
+                "queued title must not send its transcript before obtaining a permit"
+            );
+            return id;
+        }
+        assert!(Instant::now() < deadline, "title once marker missing");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn codex_title_waits_for_held_predictions_then_generates_exactly_once() {
+    let host = Host::start().await;
+    let mut client = host.client().await;
+    let held = held_predictions(&mut client).await;
+    let root = tempfile::tempdir().unwrap();
+    let id = queued_title(&mut client, root.path()).await;
+    release_predictions(&held).await;
+    title(&mut client, &id, "修复附件拖入失败").await;
+    let record = root.path().join("codex-title-inputs");
+    let recorded = std::fs::read_to_string(&record).unwrap();
+    assert_eq!(recorded.lines().count(), 1);
+    for (held_root, held_id, _) in &held {
+        title(&mut client, held_id, "修复附件拖入失败").await;
+        assert_eq!(
+            std::fs::read_to_string(held_root.path().join("codex-title-inputs"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+    send(&mut client, &id, "queued-followup", "followup").await;
+    let events = wait(&mut client, &id, Status::Completed).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.event, EventKind::User { .. }))
+            .count(),
+        2
+    );
+    assert!(!events.iter().any(
+        |e| matches!(&e.event, EventKind::Text { text } if text.contains("修复附件拖入失败"))
+    ));
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), recorded);
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::CloseAgentSession {
+                session_id: id.clone(),
+                only_if_idle: Some(true)
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    send(&mut client, &id, "queued-resume", "followup").await;
+    title(&mut client, &id, "修复附件拖入失败").await;
+    assert_eq!(std::fs::read_to_string(record).unwrap(), recorded);
+}
+
+#[tokio::test]
+async fn codex_queued_title_manual_rename_and_close_cancel_without_retry() {
+    for rename in [true, false] {
+        let host = Host::start().await;
+        let mut client = host.client().await;
+        let held = held_predictions(&mut client).await;
+        let root = tempfile::tempdir().unwrap();
+        let id = queued_title(&mut client, root.path()).await;
+        let expected = if rename {
+            "Manual queued title"
+        } else {
+            "native-auto-title"
+        };
+        if rename {
+            assert!(
+                matches!(ask(&mut client, Request::RenameSession { provider: None, session_id: id.clone(), title: expected.into() }).await, Response::Session { session } if session.custom_title)
+            );
+        } else {
+            assert!(matches!(
+                ask(
+                    &mut client,
+                    Request::CloseAgentSession {
+                        session_id: id.clone(),
+                        only_if_idle: Some(true)
+                    }
+                )
+                .await,
+                Response::Ok
+            ));
+        }
+        release_predictions(&held).await;
+        // A new title round trips through the freed pool before checking that
+        // the cancelled waiter did not run when the permits were released.
+        let next_root = tempfile::tempdir().unwrap();
+        let next = create(&mut client, next_root.path(), "codex").await;
+        send(&mut client, &next, "next-title", "native-auto-title").await;
+        title(&mut client, &next, "修复附件拖入失败").await;
+        title(&mut client, &id, expected).await;
+        assert!(!root.path().join("codex-title-inputs").exists());
+        send(&mut client, &id, "after-cancel", "followup").await;
+        title(&mut client, &id, expected).await;
+        assert!(
+            !root.path().join("codex-title-inputs").exists(),
+            "cancel must not roll back the once marker or retry"
+        );
     }
 }
 

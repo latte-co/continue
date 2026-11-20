@@ -2,8 +2,8 @@
 
 A small desktop workspace for coding agents, with local and SSH projects.
 
-**Tauri 2 · React · Rust**. Integrates installed **Claude Code**, **Traex**, **Codex**, and
-**OpenCode 2.x** CLIs through native protocols and session history.
+**Tauri 2 · React · Rust**. Integrates installed **Claude Code**, **Traex**, **Codex**,
+**OpenCode 2.x**, and **Cursor Agent** CLIs through native protocols and session history.
 
 ## Start
 
@@ -12,9 +12,10 @@ make setup
 make dev
 ```
 
-Install and sign in to the selected CLI (`claude`, `traex`, `codex`, or
-`opencode`) on each execution host, or bind a compatible App Provider before
+Install and sign in to the selected CLI (`claude`, `traex`, `codex`, `opencode`, or
+`cursor-agent`) on each execution host, or bind a compatible App Provider before
 sending a task. OpenCode supports the App Provider and native host configuration.
+Cursor uses its native account and configuration, not App Providers.
 Create a project, select this computer or an SSH host, and choose its folder
 (local system picker or remote directory browser). Then create a task and send
 a prompt. You can also enter an absolute path. File
@@ -61,5 +62,18 @@ Provider。OpenCode 和 Traex 支持三种协议。Claude Code 接受 Anthropic 
 OpenCode 通过 [OpenCode 2.x ACP](https://opencode.ai/docs/cli/acp/) 运行会话，并读取执行主机的原生配置。
 详见 [Provider 与 Agent 配置](docs/providers.md)。
 
+Cursor Agent 通过执行主机上的 `cursor-agent`（或 `agent`）运行，`LATTE_WORK_CURSOR`
+可指定 CLI 路径。每轮独立启动，后续输入用已确认的原生 session ID 续聊；打开历史任务
+只准备 Host，不发送提示词、不伪造「已打开」。支持原生模型选择与 CLI 已声明的只读模式，
+不提供 App 审批、即时发送、独立 Effort、App Provider 或子智能体历史。
+默认遵循 Cursor 配置，不自动添加 `--force`、`--trust` 或批准 MCP；默认权限不等于只读。
+详见 [Cursor Agent 契约与验证](docs/cursor-agent.md)。
+
 Provider 可配置默认模型和多个可选模型。在输入框底部选择本轮模型，下一次发送时生效；
 会话记住已提交的选择，不影响其他会话。远程项目使用远端已同步的模型列表。
+
+支持智能输入建议的 Agent 完成一轮对话后，空输入框可显示灰色的下一条消息建议。
+按 Tab 仅插入可编辑草稿，不会自动发送；Escape 取消当前建议。不支持此能力的
+Agent 或旧版主机继续使用原有占位提示与欢迎建议。目前仅 Codex 启用智能生成；
+Claude Code（包括 App Provider 模式）、Traex 和 OpenCode 保留默认提示。
+建议状态随正常会话轮询返回，不额外占用主机读取通道。

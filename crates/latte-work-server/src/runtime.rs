@@ -1,5 +1,6 @@
 //! One manager per host, many independently supervised agent processes.
 use crate::{
+    admission::Guard,
     agents::{self, Action, Input},
     providers::LaunchConfig,
     store::Store,
@@ -8,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use latte_work_protocol::{EventKind, Response, Session, Status};
 use nix::{
+    errno::Errno,
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
@@ -28,6 +30,9 @@ use tokio::{
 };
 use tokio_util::codec::{FramedRead, LinesCodec};
 
+mod transport;
+use transport::Transport;
+
 pub type Database = Arc<Mutex<Store>>;
 pub type Runs = Arc<Mutex<HashMap<String, Run>>>;
 const TURN_LIMIT: Duration = Duration::from_secs(24 * 3600);
@@ -42,6 +47,24 @@ impl std::fmt::Display for AdmissionUnknown {
     }
 }
 impl std::error::Error for AdmissionUnknown {}
+
+pub(crate) use crate::admission::SendNotAdmitted;
+
+/// Only deterministic terminal rejection may combine attempt ownership and SQL absence.
+pub(crate) fn reject_send(admission: &Guard, request_id: &str, message: String) -> anyhow::Error {
+    admission.reject(request_id, message)
+}
+fn reject_turn<'a>(
+    admission: impl Into<Option<&'a Guard>>,
+    request_id: &str,
+    message: String,
+) -> anyhow::Error {
+    match admission.into() {
+        Some(admission) => reject_send(admission, request_id, message),
+        // Queue dispatch paths already have durable identities and no Send attempt.
+        None => anyhow::Error::msg(message),
+    }
+}
 
 #[derive(Default)]
 struct ForwardedInputs(HashMap<String, tokio::time::Instant>);
@@ -122,6 +145,11 @@ pub struct SendTurn {
     pub fingerprint: Option<String>,
     pub config: LaunchConfig,
 }
+pub(crate) struct Submission {
+    pub turn: SendTurn,
+    pub allow_queue: bool,
+    pub admission: Guard,
+}
 pub enum QueueAction {
     Take {
         request_id: String,
@@ -179,7 +207,8 @@ pub enum Control {
     Send {
         turn: SendTurn,
         allow_queue: bool,
-        reply: oneshot::Sender<Result<Response, String>>,
+        admission: Guard,
+        reply: oneshot::Sender<Result<Response>>,
     },
     Cancel {
         reply: Option<oneshot::Sender<Result<(), String>>>,
@@ -274,8 +303,9 @@ pub fn project_session_state(runs: &Runs, response: &mut Response) -> Result<()>
     Ok(())
 }
 
-/// Session actors serialize admission, native output and cancellation. Persist the
-/// request before writing it, but never recreate a process merely because a turn ended.
+/// Legacy test callers reserve before any asynchronous submission work. The
+/// connection path reserves earlier, immediately after decoding its Send.
+#[cfg(test)]
 pub async fn submit(
     database: Database,
     runs: Runs,
@@ -285,20 +315,63 @@ pub async fn submit(
     turn: SendTurn,
     allow_queue: bool,
 ) -> Result<Response> {
-    let control = control_for(database, runs, binary, session, path)?;
-    let (reply, receive) = oneshot::channel();
-    control
-        .try_send(Control::Send {
+    let admission = Guard::reserve(&database, &turn.request_id)?;
+    submit_reserved(
+        database,
+        runs,
+        binary,
+        session,
+        path,
+        Submission {
             turn,
             allow_queue,
-            reply,
-        })
-        .context("会话正在停止或请求队列已满，请重试；消息不会自动重发")?;
+            admission,
+        },
+    )
+    .await
+}
+
+/// The channel/actor owns the guard after transfer, even if the sender times out.
+pub(crate) async fn submit_reserved(
+    database: Database,
+    runs: Runs,
+    binary: String,
+    session: Session,
+    path: String,
+    submission: Submission,
+) -> Result<Response> {
+    let Submission {
+        turn,
+        allow_queue,
+        admission,
+    } = submission;
+    if !admission.matches(&database, &turn.request_id) {
+        bail!("消息准入所有权不匹配，请使用原请求 ID 核对");
+    }
+    let control = control_for(database.clone(), runs, binary, session, path)?;
+    let (reply, receive) = oneshot::channel();
+    if let Err(error) = control.try_send(Control::Send {
+        turn,
+        allow_queue,
+        admission,
+        reply,
+    }) {
+        let Control::Send {
+            turn, admission, ..
+        } = error.into_inner()
+        else {
+            bail!("消息准入所有权缺失，请使用原请求 ID 核对");
+        };
+        return Err(reject_send(
+            &admission,
+            &turn.request_id,
+            "会话正在停止或请求队列已满，请重试；消息不会自动重发".into(),
+        ));
+    }
     tokio::time::timeout(Duration::from_secs(10), receive)
         .await
         .map_err(|_| AdmissionUnknown)?
         .map_err(|_| AdmissionUnknown)?
-        .map_err(anyhow::Error::msg)
 }
 pub async fn queue_action(
     database: Database,
@@ -368,6 +441,7 @@ pub async fn rename_title(
                 &path,
                 config,
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
             .await?;
             let result = tokio::time::timeout(Duration::from_secs(8), async {
@@ -376,7 +450,10 @@ pub async fn rename_title(
                 let (reply, receive) = oneshot::channel();
                 let mut reply = Some(reply);
                 loop {
-                    let (line, sideband) = process.next_message().await?;
+                    let (line, sideband) = process
+                        .next_message()
+                        .await?
+                        .context("Agent原生标题transport已退出")?;
                     let actions = process.adapter.advance(if sideband {
                         Input::Sideband(&line)
                     } else {
@@ -708,6 +785,7 @@ pub async fn archive(
 
 /// Returns whether an actor acknowledged closure.
 pub async fn close(database: &Database, runs: &Runs, id: &str, only_if_idle: bool) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     db(database, |s| {
         s.session(id)?;
         if let Some(reason) = s.unconfirmed_agent_close(id)? {
@@ -723,16 +801,31 @@ pub async fn close(database: &Database, runs: &Runs, id: &str, only_if_idle: boo
     let actor_closed = control.is_some();
     if let Some(control) = control {
         let (reply, receive) = oneshot::channel();
-        control
-            .send(Control::Cancel {
-                reply: Some(reply),
-                only_if_idle,
-            })
-            .await?;
-        tokio::time::timeout(Duration::from_secs(5), receive)
-            .await
-            .context("关闭 Agent 会话超时")??
-            .map_err(anyhow::Error::msg)?;
+        tokio::time::timeout_at(deadline, async {
+            control
+                .send(Control::Cancel {
+                    reply: Some(reply),
+                    only_if_idle,
+                })
+                .await?;
+            receive.await?.map_err(anyhow::Error::msg)
+        })
+        .await
+        .context("关闭 Agent 会话超时")??;
+    }
+    let scope = agents::codex_jobs::JobScope::session(id);
+    agents::codex_jobs::registry().cancel_scope(&scope);
+    if !agents::codex_jobs::registry()
+        .wait_scope(
+            &scope,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await
+    {
+        db(database, |store| {
+            store.record_unconfirmed_agent_close(id, CLOSE_PENDING)
+        })?;
+        bail!(CLOSE_PENDING);
     }
     // A concurrent close may have recorded uncertainty and removed the actor
     // after the first lookup. A missing actor cannot clear that evidence.
@@ -868,6 +961,7 @@ impl TurnState {
                 Action::TitleRequested => {
                     db(database, |s| s.mark_title_requested(session_id))?;
                 }
+                Action::SpawnTurn(_) => bail!("未处理的Agent进程启动"),
                 Action::TitleRenamed(_) => bail!("未处理的原生标题确认"),
                 Action::ApprovalReply { .. } => bail!("未处理的原生审批确认"),
                 Action::GenerateTitle { .. } => bail!("未处理的标题生成请求"),
@@ -1098,8 +1192,11 @@ pub(crate) struct Group {
 }
 impl Drop for Group {
     fn drop(&mut self) {
-        let _ = killpg(Pid::from_raw(self.pid), Signal::SIGKILL);
-        let _ = self.child.start_kill();
+        // A reaped child's numeric PGID is no longer a signalling authority.
+        if self.child.id().is_some() {
+            let _ = killpg(Pid::from_raw(self.pid), Signal::SIGKILL);
+            let _ = self.child.start_kill();
+        }
     }
 }
 type Output = FramedRead<tokio::process::ChildStdout, LinesCodec>;
@@ -1115,14 +1212,16 @@ struct Process {
     adapter: Box<dyn agents::AgentAdapter>,
     binary: String,
     title_job: Option<tokio::task::JoinHandle<()>>,
+    prediction_owner: String,
+    prediction_turn: Option<crate::predictions::TurnContext>,
+    prediction_job: Option<tokio::task::JoinHandle<()>>,
     rename_reply: Option<oneshot::Sender<Result<String, String>>>,
     approval_replies: HashMap<String, PendingApprovalReply>,
-    group: Group,
-    input: tokio::process::ChildStdin,
-    output: Output,
-    sideband: Option<AgentSideband>,
-    drain: tokio::task::JoinHandle<()>,
-    _settings: Option<tempfile::NamedTempFile>,
+    transport: Option<Transport>,
+    /// A native result is evidence, not completion, until PerTurn I/O is reaped.
+    pending_result: Option<(bool, Option<String>)>,
+    result_deadline: Option<tokio::time::Instant>,
+    native_initialized: bool,
     state: TurnState,
     session_open: Arc<AtomicBool>,
     config: LaunchConfig,
@@ -1131,6 +1230,7 @@ struct Process {
     /// into its recorded directory while `path` stays at the project root.
     agent_cwd: String,
     turn_active: bool,
+    active_request_id: Option<String>,
     /// The main turn can settle while a child still needs input.
     settled_turn: Option<Outcome>,
     /// Background work already alive when this turn started. Its writes may
@@ -1143,6 +1243,7 @@ struct Process {
     stop_reply: Option<oneshot::Sender<Result<(), String>>>,
     init_deadline: tokio::time::Instant,
     turn_deadline: tokio::time::Instant,
+    side_chat: bool,
 }
 struct PendingApprovalReply {
     reply: Option<oneshot::Sender<Result<(), String>>>,
@@ -1175,39 +1276,72 @@ impl AgentSideband {
 impl Drop for Process {
     fn drop(&mut self) {
         self.session_open.store(false, Ordering::SeqCst);
-        self.drain.abort();
+        crate::predictions::invalidate(&self.prediction_owner);
+        agents::codex_jobs::registry().cancel_scope(&agents::codex_jobs::JobScope::session(
+            &self.prediction_owner,
+        ));
+        // These tasks only observe results; resource owners remain registered
+        // and hold their permits until direct-child cleanup is confirmed.
+        if let Some(job) = self.prediction_job.take() {
+            job.abort();
+        }
         if let Some(job) = self.title_job.take() {
             job.abort();
         }
     }
 }
 impl Process {
-    async fn next_message(&mut self) -> Result<(String, bool)> {
+    async fn next_message(&mut self) -> Result<Option<(String, bool)>> {
+        let Some(transport) = &mut self.transport else {
+            return std::future::pending().await;
+        };
         tokio::select! {
-            line = self.output.next() => {
-                Ok((line.context("Agent 进程意外退出；会话历史已保留，后台任务状态无法恢复")??, false))
+            line = transport.output.next() => {
+                match line {
+                    Some(line) => Ok(Some((line?, false))),
+                    None if self.adapter.transport_lifetime() == agents::TransportLifetime::PerTurn => Ok(None),
+                    None => bail!("Agent 进程意外退出；会话历史已保留，后台任务状态无法恢复"),
+                }
             }
             line = async {
-                match &mut self.sideband {
+                match &mut transport.sideband {
                     Some(channel) => channel.read().await,
                     None => std::future::pending().await,
                 }
-            } => Ok((line?, true))
+            } => Ok(Some((line?, true)))
         }
+    }
+    fn initializing(&self) -> bool {
+        match self.adapter.transport_lifetime() {
+            agents::TransportLifetime::Persistent => !self.state.ready,
+            agents::TransportLifetime::PerTurn => {
+                self.transport.is_some() && !self.native_initialized
+            }
+        }
+    }
+    fn host_prepared(&self) -> bool {
+        self.state.ready || self.adapter.transport_lifetime() == agents::TransportLifetime::PerTurn
+    }
+    fn idle_for_close(&self) -> bool {
+        !self.close_blocked
+            && !self.turn_active
+            && self.pending_result.is_none()
+            && !self.interrupt_ack_pending
+            && self.state.pending.is_empty()
+            && self.adapter.can_reconfigure()
     }
     fn can_start_turn(&self) -> bool {
         !self.close_blocked
-            && self.state.ready
+            && self.host_prepared()
+            && self.pending_result.is_none()
+            && (self.adapter.transport_lifetime() != agents::TransportLifetime::PerTurn
+                || self.transport.is_none())
             && !self.turn_active
             && !self.stopping
             && !self.interrupt_ack_pending
             && self.state.pending.is_empty()
             && self.adapter.can_start_turn()
     }
-    // Resume the native session where it now lives instead of only the
-    // project directory, so a conversation that moved into a worktree keeps
-    // working after its process was restarted. A failed lookup keeps the
-    // project directory; the adapter's mismatch repair recovers from there.
     // Resume the native session where it now lives instead of only the
     // project directory, so a conversation that moved into a worktree keeps
     // working after its process was restarted. A failed lookup keeps the
@@ -1222,6 +1356,7 @@ impl Process {
         path: &str,
         config: LaunchConfig,
         session_open: Arc<AtomicBool>,
+        request_id: Option<&str>,
     ) -> Result<Self> {
         // Gate the launch before any native helper runs: an unconfirmed
         // close must block the export probe exactly as it blocks the agent.
@@ -1253,8 +1388,10 @@ impl Process {
             &agent_cwd,
             config,
             session_open,
+            request_id,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         database: &Database,
         binary: &str,
@@ -1263,6 +1400,7 @@ impl Process {
         agent_cwd: &str,
         config: LaunchConfig,
         session_open: Arc<AtomicBool>,
+        request_id: Option<&str>,
     ) -> Result<Self> {
         db(database, |s| {
             if let Some(reason) = s.unconfirmed_agent_close(&session.id)? {
@@ -1286,60 +1424,69 @@ impl Process {
             })?;
             adapter.set_side_parent(native)?;
         }
+        Self::prepare_adapter(
+            database,
+            binary,
+            session,
+            path,
+            agent_cwd,
+            config,
+            session_open,
+            request_id,
+            adapter,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_adapter(
+        database: &Database,
+        binary: &str,
+        session: &Session,
+        path: &str,
+        agent_cwd: &str,
+        config: LaunchConfig,
+        session_open: Arc<AtomicBool>,
+        request_id: Option<&str>,
+        mut adapter: Box<dyn agents::AgentAdapter>,
+    ) -> Result<Self> {
+        let side_chat = db(database, |s| Ok(s.side_parent(&session.id)?.is_some()))?;
         let prepared = adapter.command(binary, agent_cwd, session.native_id.as_deref(), &config)?;
-        let mut command = prepared.command;
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0);
-        let child = command.spawn().with_context(|| {
-            format!(
-                "无法启动 Agent {}，请检查此 Host 的 CLI 安装和登录状态",
-                session.agent
-            )
-        })?;
-        let pid = child.id().context("Agent PID missing")? as i32;
-        let mut group = Group { child, pid };
-        let input = group.child.stdin.take().context("Agent stdin missing")?;
-        let stdout = group.child.stdout.take().context("Agent stdout missing")?;
-        let output = match adapter.frame_limit() {
-            Some(limit) => FramedRead::new(stdout, LinesCodec::new_with_max_length(limit)),
-            None => native_output(stdout),
+        let transport = if adapter.transport_lifetime() == agents::TransportLifetime::Persistent {
+            Some(Self::spawn_transport(
+                database,
+                &session.id,
+                &session.agent,
+                prepared,
+                adapter.frame_limit(),
+                &config,
+                request_id,
+                agents::TransportLifetime::Persistent,
+                None,
+            )?)
+        } else {
+            None
         };
-        let mut stderr = group.child.stderr.take().context("Agent stderr missing")?;
-        let drain = tokio::spawn(async move {
-            let mut buf = [0; 4096];
-            while let Ok(n) = stderr.read(&mut buf).await {
-                if n == 0 {
-                    break;
-                }
-            }
-        });
         Ok(Self {
             close_blocked: false,
             close_started: false,
             adapter,
             binary: binary.into(),
             title_job: None,
+            prediction_owner: session.id.clone(),
+            prediction_turn: None,
+            prediction_job: None,
             rename_reply: None,
             approval_replies: HashMap::new(),
-            group,
-            input,
-            output,
-            sideband: prepared.sideband.map(|listener| AgentSideband {
-                listener,
-                stream: None,
-            }),
-            drain,
-            _settings: prepared._settings,
+            transport,
+            pending_result: None,
+            result_deadline: None,
+            native_initialized: false,
             state: TurnState::default(),
             session_open,
             config,
             path: path.into(),
             agent_cwd: agent_cwd.into(),
             turn_active: false,
+            active_request_id: None,
             settled_turn: None,
             background_at_start: false,
             stopping: false,
@@ -1348,11 +1495,97 @@ impl Process {
             stop_reply: None,
             init_deadline: tokio::time::Instant::now() + Duration::from_secs(18),
             turn_deadline: tokio::time::Instant::now() + TURN_LIMIT,
+            side_chat,
         })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_transport(
+        database: &Database,
+        id: &str,
+        agent: &str,
+        prepared: agents::AgentCommand,
+        frame_limit: Option<usize>,
+        config: &LaunchConfig,
+        request_id: Option<&str>,
+        lifetime: agents::TransportLifetime,
+        main_request_id: Option<&str>,
+    ) -> Result<Transport> {
+        let write_id = db(database, |s| {
+            if let Some(reason) = s.unconfirmed_agent_close(id)? {
+                bail!(reason);
+            }
+            if let Some(request) = request_id {
+                s.start_side_write(request)?;
+                Ok(Some(request.to_owned()))
+            } else if config.permission_mode.is_some() {
+                s.start_side_launch_write(id)
+            } else {
+                Ok(None)
+            }
+        })?;
+        let spawned = Transport::spawn(prepared, frame_limit, config, lifetime);
+        if let Err(error) = &spawned
+            && let Some(failure) = error.downcast_ref::<transport::SpawnNotStarted>()
+        {
+            if let Some(request_id) = main_request_id {
+                db(database, |s| {
+                    s.record_confirmed_not_started(id, request_id, failure.evidence)
+                })?;
+            }
+            if failure.evidence == crate::store::ConfirmedNotStarted::Enoent
+                && let Some(write_id) = &write_id
+            {
+                db(database, |s| s.mark_side_write_not_started(write_id))?;
+            }
+        }
+        spawned
+            .with_context(|| format!("无法启动 Agent {agent}，请检查此 Host 的 CLI 安装和登录状态"))
     }
     async fn apply(&mut self, actions: Vec<Action>, database: &Database, id: &str) -> Result<()> {
         let mut batch = Vec::new();
         for action in actions {
+            if let Action::SpawnTurn(prepared) = action {
+                if self.adapter.transport_lifetime() != agents::TransportLifetime::PerTurn
+                    || self.transport.is_some()
+                    || !self.turn_active
+                    || self.close_blocked
+                {
+                    bail!("Agent请求了未获准的单轮进程启动");
+                }
+                let session = db(database, |s| s.session(id))?;
+                if !session.status.active() {
+                    bail!("Agent请求未通过持久化admission的启动");
+                }
+                self.transport = Some(Self::spawn_transport(
+                    database,
+                    id,
+                    &session.agent,
+                    prepared,
+                    self.adapter.frame_limit(),
+                    &self.config,
+                    self.active_request_id.as_deref(),
+                    agents::TransportLifetime::PerTurn,
+                    self.active_request_id.as_deref(),
+                )?);
+                self.result_deadline = None;
+                self.native_initialized = false;
+                self.init_deadline = tokio::time::Instant::now() + Duration::from_secs(18);
+                continue;
+            }
+            if self.adapter.transport_lifetime() == agents::TransportLifetime::PerTurn {
+                if let Action::Finished { failed, message } = action {
+                    if !self.turn_active || self.pending_result.is_some() {
+                        bail!("Agent返回了重复或无活动轮次的result");
+                    }
+                    self.pending_result = Some((failed, message));
+                    self.result_deadline =
+                        Some(tokio::time::Instant::now() + Duration::from_secs(10));
+                    continue;
+                }
+                if matches!(action, Action::Ready) {
+                    bail!("单轮Agent不能宣称常驻会话Ready");
+                }
+            }
             let finished = matches!(action, Action::Finished { .. });
             batch.push(action);
             if finished {
@@ -1363,7 +1596,7 @@ impl Process {
         if !batch.is_empty() {
             self.apply_batch(batch, database, id).await?;
         }
-        Ok(())
+        self.finish_settled_side_writes(database, id)
     }
     async fn apply_batch(
         &mut self,
@@ -1395,15 +1628,19 @@ impl Process {
                 let path = self.path.clone();
                 let mut config = self.config.clone();
                 config.model = model;
+                let job = agents::codex_title::start_generate(
+                    &id,
+                    &binary,
+                    &path,
+                    &config,
+                    &description,
+                    native_provider.as_ref(),
+                );
                 self.title_job = Some(tokio::spawn(async move {
-                    let result = agents::codex_title::generate(
-                        &binary,
-                        &path,
-                        &config,
-                        &description,
-                        native_provider.as_ref(),
-                    )
-                    .await;
+                    let result = match job {
+                        Ok(job) => job.wait().await,
+                        Err(error) => Err(error),
+                    };
                     let _ = db(&database, |s| {
                         let session = s.session(&id)?;
                         if session.custom_title
@@ -1485,7 +1722,16 @@ impl Process {
             self.interrupt_ack_pending = false;
         }
         let became_ready = actions.iter().any(|a| matches!(a, Action::Ready));
+        if actions
+            .iter()
+            .any(|a| matches!(a, Action::NativeSession(_)))
+        {
+            self.native_initialized = true;
+        }
         if actions.iter().any(|a| matches!(a, Action::TurnStarted)) {
+            if !self.turn_active {
+                self.cancel_prediction().await;
+            }
             self.turn_active = true;
             self.settled_turn = None;
             self.background_at_start = self.adapter.has_background_work();
@@ -1498,16 +1744,23 @@ impl Process {
             self.clear_approval_replies();
             self.state.pending.clear();
         }
-        let outcome = self
-            .state
-            .apply(actions, &mut self.input, database, id, &self.config)
-            .await?;
+        if let Some(context) = &mut self.prediction_turn {
+            for action in &actions {
+                match action {
+                    Action::Event(event) => context.observe(event),
+                    Action::Approval { .. } | Action::Question { .. } => context.boundary(),
+                    _ => {}
+                }
+            }
+        }
+        let outcome = self.apply_state(actions, database, id).await?;
         // Persist the native session identity before any command can run
         // through the supplementary channel.
         for bytes in sideband_writes {
             let stream = self
-                .sideband
+                .transport
                 .as_mut()
+                .and_then(|transport| transport.sideband.as_mut())
                 .and_then(|channel| channel.stream.as_mut())
                 .context("Agent 辅助通道尚未连接")?;
             write(stream.get_mut(), &bytes).await?;
@@ -1522,6 +1775,7 @@ impl Process {
                 bail!("Agent 在审批完成前结束了本轮任务");
             }
             self.turn_active = false;
+            self.active_request_id = None;
             let (status, message) = if self.stopping {
                 (
                     Status::Stopped,
@@ -1538,6 +1792,30 @@ impl Process {
                 self.background_at_start || self.adapter.has_background_work(),
             )
             .await?;
+            if let Some(context) = self.prediction_turn.take()
+                && status == Status::Completed
+                && context.useful()
+            {
+                let session = db(database, |s| s.session(id))?;
+                if !session.archived && db(database, |s| Ok(s.side_parent(id)?.is_none()))? {
+                    if let Some(snapshot) = self.adapter.prediction_snapshot(&self.config) {
+                        self.prediction_job = crate::predictions::schedule(
+                            id,
+                            &session.agent,
+                            self.binary.clone(),
+                            self.path.clone(),
+                            context,
+                            snapshot,
+                        );
+                    } else {
+                        crate::predictions::unsupported(
+                            id,
+                            &context.request_id,
+                            context.source_user_seq,
+                        );
+                    }
+                }
+            }
             if self.state.pending.is_empty() {
                 db(database, |s| s.state(id, status.clone(), message.clone()))?;
             }
@@ -1552,12 +1830,77 @@ impl Process {
             self.interrupt_sent = true;
             self.interrupt_ack_pending = true;
             let actions = self.adapter.advance(Input::Interrupt)?;
-            self.state
-                .apply(actions, &mut self.input, database, id, &self.config)
-                .await?;
+            self.apply_state(actions, database, id).await?;
         }
         self.session_open.store(self.state.ready, Ordering::SeqCst);
-        Ok(())
+        self.finish_settled_side_writes(database, id)
+    }
+    async fn apply_state(
+        &mut self,
+        actions: Vec<Action>,
+        database: &Database,
+        id: &str,
+    ) -> Result<Option<Outcome>> {
+        if let Some(input) = self
+            .transport
+            .as_mut()
+            .and_then(|transport| transport.input.as_mut())
+        {
+            self.state
+                .apply(actions, input, database, id, &self.config)
+                .await
+        } else {
+            if actions.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::Write(_) | Action::MetadataWrite(_) | Action::SidebandWrite(_)
+                )
+            }) {
+                bail!("Agent未启动，不能写入原生transport");
+            }
+            self.state
+                .apply(actions, &mut tokio::io::sink(), database, id, &self.config)
+                .await
+        }
+    }
+    async fn finish_per_turn(&mut self, database: &Database, id: &str) -> Result<()> {
+        let exit = self
+            .transport
+            .as_mut()
+            .context("Agent transport missing")?
+            .exited_successfully()
+            .await;
+        if self.pending_result.is_none() {
+            let diagnostic = match exit {
+                Ok(diagnostic) => diagnostic,
+                Err(error) => format!("{error:#}"),
+            };
+            bail!("Agent stdout EOF但没有native result；任务不能确认完成：{diagnostic}");
+        }
+        exit?;
+        self.retire_per_turn(database, id).await?;
+        let (failed, message) = self.pending_result.take().context("Agent result missing")?;
+        self.result_deadline = None;
+        self.close_started = false;
+        self.apply_batch(vec![Action::Finished { failed, message }], database, id)
+            .await
+    }
+    async fn stop_per_turn(&mut self, database: &Database, id: &str) -> Result<()> {
+        self.cancel_prediction().await;
+        self.retire_per_turn(database, id).await?;
+        self.pending_result = None;
+        self.result_deadline = None;
+        self.close_started = false;
+        self.stopping = true;
+        self.apply_batch(
+            vec![Action::Finished {
+                failed: true,
+                message: None,
+            }],
+            database,
+            id,
+        )
+        .await
     }
     fn record_approval(
         &mut self,
@@ -1590,15 +1933,41 @@ impl Process {
                 .clone()
                 .unwrap_or((Status::Completed, None))
         };
-        db(database, |s| s.state(id, status, message))
+        db(database, |s| s.state(id, status, message))?;
+        self.finish_settled_side_writes(database, id)
+    }
+    fn finish_settled_side_writes(&self, database: &Database, id: &str) -> Result<()> {
+        if self.side_chat
+            && !self.turn_active
+            && self.pending_result.is_none()
+            && !self.adapter.has_background_work()
+            && self.state.pending.is_empty()
+            && (self.state.ready || self.transport.is_none())
+        {
+            db(database, |s| s.finish_side_writes(id))?;
+        }
+        Ok(())
+    }
+    fn request_prediction_cancel(&mut self) {
+        crate::predictions::invalidate(&self.prediction_owner);
+        self.prediction_turn = None;
+        agents::codex_jobs::registry().cancel_predictions(&self.prediction_owner);
+    }
+    async fn cancel_prediction(&mut self) {
+        self.request_prediction_cancel();
+        if let Some(job) = self.prediction_job.take() {
+            job.abort();
+            let _ = job.await;
+        }
     }
     async fn cancel_title(&mut self) {
+        agents::codex_jobs::registry().cancel_titles(&self.prediction_owner);
         if let Some(job) = self.title_job.take() {
             job.abort();
             let _ = job.await;
         }
     }
-    async fn close_confirmed(&mut self, database: &Database, id: &str) -> Result<()> {
+    fn begin_close(&mut self, database: &Database, id: &str) -> Result<()> {
         let journal = db(database, |s| {
             if let Some(reason) = s.unconfirmed_agent_close(id)? {
                 bail!(reason);
@@ -1607,62 +1976,154 @@ impl Process {
         });
         if let Err(error) = journal {
             self.close_blocked = true;
+            // No signal was sent. Keep the handle for explicit Close, not timer retries.
+            self.result_deadline = None;
             return Err(error);
         }
         self.close_blocked = false;
         self.close_started = true;
+        Ok(())
+    }
+    async fn close_confirmed(&mut self, database: &Database, id: &str) -> Result<()> {
+        // Even a prepared/retired PerTurn actor can own detached auxiliary jobs.
+        self.begin_close(database, id)?;
         let confirmed = self.close().await;
         finish_native_close(database, id, confirmed)
     }
+    async fn retire_per_turn(&mut self, database: &Database, id: &str) -> Result<()> {
+        self.begin_close(database, id)?;
+        // Retiring physical I/O is not closing the session or its title owner.
+        let confirmed = match self.transport.as_mut() {
+            Some(transport) => transport.terminate(true).await,
+            None => true,
+        };
+        if confirmed {
+            self.transport = None;
+            self.adapter.transport_closed();
+        }
+        finish_native_close(database, id, confirmed)
+    }
     async fn close(&mut self) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        self.cancel_prediction().await;
         self.cancel_title().await;
         self.clear_approval_replies();
         if let Some(reply) = self.rename_reply.take() {
             let _ = reply.send(Err("原生会话已关闭，标题修改结果待确认".into()));
         }
         self.session_open.store(false, Ordering::SeqCst);
-        if let Ok(Some(bytes)) = self.adapter.close_request() {
-            let (adapter, input, output) = (&mut self.adapter, &mut self.input, &mut self.output);
-            let _ = tokio::time::timeout(Duration::from_millis(750), async move {
-                write(input, &bytes).await?;
-                for _ in 0..64 {
-                    let Some(Ok(line)) = output.next().await else {
-                        break;
-                    };
-                    if adapter.close_ack(&line) {
-                        break;
+        let scope = agents::codex_jobs::JobScope::session(&self.prediction_owner);
+        agents::codex_jobs::registry().cancel_scope(&scope);
+        let auxiliary = async {
+            agents::codex_jobs::registry()
+                .wait_scope(
+                    &scope,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .await
+        };
+        let Some(transport) = &mut self.transport else {
+            return tokio::time::timeout_at(deadline, auxiliary)
+                .await
+                .unwrap_or(false);
+        };
+        let requires_drain = self.adapter.requires_close_drain();
+        let background_confirmed = if requires_drain {
+            matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    transport.drain_native_close(self.adapter.as_mut()),
+                )
+                .await,
+                Ok(Ok(true))
+            )
+        } else {
+            if let Ok(Some(bytes)) = self.adapter.close_request()
+                && let Some(input) = transport.input.as_mut()
+            {
+                let (adapter, output) = (&mut self.adapter, &mut transport.output);
+                let _ = tokio::time::timeout(Duration::from_millis(750), async move {
+                    write(input, &bytes).await?;
+                    for _ in 0..64 {
+                        let Some(Ok(line)) = output.next().await else {
+                            break;
+                        };
+                        if adapter.close_ack(&line) {
+                            break;
+                        }
                     }
-                }
-                Ok::<_, anyhow::Error>(())
-            })
-            .await;
-        }
-        // Closing stdin alone lets some CLI versions wait indefinitely for background work.
-        let group = Pid::from_raw(self.group.pid);
-        let _ = killpg(group, Signal::SIGTERM);
-        let mut reaped = matches!(
-            tokio::time::timeout(Duration::from_secs(2), self.group.child.wait()).await,
-            Ok(Ok(_))
-        );
-        // The parent may have exited before its descendants. A signal alone
-        // does not prove that they have stopped writing.
-        let _ = killpg(group, Signal::SIGKILL);
-        self.drain.abort();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            if !reaped {
-                reaped = self.group.child.wait().await.is_ok();
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
             }
-            reaped
-        })
-        .await
-        .unwrap_or(false)
+            true
+        };
+        let confirmed = transport
+            .terminate_with_auxiliary(
+                self.adapter.transport_lifetime() == agents::TransportLifetime::PerTurn,
+                requires_drain && background_confirmed,
+                deadline,
+                auxiliary,
+            )
+            .await;
+        if confirmed {
+            self.transport = None;
+            self.adapter.transport_closed();
+        }
+        confirmed && background_confirmed
     }
+}
+async fn close_group(
+    group: &mut Group,
+    deadline: tokio::time::Instant,
+    expect_clean_exit: bool,
+    auxiliary: impl std::future::Future<Output = bool>,
+) -> bool {
+    let pid = Pid::from_raw(group.pid);
+    let owned = group.child.id().is_some();
+    if owned && !expect_clean_exit {
+        let _ = killpg(pid, Signal::SIGTERM);
+    }
+    // Keep the native PID owned while auxiliary cleanup may suspend. Waiting
+    // after reap would let Group::drop signal a reused numeric process group.
+    let auxiliary_reaped = tokio::time::timeout_at(deadline, auxiliary)
+        .await
+        .unwrap_or(false);
+    // Per-turn transports can already have reaped their native leader. Never
+    // signal that numeric process group after an auxiliary await.
+    if !owned {
+        return auxiliary_reaped && !expect_clean_exit;
+    }
+    let exit = tokio::time::timeout_at(
+        deadline.min(tokio::time::Instant::now() + Duration::from_secs(2)),
+        group.child.wait(),
+    )
+    .await;
+    let group_signaled = matches!(killpg(pid, Signal::SIGKILL), Ok(()) | Err(Errno::ESRCH));
+    let native_confirmed = match exit {
+        Ok(Ok(status)) => !expect_clean_exit || status.success(),
+        _ => {
+            let reaped = matches!(
+                tokio::time::timeout_at(
+                    deadline.min(tokio::time::Instant::now() + Duration::from_secs(2)),
+                    group.child.wait(),
+                )
+                .await,
+                Ok(Ok(_))
+            );
+            reaped && !expect_clean_exit
+        }
+    };
+    native_confirmed && group_signaled && auxiliary_reaped
 }
 fn finish_native_close(database: &Database, id: &str, confirmed: bool) -> Result<()> {
     if !confirmed {
         bail!(CLOSE_PENDING);
     }
-    db(database, |s| s.clear_unconfirmed_agent_close(id))
+    db(database, |s| {
+        s.clear_unconfirmed_agent_close(id)?;
+        s.finish_side_writes(id)
+    })
 }
 async fn finish_turn(
     database: &Database,
@@ -1730,6 +2191,7 @@ async fn accept_turn(
     path: &str,
     turn: SendTurn,
     session_open: &Arc<AtomicBool>,
+    admission: Option<&Guard>,
     on_admitted: impl FnOnce(),
 ) -> Result<bool> {
     let config = turn.config.clone();
@@ -1746,20 +2208,57 @@ async fn accept_turn(
     })? {
         return Ok(false);
     }
-    if db(database, |s| Ok(s.session(&session.id)?.status.active()))? {
-        bail!("会话已有运行中的任务");
+    if session.agent == "cursor" {
+        agents::cursor::validate_prompt(&turn.text)
+            .map_err(|error| reject_turn(admission, &turn.request_id, error.to_string()))?;
     }
-    if process.as_ref().is_some_and(|p| !p.state.ready) {
-        bail!("Agent 会话正在恢复，请稍后重试；消息未发送");
+    if db(database, |s| Ok(s.session(&session.id)?.status.active()))? {
+        return Err(reject_turn(
+            admission,
+            &turn.request_id,
+            "会话已有运行中的任务".into(),
+        ));
+    }
+    let per_turn = match process.as_ref() {
+        Some(p) => p.adapter.transport_lifetime() == agents::TransportLifetime::PerTurn,
+        None => {
+            agents::create(&session.agent)?.transport_lifetime()
+                == agents::TransportLifetime::PerTurn
+        }
+    };
+    if per_turn
+        && db(database, |s| {
+            Ok(s.session(&session.id)?.native_id.is_none()
+                && s.has_possibly_started_request(&session.id)?)
+        })?
+    {
+        bail!(
+            "此前请求已接收，但没有已确认的原生会话ID；不能新建chat冒充continuation，请核对原生记录或创建新任务"
+        );
+    }
+    if process.as_ref().is_some_and(|p| !p.host_prepared()) {
+        return Err(reject_turn(
+            admission,
+            &turn.request_id,
+            "Agent 会话正在恢复，请稍后重试；消息未发送".into(),
+        ));
     }
     if process.as_ref().is_some_and(|p| !p.can_start_turn()) {
-        bail!("Agent 尚有本轮响应、审批或发送确认待处理；消息未发送");
+        return Err(reject_turn(
+            admission,
+            &turn.request_id,
+            "Agent 尚有本轮响应、审批或发送确认待处理；消息未发送".into(),
+        ));
     }
     if let Some(current) = process.as_mut()
         && !same_config(&current.config, &config)
     {
         if !current.adapter.can_reconfigure() {
-            bail!(RECONFIGURE_BLOCKED);
+            return Err(reject_turn(
+                admission,
+                &turn.request_id,
+                RECONFIGURE_BLOCKED.into(),
+            ));
         }
         let closed = current.close_confirmed(database, &session.id).await;
         if current.close_started {
@@ -1767,8 +2266,8 @@ async fn accept_turn(
         }
         closed?;
     }
-    db(database, |s| {
-        s.begin(
+    let Some(source_user_seq) = db(database, |s| {
+        s.begin_with_source(
             &session.id,
             &turn.request_id,
             &turn.text,
@@ -1777,7 +2276,15 @@ async fn accept_turn(
             turn.fingerprint.as_deref(),
             config.permission_mode.as_deref(),
         )
-    })?;
+    })?
+    else {
+        return Ok(false);
+    };
+    crate::predictions::invalidate(&session.id);
+    agents::codex_jobs::registry().cancel_predictions(&session.id);
+    if let Some(p) = process.as_mut() {
+        p.request_prediction_cancel();
+    }
     // Admission is complete once the request and User/Running events are durable.
     // Filesystem snapshots and Agent startup can take longer than the sender's
     // confirmation deadline; they must not make accepted input look rejected.
@@ -1785,6 +2292,9 @@ async fn accept_turn(
     // After durable admission, all failures become explicit terminal events. The
     // accepted request ID still reconciles a lost transport response without replay.
     let result = async {
+        if let Some(p) = process.as_mut() {
+            p.cancel_prediction().await;
+        }
         // Side chats share the main working directory. An independent snapshot
         // could attribute concurrent main writes to the child and undo them.
         if db(database, |s| Ok(s.side_parent(&session.id)?.is_none()))? {
@@ -1808,7 +2318,9 @@ async fn accept_turn(
                 db(database, |s| s.save_baseline(&session.id, &task_baseline))?;
             }
         }
-        if process.is_none() {
+        if process.is_some() {
+            db(database, |s| s.start_side_write(&turn.request_id))?;
+        } else {
             let current = db(database, |s| s.session(&session.id))?;
             *process = Some(
                 Process::launch(
@@ -1818,12 +2330,24 @@ async fn accept_turn(
                     path,
                     turn.config,
                     session_open.clone(),
+                    Some(&turn.request_id),
                 )
                 .await?,
             );
         }
         let p = process.as_mut().context("Agent process missing")?;
         p.turn_active = true;
+        p.active_request_id = Some(turn.request_id.clone());
+        if !turn.text.trim_start().starts_with('/')
+            && db(database, |s| Ok(s.side_parent(&session.id)?.is_none()))?
+        {
+            p.prediction_turn = crate::predictions::TurnContext::try_new(
+                &turn.request_id,
+                source_user_seq,
+                &p.config.redact(&turn.text),
+                p.config.redactor(),
+            );
+        }
         p.settled_turn = None;
         p.background_at_start = p.adapter.has_background_work();
         p.turn_deadline = tokio::time::Instant::now() + TURN_LIMIT;
@@ -1883,6 +2407,7 @@ async fn receive_turn(
     allow_queue: bool,
     pending_inputs: bool,
     configs: &mut HashMap<String, LaunchConfig>,
+    admission: &Guard,
     on_admitted: impl FnOnce(),
 ) -> Result<Response> {
     {
@@ -1903,8 +2428,16 @@ async fn receive_turn(
     })? {
         return Ok(Response::Accepted { duplicate: true });
     }
+    if session.agent == "cursor" {
+        agents::cursor::validate_prompt(&turn.text)
+            .map_err(|error| reject_turn(admission, &turn.request_id, error.to_string()))?;
+    }
     if pending_inputs && !allow_queue {
-        bail!("Agent 尚有已交付的消息待处理");
+        return Err(reject_turn(
+            admission,
+            &turn.request_id,
+            "Agent 尚有已交付的消息待处理".into(),
+        ));
     }
     if allow_queue {
         let queued = db(database, |d| d.queued(&session.id))?;
@@ -1918,10 +2451,22 @@ async fn receive_turn(
             && !same_config(&p.config, &turn.config)
             && !p.adapter.can_reconfigure()
         {
-            bail!(RECONFIGURE_BLOCKED);
+            return Err(reject_turn(
+                admission,
+                &turn.request_id,
+                RECONFIGURE_BLOCKED.into(),
+            ));
         }
         if busy || !queued.is_empty() {
-            db(database, |d| d.enqueue(&session.id, &turn))?;
+            if let Err(error) = db(database, |d| d.enqueue(&session.id, &turn)) {
+                return Err(
+                    if error.is::<crate::message_queue::QueueCapacityExceeded>() {
+                        reject_send(admission, &turn.request_id, error.to_string())
+                    } else {
+                        error
+                    },
+                );
+            }
             configs.insert(turn.request_id, turn.config);
             return Ok(Response::MessageQueued { duplicate: false });
         }
@@ -1937,6 +2482,7 @@ async fn receive_turn(
         path,
         turn,
         session_open,
+        Some(admission),
         on_admitted,
     )
     .await?;
@@ -1967,7 +2513,7 @@ async fn actor(
     loop {
         let init_deadline = process
             .as_ref()
-            .filter(|p| !p.close_blocked && !p.state.ready)
+            .filter(|p| !p.close_blocked && p.initializing())
             .map(|p| p.init_deadline);
         let turn_deadline = process
             .as_ref()
@@ -1978,6 +2524,10 @@ async fn actor(
         // active turn's execution limit.
         let handoff_deadline = forwarded.deadline();
         let immediate_deadline = immediate.as_ref().map(|v| v.deadline);
+        let result_deadline = process
+            .as_ref()
+            .filter(|p| !p.close_blocked)
+            .and_then(|p| p.result_deadline);
         let approval_deadline = process.as_ref().and_then(|p| {
             p.approval_replies
                 .values()
@@ -2020,6 +2570,7 @@ async fn actor(
                                 &path,
                                 config,
                                 session_open.clone(),
+                                None,
                             )
                             .await?;
                             let actions = p.adapter.advance(Input::Open)?;
@@ -2030,7 +2581,7 @@ async fn actor(
                     }
                     .await;
                     match result {
-                        Ok(()) if process.as_ref().is_some_and(|p| p.state.ready) => {
+                        Ok(()) if process.as_ref().is_some_and(Process::host_prepared) => {
                             let _ = reply.send(Ok(()));
                         }
                         Ok(()) => opening.push(reply),
@@ -2041,6 +2592,12 @@ async fn actor(
                     Ok(())
                 }
                 Some(Control::Interrupt { reply }) => async {
+                    if let Some(p) = process.as_mut().filter(|p| p.adapter.transport_lifetime() == agents::TransportLifetime::PerTurn && p.turn_active) {
+                        db(&database, |d| d.pause_queue(&session.id, Some("当前执行已停止，队列已暂停")))?;
+                        let result = p.stop_per_turn(&database, &session.id).await;
+                        let _ = reply.send(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+                        return result;
+                    }
                     if let Some(pending) = immediate.take() { let _ = pending.reply.send(Err("发送已取消，消息保留在队列".into())); }
                     if !forwarded.is_empty() {
                         let background_pending=process.as_ref().is_some_and(|p|p.turn_active&&p.background_at_start);
@@ -2134,6 +2691,8 @@ async fn actor(
                         let p=process.as_mut().context("Agent 未启动")?;
                         if !p.state.ready || p.stopping || p.interrupt_ack_pending || !same_config(&p.config,&config) {bail!("当前 Agent 尚未就绪或执行配置不一致，消息保留在队列");}
                         let (entry,_)=db(&database,|d|d.queued(&session.id))?.into_iter().find(|(e,_)|e.request_id==request_id && e.revision==revision).context("消息已执行、移除或更新，请刷新队列")?;
+                        p.request_prediction_cancel();
+                        if let Some(job) = p.prediction_job.take() { job.abort(); }
                         let actions=p.adapter.advance(Input::Queue{request_id:&request_id,prompt:&entry.text})?;
                         Ok(actions)
                     })();
@@ -2162,7 +2721,7 @@ async fn actor(
                         if immediate.is_some() { bail!("正在发送，请稍后重试"); }
                         if !interrupt && !forwarded.is_empty() { bail!("Agent 尚有已交付的消息待处理，请稍后重试"); }
                         if let Some(p) = process.as_ref() {
-                            if !p.state.ready || p.stopping || p.interrupt_ack_pending { bail!("Agent 正在准备或停止，请稍后重试"); }
+                            if !p.host_prepared() || p.stopping || p.interrupt_ack_pending { bail!("Agent 正在准备或停止，请稍后重试"); }
                             if p.turn_active && !same_config(&p.config,&config) { bail!("立即发送需沿用当前 Agent 的执行配置，请编辑后重新发送"); }
                         }
                         db(&database, |d| {
@@ -2186,6 +2745,9 @@ async fn actor(
                                 db(&database,|d|d.state(&session.id,Status::Stopped,Some("已停止当前任务".into())))?;
                                 Ok(())
                             } else if let Some(p)=process.as_mut().filter(|p|p.turn_active && interrupt) {
+                                if p.adapter.transport_lifetime() == agents::TransportLifetime::PerTurn {
+                                    return p.stop_per_turn(&database, &session.id).await;
+                                }
                                 p.stopping=true;
                                 p.interrupt_sent=true;
                                 p.interrupt_ack_pending=true;
@@ -2201,7 +2763,13 @@ async fn actor(
                         match action {
                             QueueAction::Dispatch {..} => unreachable!(),
                             QueueAction::Take {request_id,revision} => { let result=d.take_queued(&session.id,&request_id,revision)?; queued_configs.remove(&request_id); return Ok(result); },
-                            QueueAction::Edit {request_id,revision,text} => {d.edit_queued(&session.id,&request_id,revision,text.as_deref())?;if text.is_none(){queued_configs.remove(&request_id);}},
+                            QueueAction::Edit {request_id,revision,text} => {
+                                if session.agent == "cursor" && let Some(text) = text.as_deref() {
+                                    agents::cursor::validate_prompt(text)?;
+                                }
+                                d.edit_queued(&session.id,&request_id,revision,text.as_deref())?;
+                                if text.is_none(){queued_configs.remove(&request_id);}
+                            },
                             QueueAction::Reorder {expected,order} => d.reorder_queue(&session.id,&expected,&order)?,
                             QueueAction::Clear => {d.clear_queue(&session.id)?;queued_configs.clear();},
                             QueueAction::Resume {configs} => {
@@ -2215,17 +2783,19 @@ async fn actor(
                     let _=reply.send(result.map_err(|e|e.to_string()));
                     Ok(())
                 }
-                Some(Control::Send { turn, allow_queue, reply }) => {
+                Some(Control::Send { turn, allow_queue, admission, reply }) => {
                     safe_to_close.store(false, Ordering::SeqCst);
                     let mut reply = Some(reply);
-                    let result = receive_turn(&mut process, &database, &binary, &session, &path, turn, &session_open, allow_queue, !forwarded.is_empty(), &mut queued_configs, || {
+                    let result = receive_turn(&mut process, &database, &binary, &session, &path, turn, &session_open, allow_queue, !forwarded.is_empty(), &mut queued_configs, &admission, || {
                         if let Some(reply) = reply.take() {
                             let _ = reply.send(Ok(Response::Accepted { duplicate: false }));
                         }
                     }).await;
                     if let Some(reply) = reply {
-                        let _ = reply.send(result.map_err(|e| e.to_string()));
+                        let _ = reply.send(result);
                     }
+                    // The decoded attempt ends here, not when its sender times out.
+                    drop(admission);
                     Ok(())
                 }
                 Some(Control::Cancel { reply, only_if_idle }) => {
@@ -2346,7 +2916,9 @@ async fn actor(
             line = async { match process.as_mut().filter(|p| !p.close_blocked) { Some(p) => p.next_message().await, None => std::future::pending().await } } => {
                 async {
                     let p = process.as_mut().context("Agent process missing")?;
-                    let (line, sideband) = line?;
+                    let Some((line, sideband)) = line? else {
+                        return p.finish_per_turn(&database, &session.id).await;
+                    };
                     let actions = p.adapter.advance(if sideband { Input::Sideband(&line) } else { Input::Message(&line) })?;
                     let consumed: Vec<_> = actions.iter().filter_map(|action| match action {
                         Action::InputsConsumed(ids) => Some(ids.as_slice()), _ => None,
@@ -2368,6 +2940,7 @@ async fn actor(
                 } else { Ok(()) }
             },
             _ = deadline(init_deadline) => Err(anyhow::anyhow!("Agent 初始化超时（18 秒）")),
+            _ = deadline(result_deadline) => Err(anyhow::anyhow!("Agent已返回result，但stdout/进程未在10秒内收尾；完成未确认")),
             _ = deadline(approval_deadline) => {
                 if let Some(p) = &mut process {
                     let now = tokio::time::Instant::now();
@@ -2444,6 +3017,7 @@ async fn actor(
                         &path,
                         config,
                         session_open.clone(),
+                        None,
                     )
                     .await?;
                     let actions = p.adapter.advance(Input::Open)?;
@@ -2474,7 +3048,7 @@ async fn actor(
             process = None;
             break;
         }
-        if process.as_ref().is_some_and(|p| p.state.ready) {
+        if process.as_ref().is_some_and(Process::host_prepared) {
             for reply in opening.drain(..) {
                 let _ = reply.send(Ok(()));
             }
@@ -2506,7 +3080,7 @@ async fn actor(
                 && !status.active()
                 && process
                     .as_ref()
-                    .is_none_or(|p| p.state.ready && !p.turn_active && !p.interrupt_ack_pending)
+                    .is_none_or(|p| p.host_prepared() && !p.turn_active && !p.interrupt_ack_pending)
             {
                 let pending = immediate.take().expect("checked immediate");
                 let result = async {
@@ -2523,6 +3097,7 @@ async fn actor(
                         &path,
                         pending.turn,
                         &session_open,
+                        None,
                         || {},
                     )
                     .await?;
@@ -2577,6 +3152,7 @@ async fn actor(
                         config,
                     },
                     &session_open,
+                    None,
                     || {},
                 )
                 .await?;
@@ -2604,12 +3180,7 @@ async fn actor(
             queue_idle
                 && immediate.is_none()
                 && forwarded.is_empty()
-                && process.as_ref().is_none_or(|p| {
-                    !p.close_blocked
-                        && !p.interrupt_ack_pending
-                        && p.state.pending.is_empty()
-                        && p.adapter.can_reconfigure()
-                }),
+                && process.as_ref().is_none_or(Process::idle_for_close),
             Ordering::SeqCst,
         );
     }
@@ -2683,18 +3254,180 @@ pub async fn commands(
 }
 
 #[cfg(test)]
+mod per_turn_tests;
+
+#[cfg(test)]
+#[path = "runtime_auxiliary_tests.rs"]
+mod auxiliary_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn auxiliary_close_barrier_runs_before_native_pid_is_reaped() {
+        for (command, expect_clean_exit, expected) in [
+            ("exec sleep 60", false, true),
+            ("exit 0", true, true),
+            ("exit 17", true, false),
+        ] {
+            let child = tokio::process::Command::new("/bin/sh")
+                .args(["-c", command])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = i32::try_from(child.id().unwrap()).unwrap();
+            let mut group = Group { child, pid };
+            let owned_during_barrier = Arc::new(AtomicBool::new(false));
+            let observed = owned_during_barrier.clone();
+            let confirmed = close_group(
+                &mut group,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                expect_clean_exit,
+                async move {
+                    observed.store(
+                        nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok(),
+                        Ordering::SeqCst,
+                    );
+                    true
+                },
+            )
+            .await;
+            assert_eq!(confirmed, expected);
+            assert!(
+                owned_during_barrier.load(Ordering::SeqCst),
+                "auxiliary await must not retain a reusable native PID"
+            );
+            assert!(group.child.id().is_none());
+        }
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn queued_admission_timeout_remains_unknown_and_late_acceptance_deduplicates() {
+    async fn close_confirmation_budget_includes_waiting_to_send_control() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("state.sqlite")).unwrap();
         let project = store.add_project(dir.path()).unwrap();
         let session = store.create_session(project.id, "claude".into()).unwrap();
         let database = Arc::new(Mutex::new(store));
         let runs: Runs = Arc::default();
-        let (control, mut queued) = mpsc::channel(4);
+        let (control, _receive) = mpsc::channel(1);
+        let (reply, _response) = oneshot::channel();
+        control
+            .try_send(Control::TitleContext { reply })
+            .ok()
+            .unwrap();
+        runs.lock().unwrap().insert(
+            session.id.clone(),
+            Run {
+                control,
+                safe_to_close: Arc::new(AtomicBool::new(true)),
+                session_open: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(6),
+            close(&database, &runs, &session.id, false),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "close must bound the control-queue wait too"
+        );
+        assert!(result.unwrap().is_err(), "no actor acknowledged closure");
+    }
+
+    #[tokio::test]
+    async fn send_reply_preserves_terminal_rejection_and_full_channel_checks_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.sqlite")).unwrap();
+        let project = store.add_project(dir.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        let database = Arc::new(Mutex::new(store));
+        let runs: Runs = Arc::default();
+        let config = crate::providers::ProviderStore::open(dir.path())
+            .unwrap()
+            .turn_config("claude", None, None)
+            .unwrap();
+        let (control, mut receive) = mpsc::channel(1);
+        runs.lock().unwrap().insert(
+            session.id.clone(),
+            Run {
+                control: control.clone(),
+                safe_to_close: Arc::new(AtomicBool::new(true)),
+                session_open: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let responder = tokio::spawn(async move {
+            let Some(Control::Send {
+                turn,
+                admission,
+                reply,
+                ..
+            }) = receive.recv().await
+            else {
+                panic!("send control");
+            };
+            let error = reject_send(&admission, &turn.request_id, "明确拒绝".into());
+            reply.send(Err(error)).unwrap();
+            receive
+        });
+        let make_turn = |id: &str| SendTurn {
+            request_id: id.into(),
+            text: "once".into(),
+            model: None,
+            fingerprint: None,
+            config: config.clone(),
+        };
+        let first = submit(
+            database.clone(),
+            runs.clone(),
+            "/missing/cli".into(),
+            session.clone(),
+            dir.path().to_string_lossy().into_owned(),
+            make_turn("rejected"),
+            false,
+        )
+        .await;
+        assert!(first.unwrap_err().is::<SendNotAdmitted>());
+        let _receive = responder.await.unwrap();
+        let (reply, _response) = oneshot::channel();
+        control
+            .try_send(Control::TitleContext { reply })
+            .ok()
+            .unwrap();
+        db(&database, |s| {
+            s.begin(&session.id, "accepted", "once", None, None, None, None)
+        })
+        .unwrap();
+        for (id, not_admitted) in [("fresh", true), ("accepted", false)] {
+            let result = submit(
+                database.clone(),
+                runs.clone(),
+                "/missing/cli".into(),
+                session.clone(),
+                dir.path().to_string_lossy().into_owned(),
+                make_turn(id),
+                false,
+            )
+            .await;
+            assert_eq!(result.unwrap_err().is::<SendNotAdmitted>(), not_admitted);
+        }
+        assert!(db(&database, |s| s.request_identity_absent("fresh")).unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_admission_timeout_keeps_old_continuation_and_same_id_full_rejection_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state.sqlite")).unwrap();
+        let project = store.add_project(dir.path()).unwrap();
+        let session = store.create_session(project.id, "claude".into()).unwrap();
+        let database = Arc::new(Mutex::new(store));
+        let runs: Runs = Arc::default();
+        let (control, mut queued) = mpsc::channel(1);
         runs.lock().unwrap().insert(
             session.id.clone(),
             Run {
@@ -2709,6 +3442,25 @@ mod tests {
             .unwrap();
         let result = submit(
             database.clone(),
+            runs.clone(),
+            "/missing/cli".into(),
+            session.clone(),
+            dir.path().to_string_lossy().into_owned(),
+            SendTurn {
+                request_id: "delayed".into(),
+                text: "once".into(),
+                model: None,
+                fingerprint: None,
+                config: config.clone(),
+            },
+            false,
+        )
+        .await;
+        assert!(result.unwrap_err().is::<AdmissionUnknown>());
+        assert!(db(&database, |s| s.request_identity_absent("delayed")).unwrap());
+        // The timed-out attempt still occupies the actor channel and can admit.
+        let retry = submit(
+            database.clone(),
             runs,
             "/missing/cli".into(),
             session.clone(),
@@ -2722,12 +3474,23 @@ mod tests {
             },
             false,
         )
-        .await;
-        assert!(result.unwrap_err().is::<AdmissionUnknown>());
-        let Control::Send { turn, reply, .. } = queued.recv().await.unwrap() else {
+        .await
+        .unwrap_err();
+        assert!(
+            !retry.is::<SendNotAdmitted>(),
+            "old continuation still admits: {retry:#}"
+        );
+        let Control::Send {
+            turn,
+            admission,
+            reply,
+            ..
+        } = queued.recv().await.unwrap()
+        else {
             panic!("queued send");
         };
         assert!(reply.is_closed());
+        assert_eq!(crate::admission::active(&database, "delayed"), 1);
         db(&database, |s| {
             s.begin(
                 &session.id,
@@ -2761,6 +3524,8 @@ mod tests {
                 .count(),
             1
         );
+        drop(admission);
+        assert_eq!(crate::admission::active(&database, "delayed"), 0);
     }
 
     #[tokio::test]
@@ -2800,6 +3565,7 @@ mod tests {
                 dir.path().to_str().unwrap(),
                 config.clone(),
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
             .await;
             assert!(matches!(result, Err(error) if error.to_string() == CLOSE_PENDING));
@@ -2978,6 +3744,7 @@ mod tests {
                 &path,
                 make_turn(),
                 &open,
+                Some(&Guard::reserve(&database, "startup-failure").unwrap()),
                 || admitted = true
             )
             .await
@@ -3001,6 +3768,7 @@ mod tests {
                 &path,
                 make_turn(),
                 &open,
+                Some(&Guard::reserve(&database, "startup-failure").unwrap()),
                 || panic!("duplicate must not be newly admitted")
             )
             .await
@@ -3025,10 +3793,12 @@ mod tests {
                 &path,
                 next,
                 &open,
+                Some(&Guard::reserve(&database, "busy").unwrap()),
                 || panic!("rejected input must not be acknowledged")
             )
             .await
-            .is_err()
+            .unwrap_err()
+            .is::<SendNotAdmitted>()
         );
     }
 

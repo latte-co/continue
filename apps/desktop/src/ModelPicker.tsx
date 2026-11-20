@@ -6,6 +6,7 @@ import {
   type Ref,
 } from "react";
 import { request, message } from "./api";
+import { useModelConfigVersion } from "./modelConfigVersion";
 import { modelOptions } from "./modelOptions";
 import { modelSelectionScope } from "./modelSelectionScope";
 import { ModelSelector, type ModelSelectorHandle } from "./ModelSelector";
@@ -58,19 +59,23 @@ export function ModelPicker({
   ref?: Ref<ModelPickerHandle>;
 }) {
   const selector = useRef<ModelSelectorHandle>(null);
+  const configVersion = useModelConfigVersion();
   const scope = JSON.stringify([hostId, projectId, agent]);
   const conversationScope = JSON.stringify([scope, conversationKey ?? ""]);
   const [loaded, setCatalog] = useState<{
     scope: string;
+    configVersion: number;
     model: string | null;
     catalog: Catalog;
   }>();
-  const [invalidated, setInvalidated] = useState(false);
   const [settledScopes, setSettledScopes] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
   const settled = settledScopes.has(conversationScope);
-  const cached = loaded?.scope === scope && !invalidated ? loaded : undefined;
+  const cached =
+    loaded?.scope === scope && loaded.configVersion === configVersion
+      ? loaded
+      : undefined;
   const catalog = cached?.catalog;
   // The catalog covers every model, but effort levels describe the queried model.
   const matchesSelectedModel = cached?.model === value;
@@ -104,16 +109,20 @@ export function ModelPicker({
       action: { label: "重新加载模型", run: () => setRetry((v) => v + 1) },
     },
   ]);
-  if (settingsOpen && !invalidated && loaded) setInvalidated(true);
+  const initialConfigVersion = useRef(configVersion);
   useEffect(() => {
-    if (!settingsOpen || !value) return;
+    if (
+      (!settingsOpen && configVersion === initialConfigVersion.current) ||
+      !value
+    )
+      return;
     setSettledScopes((current) => {
       if (current.has(conversationScope)) return current;
       const next = new Set(current);
       next.add(conversationScope);
       return next;
     });
-  }, [settingsOpen, value, conversationScope]);
+  }, [settingsOpen, configVersion, value, conversationScope]);
   useEffect(() => {
     if (!connected || settingsOpen) return;
     let disposed = false;
@@ -128,8 +137,7 @@ export function ModelPicker({
       .then((result) => {
         if (result.kind !== "models") throw new Error("无法加载模型列表");
         if (!disposed) {
-          setInvalidated(false);
-          setCatalog({ scope, model: value, catalog: result });
+          setCatalog({ scope, configVersion, model: value, catalog: result });
           if (value && result.models.includes(value)) {
             setSettledScopes((current) => {
               if (current.has(conversationScope)) return current;
@@ -156,6 +164,7 @@ export function ModelPicker({
     hostId,
     projectId,
     agent,
+    configVersion,
     conversationScope,
     connected,
     settingsOpen,

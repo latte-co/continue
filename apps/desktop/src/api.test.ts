@@ -2,7 +2,19 @@
 import { afterEach, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
-import { connect, disconnect, request, ServerRequestError } from "./api";
+import {
+  agentEnvironments,
+  agentProviders,
+  bindAgentProvider,
+  connect,
+  disconnect,
+  providerRequest,
+  request,
+  saveAgentEnvironment,
+  saveHosts,
+  ServerRequestError,
+} from "./api";
+import { getModelConfigVersion } from "./modelConfigVersion";
 import {
   HOST_DISCONNECTED_EVENT,
   HostConnectionError,
@@ -192,4 +204,58 @@ it("preserves structured Server error codes without marking the host disconnecte
   } finally {
     window.removeEventListener(HOST_DISCONNECTED_EVENT, listener);
   }
+});
+
+it("bumps model config version only on actual Provider, Agent or Host config mutations", async () => {
+  const start = getModelConfigVersion();
+  mocks.invoke.mockResolvedValue({
+    kind: "providers",
+    providers: [],
+    bindings: [],
+  });
+  await providerRequest({ method: "providers" });
+  await agentProviders("local");
+  mocks.invoke.mockResolvedValueOnce({});
+  await agentEnvironments("local");
+  expect(getModelConfigVersion()).toBe(start);
+
+  mocks.invoke.mockResolvedValueOnce({
+    kind: "providers",
+    providers: [],
+    bindings: [],
+  });
+  await providerRequest({
+    method: "save_provider",
+    provider: {
+      id: null,
+      name: "Team",
+      protocol: "anthropic_messages",
+      base_url: "https://api.example.com",
+      model: "claude",
+      models: ["claude"],
+      model_labels: {},
+      models_1m: [],
+      auth: "none",
+      credential: null,
+    },
+  });
+  expect(getModelConfigVersion()).toBe(start + 1);
+
+  mocks.invoke.mockResolvedValueOnce({
+    kind: "providers",
+    providers: [],
+    bindings: [],
+  });
+  await bindAgentProvider("local", "claude", "p1");
+  expect(getModelConfigVersion()).toBe(start + 2);
+
+  mocks.invoke.mockResolvedValueOnce({ ANTHROPIC_BASE_URL: "https://x" });
+  await saveAgentEnvironment("local", "claude", {
+    ANTHROPIC_BASE_URL: "https://x",
+  });
+  expect(getModelConfigVersion()).toBe(start + 3);
+
+  mocks.invoke.mockResolvedValueOnce(undefined);
+  await saveHosts([]);
+  expect(getModelConfigVersion()).toBe(start + 4);
 });

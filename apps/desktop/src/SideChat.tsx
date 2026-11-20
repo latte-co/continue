@@ -82,7 +82,8 @@ export async function closeSideChat(
           session_id: sideId,
           only_if_idle: false,
         });
-        if (result.kind !== "ok") throw new Error("无法确认侧边聊天已关闭");
+        if (result.kind !== "ok" && result.kind !== "side_chat_closed")
+          throw new Error("无法确认侧边聊天已关闭");
       } catch (cause) {
         if (!missingSession(cause)) throw cause;
       }
@@ -156,9 +157,16 @@ export function SideChat({
   const effort = selection
     ? selection.effort
     : ((session ?? parent).effort ?? null);
+  const hadDraft = useRef(isDraft);
+  if (isDraft) hadDraft.current = true;
+  if (session) hadDraft.current = false;
   const permission = selection
     ? selection.permission
-    : ((session ?? parent).permission_mode ?? null);
+    : session
+      ? (session.permission_mode ?? null)
+      : hadDraft.current
+        ? (parent.permission_mode ?? "inherit")
+        : null;
   const quotes = draft.quotes ?? [];
   const annotations = draft.annotations ?? [];
   function saveAnnotation(entry: Annotation) {
