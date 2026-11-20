@@ -13,7 +13,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
 });
-it("groups a declared Provider 1M mode as 默认 / 1M, restores it, and drops it when support is removed", async () => {
+it("groups a declared Provider 1M mode as 默认 / 1M, restores it, and keeps the open chat's model when support is removed", async () => {
   const onChange = vi.fn();
   const ready = vi.fn();
   const catalog = {
@@ -36,6 +36,7 @@ it("groups a declared Provider 1M mode as 默认 / 1M, restores it, and drops it
     agent: "claude",
     connected: true,
     settingsOpen: false,
+    preserveUnavailableModel: true,
     value: "custom[1m]",
     onChange,
     effort: null,
@@ -49,6 +50,7 @@ it("groups a declared Provider 1M mode as 默认 / 1M, restores it, and drops it
     value: string;
     options: {
       value: string;
+      label?: string;
       variants?: { value: string; label: string; contextWindow?: number }[];
     }[];
     onChange: (value: string) => void;
@@ -85,7 +87,100 @@ it("groups a declared Provider 1M mode as 默认 / 1M, restores it, and drops it
   });
   view.rerender(<ModelPicker {...props} />);
   await act(async () => {});
-  expect(onChange).toHaveBeenCalledWith("custom");
+  expect(onChange).not.toHaveBeenCalled();
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      value: "custom[1m]",
+      options: [
+        expect.objectContaining({ value: "custom" }),
+        expect.objectContaining({ value: "small" }),
+        expect.objectContaining({
+          value: "custom[1m]",
+          label: "custom[1m] (unavailable)",
+        }),
+      ],
+    }),
+    undefined,
+  );
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+});
+
+it("keeps an already-open draft's model across a Provider update without flashing stale readiness", async () => {
+  const onChange = vi.fn();
+  const onProviderFallback = vi.fn();
+  const ready = vi.fn();
+  mocks.request.mockResolvedValue({
+    kind: "models",
+    models: ["model-a", "model-b"],
+    provider: "Team",
+    default_model: "model-a",
+    effort_levels: [],
+    model_labels: {},
+  });
+  const props = {
+    hostId: "local",
+    projectId: "p",
+    agent: "claude",
+    connected: true,
+    settingsOpen: false,
+    value: "model-b",
+    onChange,
+    onProviderFallback,
+    effort: null,
+    onEffortChange: vi.fn(),
+    disabled: false,
+    onReadyChange: ready,
+  };
+  const view = render(<ModelPicker {...props} />);
+  await act(async () => {});
+  expect(onChange).not.toHaveBeenCalled();
+  expect(onProviderFallback).not.toHaveBeenCalled();
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  let resolveUpdated: ((value: Response) => void) | undefined;
+  mocks.request.mockImplementation(
+    () =>
+      new Promise<Response>((resolve) => {
+        resolveUpdated = resolve;
+      }),
+  );
+  ready.mockClear();
+  view.rerender(<ModelPicker {...props} settingsOpen />);
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+  view.rerender(<ModelPicker {...props} settingsOpen={false} />);
+  expect(ready.mock.calls.some(([state]) => state.ready)).toBe(false);
+  await act(async () =>
+    resolveUpdated?.({
+      kind: "models",
+      models: ["model-c"],
+      provider: "Team",
+      default_model: "model-c",
+      effort_levels: [],
+      model_labels: {},
+    }),
+  );
+  expect(onChange).not.toHaveBeenCalled();
+  expect(onProviderFallback).not.toHaveBeenCalled();
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      value: "model-b",
+      options: [
+        expect.objectContaining({ value: "model-c" }),
+        expect.objectContaining({
+          value: "model-b",
+          label: "model-b (unavailable)",
+        }),
+      ],
+    }),
+    undefined,
+  );
+  expect(ready.mock.calls.some(([state]) => state.ready)).toBe(false);
   expect(ready).toHaveBeenLastCalledWith(
     expect.objectContaining({ ready: false }),
   );

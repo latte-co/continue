@@ -62,7 +62,6 @@ export function PermissionPicker({
       .catch((e) => {
         if (!disposed && !(e instanceof HostConnectionError)) {
           setFailure({ scope, message: message(e) });
-          if (sideChat) setLoaded({ scope, modes: [] });
         }
       })
       .finally(() => {
@@ -71,16 +70,14 @@ export function PermissionPicker({
     return () => {
       disposed = true;
     };
-  }, [hostId, agent, connected, hidden, retry, sideChat]);
+  }, [hostId, agent, connected, hidden, retry]);
   const current = modes?.find((mode) => mode.id === value);
   const Icon = current?.elevated ? ShieldAlert : Shield;
   const options: SelectOption[] = [
     {
       value: "",
-      label: sideChat ? "只读" : "跟随 Agent",
-      description: sideChat
-        ? "可以读取文件。禁止写入或请求提权。"
-        : "沿用 Agent 自己的权限配置。",
+      label: "跟随 Agent",
+      description: "沿用 Agent 自己的权限配置。",
     },
     ...(modes ?? []).map((mode) => ({
       value: mode.id,
@@ -96,9 +93,7 @@ export function PermissionPicker({
     options.push({
       value,
       label: modes ? "权限模式不可用" : value,
-      description: sideChat
-        ? "此选择尚未验证，可切换为只读。"
-        : "此选择尚未验证；可切换为跟随 Agent。",
+      description: "此选择尚未验证；可切换为跟随 Agent。",
     });
   return (
     <div

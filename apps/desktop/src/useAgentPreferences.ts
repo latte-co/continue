@@ -98,7 +98,10 @@ export function useAgentPreferences(
     choosePermissionMode: (permissionMode: string | null) =>
       choose({ permissionMode }),
     chooseEffort: (effort: Effort | null) => choose({ effort }),
-    // Capability refreshes are not user choices and must not erase remembered effort.
+    // Capability refreshes and initial Provider fallbacks are not user choices
+    // and must not erase remembered selections in localStorage.
+    replaceUnsupportedModel: (model: string | null) =>
+      setSelection((current) => ({ ...current, model })),
     clearUnsupportedEffort: () =>
       setSelection((current) => ({ ...current, effort: null })),
   };

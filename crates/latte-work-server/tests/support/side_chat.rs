@@ -83,7 +83,7 @@ async fn side_chat_forks_while_parent_waits_and_resumes_independently() {
                 }
             )
             .await,
-            Response::Ok
+            Response::SideChatClosed
         ));
         assert!(matches!(
             send(&mut reconnect, &side.id, "follow", "question").await,
@@ -99,9 +99,9 @@ async fn side_chat_forks_while_parent_waits_and_resumes_independently() {
                 }
             )
             .await,
-            Response::Ok
+            Response::SideChatClosed
         ));
-        wait(&mut reconnect, &side.id, Status::Stopped).await;
+        wait(&mut reconnect, &side.id, Status::Unknown).await;
         assert!(matches!(
             ask(&mut reconnect, Request::Session { session_id: side.id.clone() }).await,
             Response::Session { session } if session.agent_session_open == Some(false)
@@ -202,7 +202,7 @@ async fn side_chat_forks_while_parent_waits_and_resumes_independently() {
 }
 
 #[tokio::test]
-async fn claude_side_chat_resumes_its_own_native_session_and_denies_readonly_approval() {
+async fn claude_side_chat_resumes_its_own_native_session_and_handles_approvals() {
     let host = Host::start().await;
     let root = tempfile::tempdir().unwrap();
     let mut client = host.client().await;
@@ -243,12 +243,20 @@ async fn claude_side_chat_resumes_its_own_native_session_and_denies_readonly_app
         send(&mut client, &side.id, "side", "approve").await,
         Response::Accepted { .. }
     ));
-    let events = wait(&mut client, &side.id, Status::Completed).await;
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e.event, EventKind::Approval { .. }))
-    );
+    let side_denied = permission(&wait(&mut client, &side.id, Status::Waiting).await);
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::Approve {
+                session_id: side.id.clone(),
+                request_id: side_denied,
+                allow: false
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    wait(&mut client, &side.id, Status::Completed).await;
     assert!(!root.path().join("approved.txt").exists());
     let Response::Session {
         session: completed_side,
@@ -267,7 +275,7 @@ async fn claude_side_chat_resumes_its_own_native_session_and_denies_readonly_app
             }
         )
         .await,
-        Response::Ok
+        Response::SideChatClosed
     ));
     let mut reconnect = host.client().await;
     assert!(matches!(
@@ -642,7 +650,7 @@ async fn side_chat_forks_and_resumes_after_switching_providers() {
                 }
             )
             .await,
-            Response::Ok
+            Response::SideChatClosed
         ));
         assert!(matches!(
             ask(
@@ -1763,7 +1771,7 @@ async fn an_interrupted_writable_side_chat_can_reopen_and_archive_its_parent() {
     assert!(matches!(ask(&mut client, Request::Poll {
         session_id: side.id, after: 0.0,
     }).await, Response::Events { session, .. } if session.agent_session_open == Some(false) &&
-        session.side_write_pending.as_deref() == Some("side-write")));
+        session.side_write_pending.as_deref() == Some("resumed-side")));
 }
 
 #[tokio::test]
@@ -1832,16 +1840,87 @@ async fn retrying_a_side_write_confirmation_preserves_reopened_resource_ownershi
         .await
         .unwrap();
     assert!(matches!(
-        send(
+        ask(
             &mut reopened,
-            &side.id,
-            "read-only-after-confirmation",
-            "hello"
+            Request::OpenAgentSession {
+                session_id: side.id.clone(),
+                provider: Some(TurnProvider::Cli),
+            }
         )
         .await,
+        Response::Ok
+    ));
+    let Response::Session {
+        session: reopened_session,
+    } = ask(
+        &mut reopened,
+        Request::Session {
+            session_id: side.id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("reopened side session");
+    };
+    let launch_write = reopened_session
+        .side_write_pending
+        .expect("side launch write");
+    assert!(matches!(
+        ask(&mut writer, confirm()).await,
+        Response::Error { message, .. } if message.contains("后台写入记录已变化")
+    ));
+    assert!(matches!(
+        ask(
+            &mut reopened,
+            Request::Session {
+                session_id: side.id.clone()
+            }
+        )
+        .await,
+        Response::Session { session } if session.side_write_pending.as_deref() == Some(launch_write.as_str())
+            && session.agent_session_open == Some(true)
+    ));
+    assert!(matches!(
+        send(&mut reopened, &side.id, "turn-after-confirmation", "hello").await,
         Response::Accepted { .. }
     ));
     wait(&mut reopened, &side.id, Status::Completed).await;
+    assert!(matches!(
+        ask(
+            &mut reopened,
+            Request::ConfirmSideWritesEnded {
+                session_id: side.id.clone(),
+                request_id: "turn-after-confirmation".into(),
+            }
+        )
+        .await,
+        Response::Session { session } if session.side_write_pending.is_none()
+            && session.agent_session_open == Some(false)
+            && session.agent_closed_by_confirmation == Some(true)
+    ));
+    reopened
+        .claim_resources("reopened-again".into(), vec![resource.clone()])
+        .await
+        .unwrap();
+    assert!(matches!(
+        ask(
+            &mut reopened,
+            Request::OpenAgentSession {
+                session_id: side.id.clone(),
+                provider: Some(TurnProvider::Cli),
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    // Clear the launch-write row to simulate an already-confirmed idle actor when a stale retry arrives.
+    rusqlite::Connection::open(host.directory.path().join("state.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE side_launch_writes SET verified_end=start_seq WHERE session_id=?1",
+            [&side.id],
+        )
+        .unwrap();
     assert!(matches!(
         ask(&mut writer, confirm()).await,
         Response::Session { session } if session.side_write_pending.is_none()
@@ -1849,7 +1928,7 @@ async fn retrying_a_side_write_confirmation_preserves_reopened_resource_ownershi
             && session.agent_closed_by_confirmation == Some(false)
     ));
     reopened
-        .close_owned_resources(server_id, "reopened".into(), vec![resource])
+        .close_owned_resources(server_id, "reopened-again".into(), vec![resource])
         .await
         .unwrap();
     assert!(
@@ -1877,8 +1956,13 @@ async fn main_and_read_only_side_closes_can_be_verified_after_a_restart() {
     drop(client);
 
     // Simulate interruption after the close journal commits and before its
-    // acknowledgement. Use the previous Server's record format as well.
+    // acknowledgement, including a legacy read-only side-chat request row.
     let db = rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
+    db.execute(
+        "UPDATE requests SET side_write_start=NULL, side_write_end=NULL WHERE session_id=?1",
+        [&side.id],
+    )
+    .unwrap();
     for id in [&parent.id, &side.id] {
         db.execute(
             "INSERT INTO unconfirmed_agent_closes(session_id,reason) VALUES (?1,'close unknown')",
@@ -1918,7 +2002,14 @@ async fn main_and_read_only_side_closes_can_be_verified_after_a_restart() {
             Response::Accepted { .. }
         ));
         wait(&mut client, id, Status::Completed).await;
-        assert!(matches!(ask(&mut client, close()).await, Response::Ok));
+        if id == &side.id {
+            assert!(matches!(
+                ask(&mut client, close()).await,
+                Response::SideChatClosed
+            ));
+        } else {
+            assert!(matches!(ask(&mut client, close()).await, Response::Ok));
+        }
     }
     assert!(
         matches!(ask(&mut client, Request::ArchiveSession { session_id: parent.id, archived: true }).await,

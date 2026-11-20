@@ -366,6 +366,7 @@ export default function App() {
             agents={workbench.agents}
             selectAgent={workbench.selectAgent}
             session={session}
+            conversationKey={workbench.workspaceId}
             hostId={hostId}
             agentSessionState={
               session

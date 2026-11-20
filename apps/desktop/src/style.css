@@ -4074,7 +4074,9 @@ button.recent-notice {
 @container conversation (max-width: 320px) {
   .messages,
   .welcome,
-  .composer-wrap {
+  .composer-wrap,
+  .side-chat-messages,
+  .side-chat-compose {
     --content-gutter: var(--space-2);
   }
 }
@@ -6259,26 +6261,43 @@ button.task-info-row:not(:disabled):hover,
 }
 
 .side-chat {
+  container-type: inline-size;
+  container-name: conversation;
+  --content-gutter: clamp(16px, 4cqw, 48px);
   display: flex;
   flex: 1;
   flex-direction: column;
   min-height: 0;
+  margin-bottom: var(--space-2);
 }
 .side-chat-transcript {
   flex: 1;
   min-height: 0;
   overflow: auto;
   overscroll-behavior: contain;
-  padding: var(--space-4);
+  scrollbar-gutter: stable both-edges;
 }
 .side-chat-messages {
-  width: min(100%, var(--content-width));
-  margin-inline: auto;
+  font-family: var(--font-content);
+  font-weight: var(--weight-content);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  width: 100%;
+  max-width: calc(var(--content-width) + 2 * var(--content-gutter));
+  margin: 0 auto;
+  padding: var(--space-4) var(--content-gutter) var(--space-2);
+  font-size: var(--text-body);
+  line-height: 1.8;
 }
 .side-chat-compose {
-  width: min(100%, var(--content-width));
-  align-self: center;
-  padding: var(--space-3);
+  --composer-radius: 14px;
+  container-type: inline-size;
+  container-name: composer;
+  padding: var(--space-3) var(--content-gutter) var(--space-4);
+  max-width: calc(var(--content-width) + 2 * var(--content-gutter));
+  width: 100%;
+  margin: 0 auto;
+  flex: none;
 }
 .side-chat-quotes details {
   min-width: 0;

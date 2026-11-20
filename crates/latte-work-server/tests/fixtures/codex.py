@@ -92,12 +92,16 @@ for line in sys.stdin:
         config_file = pathlib.Path('codex-native-config.json')
         reply(value, {'config': json.loads(config_file.read_text()) if config_file.exists() else {'model_provider': None, 'model': None, 'developer_instructions': 'NATIVE_CODEX_INSTRUCTIONS'}})
     elif method == 'thread/fork' or (method == 'thread/resume' and params['threadId'].startswith('side-thread-')):
-        sandbox, approval = {
-            'read-only': ('readOnly', 'never'),
-            'workspace-write': ('workspaceWrite', 'on-request'),
-            'danger-full-access': ('dangerFullAccess', 'never'),
-        }[params['sandbox']]
-        assert params['approvalPolicy'] == approval
+        if 'sandbox' in params:
+            sandbox, approval = {
+                'read-only': ('readOnly', 'never'),
+                'workspace-write': ('workspaceWrite', 'on-request'),
+                'danger-full-access': ('dangerFullAccess', 'never'),
+            }[params['sandbox']]
+            assert params['approvalPolicy'] == approval
+        else:
+            assert 'approvalPolicy' not in params
+            sandbox, approval = ('workspaceWrite', 'on-request')
         assert 'inherited messages' in params['developerInstructions']
         check_provider = pathlib.Path('check-side-provider-resume').exists()
         source = params['threadId']

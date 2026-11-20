@@ -122,3 +122,24 @@ it("hides an old permission error while disconnected", async () => {
   view.rerender(<PermissionPicker {...props} connected={false} />);
   expect(screen.queryByRole("button", { name: "重新加载权限选项" })).toBeNull();
 });
+it("aligns side-chat permission options and discovery failure behavior with main conversations", async () => {
+  mocks.request
+    .mockRejectedValueOnce(new Error("发现失败"))
+    .mockResolvedValue(catalog);
+  const view = render(<PermissionPicker {...props} sideChat />);
+  await act(async () => {});
+  expect(
+    screen.getByRole("combobox", { name: "侧边聊天权限" }).textContent,
+  ).toContain("跟随 Agent");
+  fireEvent.click(screen.getByRole("button", { name: "状态提示（1）" }));
+  fireEvent.click(screen.getByRole("button", { name: "重新加载权限选项" }));
+  await act(async () => {});
+  fireEvent.click(screen.getByRole("combobox", { name: "侧边聊天权限" }));
+  expect(screen.queryByRole("option", { name: /只读/ })).toBeNull();
+  expect(screen.getByRole("option", { name: /^跟随 Agent/ })).toBeTruthy();
+  expect(
+    screen.getByText("跳过常规确认 侧边聊天与主聊使用同一个工作目录。"),
+  ).toBeTruthy();
+  view.rerender(<PermissionPicker {...props} sideChat value="stale-mode" />);
+  expect(screen.getByText("此选择尚未验证；可切换为跟随 Agent。")).toBeTruthy();
+});

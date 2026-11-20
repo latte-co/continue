@@ -206,8 +206,10 @@ impl Store {
         // Older versions can still write inferred side_write_end values after a
         // downgrade. Only zero (never started) and verified ends carry evidence.
         migration.execute_batch(
-            "CREATE INDEX IF NOT EXISTS unverified_side_writes ON requests(session_id)
-             WHERE permission_mode IS NOT NULL AND side_write_end IS NOT 0 AND side_write_verified_end IS NULL;",
+            "DROP INDEX IF EXISTS unverified_side_writes;
+             CREATE INDEX IF NOT EXISTS unverified_side_writes_v2 ON requests(session_id)
+             WHERE (permission_mode IS NOT NULL OR side_write_start IS NOT NULL)
+               AND side_write_end IS NOT 0 AND side_write_verified_end IS NULL;",
         )?;
         if !migration.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('unconfirmed_agent_closes') WHERE name='close_id')",
@@ -648,6 +650,7 @@ impl Store {
         side.title = "侧边聊天".into();
         side.model = parent.model;
         side.effort = parent.effort;
+        side.permission_mode = parent.permission_mode;
         self.save(&side)?;
         tx.execute(
             "INSERT INTO side_chats(parent_id,session_id,parent_native_id) VALUES (?1,?2,?3)",
@@ -1539,7 +1542,7 @@ impl Store {
     /// an admitted side request that has not reached this point.
     pub fn start_side_write(&self, request_id: &str) -> Result<()> {
         self.db.execute(
-            "UPDATE requests SET side_write_start=(SELECT MAX(seq) FROM events),
+            "UPDATE requests SET side_write_start=COALESCE((SELECT MAX(seq) FROM events),0),
                  side_write_end=NULL WHERE id=?1 AND side_write_end=0",
             [request_id],
         )?;
@@ -1570,7 +1573,8 @@ impl Store {
                      AND json_extract(data,'$.request_id')=r.id),0) AS start_seq,
                     0 AS launch_order
                  FROM side_chats c JOIN requests r ON r.session_id=c.session_id
-                 WHERE c.session_id=?1 AND r.permission_mode IS NOT NULL
+                 WHERE c.session_id=?1
+                 AND (r.permission_mode IS NOT NULL OR r.side_write_start IS NOT NULL)
                  AND r.side_write_end IS NOT 0 AND r.side_write_verified_end IS NULL
                  UNION ALL
                  SELECT id,start_seq,rowid AS launch_order FROM side_launch_writes
@@ -1616,9 +1620,10 @@ impl Store {
         }
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
-            "UPDATE requests SET side_write_verified_end=(SELECT MAX(seq) FROM events),
-                side_write_end=(SELECT MAX(seq) FROM events)
-             WHERE session_id=?1 AND permission_mode IS NOT NULL
+            "UPDATE requests SET side_write_verified_end=COALESCE((SELECT MAX(seq) FROM events),0),
+                side_write_end=COALESCE((SELECT MAX(seq) FROM events),0)
+             WHERE session_id=?1
+                AND (permission_mode IS NOT NULL OR side_write_start IS NOT NULL)
                 AND side_write_end IS NOT 0 AND side_write_verified_end IS NULL",
             [session_id],
         )?;
@@ -1727,7 +1732,8 @@ impl Store {
                 r.side_write_verified_end AS verified_end FROM side_chats side
                 JOIN events admitted ON admitted.session_id=side.session_id AND json_extract(admitted.data,'$.kind')='user'
                 JOIN requests r ON r.session_id=side.session_id AND r.id=json_extract(admitted.data,'$.request_id')
-                WHERE r.permission_mode IS NOT NULL AND r.side_write_end IS NOT 0
+                WHERE (r.permission_mode IS NOT NULL OR r.side_write_start IS NOT NULL)
+                    AND r.side_write_end IS NOT 0
             UNION ALL SELECT session_id,start_seq,verified_end FROM side_launch_writes)
             SELECT writes.session_id, writes.verified_end IS NULL FROM writes CROSS JOIN main_turn
                 WHERE writes.session_id!=?1 AND (writes.verified_end IS NULL
@@ -2028,9 +2034,10 @@ impl Store {
             )?;
             index_event(&tx, id, &event)?;
         }
-        if is_side_chat && permission_mode.is_some() {
+        if is_side_chat {
             // Keep the durable admission separate from possible native writes.
-            // Legacy rows have NULL here, so they retain the conservative fence.
+            // Legacy rows have NULL here: read-only rows have permission_mode IS NULL,
+            // while legacy writable rows keep the conservative fence.
             tx.execute(
                 "UPDATE requests SET side_write_end=0 WHERE id=?1",
                 [request_id],
@@ -2740,6 +2747,60 @@ mod tests {
                 "a verified later interval does not contaminate the historical snapshot"
             );
         }
+    }
+
+    #[test]
+    fn open_side_chat_inherits_parent_permission_and_tracks_agent_default_writes_without_fencing_legacy_readonly_rows()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let mut store = Store::open(&path).unwrap();
+        let project = store.add_project(directory.path()).unwrap();
+        let mut parent = store.create_session(project.id, "codex".into()).unwrap();
+        parent.native_id = Some("native-main".into());
+        parent.model = Some("gpt-5".into());
+        parent.effort = Some(latte_work_protocol::Effort::High);
+        parent.permission_mode = Some("bypass_permissions".into());
+        store.save(&parent).unwrap();
+
+        let inherited = store.open_side_chat(&parent.id, None).unwrap();
+        assert_eq!(inherited.model.as_deref(), Some("gpt-5"));
+        assert_eq!(inherited.effort, Some(latte_work_protocol::Effort::High));
+        assert_eq!(
+            inherited.permission_mode.as_deref(),
+            Some("bypass_permissions")
+        );
+
+        let side_id = Uuid::new_v4().to_string();
+        let side = store.open_side_chat(&parent.id, Some(&side_id)).unwrap();
+        // Simulate a legacy read-only side-chat request row written before permission alignment.
+        store
+            .db
+            .execute(
+                "INSERT INTO requests(id,session_id,text,permission_mode,side_write_start,side_write_end,side_write_verified_end)
+                 VALUES ('legacy-readonly',?1,'hello',NULL,NULL,NULL,NULL)",
+                [&side.id],
+            )
+            .unwrap();
+        assert!(store.pending_side_write(&side.id).unwrap().is_none());
+
+        // Admitted agent-default (permission_mode: None) side turn stays unfenced before native launch.
+        store
+            .begin(&side.id, "agent-default", "edit", None, None, None, None)
+            .unwrap();
+        assert!(store.pending_side_write(&side.id).unwrap().is_none());
+
+        // Once native launch starts, agent-default side turn tracks and fences writes until verified.
+        store.start_side_write("agent-default").unwrap();
+        store.state(&side.id, Status::Completed, None).unwrap();
+        assert_eq!(
+            store.pending_side_write(&side.id).unwrap().as_deref(),
+            Some("agent-default")
+        );
+        store
+            .confirm_side_writes_ended(&side.id, "agent-default")
+            .unwrap();
+        assert!(store.pending_side_write(&side.id).unwrap().is_none());
     }
 
     #[test]

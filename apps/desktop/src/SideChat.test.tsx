@@ -143,19 +143,28 @@ vi.mock("./ModelPicker", async () => {
       hostId,
       projectId,
       agent,
+      settingsOpen,
+      preserveUnavailableModel,
       value,
       effort,
       onReadyChange,
       onChange,
+      onProviderFallback,
       onEffortChange,
     }: ComponentProps<typeof ModelPicker>) => {
+      pickerSpy({
+        settingsOpen,
+        preserveUnavailableModel,
+        value,
+        onProviderFallback,
+      });
       useEffect(
         () =>
           onReadyChange?.({
             scope: modelSelectionScope(hostId, projectId, agent, value, effort),
-            ready: true,
+            ready: !settingsOpen,
           }),
-        [hostId, projectId, agent, value, effort, onReadyChange],
+        [hostId, projectId, agent, settingsOpen, value, effort, onReadyChange],
       );
       return (
         <>
@@ -170,7 +179,10 @@ vi.mock("./ModelPicker", async () => {
     },
   };
 });
-const { request } = vi.hoisted(() => ({ request: vi.fn() }));
+const { request, pickerSpy } = vi.hoisted(() => ({
+  request: vi.fn(),
+  pickerSpy: vi.fn(),
+}));
 vi.mock("./api", () => ({
   request,
   message: String,
@@ -412,7 +424,7 @@ it("stops only the side turn and never reads a hidden tab", async () => {
   });
 });
 
-it("retains unsent read-only, model and effort choices across main conversation navigation", async () => {
+it("inherits parent permission mode on draft side chats and retains unsent choices across navigation", async () => {
   HTMLElement.prototype.scrollIntoView = vi.fn();
   const drafts = new DraftStore();
   const workspaceId = crypto.randomUUID();
@@ -431,6 +443,11 @@ it("retains unsent read-only, model and effort choices across main conversation 
           },
         ],
       };
+    if (action.method === "open_side_chat")
+      return {
+        kind: "session",
+        session: { ...child, permission_mode: "bypass_permissions" },
+      };
     if (action.method === "send") return { kind: "accepted" };
     if (action.method === "poll")
       return {
@@ -441,6 +458,27 @@ it("retains unsent read-only, model and effort choices across main conversation 
       };
     throw new Error("unexpected request");
   });
+  const draftId = "draft-side";
+  openSideChatTab(workspaceId, draftId, true);
+  const draftView = render(
+    <ChatTab
+      parent={{ ...parent, permission_mode: "bypass_permissions" }}
+      workspaceId={workspaceId}
+      sideId={draftId}
+      hostId="local"
+      drafts={drafts}
+      active
+      connected
+      supported
+    />,
+  );
+  await waitFor(() =>
+    expect(
+      screen.getByRole("combobox", { name: "侧边聊天权限" }).textContent,
+    ).toContain("完全访问权限"),
+  );
+  draftView.unmount();
+
   const props = {
     parent,
     workspaceId,
@@ -458,7 +496,7 @@ it("retains unsent read-only, model and effort choices across main conversation 
     screen.getByRole<HTMLButtonElement>("button", { name: "发送侧边聊天消息" });
   await waitFor(() => expect(send().disabled).toBe(false));
   fireEvent.click(screen.getByRole("combobox", { name: "侧边聊天权限" }));
-  fireEvent.click(screen.getByRole("option", { name: /只读/ }));
+  fireEvent.click(screen.getByRole("option", { name: /^跟随 Agent/ }));
   fireEvent.click(screen.getByRole("button", { name: "选择侧边聊天模型" }));
   fireEvent.click(screen.getByRole("button", { name: "选择侧边聊天思考强度" }));
   view.rerender(<div>另一主会话</div>);
@@ -470,7 +508,7 @@ it("retains unsent read-only, model and effort choices across main conversation 
   ).toBe("keep this draft");
   expect(
     screen.getByRole("combobox", { name: "侧边聊天权限" }).textContent,
-  ).toContain("只读");
+  ).toContain("跟随 Agent");
   fireEvent.click(send());
   await waitFor(() =>
     expect(request).toHaveBeenCalledWith(
@@ -482,6 +520,55 @@ it("retains unsent read-only, model and effort choices across main conversation 
         permission_mode: null,
         model: "chosen-model",
         effort: "high",
+      }),
+    ),
+  );
+});
+
+it("waits for an existing side chat session before activating ModelPicker and preserves its model", async () => {
+  const drafts = new DraftStore();
+  let resolvePoll: ((value: unknown) => void) | undefined;
+  request.mockImplementation((_host: string, action: Request) => {
+    if (action.method === "agent_permissions")
+      return Promise.resolve({ kind: "agent_permissions", modes: [] });
+    if (action.method === "poll")
+      return new Promise((resolve) => {
+        resolvePoll = resolve;
+      });
+    throw new Error("unexpected request");
+  });
+  pickerSpy.mockClear();
+  render(
+    <SideChat
+      parent={{ ...parent, model: "parent-model" }}
+      sideId={child.id}
+      workspaceId={crypto.randomUUID()}
+      hostId="local"
+      drafts={drafts}
+      active
+      connected
+      supported
+    />,
+  );
+  expect(pickerSpy).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      settingsOpen: true,
+      preserveUnavailableModel: true,
+    }),
+  );
+  await waitFor(() => expect(resolvePoll).toBeTypeOf("function"));
+  resolvePoll?.({
+    kind: "events",
+    session: { ...child, model: "side-model" },
+    events: [],
+    has_more: false,
+  });
+  await waitFor(() =>
+    expect(pickerSpy).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        settingsOpen: false,
+        preserveUnavailableModel: true,
+        value: "side-model",
       }),
     ),
   );

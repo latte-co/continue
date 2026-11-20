@@ -20,21 +20,27 @@
   background: color-mix(in srgb, var(--color-unread) 32%, transparent);
   border-radius: 3px;
 }
-.annotation-marker {
+.annotation-marker,
+button.annotation-marker {
   position: absolute;
   z-index: 2;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  text-align: center;
+  gap: 0;
   pointer-events: auto;
+  box-sizing: border-box;
   min-width: 28px;
+  min-height: 28px;
   height: 28px;
   padding: 0 6px;
   border: 1.5px solid #ffffff;
   border-radius: 999px 999px 999px 4px;
-  background: color-mix(in srgb, var(--color-unread) 55%, #0066ff);
+  background-color: #1677ff;
+  background-image: none;
   color: #ffffff;
-  box-shadow: 0 4px 12px #0005;
+  box-shadow: 0 4px 12px #0006;
   font-family: var(--font-ui);
   font-size: var(--text-md);
   font-weight: 600;
@@ -44,8 +50,17 @@
 .annotation-marker-pending {
   pointer-events: none;
 }
-.annotation-marker:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--color-unread) 72%, #0066ff);
+button.annotation-marker:hover:not(:disabled) {
+  background-color: #2984ff;
+  background-image: none;
+  color: #ffffff;
+}
+:root button.annotation-marker:focus-visible:not(:disabled) {
+  background-color: #2984ff;
+  background-image: none;
+  box-shadow:
+    0 0 0 2px #1677ff66,
+    0 4px 12px #0006;
 }
 .annotation-selection-menu {
   position: fixed;
@@ -266,6 +281,64 @@
   font-size: var(--text-lg);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+.annotation-inline-editor-wrap {
+  margin-top: 4px;
+}
+.annotation-inline-editor {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 4px 10px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 12px;
+  background: var(--color-composer);
+}
+.annotation-inline-editor textarea {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--color-text);
+  outline: none;
+  box-shadow: none;
+  display: block;
+  width: 100%;
+  min-height: 24px;
+  max-height: 120px;
+  resize: none;
+  margin: 0;
+  padding: 2px 0;
+  font-family: var(--font-ui);
+  font-size: var(--text-lg);
+  line-height: var(--leading-ui);
+  overflow-y: auto;
+}
+.annotation-inline-editor textarea::placeholder {
+  color: color-mix(
+    in srgb,
+    var(--color-placeholder) 80%,
+    var(--color-composer)
+  );
+}
+.annotation-inline-cancel {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
+  padding: 0;
+  justify-content: center;
+  border-radius: var(--radius-pill);
+  color: var(--color-text-muted);
+}
+.annotation-inline-cancel:hover:not(:disabled) {
+  color: var(--color-text);
+}
+.annotation-inline-submit {
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
 }
 .annotation-entry-actions {
   display: flex;

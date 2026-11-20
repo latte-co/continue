@@ -166,7 +166,7 @@ export function SideChat({
     : ((session ?? parent).effort ?? null);
   const permission = selection
     ? selection.permission
-    : (session?.permission_mode ?? null);
+    : ((session ?? parent).permission_mode ?? null);
   const quotes = draft.quotes ?? [];
   const annotations = draft.annotations ?? [];
   function saveAnnotation(entry: Annotation) {
@@ -454,10 +454,10 @@ export function SideChat({
             el.scrollHeight - el.clientHeight - el.scrollTop < 90;
         }}
       >
-        {!isDraft && !ready && !events.length && enabled && !readError && (
-          <WorkingStatus label="正在读取记录…" animated />
-        )}
         <div className="side-chat-messages">
+          {!isDraft && !ready && !events.length && enabled && !readError && (
+            <WorkingStatus label="正在读取记录…" animated />
+          )}
           <TurnTranscript events={events}>
             {(item) => {
               if (item.type === "user")
@@ -618,6 +618,7 @@ export function SideChat({
                 onSave={saveAnnotation}
                 onRemove={removeAnnotation}
                 onClear={() => drafts.update(key, { annotations: [] })}
+                onFocusComposer={() => setFocus((value) => value + 1)}
                 disabled={busy || parent.archived}
                 active={active}
               />
@@ -677,12 +678,12 @@ export function SideChat({
                 hostId={hostId}
                 agent={parent.agent}
                 connected={connected}
-                hidden={!active}
+                hidden={!active || (!isDraft && !session)}
                 value={permission}
                 onChange={(permission) =>
                   setSelection({ model, effort, permission })
                 }
-                disabled={disabled || running}
+                disabled={disabled || running || (!isDraft && !session)}
                 sideChat
               />
               <ModelPicker
@@ -691,10 +692,15 @@ export function SideChat({
                 hostId={hostId}
                 projectId={parent.project_id}
                 agent={parent.agent}
+                conversationKey={key}
                 connected={connected}
-                settingsOpen={!active}
+                settingsOpen={!active || (!isDraft && !session)}
+                preserveUnavailableModel
                 value={model}
                 onChange={(model) =>
+                  setSelection({ model, effort, permission })
+                }
+                onProviderFallback={(model) =>
                   setSelection({ model, effort, permission })
                 }
                 effort={effort}
@@ -704,7 +710,7 @@ export function SideChat({
                 onEffortInvalid={() =>
                   setSelection({ model, effort: null, permission })
                 }
-                disabled={disabled || running}
+                disabled={disabled || running || (!isDraft && !session)}
               />
               <ComposerAction
                 active={running}

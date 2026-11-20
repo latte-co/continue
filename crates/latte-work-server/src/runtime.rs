@@ -1307,10 +1307,8 @@ impl Process {
             if let Some(id) = request_id {
                 s.start_side_write(id)?;
                 Ok(Some(id.to_owned()))
-            } else if config.permission_mode.is_some() {
-                s.start_side_launch_write(&session.id)
             } else {
-                Ok(None)
+                s.start_side_launch_write(&session.id)
             }
         })?;
         let child = command

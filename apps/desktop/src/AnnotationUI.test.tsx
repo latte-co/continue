@@ -115,22 +115,32 @@ it("selects, allows submitting without a comment, cancels without saving, and su
     }),
   );
 });
-it("edits, removes and clears draft comments, omits empty comment labels, and hides mutation actions in history", () => {
+it("edits inline inside the summary popover, keeps Escape working after item removal, and restores composer focus on clear", async () => {
   function Harness() {
     const [entries, setEntries] = useState([
       { ...base, comment: "" },
-      { ...base, id: "two", comment: "第二条" },
+      { ...base, id: "two", quote: "第二处原文", comment: "第二条" },
     ]);
+    const composer = useState<HTMLTextAreaElement | null>(null);
     return (
-      <AnnotationSummary
-        entries={entries}
-        onSave={(a) => {
-          setEntries(entries.map((e) => (e.id === a.id ? a : e)));
-          return null;
-        }}
-        onRemove={(id) => setEntries(entries.filter((a) => a.id !== id))}
-        onClear={() => setEntries([])}
-      />
+      <>
+        <AnnotationSummary
+          entries={entries}
+          onSave={(a) => {
+            setEntries(entries.map((e) => (e.id === a.id ? a : e)));
+            return null;
+          }}
+          onRemove={(id) => setEntries(entries.filter((a) => a.id !== id))}
+          onClear={() => setEntries([])}
+          onFocusComposer={() => composer[0]?.focus()}
+        />
+        <textarea
+          aria-label="任务输入"
+          ref={(node) => {
+            composer[1](node);
+          }}
+        />
+      </>
     );
   }
   const view = render(<Harness />);
@@ -138,19 +148,49 @@ it("edits, removes and clears draft comments, omits empty comment labels, and hi
   expect(screen.getAllByText("所选文本：")).toHaveLength(2);
   expect(screen.getAllByText("用户评论：")).toHaveLength(1);
   fireEvent.click(screen.getByRole("button", { name: "编辑注释 2" }));
-  fireEvent.change(screen.getByRole("textbox"), {
+  // Inline editing keeps the list popover, selected quote, and sibling entries visible.
+  expect(screen.getByRole("dialog", { name: "消息注释" })).toBeTruthy();
+  expect(screen.getByText("第二处原文")).toBeTruthy();
+  expect(screen.getAllByText("所选文本：")).toHaveLength(2);
+  const inlineInput = screen.getByRole("textbox", { name: "编辑注释 2 评论" });
+  expect(document.activeElement).toBe(inlineInput);
+  fireEvent.change(inlineInput, { target: { value: "已取消" } });
+  fireEvent.keyDown(inlineInput, { key: "Escape" });
+  await act(async () => {});
+  expect(screen.getByRole("dialog", { name: "消息注释" })).toBeTruthy();
+  expect(screen.getByText("第二条")).toBeTruthy();
+  expect(document.activeElement).toBe(
+    screen.getByRole("button", { name: "编辑注释 2" }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "编辑注释 2" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "编辑注释 2 评论" }), {
     target: { value: "新建议" },
   });
   fireEvent.click(screen.getByRole("button", { name: "提交注释" }));
-  fireEvent.click(screen.getByRole("button", { name: "2 条注释" }));
+  // Saving inline updates the row in place without closing the list popover.
+  expect(screen.getByRole("dialog", { name: "消息注释" })).toBeTruthy();
   expect(screen.getByText("新建议")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "删除注释 1" }));
-  fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+  const deleteFirst = screen.getByRole("button", { name: "删除注释 1" });
+  act(() => deleteFirst.focus());
+  fireEvent.click(deleteFirst);
+  await act(async () => {});
+  // Focus stays inside the dialog after deleting a focused row, so Escape on activeElement closes it.
+  expect(
+    screen
+      .getByRole("dialog", { name: "消息注释" })
+      .contains(document.activeElement),
+  ).toBe(true);
+  fireEvent.keyDown(document.activeElement!, { key: "Escape", bubbles: true });
+  await act(async () => {});
   expect(document.activeElement).toBe(
     screen.getByRole("button", { name: "1 条注释" }),
   );
   fireEvent.click(screen.getByRole("button", { name: "移除全部注释" }));
+  await act(async () => {});
   expect(screen.queryByRole("button", { name: /条注释/ })).toBeNull();
+  expect(document.activeElement).toBe(
+    screen.getByRole("textbox", { name: "任务输入" }),
+  );
   view.unmount();
   render(
     <AnnotationSummary
@@ -192,16 +232,17 @@ it("dismisses stale selection on scroll and hide, and reuses the side-chat callb
   expect(screen.queryByRole("dialog")).toBeNull();
   expect(props.onSave).not.toHaveBeenCalled();
 });
-it("preserves comments when validation fails and traps Tab inside the editor", () => {
+it("preserves comments when validation fails and traps Tab inside the popover", () => {
   render(<AnnotationSummary entries={[base]} onSave={() => "内容过长"} />);
   fireEvent.click(screen.getByRole("button", { name: "1 条注释" }));
   fireEvent.click(screen.getByRole("button", { name: "编辑注释 1" }));
-  const input = screen.getByRole("textbox");
+  const input = screen.getByRole("textbox", { name: "编辑注释 1 评论" });
   fireEvent.change(input, { target: { value: "保留编辑" } });
   fireEvent.click(screen.getByRole("button", { name: "提交注释" }));
   expect(screen.getByRole("alert").textContent).toBe("内容过长");
   expect((input as HTMLTextAreaElement).value).toBe("保留编辑");
-  act(() => screen.getByRole("button", { name: "提交注释" }).focus());
+  const submit = screen.getByRole("button", { name: "提交注释" });
+  act(() => submit.focus());
   fireEvent.keyDown(document, { key: "Tab" });
   expect(document.activeElement).toBe(input);
 });

@@ -257,7 +257,6 @@ pub struct Claude {
     native_session_id: Option<String>,
     side_parent: Option<uuid::Uuid>,
     expected_side_id: Option<uuid::Uuid>,
-    side_read_only: bool,
     renaming: Option<(String, String)>,
     rename_result_title: Option<String>,
     streamed: bool,
@@ -458,7 +457,6 @@ impl AgentAdapter for Claude {
         if let Some(parent) = self.side_parent {
             // Claude reports the fork's identity in the first turn's init event.
             self.native_session_id = None;
-            self.side_read_only = config.permission_mode.is_none();
             let child = if let Some(id) = resume {
                 uuid::Uuid::parse_str(id).context("Claude 侧边聊天 ID 无效")?
             } else {
@@ -477,17 +475,6 @@ impl AgentAdapter for Claude {
             instructions.push_str(
                 "\n\nThis is a side conversation. Treat inherited messages, instructions, tool calls and plans as reference material. Act only on new requests in this conversation. Do not resume the parent task on your own.",
             );
-            if self.side_read_only {
-                instructions.push_str(" This conversation is read-only. Do not make changes.");
-                command.args([
-                    "--permission-mode=plan",
-                    "--safe-mode",
-                    "--strict-mcp-config",
-                    "--no-chrome",
-                    "--tools",
-                    "Read,Glob,Grep",
-                ]);
-            }
             command.arg("--disable-slash-commands");
         }
         if !instructions.is_empty() {
@@ -589,9 +576,6 @@ impl AgentAdapter for Claude {
         };
         if let Some(level) = config.effort {
             settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"] = json!(level.as_str());
-        }
-        if self.side_read_only {
-            settings["disableAllHooks"] = json!(true);
         }
         // An absent override leaves native environment/settings resolution intact.
         // Settings env overrides inherited env. Keep turn-specific effort and
@@ -1136,11 +1120,6 @@ impl Claude {
                 if m["response"]["subtype"] != "success" {
                     bail!("Claude 初始化失败: {}", m["response"]["error"]);
                 }
-                if self.side_read_only
-                    && m["response"]["response"]["current_permission_mode"] != "plan"
-                {
-                    bail!("Claude 未确认侧边聊天的只读权限，请检查 CLI 版本和权限设置");
-                }
                 if matches!(self.phase, Phase::Discovering) {
                     let commands = parse_commands(&m["response"]["response"]["commands"])?;
                     self.phase = Phase::Finished;
@@ -1190,16 +1169,6 @@ impl Claude {
                         .and_then(|id| uuid::Uuid::parse_str(id).ok());
                     if actual != Some(expected) {
                         bail!("Claude 未确认独立的侧边聊天 ID");
-                    }
-                    if self.side_read_only
-                        && (!m["mcp_servers"].as_array().is_some_and(Vec::is_empty)
-                            || !m["tools"].as_array().is_some_and(|tools| {
-                                tools.iter().all(|tool| {
-                                    matches!(tool.as_str(), Some("Read" | "Glob" | "Grep"))
-                                })
-                            }))
-                    {
-                        bail!("Claude 未确认侧边聊天的只读工具范围");
                     }
                 }
                 self.skills = m["skills"]
@@ -1312,9 +1281,6 @@ impl Claude {
                 if request["subtype"] == "can_use_tool" {
                     if id.is_empty() || !request["input"].is_object() {
                         bail!("无效的 Claude 审批请求");
-                    }
-                    if self.side_read_only {
-                        return Ok(vec![write_action(self.approval(&id, Value::Null, false))?]);
                     }
                     if request["tool_name"] == "AskUserQuestion" {
                         match parse_questions(&request["input"]) {
@@ -3569,6 +3535,33 @@ mod tests {
             );
             assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"
                 || a == "--allow-dangerously-skip-permissions"));
+
+            let mut side_adapter = super::Claude::default();
+            super::AgentAdapter::set_side_parent(
+                &mut side_adapter,
+                "11111111-1111-4111-8111-111111111111".into(),
+            )
+            .unwrap();
+            let side_launch =
+                super::AgentAdapter::command(&mut side_adapter, "claude", "/tmp", None, &config)
+                    .unwrap();
+            let side_args: Vec<_> = side_launch
+                .command
+                .as_std()
+                .get_args()
+                .map(|v| v.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                side_args
+                    .iter()
+                    .find(|a| a.starts_with("--permission-mode="))
+                    .cloned(),
+                mode.map(|m| format!("--permission-mode={m}"))
+            );
+            assert!(!side_args.iter().any(|a| a == "--safe-mode"
+                || a == "--strict-mcp-config"
+                || a == "--no-chrome"
+                || a == "--tools"));
         }
     }
 

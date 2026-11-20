@@ -90,13 +90,21 @@ it("capability cleanup does not erase the user's remembered choice and storage f
   const hook = renderHook(() =>
     useAgentPreferences("local", "claude", "p", undefined, false),
   );
-  act(() => hook.result.current.chooseEffort("high"));
-  act(() => hook.result.current.clearUnsupportedEffort());
+  act(() => {
+    hook.result.current.chooseModel("opus");
+    hook.result.current.chooseEffort("high");
+  });
+  act(() => {
+    hook.result.current.replaceUnsupportedModel("provider-default");
+    hook.result.current.clearUnsupportedEffort();
+  });
+  expect(hook.result.current.model).toBe("provider-default");
   expect(hook.result.current.effort).toBeNull();
   hook.unmount();
   const restored = renderHook(() =>
     useAgentPreferences("local", "claude", "p", undefined, false),
   );
+  expect(restored.result.current.model).toBe("opus");
   expect(restored.result.current.effort).toBe("high");
   vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
     throw new Error("quota");

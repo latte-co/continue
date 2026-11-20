@@ -225,11 +225,111 @@ export function AnnotationEditor({
   );
 }
 
+function AnnotationInlineEditor({
+  entry,
+  number,
+  disabled,
+  onSave,
+  onCancel,
+}: {
+  entry: Annotation;
+  number: number;
+  disabled: boolean;
+  onSave: Change;
+  onCancel: () => void;
+}) {
+  const [comment, setComment] = useState(entry.comment);
+  const [error, setError] = useState("");
+  const input = useRef<HTMLTextAreaElement>(null);
+  const composing = useRef(false);
+  useLayoutEffect(() => {
+    const el = input.current;
+    if (!el) return;
+    el.style.height = "0px";
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, 24), 120)}px`;
+  }, [comment]);
+  function save() {
+    const result = onSave({ ...entry, comment: comment.trim() });
+    if (result) setError(result);
+    else onCancel();
+  }
+  return (
+    <div className="annotation-inline-editor-wrap">
+      <div className="annotation-inline-editor">
+        <textarea
+          ref={input}
+          aria-label={`编辑注释 ${number} 评论`}
+          autoFocus
+          rows={1}
+          disabled={disabled}
+          maxLength={MAX_COMMENT}
+          placeholder="添加可选评论…"
+          value={comment}
+          onChange={(e) => {
+            setComment(e.target.value);
+            setError("");
+          }}
+          onCompositionStart={() => {
+            composing.current = true;
+          }}
+          onCompositionEnd={() => {
+            composing.current = false;
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Escape" && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              e.stopPropagation();
+              onCancel();
+              return;
+            }
+            if (
+              e.key === "Enter" &&
+              (!e.shiftKey || e.metaKey || e.ctrlKey) &&
+              !e.nativeEvent.isComposing &&
+              !composing.current &&
+              e.keyCode !== 229
+            ) {
+              e.preventDefault();
+              save();
+            }
+          }}
+        />
+        <button
+          type="button"
+          className="icon-button annotation-inline-cancel"
+          aria-label="取消编辑"
+          title="取消编辑（Esc）"
+          disabled={disabled}
+          onClick={onCancel}
+        >
+          <X size={14} />
+        </button>
+        <button
+          type="button"
+          className="annotation-submit annotation-inline-submit"
+          aria-label="提交注释"
+          title="提交注释（Enter）"
+          disabled={disabled}
+          onClick={save}
+        >
+          <ArrowUp size={15} />
+        </button>
+      </div>
+      {error && (
+        <p role="alert" className="annotation-error">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function AnnotationSummary({
   entries,
   onSave,
   onRemove,
   onClear,
+  onFocusComposer,
   disabled = false,
   active = true,
 }: {
@@ -237,24 +337,64 @@ export function AnnotationSummary({
   onSave?: Change;
   onRemove?: (id: string) => void;
   onClear?: () => void;
+  onFocusComposer?: () => void;
   disabled?: boolean;
   active?: boolean;
 }) {
   const trigger = useRef<HTMLButtonElement>(null);
+  const list = useRef<HTMLOListElement>(null);
   const [anchor, setAnchor] = useState<Rect | null>(null);
-  const [editing, setEditing] = useState<Annotation | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
   useEffect(() => {
     if (!active || disabled || !entries.length) {
       setAnchor(null);
-      setEditing(null);
+      setEditingId(null);
     }
   }, [active, disabled, entries.length]);
+  useEffect(() => {
+    if (editingId && !entries.some((entry) => entry.id === editingId)) {
+      setEditingId(null);
+    }
+  }, [editingId, entries]);
   const close = () => {
     setAnchor(null);
-    setEditing(null);
+    setEditingId(null);
     queueMicrotask(() => {
       if (trigger.current?.isConnected && !trigger.current.closest("[inert]"))
         trigger.current.focus();
+    });
+  };
+  const focusRowEditButton = (id: string) => {
+    queueMicrotask(() => {
+      const button = Array.from(
+        list.current?.querySelectorAll<HTMLButtonElement>(
+          "button[data-edit-id]",
+        ) ?? [],
+      ).find((el) => el.dataset.editId === id);
+      button?.focus();
+    });
+  };
+  const removeItem = (id: string) => {
+    if (!onRemove) return;
+    const willEmpty = entries.length <= 1;
+    if (editingId === id) setEditingId(null);
+    onRemove(id);
+    if (willEmpty) {
+      setAnchor(null);
+      queueMicrotask(() => onFocusComposer?.());
+      return;
+    }
+    queueMicrotask(() => {
+      const dialog = list.current?.closest('[role="dialog"]') as
+        HTMLElement | null | undefined;
+      if (!dialog?.isConnected) return;
+      if (!dialog.contains(document.activeElement)) {
+        const nextControl =
+          list.current?.querySelector<HTMLElement>(
+            "button:not(:disabled), textarea:not(:disabled)",
+          ) ?? dialog;
+        nextControl.focus({ preventScroll: true });
+      }
     });
   };
   if (!entries.length) return null;
@@ -262,6 +402,7 @@ export function AnnotationSummary({
     <div className="annotation-summary">
       <div className="annotation-chip">
         <button
+          type="button"
           ref={trigger}
           className="annotation-chip-trigger"
           aria-expanded={!!anchor}
@@ -277,84 +418,98 @@ export function AnnotationSummary({
         </button>
         {onClear && (
           <button
+            type="button"
             disabled={disabled}
             className="annotation-clear"
             aria-label="移除全部注释"
             title="移除全部注释"
-            onClick={onClear}
+            onClick={() => {
+              onClear();
+              queueMicrotask(() => onFocusComposer?.());
+            }}
           >
             <X size={11} strokeWidth={2.4} />
           </button>
         )}
       </div>
-      {anchor &&
-        active &&
-        (editing && onSave ? (
-          <AnnotationEditor
-            key={editing.id}
-            entry={editing}
-            anchor={anchor}
-            onSave={onSave}
-            onRemove={onRemove ? () => onRemove(editing.id) : undefined}
-            close={close}
-          />
-        ) : (
-          <AnnotationPopover
-            anchor={anchor}
-            label="消息注释"
-            maxWidth={460}
-            gap={8}
-            className="annotation-list-popover"
-            close={close}
-          >
-            <ol className="annotation-list">
-              {entries.map((entry, index) => {
-                const comment = entry.comment.trim();
-                return (
-                  <li key={entry.id}>
-                    <span className="annotation-index">{index + 1}.</span>
-                    <div className="annotation-copy">
-                      <span>所选文本：</span>
-                      <blockquote>{entry.quote}</blockquote>
-                      {comment && (
+      {anchor && active && (
+        <AnnotationPopover
+          anchor={anchor}
+          label="消息注释"
+          maxWidth={460}
+          gap={8}
+          className="annotation-list-popover"
+          close={close}
+        >
+          <ol className="annotation-list" ref={list}>
+            {entries.map((entry, index) => {
+              const comment = entry.comment.trim();
+              const isEditing = editingId === entry.id && !!onSave;
+              return (
+                <li key={entry.id}>
+                  <span className="annotation-index">{index + 1}.</span>
+                  <div className="annotation-copy">
+                    <span>所选文本：</span>
+                    <blockquote>{entry.quote}</blockquote>
+                    {isEditing ? (
+                      <>
+                        <span>用户评论：</span>
+                        <AnnotationInlineEditor
+                          key={entry.id}
+                          entry={entry}
+                          number={index + 1}
+                          disabled={disabled}
+                          onSave={onSave}
+                          onCancel={() => {
+                            setEditingId(null);
+                            focusRowEditButton(entry.id);
+                          }}
+                        />
+                      </>
+                    ) : (
+                      comment && (
                         <>
                           <span>用户评论：</span>
                           <p>{comment}</p>
                         </>
+                      )
+                    )}
+                  </div>
+                  {(onSave || onRemove) && !isEditing && (
+                    <div className="annotation-entry-actions">
+                      {onSave && (
+                        <button
+                          type="button"
+                          data-edit-id={entry.id}
+                          className="icon-button"
+                          aria-label={`编辑注释 ${index + 1}`}
+                          title="编辑注释"
+                          disabled={disabled}
+                          onClick={() => setEditingId(entry.id)}
+                        >
+                          <Pencil size={15} />
+                        </button>
+                      )}
+                      {onRemove && (
+                        <button
+                          type="button"
+                          className="icon-button"
+                          aria-label={`删除注释 ${index + 1}`}
+                          title="删除注释"
+                          disabled={disabled}
+                          onClick={() => removeItem(entry.id)}
+                        >
+                          <Trash2 size={15} />
+                        </button>
                       )}
                     </div>
-                    {(onSave || onRemove) && (
-                      <div className="annotation-entry-actions">
-                        {onSave && (
-                          <button
-                            className="icon-button"
-                            aria-label={`编辑注释 ${index + 1}`}
-                            title="编辑注释"
-                            disabled={disabled}
-                            onClick={() => setEditing(entry)}
-                          >
-                            <Pencil size={15} />
-                          </button>
-                        )}
-                        {onRemove && (
-                          <button
-                            className="icon-button"
-                            aria-label={`删除注释 ${index + 1}`}
-                            title="删除注释"
-                            disabled={disabled}
-                            onClick={() => onRemove(entry.id)}
-                          >
-                            <Trash2 size={15} />
-                          </button>
-                        )}
-                      </div>
-                    )}
-                  </li>
-                );
-              })}
-            </ol>
-          </AnnotationPopover>
-        ))}
+                  )}
+                </li>
+              );
+            })}
+          </ol>
+        </AnnotationPopover>
+      )}
     </div>
   );
 }
@@ -695,6 +850,7 @@ export function AnnotatedMessage({
                   </span>
                 ) : (
                   <button
+                    type="button"
                     className="annotation-marker"
                     aria-label={`编辑注释 ${number}`}
                     title={entry.comment || entry.quote}
