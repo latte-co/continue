@@ -22,6 +22,171 @@ fn assert_pid_gone(pid: u32) {
 }
 
 #[tokio::test]
+async fn prepared_per_turn_close_without_transport_waits_for_auxiliary_owner() {
+    let _serial = GLOBAL_POOL.lock().await;
+    let (dir, database, session, config) = per_turn_tests::context();
+    let mut process = per_turn_tests::prepared(&dir, &database, &session, config, "exit 0");
+    assert!(process.transport.is_none());
+    let (owner, gate, pid) = codex_jobs::test_job(&session.id, JobKind::Prediction).unwrap();
+    let pid = pid.await.unwrap();
+    let mut operation = tokio::spawn({
+        let database = database.clone();
+        let id = session.id.clone();
+        async move { process.close_confirmed(&database, &id).await }
+    });
+    let entered = tokio::time::timeout(Duration::from_secs(1), gate.entered.notified()).await;
+    if entered.is_err() {
+        owner.request_cancel();
+        gate.entered.notified().await;
+    }
+    let premature = tokio::time::timeout(Duration::from_millis(20), &mut operation).await;
+    let acknowledged_early = premature.is_ok();
+    let retained = !codex_jobs::registry().scope_confirmed(&JobScope::session(&session.id));
+    gate.release.notify_one();
+    assert!(owner.wait().await.is_err());
+    let result = match premature {
+        Ok(result) => result,
+        Err(_) => operation.await,
+    };
+    assert!(result.unwrap().is_ok());
+    assert!(
+        entered.is_ok() && !acknowledged_early,
+        "prepared host context is not owner cleanup evidence"
+    );
+    assert!(retained);
+    assert_pid_gone(pid);
+    assert!(
+        db(&database, |store| store
+            .unconfirmed_agent_close(&session.id))
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[tokio::test]
+async fn prepared_per_turn_auxiliary_close_timeout_retains_unknown_and_owner_accounting() {
+    let _serial = GLOBAL_POOL.lock().await;
+    let (dir, database, session, config) = per_turn_tests::context();
+    let mut process = per_turn_tests::prepared(&dir, &database, &session, config, "exit 0");
+    let (owner, gate, pid) = codex_jobs::test_job(&session.id, JobKind::Prediction).unwrap();
+    let pid = pid.await.unwrap();
+    let operation = tokio::spawn({
+        let database = database.clone();
+        let id = session.id.clone();
+        async move {
+            let result = process.close_confirmed(&database, &id).await;
+            (process, result)
+        }
+    });
+    let entered = tokio::time::timeout(Duration::from_secs(1), gate.entered.notified()).await;
+    if entered.is_err() {
+        owner.request_cancel();
+        gate.entered.notified().await;
+    }
+    let (process, result) = operation.await.unwrap();
+    let unknown = db(&database, |store| {
+        store.unconfirmed_agent_close(&session.id)
+    })
+    .unwrap();
+    let retained = !codex_jobs::registry().scope_confirmed(&JobScope::session(&session.id));
+    gate.release.notify_one();
+    assert!(owner.wait().await.is_err());
+    assert!(
+        codex_jobs::registry()
+            .wait_scope(&JobScope::session(&session.id), Duration::from_secs(2))
+            .await
+    );
+    assert!(
+        result.is_err(),
+        "transport absence must not acknowledge an unconfirmed owner"
+    );
+    assert!(unknown.is_some() && retained);
+    assert!(process.close_started);
+    assert!(
+        db(&database, |store| store
+            .unconfirmed_agent_close(&session.id))
+        .unwrap()
+        .is_some(),
+        "later owner reap cannot silently clear durable uncertainty"
+    );
+    assert_pid_gone(pid);
+}
+
+#[tokio::test]
+async fn successful_per_turn_retirement_preserves_auxiliary_session_owners() {
+    let _serial = GLOBAL_POOL.lock().await;
+    let (dir, database, session, config) = per_turn_tests::context();
+    let mut process = per_turn_tests::prepared(
+        &dir,
+        &database,
+        &session,
+        config,
+        "printf 'init\\nresult\\n'",
+    );
+    let (title, title_gate, title_pid) = codex_jobs::test_job(&session.id, JobKind::Title).unwrap();
+    let (prediction, prediction_gate, prediction_pid) =
+        codex_jobs::test_job(&session.id, JobKind::Prediction).unwrap();
+    let title_pid = title_pid.await.unwrap();
+    let prediction_pid = prediction_pid.await.unwrap();
+    per_turn_tests::start(&mut process, &database, &session).await;
+    per_turn_tests::read_apply(&mut process, &database, &session).await;
+    per_turn_tests::read_apply(&mut process, &database, &session).await;
+    assert!(process.next_message().await.unwrap().is_none());
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        process.finish_per_turn(&database, &session.id),
+    )
+    .await;
+    let retained = codex_jobs::registry()
+        .inventory()
+        .iter()
+        .filter(|record| record.scope == JobScope::session(&session.id))
+        .count();
+    let title_cancelled =
+        tokio::time::timeout(Duration::from_millis(20), title_gate.entered.notified())
+            .await
+            .is_ok();
+    let prediction_cancelled = tokio::time::timeout(
+        Duration::from_millis(20),
+        prediction_gate.entered.notified(),
+    )
+    .await
+    .is_ok();
+    title.request_cancel();
+    prediction.request_cancel();
+    if !title_cancelled {
+        title_gate.entered.notified().await;
+    }
+    if !prediction_cancelled {
+        prediction_gate.entered.notified().await;
+    }
+    title_gate.release.notify_one();
+    prediction_gate.release.notify_one();
+    assert!(title.wait().await.is_err());
+    assert!(prediction.wait().await.is_err());
+    assert!(
+        matches!(result, Ok(Ok(()))),
+        "physical retirement must not wait for session owners: {result:?}"
+    );
+    assert_eq!(retained, 2);
+    assert!(
+        !title_cancelled && !prediction_cancelled,
+        "a successful Cursor-style turn is not whole-session Close"
+    );
+    assert!(process.transport.is_none() && process.can_start_turn());
+    assert_eq!(
+        db(&database, |store| Ok(store.session(&session.id)?.status)).unwrap(),
+        Status::Completed
+    );
+    process
+        .close_confirmed(&database, &session.id)
+        .await
+        .unwrap();
+    assert_pid_gone(title_pid);
+    assert_pid_gone(prediction_pid);
+}
+
+#[tokio::test]
 async fn close_without_actor_waits_for_registered_auxiliary_reap_before_success() {
     let _serial = GLOBAL_POOL.lock().await;
     let (_dir, database, session) = setup();

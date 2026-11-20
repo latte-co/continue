@@ -10,7 +10,7 @@ React UI → Tauri commands → latte-work-client
                                    singleton latte-work-server
                                      ├─ SQLite projects/sessions/events
                                      ├─ read-only files / Git
-                                     └─ AgentAdapter → Claude CLI children
+                                     └─ AgentAdapter → native CLI processes
 ```
 
 `latte-work-protocol` contains only serde wire types and TypeScript type export.
@@ -18,11 +18,12 @@ React UI → Tauri commands → latte-work-client
 and local/SSH transport. It knows no Claude message formats.
 `latte-work-server` owns all execution and durable host state. Its internal
 `AgentAdapter` is defined in `agents/adapter.rs`, separately from implementations.
-The registry in `agents/mod.rs` constructs a fresh adapter by `session.agent` for
-each turn and rejects unsupported IDs. Only Claude is implemented; its executable
-discovery, launch configuration, wire encoding/decoding and protocol state live in
-`agents/claude.rs`. The internal transport contract currently covers bounded UTF-8
-line-framed stdio, not arbitrary future Agent transports.
+The registry in `agents/mod.rs` selects the adapter by `session.agent` and rejects
+unsupported IDs. Claude Code, Codex, Traex and OpenCode retain bidirectional native
+processes. Cursor Agent retains a Host actor but starts a supervised print process
+per turn. Executable discovery, launch configuration, wire encoding/decoding and
+protocol state remain implementation-owned. The internal transport contract covers
+line-framed stdio and explicit per-turn process retirement, not arbitrary transports.
 `apps/desktop` owns presentation, OS integration and saved host connections.
 
 ## Adapter and Runtime boundary
@@ -42,7 +43,9 @@ approval requests to fresh public IDs and consumes an ID exactly once before
 returning the original input and decision to the adapter. EOF or process exit
 without explicit completion is a failure. Server API persists an accepted request
 before launching Runtime, retaining the existing deduplication and restart rules.
-The refactor does not change desktop/host protocol v1 or add another Agent.
+Cursor's result stays pending until stdout has drained, the child has exited and
+its owned process group has been retired. Only then may Runtime settle the turn
+and advance FIFO. This internal lifecycle extension does not change protocol v1.
 
 ## One daemon per host user
 
@@ -81,8 +84,8 @@ spawning. Repeating the same ID and body returns an accepted duplicate, without
 launching another process. Conflicting reuse fails. Each session has at most one
 active turn; different sessions can run concurrently.
 
-Each opened conversation owns a persistent, supervised CLI process group. Opening
-initializes or resumes its native session without sending a prompt. Subsequent
+For persistent adapters, each opened conversation owns a supervised CLI process
+group. Opening initializes or resumes its native session without sending a prompt. Subsequent
 turns share the same input/output stream; a native result ends one turn and never
 closes stdin or background subagents. Background completion can start an autonomous
 follow-up, which is persisted without inventing or replaying a user message.
@@ -91,6 +94,14 @@ protocol. Only explicit Close or graceful App exit releases the process group;
 transport loss and conversation switching do not. Unexpected native process loss
 reopens its persisted native ID without replaying the interrupted prompt. This
 restores history, not lost background execution; failure remains explicit.
+
+Cursor Open only prepares Host context, without creating a native chat or marking
+`agent_session_open` true. Each admitted turn launches its own process, persists the
+real init ID, and uses that exact ID for later `--resume` turns. Stop retires the
+current process without claiming rollback of effects. An admitted first turn with
+no known native ID cannot continue by silently creating a replacement chat.
+The UI tracks Host-prepared and native-open evidence separately. Cursor exposes no
+App approvals, steering, App Provider, or subagent-history capability.
 
 Configuration changes can replace an idle process and resume its native history.
 Native task/session lifecycle evidence must establish that no background work will

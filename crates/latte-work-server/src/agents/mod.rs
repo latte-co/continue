@@ -12,7 +12,8 @@ mod opencode;
 mod titles;
 pub(crate) mod traex;
 pub use adapter::Sideband;
-pub use adapter::{Action, AgentAdapter, AgentCommand, Input};
+pub use adapter::{Action, AgentAdapter, AgentCommand, Input, TransportLifetime};
+pub(crate) mod cursor;
 use anyhow::{Result, bail};
 
 #[derive(Default)]
@@ -200,6 +201,7 @@ pub async fn child_transcript(
 /// Concrete adapters are constructed only here; unsupported IDs never fall back.
 pub fn create(agent: &str) -> Result<Box<dyn AgentAdapter>> {
     match agent {
+        "cursor" => Ok(Box::<cursor::Cursor>::default()),
         "claude" => Ok(Box::<claude::Claude>::default()),
         "traex" => Ok(Box::<traex::Traex>::default()),
         "codex" => Ok(Box::new(app_server::AppServer::codex())),
@@ -210,18 +212,20 @@ pub fn create(agent: &str) -> Result<Box<dyn AgentAdapter>> {
 
 /// Discovery and CLI identities stay implementation-owned.
 pub async fn discover() -> Vec<(String, latte_work_protocol::AgentInfo)> {
-    let (claude, traex, codex, opencode) = tokio::join!(
+    let (claude, traex, codex, opencode, cursor) = tokio::join!(
         claude::discover(),
         traex::discover(),
         codex::discover(),
-        opencode::discover()
+        opencode::discover(),
+        cursor::discover()
     );
-    vec![claude, traex, codex, opencode]
+    vec![claude, traex, codex, opencode, cursor]
 }
 
 /// Protocol compatibility belongs to the adapter registry, never to presentation code.
 pub fn provider_protocols(agent: &str) -> Option<&'static [latte_work_protocol::ProviderProtocol]> {
     match agent {
+        "cursor" => Some(&[]),
         "claude" => Some(&[latte_work_protocol::ProviderProtocol::AnthropicMessages]),
         "codex" => Some(&[latte_work_protocol::ProviderProtocol::OpenaiResponses]),
         "traex" | "opencode" => Some(&[
@@ -234,7 +238,7 @@ pub fn provider_protocols(agent: &str) -> Option<&'static [latte_work_protocol::
 }
 
 pub fn has_native_models(agent: &str) -> bool {
-    matches!(agent, "codex" | "traex" | "opencode")
+    matches!(agent, "codex" | "traex" | "opencode" | "cursor")
 }
 
 /// Prompt-free catalogs share probe bounds; each adapter owns its model semantics.
@@ -249,6 +253,7 @@ pub async fn native_models(
         "codex" => codex::models(binary, path, selected, environment).await,
         "traex" => traex::models(binary, path, selected, environment).await,
         "opencode" => opencode::models(binary, path, selected, environment).await,
+        "cursor" => cursor::models(binary, path, selected, environment).await,
         _ => bail!("此 Agent 尚未实现原生模型目录：{agent}"),
     }
 }
@@ -279,6 +284,7 @@ pub async fn permission_modes(
         "traex" => traex::permission_modes(binary).await,
         "codex" => codex::permission_modes(binary).await,
         "opencode" => opencode::permission_modes(binary).await,
+        "cursor" => cursor::permission_modes(binary).await,
         _ => bail!("此 Agent 尚未实现权限设置：{agent}"),
     }
 }
@@ -382,6 +388,27 @@ pub async fn resume_directory(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cursor_registry_has_explicit_isolated_capabilities() {
+        let mut adapter = super::create("cursor").expect("Cursor adapter must be registered");
+        assert!(adapter.advance(super::Input::Open).unwrap().is_empty());
+        assert_eq!(super::provider_protocols("cursor"), Some(&[][..]));
+        assert!(super::has_native_models("cursor"));
+        assert!(super::model_aliases("cursor").is_empty());
+        assert!(super::effort_levels("cursor", Some("opus")).is_empty());
+        assert!(adapter.advance(super::Input::DiscoverCommands).is_err());
+        assert!(adapter.advance(super::Input::Interrupt).is_err());
+        assert!(
+            adapter
+                .advance(super::Input::Queue {
+                    request_id: "r",
+                    prompt: "p"
+                })
+                .is_err()
+        );
+        assert!(adapter.set_side_parent("parent".into()).is_err());
+    }
+
     #[test]
     fn unimplemented_agents_do_not_inherit_claude_effort() {
         for agent in ["unknown", ""] {

@@ -219,6 +219,7 @@ export function useWorkbench() {
   const [hostConnectionVersions, setHostConnectionVersions] = useState<
     Record<string, number>
   >({});
+  const currentHostConnectionVersions = useRef<Record<string, number>>({});
   const projects = orderProjects(
     hostedProjects(
       catalog,
@@ -383,7 +384,12 @@ export function useWorkbench() {
   const [agentSessionTransitions, setAgentSessionTransitions] = useState<
     Record<string, AgentSessionTransition>
   >({});
-  const openedEvidence = useRef(new Map<string, number>());
+  // Native-open evidence is reserved for a live Agent process. Cursor Open
+  // prepares only its Host actor; idle per-turn sessions have no native process.
+  const openedEvidence = useRef(new Map<string, string>());
+  const preparedEvidence = useRef(new Map<string, string>());
+  const currentRestoreVersions = useRef(restoreVersions);
+  currentRestoreVersions.current = restoreVersions;
   const [modal, setModal] = useState<"project" | "settings" | "skills" | null>(
     null,
   );
@@ -524,15 +530,26 @@ export function useWorkbench() {
     const key = JSON.stringify(target);
     const pending = initializingHosts.current.get(key);
     if (pending && !force) return pending;
+    // Fence the old transport immediately, before its pending requests reject.
+    // Publish the generation only after the replacement is initialized.
+    currentHostConnectionVersions.current = Object.fromEntries(
+      Object.entries(currentHostConnectionVersions.current).filter(
+        ([id]) => id !== target.id,
+      ),
+    );
     const promise = (async (): Promise<HostInitialization> => {
       const hello = await connectWithPrompt(target, !force, password);
       if (hello.kind !== "hello")
         throw new Error(hello.kind === "error" ? hello.message : "连接失败");
       const result = await request(target.id, { method: "projects" });
       if (result.kind !== "projects") throw new Error("无法加载主机项目");
-      // Fence old identities immediately, before React commits the new connection version.
+      // Publish both identities synchronously before React commits the new version.
       const version = (connectionVersions.current.get(target.id) ?? 0) + 1;
       connectionVersions.current.set(target.id, version);
+      currentHostConnectionVersions.current = {
+        ...currentHostConnectionVersions.current,
+        [target.id]: version,
+      };
       if (selection.current.hostId === target.id) invalidatePrediction();
       setHostConnectionVersions((old) => ({ ...old, [target.id]: version }));
       return { hello, projects: result.projects, reused: false };
@@ -773,6 +790,7 @@ export function useWorkbench() {
         !disposed &&
         liveHosts.current.has(hostId) &&
         connectionVersions.current.get(hostId) === connectionVersion &&
+        currentHostConnectionVersions.current[hostId] === connectionVersion &&
         hostHellos.current.get(hostId)?.server_id === sourceServer &&
         selection.current.hostId === hostId &&
         selection.current.projectId === projectId &&
@@ -968,6 +986,7 @@ export function useWorkbench() {
     if (
       !native ||
       !connected ||
+      lostHosts.current.has(hostId) ||
       !sessionId ||
       !session ||
       session.archived ||
@@ -979,36 +998,61 @@ export function useWorkbench() {
     const key = agentSessionKey(targetHost, targetId);
     const closeVersion = closedVersions.current.get(key) ?? 0;
     const restoreVersion = restoreVersions[targetHost] ?? 0;
+    const connectionVersion = hostConnectionVersions[targetHost] ?? 0;
+    if (currentHostConnectionVersions.current[targetHost] !== connectionVersion)
+      return;
+    const evidenceVersion = JSON.stringify([restoreVersion, connectionVersion]);
+    const perTurn = session.agent === "cursor";
+    const evidence = perTurn ? preparedEvidence : openedEvidence;
     if (
-      session.agent_session_open === true &&
-      openedEvidence.current.get(key) === restoreVersion
+      (perTurn || session.agent_session_open === true) &&
+      evidence.current.get(key) === evidenceVersion
     )
       return;
     const needsRestore =
-      openedEvidence.current.has(key) &&
-      openedEvidence.current.get(key) !== restoreVersion;
+      evidence.current.has(key) &&
+      evidence.current.get(key) !== evidenceVersion;
     if (session.agent_session_open !== true || needsRestore)
       setAgentSessionTransitions((old) => ({
         ...old,
         [key]: {
-          phase: openedEvidence.current.has(key) ? "restoring" : "opening",
+          phase: evidence.current.has(key) ? "restoring" : "opening",
         },
       }));
+    let disposed = false;
+    const stale = () =>
+      disposed ||
+      !liveHosts.current.has(targetHost) ||
+      lostHosts.current.has(targetHost) ||
+      (currentRestoreVersions.current[targetHost] ?? 0) !== restoreVersion ||
+      currentHostConnectionVersions.current[targetHost] !== connectionVersion ||
+      (closedVersions.current.get(key) ?? 0) !== closeVersion;
     void request(targetHost, {
       method: "open_agent_session",
       session_id: targetId,
     })
-      .then(async () => {
-        if ((closedVersions.current.get(key) ?? 0) !== closeVersion) return;
+      .then(async (acknowledgement) => {
+        if (stale()) return;
+        if (acknowledgement.kind !== "ok")
+          throw new Error(
+            acknowledgement.kind === "error"
+              ? acknowledgement.message
+              : "Agent 会话准备失败，请重试",
+          );
         const result = await request(targetHost, {
           method: "poll",
           session_id: targetId,
           after: Number.MAX_SAFE_INTEGER,
         });
-        if ((closedVersions.current.get(key) ?? 0) !== closeVersion) return;
+        if (stale()) return;
         if (
           result.kind !== "events" ||
-          result.session.agent_session_open !== true
+          result.session.id !== targetId ||
+          result.session.agent !== session.agent ||
+          result.session.archived ||
+          result.session.agent_close_pending ||
+          (result.session.agent_session_open !== true &&
+            !(perTurn && result.session.agent_session_open === false))
         )
           throw new Error(
             result.kind === "events" &&
@@ -1016,7 +1060,7 @@ export function useWorkbench() {
               ? "当前 Server 未提供会话状态，请更新 Server"
               : "Agent 会话尚未打开，请重试",
           );
-        openedEvidence.current.set(key, restoreVersion);
+        evidence.current.set(key, evidenceVersion);
         updateSession(targetHost, result.session);
         setAgentSessionTransitions((old) => {
           const next = { ...old };
@@ -1025,12 +1069,15 @@ export function useWorkbench() {
         });
       })
       .catch((e) => {
-        if ((closedVersions.current.get(key) ?? 0) !== closeVersion) return;
+        if (stale()) return;
         setAgentSessionTransitions((old) => ({
           ...old,
           [key]: { phase: "error", error: message(e) },
         }));
       });
+    return () => {
+      disposed = true;
+    };
   }, [
     hostId,
     sessionId,
@@ -1038,6 +1085,7 @@ export function useWorkbench() {
     session?.archived,
     session?.agent_close_pending,
     restoreVersions[hostId],
+    hostConnectionVersions[hostId],
   ]);
   function updateSession(targetHostId: string, value: Session) {
     setPinCache((old) => ({
@@ -1066,6 +1114,7 @@ export function useWorkbench() {
     ) {
       const key = JSON.stringify([targetHostId, action.session_id]);
       openedEvidence.current.delete(key);
+      preparedEvidence.current.delete(key);
       setAgentSessionTransitions((old) => {
         const next = { ...old };
         delete next[key];
@@ -1168,7 +1217,8 @@ export function useWorkbench() {
       });
       if (
         hostHellos.current.get(targetHost)?.server_id !== server ||
-        connectionVersions.current.get(targetHost) !== connectionVersion
+        connectionVersions.current.get(targetHost) !== connectionVersion ||
+        currentHostConnectionVersions.current[targetHost] !== connectionVersion
       )
         return;
       if (r.kind !== "history") throw new Error("无法读取之前的对话记录");
@@ -1177,13 +1227,9 @@ export function useWorkbench() {
         (!r.events.length || r.before === null || r.before >= before)
       )
         throw new Error("对话分页未前进，请重试");
-      if (
-        selection.current.hostId === targetHost &&
-        selection.current.projectId === projectId &&
-        selectedSessionId.current === targetSession &&
-        r.session.id === targetSession &&
-        r.session.project_id === projectId
-      )
+      // Valid facts belong to the captured durable scope even after navigation.
+      // Only the transcript publication below depends on the selected page.
+      if (r.session.id === targetSession && r.session.project_id === projectId)
         harvestPredictionSend(sendScope, r.events, targetSession);
       const updated = appendEvents(r.events, historyCache.get(scope) ?? cached);
       historyCache.set(scope, updated, r.has_more, r.before);

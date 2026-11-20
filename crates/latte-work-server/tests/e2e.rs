@@ -1,8 +1,12 @@
 //! Final-binary tests: real daemon, real socket/bridge, deterministic native processes.
 #[path = "support/codex.rs"]
 mod codex_e2e;
+#[path = "support/cursor.rs"]
+mod cursor_e2e;
 #[path = "support/environment.rs"]
 mod environment_e2e;
+#[path = "support/fixture_bridge.rs"]
+mod fixture_bridge;
 #[path = "support/opencode.rs"]
 mod opencode_e2e;
 #[path = "support/prediction_admission.rs"]
@@ -43,21 +47,40 @@ impl Host {
             .prefix("lw-")
             .tempdir_in("/tmp")
             .unwrap();
+        fixture_bridge::prepare(
+            directory.path(),
+            env,
+            Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+        );
         let process = Self::spawn(directory.path(), env);
         let host = Self { directory, process };
         host.wait_ready().await;
         host
     }
     fn spawn(directory: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Child {
+        Self::spawn_with_removed_environment(directory, env, &[])
+    }
+    fn spawn_with_removed_environment(
+        directory: &Path,
+        env: &[(&str, &std::ffi::OsStr)],
+        removed: &[&str],
+    ) -> Child {
         Self::spawn_binary(
             Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
             directory,
             env,
+            removed,
         )
     }
-    fn spawn_binary(binary: &Path, directory: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Child {
+    fn spawn_binary(
+        binary: &Path,
+        directory: &Path,
+        env: &[(&str, &std::ffi::OsStr)],
+        removed: &[&str],
+    ) -> Child {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude.py");
-        Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .env("LATTE_WORK_AGENT_ENV", "inherit")
             .arg("serve")
             .arg("--state-dir")
@@ -75,8 +98,16 @@ impl Host {
                 "LATTE_WORK_OPENCODE",
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opencode.py"),
             )
+            .env(
+                "LATTE_WORK_CURSOR",
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cursor.py"),
+            )
             .env("CLAUDE_CONFIG_DIR", directory.join("claude-config"))
-            .envs(env.iter().copied())
+            .envs(env.iter().copied());
+        for name in removed {
+            command.env_remove(name);
+        }
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -91,12 +122,14 @@ impl Host {
         }
     }
     async fn client(&self) -> Client {
-        Client::local(
+        let bridge = fixture_bridge::prepare(
+            self.directory.path(),
+            &[],
             Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
-            Some(self.directory.path()),
-        )
-        .await
-        .unwrap()
+        );
+        Client::local(&bridge, Some(self.directory.path()))
+            .await
+            .unwrap()
     }
 }
 impl Drop for Host {
@@ -3012,15 +3045,16 @@ async fn upgrade_local_coordinator_replaces_idle_build_once_for_concurrent_clien
         std::fs::remove_file(old_dir.join("control.sock")).unwrap();
         drop(guard);
     });
-    // Spawn bridges with a fixture CLI even on machines with a real Claude installation.
-    async fn connect(dir: &Path) -> (tokio::process::Child, serde_json::Value) {
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+    let bridge = fixture_bridge::prepare(
+        &dir,
+        &[],
+        Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+    );
+    // Prepare once before concurrent clients, keeping every CLI deterministic on upgrade.
+    async fn connect(binary: &Path, dir: &Path) -> (tokio::process::Child, serde_json::Value) {
+        let mut child = tokio::process::Command::new(binary)
             .args(["connect-local", "--state-dir"])
             .arg(dir)
-            .env(
-                "LATTE_WORK_CLAUDE",
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude.py"),
-            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -3044,7 +3078,7 @@ async fn upgrade_local_coordinator_replaces_idle_build_once_for_concurrent_clien
         .unwrap();
         (child, serde_json::from_str(&line).unwrap())
     }
-    let ((a, hello_a), (b, hello_b)) = tokio::join!(connect(&dir), connect(&dir));
+    let ((a, hello_a), (b, hello_b)) = tokio::join!(connect(&bridge, &dir), connect(&bridge, &dir));
     old.await.unwrap();
     let status = lifecycle(&dir, json!({"method":"server_status"})).await;
     // Stop the disposable daemon before assertions, including on a failed comparison.
@@ -3063,6 +3097,9 @@ async fn upgrade_local_coordinator_replaces_idle_build_once_for_concurrent_clien
     assert_eq!(hello_a["kind"], "hello", "{hello_a}");
     assert_eq!(hello_a["server_id"], hello_b["server_id"]);
     assert_eq!(hello_a["version"], 1);
+    let agents = hello_a["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 5);
+    assert!(agents.iter().all(|agent| agent["available"] == true));
     assert_ne!(status["build_id"], "old-build");
 }
 
@@ -3320,7 +3357,7 @@ async fn busy_server_with_one_pending_close_releases_other_owned_processes() {
         .prefix("lw-")
         .tempdir_in("/tmp")
         .unwrap();
-    let process = Host::spawn_binary(binary, directory.path(), &[]);
+    let process = Host::spawn_binary(binary, directory.path(), &[], &[]);
     let host = Host { directory, process };
     host.wait_ready().await;
     let mut app = Client::local_cleanup(current, Some(host.directory.path()))

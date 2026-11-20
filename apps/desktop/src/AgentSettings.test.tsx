@@ -115,6 +115,85 @@ it("loads host and Agent settings, saves literal ENV independently and restores 
   ).toBe(false);
 });
 
+it("keeps Cursor ENV host-isolated and disables unsupported App Provider binding", async () => {
+  setup();
+  const base = invoke.getMockImplementation()!;
+  invoke.mockImplementation(async (command, args) => {
+    if (command === "connect_host") {
+      const hello = await base(command, args);
+      return {
+        ...hello,
+        agents: [
+          ...hello.agents,
+          {
+            id: "cursor",
+            name: "Cursor Agent",
+            available: true,
+            detail: "Host-prepared",
+            provider_protocols: [],
+          },
+        ],
+      };
+    }
+    return base(command, args);
+  });
+  const other = { ...host, id: "cursor-other-host", name: "Cursor Other Host" };
+  render(
+    <AgentSettings
+      state={{ ...state, hosts: [host, other] } as Workbench}
+      active
+      onBusy={() => {}}
+    />,
+  );
+  const field = (await screen.findByLabelText(
+    "Cursor Agent 环境变量",
+  )) as HTMLTextAreaElement;
+  const card = within(field.closest(".agent-card") as HTMLElement);
+  expect(
+    (
+      card.getByRole("combobox", {
+        name: "Cursor Agent 关联 Provider",
+      }) as HTMLButtonElement
+    ).disabled,
+  ).toBe(true);
+  expect(card.getByText(/暂不支持 App Provider 关联/)).toBeTruthy();
+  expect(
+    (card.getByRole("button", { name: "保存关联" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(true);
+  fireEvent.change(field, { target: { value: "CURSOR_ENV=local-value" } });
+  fireEvent.click(saveButton(field));
+  await screen.findByText(/环境变量已保存；下次启动/);
+  expect(invoke).toHaveBeenCalledWith("save_agent_environment", {
+    hostId: host.id,
+    agent: "cursor",
+    environment: { CURSOR_ENV: "local-value" },
+  });
+  expect(
+    (screen.getByLabelText("Claude Code 环境变量") as HTMLTextAreaElement)
+      .value,
+  ).toBe("HTTPS_PROXY=http://saved.test:7890");
+  fireEvent.click(screen.getByRole("combobox", { name: "运行主机" }));
+  fireEvent.click(screen.getByRole("option", { name: other.name }));
+  await waitFor(() =>
+    expect(
+      (screen.getByLabelText("Cursor Agent 环境变量") as HTMLTextAreaElement)
+        .value,
+    ).toBe(""),
+  );
+  fireEvent.click(screen.getByRole("combobox", { name: "运行主机" }));
+  fireEvent.click(screen.getByRole("option", { name: host.name }));
+  await waitFor(() =>
+    expect(
+      (screen.getByLabelText("Cursor Agent 环境变量") as HTMLTextAreaElement)
+        .value,
+    ).toBe("CURSOR_ENV=local-value"),
+  );
+  expect(
+    invoke.mock.calls.some(([command]) => command === "bind_agent_provider"),
+  ).toBe(false);
+});
+
 it("rejects invalid ENV and retains edits after a save failure", async () => {
   setup();
   render(<AgentSettings state={state} active onBusy={() => {}} />);

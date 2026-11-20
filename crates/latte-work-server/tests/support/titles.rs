@@ -515,6 +515,9 @@ async fn codex_title_handles_early_completion_and_close_cancels_pending_generati
     }
 }
 
+#[path = "title_prediction_records.rs"]
+mod prediction_records;
+
 // Start held predictions only on later turns of already named sessions. This
 // avoids racing first-turn title generation for the two shared execution slots.
 async fn held_predictions(client: &mut Client) -> Vec<(tempfile::TempDir, String, i32)> {
@@ -552,11 +555,14 @@ async fn held_predictions(client: &mut Client) -> Vec<(tempfile::TempDir, String
             assert!(Instant::now() < deadline, "held prediction never started");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let input: serde_json::Value = serde_json::from_str(
+        // The fixture closes the held record before writing prediction-active;
+        // an optional first-turn prediction may precede it in this NDJSON log.
+        let pid = prediction_records::held_prediction_pid(
             &std::fs::read_to_string(root.path().join("prediction-inputs")).unwrap(),
         )
-        .unwrap();
-        held.push((root, id, input["pid"].as_i64().unwrap() as i32));
+        .unwrap()
+        .expect("prediction-held record");
+        held.push((root, id, pid));
     }
     held
 }
