@@ -608,6 +608,11 @@ pub enum Request {
         project_id: String,
         name: String,
     },
+    UpdateProject {
+        project_id: String,
+        name: String,
+        path: String,
+    },
     RemoveProject {
         project_id: String,
     },
@@ -1313,6 +1318,11 @@ pub enum Response {
     },
     Project {
         project: Project,
+    },
+    ProjectUpdated {
+        project: Project,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        closed_session_ids: Vec<String>,
     },
     Sessions {
         sessions: Vec<Session>,

@@ -957,3 +957,139 @@ async fn opencode_resume_keeps_a_worktree_session_in_its_worktree() {
         "only the first turn ran in the project directory"
     );
 }
+
+#[tokio::test]
+async fn opencode_update_project_directory_migrates_project_sessions_and_preserves_subagent_history()
+ {
+    let host = Host::start().await;
+    let old_folder = tempfile::tempdir().unwrap();
+    let new_folder = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let project_id = project(&mut client, old_folder.path()).await;
+
+    // 1. A project-rooted session with nested subagents in old_folder.
+    let main_id = create(&mut client, &project_id).await;
+    assert!(matches!(
+        ask(&mut client, turn(&main_id, "seed-nested", "nested")).await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &main_id, Status::Completed).await;
+    let main_native = current(&mut client, &main_id).await.native_id.unwrap();
+
+    // 2. A worktree-pinned session under the same project.
+    let wt_id = create(&mut client, &project_id).await;
+    assert!(matches!(
+        ask(&mut client, turn(&wt_id, "seed-wt", "in old root")).await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &wt_id, Status::Completed).await;
+    let wt_native = current(&mut client, &wt_id).await.native_id.unwrap();
+
+    // Move project from old_folder to new_folder while old_folder still exists on disk!
+    // Without former_paths filtering, resume_directory would mistake old_folder for a live
+    // worktree and silently keep main_id pinned to old_folder.
+    let Response::ProjectUpdated {
+        closed_session_ids, ..
+    } = ask(
+        &mut client,
+        Request::UpdateProject {
+            project_id: project_id.clone(),
+            name: "OpenCode Moved".into(),
+            path: new_folder.path().to_string_lossy().into_owned(),
+        },
+    )
+    .await
+    else {
+        panic!("expected ProjectUpdated");
+    };
+    assert!(closed_session_ids.contains(&main_id));
+    assert!(closed_session_ids.contains(&wt_id));
+
+    // Export metadata in new_folder still reports main_native's recorded directory as old_folder,
+    // and OpenCode rejects resuming main_native in new_folder until repair-move runs.
+    let old_canonical = old_folder.path().canonicalize().unwrap();
+    std::fs::write(
+        new_folder.path().join(format!("{main_native}.json")),
+        serde_json::json!({
+            "info": {"id": main_native, "location": {"directory": old_canonical}},
+            "messages": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(new_folder.path().join(&main_native), "moved").unwrap();
+
+    // Subagent exports in new_folder also still carry old_canonical as their location.directory.
+    for child_export in ["ses_child.json", "ses_nested.json"] {
+        std::fs::copy(
+            old_folder.path().join(child_export),
+            new_folder.path().join(child_export),
+        )
+        .unwrap();
+    }
+
+    // Worktree session's export reports `worktree`, which is NOT in former_paths.
+    std::fs::write(
+        new_folder.path().join(format!("{wt_native}.json")),
+        serde_json::json!({
+            "info": {"id": wt_native, "location": {"directory": worktree.path()}},
+            "messages": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(worktree.path().join(&wt_native), "prompted").unwrap();
+
+    // Reopening main_id must repair-move into new_folder (NOT launch in old_folder).
+    assert!(matches!(
+        ask(&mut client, open(&main_id)).await,
+        Response::Ok
+    ));
+    assert!(matches!(
+        ask(&mut client, turn(&main_id, "after-move", "in new root")).await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &main_id, Status::Completed).await;
+    let new_log = std::fs::read_to_string(new_folder.path().join("prompts")).unwrap();
+    assert_eq!(
+        new_log.lines().collect::<Vec<_>>(),
+        [format!("{main_native}:test/other:max:in new root")]
+    );
+
+    // Reopening wt_id continues to resume inside its dedicated worktree.
+    assert!(matches!(ask(&mut client, open(&wt_id)).await, Response::Ok));
+    assert!(matches!(
+        ask(&mut client, turn(&wt_id, "wt-turn", "still in worktree")).await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &wt_id, Status::Completed).await;
+    let wt_log = std::fs::read_to_string(worktree.path().join("prompts")).unwrap();
+    assert_eq!(
+        wt_log.lines().collect::<Vec<_>>(),
+        [format!("{wt_native}:test/other:max:still in worktree")]
+    );
+
+    // Even after old_folder is deleted from disk, native subagent history recorded under
+    // old_canonical remains trusted via former_paths.
+    drop(old_folder);
+    let subagent_resp = ask(
+        &mut client,
+        Request::SubagentHistory {
+            session_id: main_id.clone(),
+            task_id: "ses_nested".into(),
+            after: None,
+            source: None,
+            provider: Some(TurnProvider::Cli),
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            &subagent_resp,
+            Response::SubagentHistory { source, events, .. }
+                if source == "native" && contains_text(events, "native ses_nested")
+        ),
+        "{subagent_resp:?}"
+    );
+}

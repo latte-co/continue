@@ -128,11 +128,18 @@ pub fn now() -> f64 {
         .unwrap_or_default()
         .as_millis() as f64
 }
+pub struct PreparedProjectUpdate {
+    pub project: Project,
+    pub path_changed: bool,
+    pub session_ids: Vec<String>,
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
         CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL UNIQUE);
+        CREATE TABLE IF NOT EXISTS project_former_paths(project_id TEXT NOT NULL REFERENCES projects(id), path TEXT NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY(project_id, path));
         CREATE TABLE IF NOT EXISTS hidden_projects(project_id TEXT PRIMARY KEY REFERENCES projects(id));
         CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS unconfirmed_agent_closes(session_id TEXT PRIMARY KEY REFERENCES sessions(id), reason TEXT NOT NULL);
@@ -407,18 +414,12 @@ impl Store {
         self.add_named_project(path, None)
     }
     pub fn add_named_project(&self, path: &Path, name: Option<&str>) -> Result<Project> {
-        let name = name.map(str::trim).filter(|v| !v.is_empty());
-        if name.is_some_and(|v| v.chars().count() > 100 || v.chars().any(char::is_control)) {
-            bail!("项目名称不能超过 100 个字符或包含控制字符");
-        }
-        if !path.is_absolute() {
-            bail!("项目路径必须是绝对路径");
-        }
-        let canonical = path.canonicalize().context("项目目录不存在或无法访问")?;
-        if !canonical.is_dir() {
-            bail!("请选择目录");
-        }
-        let path = canonical.to_str().context("项目路径不是 UTF-8")?.to_owned();
+        let name = name
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(Self::validate_project_name)
+            .transpose()?;
+        let (canonical, path) = Self::canonical_project_path(path)?;
         if let Some(existing) = self.all_projects()?.into_iter().find(|p| p.path == path) {
             self.db.execute(
                 "DELETE FROM hidden_projects WHERE project_id=?1",
@@ -443,16 +444,136 @@ impl Store {
         )?;
         Ok(project)
     }
-    pub fn rename_project(&self, id: &str, name: &str) -> Result<Project> {
+    fn validate_project_name(name: &str) -> Result<&str> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 100 || name.chars().any(char::is_control) {
             bail!("项目名称不能为空、超过 100 个字符或包含控制字符");
         }
+        Ok(name)
+    }
+    fn canonical_project_path(path: &Path) -> Result<(std::path::PathBuf, String)> {
+        if !path.is_absolute() {
+            bail!("项目路径必须是绝对路径");
+        }
+        let canonical = path.canonicalize().context("项目目录不存在或无法访问")?;
+        if !canonical.is_dir() {
+            bail!("请选择目录");
+        }
+        let text = canonical.to_str().context("项目路径不是 UTF-8")?.to_owned();
+        Ok((canonical, text))
+    }
+    pub fn rename_project(&self, id: &str, name: &str) -> Result<Project> {
+        let name = Self::validate_project_name(name)?;
         let mut project = self.project(id)?;
         self.db
             .execute("UPDATE projects SET name=?1 WHERE id=?2", params![name, id])?;
         project.name = name.into();
         Ok(project)
+    }
+    pub fn prepare_project_update(
+        &self,
+        id: &str,
+        name: &str,
+        path: &Path,
+    ) -> Result<PreparedProjectUpdate> {
+        let name = Self::validate_project_name(name)?.to_owned();
+        let (_, canonical_path) = Self::canonical_project_path(path)?;
+        let current = self.project(id)?;
+        let path_changed = canonical_path != current.path;
+        let mut session_ids = Vec::new();
+        if path_changed {
+            if self
+                .all_projects()?
+                .iter()
+                .any(|p| p.id != id && p.path == canonical_path)
+            {
+                bail!("该目录已关联其他项目");
+            }
+            let rows = self
+                .db
+                .prepare("SELECT data FROM sessions WHERE project_id=?1 ORDER BY rowid DESC")?
+                .query_map([id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for raw in rows {
+                let session: Session = serde_json::from_str(&raw)?;
+                if session.status.active() {
+                    bail!("项目中还有运行中的任务，请等待完成或停止后再修改目录");
+                }
+                if let Some(reason) = self.unconfirmed_agent_close(&session.id)? {
+                    bail!("{reason}");
+                }
+                if self.pending_side_write(&session.id)?.is_some() {
+                    bail!("项目中还有待确认的侧边聊天写入，请确认后再修改目录");
+                }
+                session_ids.push(session.id);
+            }
+        }
+        Ok(PreparedProjectUpdate {
+            project: Project {
+                id: current.id,
+                name,
+                path: canonical_path,
+            },
+            path_changed,
+            session_ids,
+        })
+    }
+    pub fn commit_project_update(&self, project: &Project) -> Result<Project> {
+        self.db.execute_batch("SAVEPOINT commit_project_update")?;
+        let outcome = (|| -> Result<Project> {
+            let current = self.project(&project.id)?;
+            let updated = self.db.execute(
+                "UPDATE projects SET name=?1, path=?2 WHERE id=?3",
+                params![project.name, project.path, project.id],
+            )?;
+            anyhow::ensure!(updated == 1, "项目不存在");
+            if current.path != project.path {
+                self.db.execute(
+                    "DELETE FROM project_former_paths WHERE project_id=?1 AND path=?2",
+                    params![project.id, project.path],
+                )?;
+                self.db.execute(
+                    "INSERT INTO project_former_paths(project_id, path, updated_at) VALUES(?1, ?2, ?3)
+                     ON CONFLICT(project_id, path) DO UPDATE SET updated_at=excluded.updated_at",
+                    params![project.id, current.path, now()],
+                )?;
+                self.db.execute(
+                    "DELETE FROM project_former_paths WHERE project_id=?1 AND path NOT IN (
+                        SELECT path FROM project_former_paths WHERE project_id=?1 ORDER BY updated_at DESC, rowid DESC LIMIT 32
+                    )",
+                    [&project.id],
+                )?;
+            }
+            Ok(project.clone())
+        })();
+        match outcome {
+            Ok(updated) => {
+                self.db
+                    .execute_batch("RELEASE SAVEPOINT commit_project_update")?;
+                Ok(updated)
+            }
+            Err(error) => {
+                let _ = self.db.execute_batch(
+                    "ROLLBACK TO SAVEPOINT commit_project_update; RELEASE SAVEPOINT commit_project_update",
+                );
+                Err(error)
+            }
+        }
+    }
+    pub fn project_former_paths(&self, project_id: &str) -> Result<Vec<String>> {
+        Ok(self
+            .db
+            .prepare(
+                "SELECT path FROM project_former_paths WHERE project_id=?1 ORDER BY updated_at DESC, rowid DESC LIMIT 32",
+            )?
+            .query_map([project_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    pub fn project_with_former_paths(&self, project_id: &str) -> Result<(Project, Vec<String>)> {
+        Ok((
+            self.project(project_id)?,
+            self.project_former_paths(project_id)?,
+        ))
     }
     pub fn remove_project(&self, id: &str) -> Result<()> {
         self.project(id)?;
@@ -2553,6 +2674,153 @@ fn index_source(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn update_project_validates_paths_conflicts_and_session_guards() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let root_a = dir.path().join("alpha");
+        let root_b = dir.path().join("beta");
+        let root_c = dir.path().join("gamma");
+        let root_hidden = dir.path().join("hidden");
+        for path in [&root_a, &root_b, &root_c, &root_hidden] {
+            std::fs::create_dir_all(path.join("nested")).unwrap();
+        }
+        let file_path = dir.path().join("plain.txt");
+        std::fs::write(&file_path, "not a directory").unwrap();
+
+        let mut store = Store::open(&dir.path().join("state.sqlite")).unwrap();
+        let project = store.add_project(&root_a).unwrap();
+        let _other = store.add_project(&root_c).unwrap();
+        let hidden = store.add_project(&root_hidden).unwrap();
+        store.remove_project(&hidden.id).unwrap();
+
+        // Reject invalid names, missing project, relative/missing/file paths, and conflicting roots.
+        assert!(
+            store
+                .prepare_project_update("missing", "Valid", &root_b)
+                .is_err()
+        );
+        assert!(
+            store
+                .prepare_project_update(&project.id, "   ", &root_b)
+                .is_err()
+        );
+        assert!(
+            store
+                .prepare_project_update(&project.id, "bad\nname", &root_b)
+                .is_err()
+        );
+        assert!(
+            store
+                .prepare_project_update(&project.id, &"x".repeat(101), &root_b)
+                .is_err()
+        );
+        assert!(
+            store
+                .prepare_project_update(&project.id, "Valid", Path::new("relative/path"))
+                .is_err()
+        );
+        assert!(
+            store
+                .prepare_project_update(&project.id, "Valid", &dir.path().join("missing"))
+                .is_err()
+        );
+        assert!(
+            store
+                .prepare_project_update(&project.id, "Valid", &file_path)
+                .is_err()
+        );
+        assert!(
+            store
+                .prepare_project_update(&project.id, "Valid", &root_c)
+                .is_err()
+        );
+        assert!(
+            store
+                .prepare_project_update(&project.id, "Valid", &root_hidden)
+                .is_err()
+        );
+
+        // Equivalent canonical path keeps path_changed = false even while a session is running.
+        let mut main = store
+            .create_session(project.id.clone(), "codex".into())
+            .unwrap();
+        main.native_id = Some("native-main".into());
+        store.save(&main).unwrap();
+        let side = store.open_side_chat(&main.id, None).unwrap();
+        store
+            .begin(&main.id, "turn-1", "work", None, None, None, None)
+            .unwrap();
+        let same_root_alias = root_a.join("nested").join("..");
+        let same = store
+            .prepare_project_update(&project.id, "  Alpha Renamed  ", &same_root_alias)
+            .unwrap();
+        assert!(!same.path_changed);
+        assert_eq!(same.project.name, "Alpha Renamed");
+
+        // Active main turn blocks directory change.
+        assert!(
+            store
+                .prepare_project_update(&project.id, "Moved", &root_b)
+                .is_err()
+        );
+        store.state(&main.id, Status::Completed, None).unwrap();
+
+        // Active side chat, pending side write, and unconfirmed close each block directory change.
+        store
+            .begin(
+                &side.id,
+                "side-1",
+                "side work",
+                None,
+                None,
+                None,
+                Some("default"),
+            )
+            .unwrap();
+        store.start_side_write("side-1").unwrap();
+        assert!(
+            store
+                .prepare_project_update(&project.id, "Moved", &root_b)
+                .is_err()
+        );
+        store.state(&side.id, Status::Completed, None).unwrap();
+        assert!(
+            store
+                .prepare_project_update(&project.id, "Moved", &root_b)
+                .is_err(),
+            "pending side write must be confirmed before moving project root"
+        );
+        store.confirm_side_writes_ended(&side.id, "side-1").unwrap();
+
+        store
+            .record_unconfirmed_agent_close(&main.id, "close pending")
+            .unwrap();
+        assert!(
+            store
+                .prepare_project_update(&project.id, "Moved", &root_b)
+                .is_err()
+        );
+        store.clear_unconfirmed_agent_close(&main.id).unwrap();
+
+        // Once all sessions are idle and confirmed, prepare + commit updates both name and canonical path.
+        let prepared = store
+            .prepare_project_update(&project.id, "  Beta Workspace  ", &root_b.join("nested/.."))
+            .unwrap();
+        assert!(prepared.path_changed);
+        assert!(prepared.session_ids.contains(&main.id));
+        assert!(prepared.session_ids.contains(&side.id));
+        let updated = store.commit_project_update(&prepared.project).unwrap();
+        assert_eq!(updated.name, "Beta Workspace");
+        assert_eq!(
+            updated.path,
+            root_b.canonicalize().unwrap().to_str().unwrap()
+        );
+        let persisted = store.project(&project.id).unwrap();
+        assert_eq!(persisted.name, updated.name);
+        assert_eq!(persisted.path, updated.path);
+    }
+
     #[test]
     fn confirmed_not_started_is_request_bound_durable_and_unknown_is_conservative() {
         let directory = tempfile::tempdir().unwrap();

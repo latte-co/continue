@@ -574,6 +574,7 @@ async fn host_request(
             | Request::ConfirmSideWritesEnded { .. }
             | Request::ConfirmAgentClosed { .. }
             | Request::ArchiveSession { archived: true, .. }
+            | Request::UpdateProject { .. }
     ) {
         Some(state.agent_admission.lock().await)
     } else {
@@ -736,6 +737,13 @@ async fn host_request(
         && matches!(&response, Response::Session { session } if session.archived && session.agent_session_open == Some(false))
     {
         forget_archived_sessions(&state, &host_id, &ids).await;
+    }
+    if let Response::ProjectUpdated {
+        closed_session_ids, ..
+    } = &response
+        && !closed_session_ids.is_empty()
+    {
+        forget_archived_sessions(&state, &host_id, closed_session_ids).await;
     }
     ui_response(response)
 }

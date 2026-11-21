@@ -18,9 +18,11 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 const LIMIT: u64 = 4 * 1024 * 1024;
 const MAX_DEPTH: usize = 8;
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::agents) async fn read(
     binary: &str,
     cwd: &Path,
+    former_paths: &[String],
     parent: &str,
     child: &str,
     known_children: &HashSet<String>,
@@ -31,11 +33,10 @@ pub(in crate::agents) async fn read(
         return Ok(None);
     }
     // The parent session may run from a moved or symlink-spelled directory
-    // (for example a worktree resume); its children record that directory.
-    // Accept both the project path and the parent's recorded directory, so a
-    // legitimate export is never rejected while foreign sessions still are.
+    // (for example a worktree resume) or have created children under a former
+    // project root before the project path was updated.
     let mut allowed = vec![cwd.to_path_buf()];
-    if let Some(directory) = super::resume::directory(binary, cwd, parent, config)
+    if let Some(directory) = super::resume::directory(binary, cwd, former_paths, parent, config)
         .await
         .ok()
         .flatten()
@@ -43,7 +44,7 @@ pub(in crate::agents) async fn read(
         allowed.push(Path::new(&directory).to_path_buf());
     }
     tokio::time::timeout(Duration::from_secs(6), async {
-        let Some(document) = export(binary, &allowed, child, config).await? else {
+        let Some(document) = export(binary, &allowed, former_paths, child, config).await? else {
             return Ok(None);
         };
         let mut current = &document;
@@ -59,7 +60,7 @@ pub(in crate::agents) async fn read(
             if depth == MAX_DEPTH || !known_children.contains(id) || !seen.insert(id.to_owned()) {
                 break;
             }
-            let Some(next) = export(binary, &allowed, id, config).await? else {
+            let Some(next) = export(binary, &allowed, former_paths, id, config).await? else {
                 break;
             };
             ancestor = next;
@@ -80,6 +81,7 @@ pub(in crate::agents) fn plausible_session_id(id: &str) -> bool {
 async fn export(
     binary: &str,
     allowed: &[std::path::PathBuf],
+    former_paths: &[String],
     id: &str,
     config: &LaunchConfig,
 ) -> Result<Option<Value>> {
@@ -121,17 +123,54 @@ async fn export(
     }
     let info = &document["info"];
     // Compare canonical forms so a symlinked spelling (macOS /var versus
-    // /private/var) does not reject a session this project owns.
-    let known = info["location"]["directory"]
-        .as_str()
-        .map(Path::new)
-        .and_then(|directory| directory.canonicalize().ok())
-        .is_some_and(|recorded| {
-            allowed
-                .iter()
-                .any(|allowed| allowed.canonicalize().is_ok_and(|base| base == recorded))
+    // /private/var) does not reject a session this project owns, while also
+    // accepting canonical former project roots without following symlinks
+    // planted at the former path after the move.
+    let known = info["location"]["directory"].as_str().is_some_and(|raw| {
+        let path = Path::new(raw);
+        let in_live = path.canonicalize().is_ok_and(|recorded| {
+            allowed.iter().any(|base| {
+                base.as_os_str() == recorded.as_os_str()
+                    || base
+                        .canonicalize()
+                        .is_ok_and(|canonical| canonical == recorded)
+            })
         });
+        in_live
+            || normalize_without_following_leaf(path).is_some_and(|resolved| {
+                former_paths
+                    .iter()
+                    .any(|former| Path::new(former) == resolved)
+            })
+    });
     Ok((info["id"] == id && known).then_some(document))
+}
+
+pub(super) fn normalize_without_following_leaf(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute()
+        || path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return None;
+    }
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir()) {
+        return path.canonicalize().ok();
+    }
+    let mut suffix = vec![path.file_name()?.to_os_string()];
+    let mut cursor = path.parent()?;
+    while !cursor.exists() {
+        suffix.push(cursor.file_name()?.to_os_string());
+        cursor = cursor.parent()?;
+    }
+    let mut resolved = cursor.canonicalize().ok()?;
+    for part in suffix.into_iter().rev() {
+        resolved.push(part);
+    }
+    Some(resolved)
 }
 
 fn history(
@@ -275,6 +314,7 @@ mod tests {
         read(
             &fixture_binary(),
             home,
+            &[],
             parent,
             child,
             &known,
@@ -348,5 +388,84 @@ mod tests {
             .await
             .unwrap();
         assert!(page.is_none(), "a foreign directory is never adopted");
+    }
+
+    #[tokio::test]
+    async fn child_history_accepts_former_project_roots_even_after_rename_on_disk() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let old_dir = sandbox.path().join("old");
+        let new_dir = sandbox.path().join("new");
+        let foreign_dir = sandbox.path().join("foreign");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::create_dir_all(&foreign_dir).unwrap();
+        let old_canonical = old_dir
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let foreign_canonical = foreign_dir.canonicalize().unwrap();
+        std::fs::remove_dir_all(&old_dir).unwrap();
+        export_file(&new_dir, "ses_parent", None, &old_canonical);
+        export_file(&new_dir, "ses_child", Some("ses_parent"), &old_canonical);
+        let store = crate::providers::ProviderStore::open(&new_dir).unwrap();
+        let config = store.turn_config("opencode", None, None).unwrap();
+        let known = HashSet::from(["ses_parent".to_owned()]);
+        let former = vec![old_canonical];
+        let page = read(
+            &fixture_binary(),
+            &new_dir,
+            &former,
+            "ses_parent",
+            "ses_child",
+            &known,
+            "sess",
+            &config,
+        )
+        .await
+        .unwrap();
+        assert!(
+            page.is_some(),
+            "children recorded under a former project path remain readable"
+        );
+
+        // Planting a symlink at the former path to a foreign directory must keep
+        // former-path children readable while still rejecting foreign children.
+        std::os::unix::fs::symlink(&foreign_canonical, &old_dir).unwrap();
+        export_file(
+            &new_dir,
+            "ses_foreign_child",
+            Some("ses_parent"),
+            foreign_canonical.to_str().unwrap(),
+        );
+        let kept = read(
+            &fixture_binary(),
+            &new_dir,
+            &former,
+            "ses_parent",
+            "ses_child",
+            &known,
+            "sess",
+            &config,
+        )
+        .await
+        .unwrap();
+        let rejected = read(
+            &fixture_binary(),
+            &new_dir,
+            &former,
+            "ses_parent",
+            "ses_foreign_child",
+            &known,
+            "sess",
+            &config,
+        )
+        .await
+        .unwrap();
+        assert!(kept.is_some());
+        assert!(
+            rejected.is_none(),
+            "a symlink at a former path never adopts foreign directories"
+        );
     }
 }

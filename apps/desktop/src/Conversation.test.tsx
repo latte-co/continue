@@ -35,6 +35,7 @@ vi.mock("./ModelPicker", async () => {
     ModelPicker: (props: {
       hostId: string;
       projectId?: string;
+      projectPath?: string;
       agent: string;
       value: null;
       effort: null;
@@ -49,12 +50,14 @@ vi.mock("./ModelPicker", async () => {
               props.agent,
               props.value,
               props.effort,
+              props.projectPath,
             ),
             ready: true,
           }),
         [
           props.hostId,
           props.projectId,
+          props.projectPath,
           props.agent,
           props.value,
           props.effort,

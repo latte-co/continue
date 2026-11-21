@@ -158,12 +158,18 @@ export function Conversation({
   approve,
   answerQuestion,
 }: Props) {
+  const projectPath = project?.path;
   const draftKey = session ? JSON.stringify([hostId, session.id]) : "new-task";
-  const submissionScope = JSON.stringify([
-    hostId,
-    projectId,
-    session?.agent ?? agent?.id ?? "claude",
-  ]);
+  const submissionScope = JSON.stringify(
+    projectPath === undefined
+      ? [hostId, projectId, session?.agent ?? agent?.id ?? "claude"]
+      : [
+          hostId,
+          projectId,
+          projectPath,
+          session?.agent ?? agent?.id ?? "claude",
+        ],
+  );
   const draft = useDraft(drafts, draftKey);
   const editingScope = useRef(draftKey);
   editingScope.current = draftKey;
@@ -262,6 +268,7 @@ export function Conversation({
     agentId,
     model,
     effort,
+    projectPath,
   );
   const modelReady =
     modelReadiness?.scope === modelScope && modelReadiness.ready;
@@ -1153,6 +1160,7 @@ export function Conversation({
           agent={agentId}
           hostId={hostId}
           projectId={projectId}
+          projectPath={projectPath}
           sessionId={session?.id}
           connected={connected}
           hidden={settingsOpen}
@@ -1210,6 +1218,7 @@ export function Conversation({
                 onReadyChange={setModelReadiness}
                 hostId={hostId}
                 projectId={projectId}
+                projectPath={projectPath}
                 agent={agentId}
                 connected={connected}
                 settingsOpen={settingsOpen}

@@ -25,6 +25,7 @@ const effortContextChanged = "模型设置已变化，请重新打开思考强�
 export function ModelPicker({
   hostId,
   projectId,
+  projectPath,
   agent,
   connected,
   settingsOpen,
@@ -39,6 +40,7 @@ export function ModelPicker({
 }: {
   hostId: string;
   projectId?: string;
+  projectPath?: string;
   agent: string;
   connected: boolean;
   settingsOpen: boolean;
@@ -52,7 +54,11 @@ export function ModelPicker({
   ref?: Ref<ModelPickerHandle>;
 }) {
   const selector = useRef<ModelSelectorHandle>(null);
-  const scope = JSON.stringify([hostId, projectId, agent]);
+  const scope = JSON.stringify(
+    projectPath === undefined
+      ? [hostId, projectId, agent]
+      : [hostId, projectId, projectPath, agent],
+  );
   const [loaded, setCatalog] = useState<{
     scope: string;
     model: string | null;
@@ -119,7 +125,16 @@ export function ModelPicker({
     return () => {
       disposed = true;
     };
-  }, [hostId, projectId, agent, connected, settingsOpen, retry, value]);
+  }, [
+    hostId,
+    projectId,
+    projectPath,
+    agent,
+    connected,
+    settingsOpen,
+    retry,
+    value,
+  ]);
   const usableCatalog =
     !loading && !settingsOpen && connected && (error || matchesSelectedModel)
       ? catalog
@@ -148,6 +163,7 @@ export function ModelPicker({
     agent,
     value,
     effort,
+    projectPath,
   );
   const ready =
     !!usableCatalog &&

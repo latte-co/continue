@@ -10,8 +10,18 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ProjectActions } from "./ProjectActions";
 import type { Workbench } from "./useWorkbench";
 import type { Session } from "./protocol";
-const mocks = vi.hoisted(() => ({ request: vi.fn(), closeSession: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  request: vi.fn(),
+  connect: vi.fn(),
+  chooseProjectFolder: vi.fn(),
+  closeSession: vi.fn(),
+  updateProject: vi.fn(),
+  removeProject: vi.fn(),
+}));
 vi.mock("./api", () => ({
+  localHost: { id: "local", name: "本机", ssh: null, server_path: null },
+  connect: mocks.connect,
+  chooseProjectFolder: mocks.chooseProjectFolder,
   request: mocks.request,
   message: String,
   revealProject: vi.fn(),
@@ -44,14 +54,31 @@ beforeEach(() => {
     sessions: rows,
     next: null,
   }));
+  mocks.connect.mockResolvedValue({
+    kind: "hello",
+    server_id: "remote-1",
+    agents: [],
+  });
+  mocks.chooseProjectFolder.mockResolvedValue(null);
   mocks.closeSession.mockResolvedValue(undefined);
+  mocks.updateProject.mockResolvedValue([]);
+  mocks.removeProject.mockResolvedValue(undefined);
 });
 afterEach(cleanup);
 const props = () => ({
-  project: { hostId: "remote", id: "p", name: "Project", path: "/p" },
+  project: { hostId: "remote", id: "p", name: "Project", path: "/work/repo" },
   point: { x: 20, y: 20 },
   close: vi.fn(),
-  state: { sessionAction: mocks.closeSession } as unknown as Workbench,
+  state: {
+    hosts: [
+      { id: "local", name: "本机", ssh: null, server_path: null },
+      { id: "remote", name: "Remote", ssh: "devbox", server_path: null },
+    ],
+    sessionAction: mocks.closeSession,
+    updateProject: mocks.updateProject,
+    removeProject: mocks.removeProject,
+    setError: vi.fn(),
+  } as unknown as Workbench,
 });
 it("shows the live count and directly closes all idle sessions on the right host", async () => {
   const p = props();
@@ -158,4 +185,108 @@ it("confirms and closes a running side chat, preserving the pending-write notice
   expect(p.close).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole("button", { name: "完成" }));
   expect(p.close).toHaveBeenCalledOnce();
+});
+
+it("edits a local project's name and source folder, supports clearing/re-adding the folder, and routes bottom-left remove back to edit on cancel", async () => {
+  mocks.chooseProjectFolder.mockResolvedValue("/Users/dev/new-repo");
+  const p = {
+    ...props(),
+    project: {
+      hostId: "local",
+      id: "p",
+      name: "continue",
+      path: "/Users/dev/continue",
+    },
+  };
+  render(<ProjectActions {...p} />);
+  fireEvent.click(await screen.findByRole("menuitem", { name: "编辑" }));
+  await screen.findByRole("dialog", { name: "编辑项目" });
+
+  const nameInput = screen.getByLabelText("项目名称") as HTMLInputElement;
+  expect(nameInput.value).toBe("continue");
+  expect(screen.getByText("continue")).toBeTruthy();
+
+  const saveButton = screen.getByRole("button", {
+    name: "保存",
+  }) as HTMLButtonElement;
+  expect(saveButton.disabled).toBe(false);
+
+  fireEvent.click(screen.getByRole("button", { name: "移除源文件夹" }));
+  expect(saveButton.disabled).toBe(true);
+  const addFolderButton = screen.getByRole("button", { name: "添加文件夹" });
+  expect(document.activeElement).toBe(addFolderButton);
+
+  fireEvent.click(addFolderButton);
+  await screen.findByText("new-repo");
+  expect(saveButton.disabled).toBe(false);
+
+  fireEvent.change(nameInput, { target: { value: "continue-next" } });
+  fireEvent.click(screen.getByRole("button", { name: "移除本地项目" }));
+  await screen.findByRole("dialog", { name: "移除项目" });
+  fireEvent.click(screen.getByRole("button", { name: "取消" }));
+
+  await screen.findByRole("dialog", { name: "编辑项目" });
+  expect(document.activeElement).toBe(
+    screen.getByRole("button", { name: "移除本地项目" }),
+  );
+  expect((screen.getByLabelText("项目名称") as HTMLInputElement).value).toBe(
+    "continue-next",
+  );
+  expect(screen.getByText("new-repo")).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "保存" }));
+  await waitFor(() => expect(p.close).toHaveBeenCalledOnce());
+  expect(mocks.updateProject).toHaveBeenCalledWith(
+    "local",
+    "p",
+    "continue-next",
+    "/Users/dev/new-repo",
+  );
+});
+
+it("browses remote directories when editing an SSH project and returns to edit view on Escape", async () => {
+  mocks.request.mockImplementation(async (_host, r) => {
+    if (r.method === "browse_directories")
+      return {
+        kind: "directories",
+        path: r.path === "/work/next" ? "/work/next" : "/work",
+        parent: "/",
+        entries: [{ name: "next", path: "/work/next", directory: true }],
+        truncated: false,
+      };
+    return { kind: "project_agent_sessions", sessions: rows, next: null };
+  });
+  const p = props();
+  render(<ProjectActions {...p} />);
+  fireEvent.click(await screen.findByRole("menuitem", { name: "编辑" }));
+  await screen.findByRole("dialog", { name: "编辑项目" });
+  expect(screen.getByRole("button", { name: "移除项目" })).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "更换文件夹" }));
+  await screen.findByRole("heading", { name: "选择文件夹" });
+
+  fireEvent.keyDown(window, { key: "Escape" });
+  await screen.findByRole("heading", { name: "编辑项目" });
+  expect(document.activeElement).toBe(
+    screen.getByRole("button", { name: "更换文件夹" }),
+  );
+  expect(p.close).not.toHaveBeenCalled();
+
+  fireEvent.click(screen.getByRole("button", { name: "更换文件夹" }));
+  fireEvent.click(await screen.findByRole("button", { name: "next" }));
+  const choose = await screen.findByRole("button", { name: "选择此文件夹" });
+  await waitFor(() =>
+    expect((choose as HTMLButtonElement).disabled).toBe(false),
+  );
+  fireEvent.click(choose);
+
+  await screen.findByText("next");
+  fireEvent.click(screen.getByRole("button", { name: "保存" }));
+  await waitFor(() => expect(p.close).toHaveBeenCalledOnce());
+  expect(mocks.updateProject).toHaveBeenCalledWith(
+    "remote",
+    "p",
+    "Project",
+    "/work/next",
+  );
 });

@@ -509,6 +509,7 @@ async fn dispatch_reserved(
             | Request::CloseTerminal { .. }
             | Request::ArchiveSession { archived: true, .. }
             | Request::RenameSession { .. }
+            | Request::UpdateProject { .. }
     );
     let _exclusive_guard = if exclusive {
         Some(s.file_admission.write().await)
@@ -862,6 +863,80 @@ async fn dispatch_admitted(
         Request::RenameProject { project_id, name } => Response::Project {
             project: db(&s.database, |d| d.rename_project(&project_id, &name))?,
         },
+        Request::UpdateProject {
+            project_id,
+            name,
+            path,
+        } => {
+            let prepared = db(&s.database, |d| {
+                d.prepare_project_update(&project_id, &name, Path::new(&path))
+            })?;
+            let mut closed_session_ids = Vec::new();
+            if prepared.path_changed {
+                if s.terminals
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("终端锁异常"))?
+                    .has_open_for_project(&project_id)
+                {
+                    bail!("项目中还有运行中的终端，请关闭后再修改目录");
+                }
+                let open_ids: std::collections::HashSet<String> = {
+                    let runs = s
+                        .runs
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("执行状态锁异常"))?;
+                    let mut ids = std::collections::HashSet::new();
+                    for id in &prepared.session_ids {
+                        if let Some(run) = runs.get(id).filter(|run| !run.control.is_closed()) {
+                            if !run.safe_to_close.load(std::sync::atomic::Ordering::SeqCst) {
+                                bail!("项目中还有忙碌的 Agent 会话，请等待空闲或关闭后再修改目录");
+                            }
+                            ids.insert(id.clone());
+                        }
+                    }
+                    ids
+                };
+                let mut targets = Vec::new();
+                for id in &prepared.session_ids {
+                    let resource = upgrade::Resource::AgentSession(id.clone());
+                    let version = s.lifecycle.claim_version(&resource)?;
+                    if open_ids.contains(id) || version.is_some() {
+                        targets.push((id.clone(), resource, version));
+                    }
+                }
+                for (id, resource, version) in targets {
+                    runtime::close(&s.database, &s.runs, &id, true).await?;
+                    s.lifecycle.forget_claim(&resource, version, claims)?;
+                    closed_session_ids.push(id);
+                }
+                let exited_terminals = {
+                    let mut terminals = s
+                        .terminals
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("终端锁异常"))?;
+                    if terminals.has_open_for_project(&project_id) {
+                        bail!("项目中还有运行中的终端，请关闭后再修改目录");
+                    }
+                    terminals.purge_exited_for_project(&project_id)
+                };
+                for terminal_id in exited_terminals {
+                    let resource = upgrade::Resource::Terminal(terminal_id);
+                    let version = s.lifecycle.claim_version(&resource)?;
+                    s.lifecycle.forget_claim(&resource, version, claims)?;
+                }
+                let project = db(&s.database, |d| d.commit_project_update(&prepared.project))?;
+                Response::ProjectUpdated {
+                    project,
+                    closed_session_ids,
+                }
+            } else {
+                let project = db(&s.database, |d| d.commit_project_update(&prepared.project))?;
+                Response::ProjectUpdated {
+                    project,
+                    closed_session_ids,
+                }
+            }
+        }
         Request::RemoveProject { project_id } => {
             db(&s.database, |d| d.remove_project(&project_id))?;
             Response::Projects {
@@ -1439,14 +1514,15 @@ async fn dispatch_admitted(
                 && let Some(parent) = session.native_id.as_deref()
                 && let Ok(binary) = s.agent_binary("opencode")
             {
-                let (child, cwd, accepted, known_children) = db(&s.database, |d| {
-                    Ok((
-                        d.subagent(&session_id, &task_id)?,
-                        d.project(&session.project_id)?.path,
-                        d.child_provider_fingerprint(&session_id, &task_id)?,
-                        d.child_native_ids(&session_id)?,
-                    ))
-                })?;
+                let (child, (project, former_paths), accepted, known_children) =
+                    db(&s.database, |d| {
+                        Ok((
+                            d.subagent(&session_id, &task_id)?,
+                            d.project_with_former_paths(&session.project_id)?,
+                            d.child_provider_fingerprint(&session_id, &task_id)?,
+                            d.child_native_ids(&session_id)?,
+                        ))
+                    })?;
                 let fingerprint = providers::turn_fingerprint(provider.as_ref())?;
                 if !child.status.active() && accepted == Some(fingerprint.clone()) {
                     let config = s
@@ -1457,7 +1533,8 @@ async fn dispatch_admitted(
                     if (fingerprint.is_some() || config.provider.is_none())
                         && let Ok(Some(page)) = agents::opencode_child_history(
                             binary,
-                            std::path::Path::new(&cwd),
+                            std::path::Path::new(&project.path),
+                            &former_paths,
                             parent,
                             &child.native_id,
                             &known_children,
@@ -1503,15 +1580,16 @@ async fn dispatch_admitted(
                     && (fingerprint.is_some() || config.provider.is_none())
                     && let Some(parent) = session.native_id
                 {
-                    let (child, cwd) = db(&s.database, |d| {
+                    let (child, (project, former_paths)) = db(&s.database, |d| {
                         Ok((
                             d.subagent(&session_id, &task_id)?,
-                            d.project(&session.project_id)?.path,
+                            d.project_with_former_paths(&session.project_id)?,
                         ))
                     })?;
                     let permit = agents::child_read_permit()?;
                     if let Some(page) = agents::child_history(
-                        std::path::PathBuf::from(cwd),
+                        std::path::PathBuf::from(project.path),
+                        former_paths,
                         parent,
                         child.native_id,
                         session_id.clone(),
@@ -1971,11 +2049,12 @@ async fn dispatch_admitted(
                         let project = db(&s.database, |d| d.project(&session.project_id))?;
                         let baseline = db(&s.database, |d| d.baseline(&session_id))?
                             .context("此任务没有记录文件基线")?;
+                        let root = Path::new(&project.path);
+                        baseline.ensure_same_root(root).await?;
                         if before {
                             baseline.image_chunk(&path, offset).await
                         } else {
                             task_changes::validate_path(&path)?;
-                            let root = Path::new(&project.path);
                             let mut target = root.to_path_buf();
                             for component in Path::new(&path).components() {
                                 target.push(component);

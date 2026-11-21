@@ -58,7 +58,13 @@ export function WorkspaceFiles({
   const [treeOpen, setTreeOpen] = useState(true);
   const [wrap, setWrap] = useState(savedWrap);
   const [markdownScope, setMarkdownScope] = useState("");
-  const fileScope = JSON.stringify([hostId, project.id, reference?.path, file]);
+  const fileScope = JSON.stringify([
+    hostId,
+    project.id,
+    project.path,
+    reference?.path,
+    file,
+  ]);
   const markdown = isMarkdownFile(file) && markdownScope === fileScope;
   useEffect(() => setMarkdownScope(""), [fileScope]);
   const treeWidth = useFileTreeWidth(active && tab === "files" && treeOpen);
@@ -106,10 +112,19 @@ export function WorkspaceFiles({
     return () => {
       disposed = true;
     };
-  }, [hostId, project.id, file, tab, revision, active, reference]);
+  }, [
+    hostId,
+    project.id,
+    project.path,
+    file,
+    tab,
+    revision,
+    active,
+    reference,
+  ]);
   useStatusIssues([
     {
-      id: `file:${hostId}:${project.id}:${file || path}`,
+      id: `file:${hostId}:${project.id}:${project.path}:${file || path}`,
       title: `${file || path || project.name} 未能读取`,
       error: active && tab === "files" && file && !reference ? error : "",
       pending: active && tab === "files" && !!file && loading,
@@ -214,6 +229,7 @@ export function WorkspaceFiles({
               key={`${file}:${revision}`}
               hostId={hostId}
               projectId={project.id}
+              projectPath={project.path}
               sessionId={sessionId}
               source={{
                 path: file,
@@ -232,7 +248,7 @@ export function WorkspaceFiles({
             </div>
           ) : error ? null : (
             <FileTextView
-              key={file}
+              key={`${project.path}:${file}`}
               content={content}
               wrap={wrap}
               markdown={markdown}
@@ -259,7 +275,7 @@ export function WorkspaceFiles({
           style={{ flexBasis: treeWidth.width }}
         >
           <WorkspaceFileTree
-            key={`${hostId}:${project.id}:${reference?.path ?? ""}`}
+            key={`${hostId}:${project.id}:${project.path}:${reference?.path ?? ""}`}
             hostId={hostId}
             projectId={project.id}
             reference={reference}

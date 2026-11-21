@@ -7,6 +7,7 @@ import {
   CONVERSATION_MIN_WIDTH,
   copyWorkspace,
   openSubagents,
+  syncProjectInWorkspaces,
   useWorkspaceState,
   workspaceKey,
 } from "./workspaceState";
@@ -1585,6 +1586,114 @@ export function useWorkbench() {
         p.id === id ? result.project : p,
       ),
     }));
+    syncProjectInWorkspaces(targetHostId, result.project);
+  }
+  async function updateProject(
+    targetHostId: string,
+    id: string,
+    name: string,
+    path: string,
+  ): Promise<string[]> {
+    const current = (catalog[targetHostId] ?? []).find((p) => p.id === id);
+    if (current && path.trim() === current.path) {
+      await renameProject(targetHostId, id, name);
+      return [];
+    }
+    let result: Response;
+    try {
+      result = await request(targetHostId, {
+        method: "update_project",
+        project_id: id,
+        name,
+        path,
+      });
+    } catch (cause) {
+      if (
+        cause instanceof ServerRequestError &&
+        (cause.code === "unsupported" ||
+          (cause.code === "invalid_request" &&
+            cause.message.includes("update_project")))
+      )
+        throw new Error(
+          "当前主机 Server 版本较旧，不支持修改项目目录，请更新远程 Server 后重试",
+        );
+      throw cause;
+    }
+    if (result.kind !== "project_updated") throw new Error("项目更新失败");
+    setCatalog((old) => ({
+      ...old,
+      [targetHostId]: (old[targetHostId] ?? []).map((p) =>
+        p.id === id ? result.project : p,
+      ),
+    }));
+    const pathChanged = !current || current.path !== result.project.path;
+    const closedSessionIds = result.closed_session_ids ?? [];
+    const ownedWorkspaceKeys = new Set<string>(
+      closedSessionIds.map((sid) => workspaceKey(sid)),
+    );
+    if (selection.current.hostId === targetHostId) {
+      if (selection.current.projectId === id) {
+        ownedWorkspaceKeys.add(workspaceId);
+      }
+      for (const s of sessions) {
+        if (s.project_id === id) ownedWorkspaceKeys.add(workspaceKey(s.id));
+      }
+    }
+    for (const s of pinCache[targetHostId] ?? []) {
+      if (s.project_id === id) ownedWorkspaceKeys.add(workspaceKey(s.id));
+    }
+    if (pathChanged) {
+      const listed = await request(targetHostId, {
+        method: "sessions",
+        project_id: id,
+      }).catch(() => null);
+      if (listed?.kind === "sessions") {
+        for (const s of listed.sessions) {
+          ownedWorkspaceKeys.add(workspaceKey(s.id));
+        }
+      }
+    }
+    syncProjectInWorkspaces(targetHostId, result.project, {
+      pathChanged,
+      ownedWorkspaceKeys,
+    });
+    if (closedSessionIds.length) {
+      const closedIds = new Set(closedSessionIds);
+      const closedKeys = new Set(
+        closedSessionIds.map((sid) => JSON.stringify([targetHostId, sid])),
+      );
+      for (const key of closedKeys) {
+        openedEvidence.current.delete(key);
+        preparedEvidence.current.delete(key);
+        closedVersions.current.set(
+          key,
+          (closedVersions.current.get(key) ?? 0) + 1,
+        );
+      }
+      setAgentSessionTransitions((old) => {
+        const next = { ...old };
+        for (const key of closedKeys) delete next[key];
+        return next;
+      });
+      setSessions((old) =>
+        selection.current.hostId === targetHostId
+          ? old.map((s) =>
+              closedIds.has(s.id)
+                ? { ...s, agent_session_open: false, agent_session_busy: false }
+                : s,
+            )
+          : old,
+      );
+      setPinCache((old) => ({
+        ...old,
+        [targetHostId]: (old[targetHostId] ?? []).map((s) =>
+          closedIds.has(s.id)
+            ? { ...s, agent_session_open: false, agent_session_busy: false }
+            : s,
+        ),
+      }));
+    }
+    return closedSessionIds;
   }
   async function removeProject(targetHostId: string, id: string) {
     const result = await request(targetHostId, {
@@ -1824,6 +1933,7 @@ export function useWorkbench() {
     setProjectHostId,
     openProject,
     renameProject,
+    updateProject,
     removeProject,
     refreshHost,
     saveSshHost,

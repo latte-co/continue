@@ -142,6 +142,7 @@ vi.mock("./ModelPicker", async () => {
     ModelPicker: ({
       hostId,
       projectId,
+      projectPath,
       agent,
       value,
       effort,
@@ -152,10 +153,17 @@ vi.mock("./ModelPicker", async () => {
       useEffect(
         () =>
           onReadyChange?.({
-            scope: modelSelectionScope(hostId, projectId, agent, value, effort),
+            scope: modelSelectionScope(
+              hostId,
+              projectId,
+              agent,
+              value,
+              effort,
+              projectPath,
+            ),
             ready: true,
           }),
-        [hostId, projectId, agent, value, effort, onReadyChange],
+        [hostId, projectId, projectPath, agent, value, effort, onReadyChange],
       );
       return (
         <>

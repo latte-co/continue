@@ -17,6 +17,7 @@ const LIMIT: u64 = 8 * 1024 * 1024;
 pub(in crate::agents) async fn directory(
     binary: &str,
     project: &Path,
+    former_paths: &[String],
     id: &str,
     config: &LaunchConfig,
 ) -> Result<Option<String>> {
@@ -36,7 +37,21 @@ pub(in crate::agents) async fn directory(
         return Ok(None);
     };
     let directory = Path::new(&directory);
-    if !directory.is_absolute() || !directory.is_dir() {
+    if !directory.is_absolute() {
+        return Ok(None);
+    }
+    // When the user updates the project's associated directory, sessions still
+    // pinned to a former project root must fall back to the new project path so
+    // OpenCode's mismatch repair migrates them—even if the old path was replaced
+    // by a compatibility or foreign symlink on disk.
+    if super::history::normalize_without_following_leaf(directory).is_some_and(|normalized| {
+        former_paths
+            .iter()
+            .any(|former| Path::new(former) == normalized)
+    }) {
+        return Ok(None);
+    }
+    if !directory.is_dir() {
         return Ok(None);
     }
     // The recorded directory may carry a symlinked spelling (for example
@@ -48,6 +63,12 @@ pub(in crate::agents) async fn directory(
     if project
         .canonicalize()
         .is_ok_and(|current| recorded == current)
+    {
+        return Ok(None);
+    }
+    if former_paths
+        .iter()
+        .any(|former| Path::new(former) == recorded)
     {
         return Ok(None);
     }
@@ -124,9 +145,17 @@ mod tests {
     }
 
     async fn lookup(project: &Path, id: &str) -> Result<Option<String>> {
+        lookup_with_former(project, &[], id).await
+    }
+
+    async fn lookup_with_former(
+        project: &Path,
+        former_paths: &[String],
+        id: &str,
+    ) -> Result<Option<String>> {
         let store = crate::providers::ProviderStore::open(project)?;
         let config = store.turn_config("opencode", None, None)?;
-        directory(&fixture_binary(), project, id, &config).await
+        directory(&fixture_binary(), project, former_paths, id, &config).await
     }
 
     fn export_file(project: &Path, id: &str, recorded: &str) {
@@ -164,5 +193,58 @@ mod tests {
         assert_eq!(lookup(home.path(), "ses_unknown").await.unwrap(), None);
         // IDs that never reach a CLI argument.
         assert_eq!(lookup(home.path(), "../escape").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn former_project_directory_falls_back_to_updated_project_root() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let old_root = sandbox.path().join("old");
+        let new_root = sandbox.path().join("new");
+        let worktree = sandbox.path().join("worktree");
+        std::fs::create_dir_all(&old_root).unwrap();
+        std::fs::create_dir_all(&new_root).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        export_file(&new_root, "ses_former", old_root.to_str().unwrap());
+        export_file(&new_root, "ses_worktree", worktree.to_str().unwrap());
+        let former = vec![
+            old_root
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        assert_eq!(
+            lookup_with_former(&new_root, &former, "ses_former")
+                .await
+                .unwrap(),
+            None,
+        );
+        let recorded = worktree.canonicalize().unwrap();
+        assert_eq!(
+            lookup_with_former(&new_root, &former, "ses_worktree")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(recorded.to_str().unwrap()),
+        );
+
+        // Even if the former directory is replaced by a symlink to an active worktree
+        // or foreign directory, `ses_former` falls back to `new_root` while genuine
+        // `ses_worktree` stays in its worktree.
+        std::fs::remove_dir_all(&old_root).unwrap();
+        std::os::unix::fs::symlink(&recorded, &old_root).unwrap();
+        assert_eq!(
+            lookup_with_former(&new_root, &former, "ses_former")
+                .await
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            lookup_with_former(&new_root, &former, "ses_worktree")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(recorded.to_str().unwrap()),
+        );
     }
 }

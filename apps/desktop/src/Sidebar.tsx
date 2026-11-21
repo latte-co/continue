@@ -1106,7 +1106,39 @@ export function Sidebar({
           key={`${context.project.hostId}:${context.project.id}:${context.point.x}:${context.point.y}`}
           project={context.project}
           point={context.point}
-          state={state}
+          state={{
+            ...state,
+            updateProject: async (targetHostId, id, name, path) => {
+              const closed = await state.updateProject(
+                targetHostId,
+                id,
+                name,
+                path,
+              );
+              if (closed.length) {
+                const closedSet = new Set(closed);
+                const cacheKey = `${targetHostId}:${id}`;
+                setSessionCache((old) =>
+                  old[cacheKey]
+                    ? {
+                        ...old,
+                        [cacheKey]: old[cacheKey].map((s) =>
+                          closedSet.has(s.id)
+                            ? {
+                                ...s,
+                                agent_session_open: false,
+                                agent_session_busy: false,
+                              }
+                            : s,
+                        ),
+                      }
+                    : old,
+                );
+                recent.reload(targetHostId);
+              }
+              return closed;
+            },
+          }}
           close={() => setContext(null)}
         />
       )}

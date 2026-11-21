@@ -303,3 +303,228 @@ it("uses the shared file tab and consistent host paths for project-local Skill t
     reference: undefined,
   });
 });
+
+it("synchronizes updated project metadata across cached and persisted workspace tabs for the matching host", async () => {
+  const {
+    openArtifact,
+    readWorkspace: read,
+    syncProjectInWorkspaces,
+  } = await import("./workspaceState");
+  const activeKey = crypto.randomUUID();
+  const persistedOnlyKey = crypto.randomUUID();
+  const otherHostKey = crypto.randomUUID();
+  openArtifact(
+    activeKey,
+    { name: "README.md", path: "README.md", directory: false },
+    {
+      hostId: "local",
+      project: { id: "p1", name: "Old Name", path: "/old/path" },
+    },
+  );
+  localStorage.setItem(
+    "latte-work.conversation-workspace.v1:" + persistedOnlyKey,
+    JSON.stringify({
+      tabs: [
+        {
+          id: "files",
+          kind: "files",
+          hostId: "local",
+          project: { id: "p1", name: "Old Name", path: "/old/path" },
+          file: "src/index.ts",
+        },
+      ],
+      current: "files",
+      visible: true,
+      expanded: false,
+      conversationActive: false,
+      width: 380,
+    }),
+  );
+  openArtifact(
+    otherHostKey,
+    { name: "README.md", path: "README.md", directory: false },
+    {
+      hostId: "remote",
+      project: { id: "p1", name: "Remote P1", path: "/remote/p1" },
+    },
+  );
+  syncProjectInWorkspaces("local", {
+    id: "p1",
+    name: "New Name",
+    path: "/new/path",
+  });
+  expect(read(activeKey).tabs[0]?.project).toEqual({
+    id: "p1",
+    name: "New Name",
+    path: "/new/path",
+  });
+  expect(read(persistedOnlyKey).tabs[0]?.project).toEqual({
+    id: "p1",
+    name: "New Name",
+    path: "/new/path",
+  });
+  expect(read(otherHostKey).tabs[0]?.project).toEqual({
+    id: "p1",
+    name: "Remote P1",
+    path: "/remote/p1",
+  });
+});
+
+it("resets stale files and live diff locations and drops exited terminals when a project path changes while preserving turn snapshots and pure renames", async () => {
+  const {
+    openTurnChanges,
+    openWorkspaceResource,
+    readWorkspace: read,
+    syncProjectInWorkspaces,
+    updateWorkspace: update,
+  } = await import("./workspaceState");
+  const liveDiffKey = crypto.randomUUID();
+  const snapshotKey = crypto.randomUUID();
+  const terminalOnlyKey = crypto.randomUUID();
+
+  openWorkspaceResource(liveDiffKey, "files", {
+    path: "src",
+    file: "src/old.ts",
+  });
+  openWorkspaceResource(liveDiffKey, "diff", {
+    path: "src",
+    file: "src/old.ts",
+  });
+  update(liveDiffKey, (state) => ({
+    tabs: [
+      ...state.tabs,
+      {
+        id: "artifact-rel",
+        kind: "artifact",
+        hostId: "local",
+        project: { id: "p1", name: "Old Name", path: "/old/path" },
+        path: "docs/spec.md",
+        name: "spec.md",
+        directory: false,
+      },
+      {
+        id: "artifact-abs",
+        kind: "artifact",
+        hostId: "local",
+        project: { id: "p1", name: "Old Name", path: "/old/path" },
+        path: "/tmp/shared.png",
+        name: "shared.png",
+        directory: false,
+      },
+      {
+        id: "term-1",
+        kind: "terminal",
+        hostId: "local",
+        project: { id: "p1", name: "Old Name", path: "/old/path" },
+        terminal: {
+          id: "term-1",
+          project_id: "p1",
+          title: "zsh",
+          exited: true,
+          exit_code: 0,
+        },
+      },
+    ],
+  }));
+
+  openTurnChanges(snapshotKey, "s-1", "req-1", 42, "src/frozen.ts");
+
+  update(terminalOnlyKey, () => ({
+    tabs: [
+      {
+        id: "term-only",
+        kind: "terminal",
+        hostId: "local",
+        project: { id: "p1", name: "Old Name", path: "/old/path" },
+        terminal: {
+          id: "term-only",
+          project_id: "p1",
+          title: "zsh",
+          exited: true,
+          exit_code: 0,
+        },
+      },
+    ],
+    current: "term-only",
+    visible: true,
+    expanded: false,
+    conversationActive: false,
+  }));
+
+  // Pure rename keeps open file/diff selections and terminals intact.
+  syncProjectInWorkspaces("local", {
+    id: "p1",
+    name: "Renamed Only",
+    path: "/old/path",
+  });
+  expect(read(liveDiffKey).tabs).toHaveLength(5);
+  expect(read(liveDiffKey).tabs[0]).toMatchObject({
+    kind: "files",
+    path: "src",
+    file: "src/old.ts",
+  });
+  expect(read(liveDiffKey).tabs[1]).toMatchObject({
+    kind: "diff",
+    path: "src",
+    file: "src/old.ts",
+  });
+
+  // Moving the directory clears stale files/live-diff locations, drops relative
+  // artifact tabs and exited terminals, and preserves absolute artifacts + frozen snapshots.
+  syncProjectInWorkspaces(
+    "local",
+    {
+      id: "p1",
+      name: "Moved",
+      path: "/new/path",
+    },
+    {
+      pathChanged: true,
+      ownedWorkspaceKeys: [liveDiffKey, snapshotKey],
+    },
+  );
+
+  expect(read(liveDiffKey).tabs).toEqual([
+    {
+      id: "files",
+      kind: "files",
+      path: undefined,
+      file: undefined,
+      reference: undefined,
+      sessionId: undefined,
+    },
+    {
+      id: "diff",
+      kind: "diff",
+      path: undefined,
+      file: undefined,
+      reference: undefined,
+    },
+    {
+      id: "artifact-abs",
+      kind: "artifact",
+      hostId: "local",
+      project: { id: "p1", name: "Moved", path: "/new/path" },
+      path: "/tmp/shared.png",
+      name: "shared.png",
+      directory: false,
+    },
+  ]);
+  expect(read(snapshotKey).tabs).toEqual([
+    {
+      id: "diff",
+      kind: "diff",
+      requestId: "req-1",
+      snapshotSessionId: "s-1",
+      snapshotAt: 42,
+      file: "src/frozen.ts",
+    },
+  ]);
+  expect(read(terminalOnlyKey)).toMatchObject({
+    tabs: [],
+    current: "",
+    visible: false,
+    expanded: false,
+    conversationActive: false,
+  });
+});

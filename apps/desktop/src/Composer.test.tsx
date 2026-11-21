@@ -1845,3 +1845,76 @@ it("supports keyboard navigation and Escape focus recovery in the add menu", () 
   expect(screen.queryByRole("menu")).toBeNull();
   expect(document.activeElement).toBe(screen.getByRole("textbox"));
 });
+it("drops project-relative references while keeping absolute attachments when projectPath changes", async () => {
+  const onReferencesChange = vi.fn();
+  const initialReferences = {
+    scope: "local:p:claude:/dir-a",
+    entries: [
+      {
+        name: "old.ts",
+        path: "src/old.ts",
+        directory: false,
+        inlineOffset: 0,
+      },
+      {
+        name: "shot.png",
+        path: "/tmp/paste/shot.png",
+        directory: false,
+        attachmentKind: "file" as const,
+      },
+    ],
+  };
+  const view = render(
+    <Composer
+      agent="claude"
+      hostId="local"
+      projectId="p"
+      projectPath="/dir-a"
+      connected
+      disabled={false}
+      sending={false}
+      hidden={false}
+      value="hello"
+      onChange={vi.fn()}
+      onSubmit={mocks.send}
+      placeholder="任务"
+      toolbar={() => null}
+      referenceState={initialReferences}
+      onReferencesChange={onReferencesChange}
+    />,
+  );
+  expect(onReferencesChange).not.toHaveBeenCalled();
+
+  view.rerender(
+    <Composer
+      agent="claude"
+      hostId="local"
+      projectId="p"
+      projectPath="/dir-b"
+      connected
+      disabled={false}
+      sending={false}
+      hidden={false}
+      value="hello"
+      onChange={vi.fn()}
+      onSubmit={mocks.send}
+      placeholder="任务"
+      toolbar={() => null}
+      referenceState={initialReferences}
+      onReferencesChange={onReferencesChange}
+    />,
+  );
+  await waitFor(() =>
+    expect(onReferencesChange).toHaveBeenCalledWith({
+      scope: "local:p:claude:/dir-b",
+      entries: [
+        {
+          name: "shot.png",
+          path: "/tmp/paste/shot.png",
+          directory: false,
+          attachmentKind: "file",
+        },
+      ],
+    }),
+  );
+});

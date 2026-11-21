@@ -474,3 +474,51 @@ it("keeps the last model list usable after changing selection within its host, p
     expect.objectContaining({ ready: false }),
   );
 });
+
+it("refetches project-scoped models when projectPath changes without refetching on unchanged path", async () => {
+  mocks.request.mockResolvedValue({
+    kind: "models",
+    models: ["sonnet", "opus"],
+    provider: null,
+    default_model: "sonnet",
+    effort_levels: ["medium", "high"],
+    model_labels: {},
+  } satisfies Response);
+  const onReadyChange = vi.fn();
+  const props = {
+    hostId: "local",
+    projectId: "p1",
+    projectPath: "/dir-a",
+    agent: "opencode",
+    connected: true,
+    settingsOpen: false,
+    value: "sonnet",
+    onChange: vi.fn(),
+    effort: "medium" as const,
+    onEffortChange: vi.fn(),
+    disabled: false,
+    onReadyChange,
+  };
+  const view = render(<ModelPicker {...props} />);
+  await act(async () => {});
+  expect(mocks.request).toHaveBeenCalledTimes(1);
+  const scopeA = onReadyChange.mock.calls.at(-1)?.[0]?.scope;
+  expect(onReadyChange).toHaveBeenLastCalledWith({
+    scope: expect.stringContaining("/dir-a"),
+    ready: true,
+  });
+
+  view.rerender(<ModelPicker {...props} projectPath="/dir-a" />);
+  await act(async () => {});
+  expect(mocks.request).toHaveBeenCalledTimes(1);
+
+  view.rerender(<ModelPicker {...props} projectPath="/dir-b" />);
+  await act(async () => {});
+  expect(mocks.request).toHaveBeenCalledTimes(2);
+  const scopeB = onReadyChange.mock.calls.at(-1)?.[0]?.scope;
+  expect(scopeB).not.toBe(scopeA);
+  expect(onReadyChange).toHaveBeenLastCalledWith({
+    scope: expect.stringContaining("/dir-b"),
+    ready: true,
+  });
+});
