@@ -1,6 +1,11 @@
 // @vitest-environment jsdom
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
+import {
+  bumpAgentModelConfigVersion,
+  bumpHostModelConfigVersion,
+  bumpModelConfigVersion,
+} from "./modelConfigVersion";
 import { ModelPicker } from "./ModelPicker";
 import type { Response } from "./protocol";
 const mocks = vi.hoisted(() => ({
@@ -13,7 +18,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
 });
-it("groups a declared Provider 1M mode as 默认 / 1M, restores it, and drops it when support is removed", async () => {
+it("groups a declared Provider 1M mode as 默认 / 1M, restores it, and keeps the open chat's model when support is removed", async () => {
   const onChange = vi.fn();
   const ready = vi.fn();
   const catalog = {
@@ -36,6 +41,7 @@ it("groups a declared Provider 1M mode as 默认 / 1M, restores it, and drops it
     agent: "claude",
     connected: true,
     settingsOpen: false,
+    preserveUnavailableModel: true,
     value: "custom[1m]",
     onChange,
     effort: null,
@@ -49,6 +55,7 @@ it("groups a declared Provider 1M mode as 默认 / 1M, restores it, and drops it
     value: string;
     options: {
       value: string;
+      label?: string;
       variants?: { value: string; label: string; contextWindow?: number }[];
     }[];
     onChange: (value: string) => void;
@@ -85,7 +92,163 @@ it("groups a declared Provider 1M mode as 默认 / 1M, restores it, and drops it
   });
   view.rerender(<ModelPicker {...props} />);
   await act(async () => {});
-  expect(onChange).toHaveBeenCalledWith("custom");
+  expect(onChange).not.toHaveBeenCalled();
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      value: "custom[1m]",
+      options: [
+        expect.objectContaining({ value: "custom" }),
+        expect.objectContaining({ value: "small" }),
+        expect.objectContaining({
+          value: "custom[1m]",
+          label: "custom[1m] (unavailable)",
+        }),
+      ],
+    }),
+    undefined,
+  );
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+});
+
+it("keeps an already-open draft's model across a Provider update without flashing stale readiness", async () => {
+  const onChange = vi.fn();
+  const onProviderFallback = vi.fn();
+  const ready = vi.fn();
+  mocks.request.mockResolvedValue({
+    kind: "models",
+    models: ["model-a", "model-b"],
+    provider: "Team",
+    default_model: "model-a",
+    effort_levels: [],
+    model_labels: {},
+  });
+  const props = {
+    hostId: "local",
+    projectId: "p",
+    agent: "claude",
+    connected: true,
+    settingsOpen: false,
+    value: "model-b",
+    onChange,
+    onProviderFallback,
+    effort: null,
+    onEffortChange: vi.fn(),
+    disabled: false,
+    onReadyChange: ready,
+  };
+  const view = render(<ModelPicker {...props} />);
+  await act(async () => {});
+  expect(onChange).not.toHaveBeenCalled();
+  expect(onProviderFallback).not.toHaveBeenCalled();
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  let resolveUpdated: ((value: Response) => void) | undefined;
+  mocks.request.mockImplementation(
+    () =>
+      new Promise<Response>((resolve) => {
+        resolveUpdated = resolve;
+      }),
+  );
+  ready.mockClear();
+  view.rerender(<ModelPicker {...props} settingsOpen />);
+  act(() => bumpModelConfigVersion());
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+  view.rerender(<ModelPicker {...props} settingsOpen={false} />);
+  expect(ready.mock.calls.some(([state]) => state.ready)).toBe(false);
+  await act(async () =>
+    resolveUpdated?.({
+      kind: "models",
+      models: ["model-c"],
+      provider: "Team",
+      default_model: "model-c",
+      effort_levels: [],
+      model_labels: {},
+    }),
+  );
+  expect(onChange).not.toHaveBeenCalled();
+  expect(onProviderFallback).not.toHaveBeenCalled();
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      value: "model-b",
+      options: [
+        expect.objectContaining({ value: "model-c" }),
+        expect.objectContaining({
+          value: "model-b",
+          label: "model-b (unavailable)",
+        }),
+      ],
+    }),
+    undefined,
+  );
+  expect(ready.mock.calls.some(([state]) => state.ready)).toBe(false);
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+});
+
+it("keeps a verified model ready when closing Settings without Provider changes and refresh fails", async () => {
+  const onChange = vi.fn();
+  const onEffortInvalid = vi.fn();
+  const ready = vi.fn();
+  mocks.request.mockResolvedValueOnce({
+    kind: "models",
+    models: ["model-a", "model-b"],
+    provider: "Team",
+    default_model: "model-a",
+    effort_levels: ["high"],
+    model_labels: {},
+  });
+  const props = {
+    hostId: "local",
+    projectId: "p",
+    agent: "claude",
+    connected: true,
+    settingsOpen: false,
+    value: "model-b",
+    onChange,
+    effort: "high" as const,
+    onEffortChange: vi.fn(),
+    onEffortInvalid,
+    disabled: false,
+    onReadyChange: ready,
+  };
+  const view = render(<ModelPicker {...props} />);
+  await act(async () => {});
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  // Open Settings without mutating Provider/Agent config, then close with a transient refresh error.
+  view.rerender(<ModelPicker {...props} settingsOpen />);
+  mocks.request.mockRejectedValueOnce(new Error("transient refresh error"));
+  view.rerender(<ModelPicker {...props} settingsOpen={false} />);
+  await act(async () => {});
+  expect(onChange).not.toHaveBeenCalled();
+  expect(onEffortInvalid).not.toHaveBeenCalled();
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      value: "model-b",
+      notice: "刷新失败，使用上次列表",
+      levels: ["high"],
+    }),
+    undefined,
+  );
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  // Actual Provider config mutations invalidate the cached catalog so failed refreshes block sending.
+  view.rerender(<ModelPicker {...props} settingsOpen />);
+  act(() => bumpModelConfigVersion());
+  mocks.request.mockRejectedValueOnce(new Error("transient refresh error"));
+  view.rerender(<ModelPicker {...props} settingsOpen={false} />);
+  await act(async () => {});
   expect(ready).toHaveBeenLastCalledWith(
     expect.objectContaining({ ready: false }),
   );
@@ -471,6 +634,62 @@ it("keeps the last model list usable after changing selection within its host, p
     undefined,
   );
   expect(props.onReadyChange).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+});
+
+it("preserves another host's validated model cache when a different host or Agent config changes", async () => {
+  const catalog: Response = {
+    kind: "models",
+    models: ["first", "second"],
+    provider: null,
+    default_model: "first",
+    effort_levels: [],
+    model_labels: {},
+  };
+  mocks.request
+    .mockResolvedValueOnce(catalog)
+    .mockRejectedValue(new Error("transient network error"));
+  const ready = vi.fn();
+  const props = {
+    hostId: "remote-stable",
+    projectId: "p",
+    agent: "codex",
+    connected: true,
+    settingsOpen: false,
+    value: "first",
+    onChange: vi.fn(),
+    effort: null,
+    onEffortChange: vi.fn(),
+    disabled: false,
+    onReadyChange: ready,
+  };
+  const view = render(<ModelPicker {...props} />);
+  await act(async () => {});
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  // Config mutations on other hosts or other Agents do not invalidate remote-stable/codex.
+  act(() => {
+    bumpHostModelConfigVersion("other-ssh");
+    bumpAgentModelConfigVersion("remote-stable", "claude");
+  });
+  expect(mocks.request).toHaveBeenCalledTimes(1);
+
+  // Even if remote-stable later experiences a transient refresh failure on model switch,
+  // its validated catalog remains usable and sending stays unblocked.
+  view.rerender(<ModelPicker {...props} value="second" />);
+  await act(async () => {});
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  // Mutating remote-stable itself invalidates its cache, so a failed refresh blocks unverified sends.
+  await act(async () => {
+    bumpHostModelConfigVersion("remote-stable");
+  });
+  expect(ready).toHaveBeenLastCalledWith(
     expect.objectContaining({ ready: false }),
   );
 });

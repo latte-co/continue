@@ -72,6 +72,10 @@ pub struct Session {
     pub unread: bool,
     #[serde(default)]
     pub archived: bool,
+    /// Parent session ID when this session is a side chat; live server projection only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub parent_session_id: Option<String>,
     /// Live server projection only; absent on older servers and in durable history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -343,6 +347,9 @@ pub struct ProviderTarget {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct AgentProviderBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub host_id: Option<String>,
     pub agent: String,
     pub provider_id: String,
     pub provider_revision: String,
@@ -1146,8 +1153,6 @@ pub struct TaskSource {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
-    /// The local side chat closed with writes still awaiting confirmation.
-    SideChatClosed,
     RecentSessions {
         sessions: Vec<RecentSession>,
         next: Option<RecentCursor>,
@@ -1307,6 +1312,8 @@ pub enum Response {
         side_chat_controls: bool,
         #[serde(default)]
         claude_side_chat: bool,
+        #[serde(default)]
+        side_chat_inherit_permission: bool,
     },
     Projects {
         projects: Vec<Project>,
@@ -1386,6 +1393,7 @@ pub enum Response {
         text: String,
         truncated: bool,
     },
+    SideChatClosed,
     Ok,
     Error {
         code: String,
@@ -1485,6 +1493,7 @@ mod tests {
                 skill_management: false,
                 skill_file_import: false,
                 change_preview: false,
+                side_chat_inherit_permission: false,
                 ..
             }
         ));
@@ -1492,12 +1501,14 @@ mod tests {
         current["skill_management"] = serde_json::json!(true);
         current["skill_file_import"] = serde_json::json!(true);
         current["change_preview"] = serde_json::json!(true);
+        current["side_chat_inherit_permission"] = serde_json::json!(true);
         assert!(matches!(
             serde_json::from_value::<Response>(current).unwrap(),
             Response::Hello {
                 skill_management: true,
                 skill_file_import: true,
                 change_preview: true,
+                side_chat_inherit_permission: true,
                 ..
             }
         ));

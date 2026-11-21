@@ -234,7 +234,9 @@ impl AppServer {
                         } else {
                             "This is a side conversation. Treat inherited messages, instructions, tool calls and plans as reference material. Act only on new requests in this conversation. Do not resume the parent task on your own."
                         }
-                    } else { "" }
+                    } else {
+                        ""
+                    }
                 ]
                 .into_iter()
                 .filter(|s| !s.is_empty())
@@ -259,6 +261,7 @@ impl AppServer {
                 params["sandbox"] = json!("danger-full-access");
                 params["approvalsReviewer"] = json!("user");
             }
+            Some("inherit") if self.side_parent.is_some() => {}
             None => {}
             Some(_) => bail!("Agent 不支持所选权限模式"),
         }
@@ -508,17 +511,20 @@ impl AppServer {
                     {
                         bail!("Agent 未创建独立的侧边聊天");
                     }
-                    let (sandbox, approval) = match self
+                    let expected = match self
                         .config
                         .as_ref()
                         .and_then(|config| config.permission_mode.as_deref())
                     {
-                        None => ("readOnly", "never"),
-                        Some("default") => ("workspaceWrite", "on-request"),
-                        Some("bypass_permissions") => ("dangerFullAccess", "never"),
+                        None => Some(("readOnly", "never")),
+                        Some("inherit") => None,
+                        Some("default") => Some(("workspaceWrite", "on-request")),
+                        Some("bypass_permissions") => Some(("dangerFullAccess", "never")),
                         Some(_) => bail!("Agent 不支持所选权限模式"),
                     };
-                    if result["sandbox"]["type"] != sandbox || result["approvalPolicy"] != approval
+                    if let Some((sandbox, approval)) = expected
+                        && (result["sandbox"]["type"] != sandbox
+                            || result["approvalPolicy"] != approval)
                     {
                         bail!("Agent 未确认侧边聊天所选的权限模式");
                     }
@@ -1288,16 +1294,52 @@ mod tests {
         }
     }
     #[test]
-    fn side_chat_disables_external_tools_on_fork_and_resume() {
-        let config = LaunchConfig {
-            permission_mode: None,
-            ..config()
-        };
+    fn side_chat_keeps_legacy_none_read_only_and_passes_inherit_or_explicit_modes() {
         for codex in [true, false] {
-            for resume in [None, Some("child".to_owned())] {
+            for (resume, mode, read_only, expected_sandbox, expected_approval) in [
+                (None, None, true, json!("read-only"), json!("never")),
+                (
+                    Some("child".to_owned()),
+                    None,
+                    true,
+                    json!("read-only"),
+                    json!("never"),
+                ),
+                (
+                    None,
+                    Some("inherit".to_owned()),
+                    false,
+                    Value::Null,
+                    Value::Null,
+                ),
+                (
+                    Some("child".to_owned()),
+                    Some("inherit".to_owned()),
+                    false,
+                    Value::Null,
+                    Value::Null,
+                ),
+                (
+                    None,
+                    Some("default".to_owned()),
+                    false,
+                    json!("workspace-write"),
+                    json!("on-request"),
+                ),
+                (
+                    Some("child".to_owned()),
+                    Some("bypass_permissions".to_owned()),
+                    false,
+                    json!("danger-full-access"),
+                    json!("never"),
+                ),
+            ] {
                 let mut agent = AppServer {
                     codex,
-                    config: Some(config.clone()),
+                    config: Some(LaunchConfig {
+                        permission_mode: mode,
+                        ..config()
+                    }),
                     side_parent: Some("parent".into()),
                     resume,
                     ..Default::default()
@@ -1317,30 +1359,82 @@ mod tests {
                         "thread/fork"
                     }
                 );
-                assert_eq!(
-                    params["config"]["mcp_servers"]["external.tools"]["enabled"],
-                    false
-                );
-                assert_eq!(params["config"]["features.plugins"], false);
-                assert_eq!(params["config"]["features.apps"], false);
-                assert_eq!(params["sandbox"], "read-only");
+                if read_only {
+                    assert_eq!(
+                        params["config"]["mcp_servers"]["external.tools"]["enabled"],
+                        false
+                    );
+                    assert_eq!(params["config"]["features.plugins"], false);
+                    assert_eq!(params["config"]["features.apps"], false);
+                    assert!(
+                        params["developerInstructions"]
+                            .as_str()
+                            .unwrap()
+                            .contains("This is a read-only side conversation.")
+                    );
+                } else {
+                    assert!(params.get("config").is_none());
+                    assert!(
+                        params["developerInstructions"]
+                            .as_str()
+                            .unwrap()
+                            .contains("Act only on new requests in this conversation.")
+                    );
+                }
+                assert_eq!(params["sandbox"], expected_sandbox);
+                assert_eq!(params["approvalPolicy"], expected_approval);
             }
         }
     }
 
     #[test]
     fn side_chat_rejects_wrong_thread_or_permissions_before_starting_a_turn() {
-        for (id, parent, sandbox, approval) in [
-            ("parent", "parent", "readOnly", "never"),
-            ("child", "other", "readOnly", "never"),
-            ("child", "parent", "workspaceWrite", "never"),
-            ("child", "parent", "readOnly", "on-request"),
+        for (mode, id, parent, sandbox, approval) in [
+            (None, "parent", "parent", "readOnly", "never"),
+            (None, "child", "other", "readOnly", "never"),
+            (None, "child", "parent", "workspaceWrite", "never"),
+            (None, "child", "parent", "readOnly", "on-request"),
+            (
+                Some("inherit".to_owned()),
+                "parent",
+                "parent",
+                "workspaceWrite",
+                "on-request",
+            ),
+            (
+                Some("inherit".to_owned()),
+                "child",
+                "other",
+                "workspaceWrite",
+                "on-request",
+            ),
+            (
+                Some("default".to_owned()),
+                "child",
+                "parent",
+                "readOnly",
+                "on-request",
+            ),
+            (
+                Some("default".to_owned()),
+                "child",
+                "parent",
+                "workspaceWrite",
+                "never",
+            ),
+            (
+                Some("bypass_permissions".to_owned()),
+                "child",
+                "parent",
+                "workspaceWrite",
+                "never",
+            ),
         ] {
             let mut agent = AppServer {
                 side_parent: Some("parent".into()),
                 pending_prompt: Some("side question".into()),
                 config: Some(LaunchConfig {
-                    permission_mode: None,
+                    permission_mode: mode,
                     ..config()
                 }),
                 ..Default::default()

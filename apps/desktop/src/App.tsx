@@ -357,6 +357,11 @@ export default function App() {
             }
             openSubagents={showSubagents}
             openSideChat={canOpenSide ? showSide : undefined}
+            openBlockingSideChat={
+              workbench.openSideChatSession
+                ? (sideId) => workbench.openSideChatSession(hostId, sideId)
+                : undefined
+            }
             quoteInSideChat={
               canOpenSide ? (text) => void showSide(text, true) : undefined
             }
@@ -380,6 +385,7 @@ export default function App() {
             agents={workbench.agents}
             selectAgent={workbench.selectAgent}
             session={session}
+            conversationKey={workbench.workspaceId}
             hostId={hostId}
             agentSessionState={
               session
@@ -506,6 +512,9 @@ export default function App() {
                     }
                     connected={connected}
                     supported={supportsSide}
+                    supportsInheritPermission={
+                      workbench.supportsSideChatInheritPermission
+                    }
                   />
                 )
               : undefined

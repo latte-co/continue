@@ -19,28 +19,35 @@ const entry: Annotation = {
   comment: "请解释",
   source: { message: 3, start: 0, end: 6 },
 };
+const commentlessEntry: Annotation = {
+  id: "two",
+  quote: "仅标注原文",
+  comment: "",
+  source: { message: 3, start: 6, end: 11 },
+};
 afterEach(() => {
   window.getSelection()?.removeAllRanges();
   document.body.innerHTML = "";
 });
-it("round-trips annotations with attachments and preserves the visible user message", () => {
+it("round-trips annotations with optional comments and attachments while preserving the visible user message", () => {
   const refs = [{ name: "note.md", path: "note.md", directory: false }];
   const prompt = referencePrompt(
-    annotationPrompt("请看这些问题", [entry]),
+    annotationPrompt("请看这些问题", [entry, commentlessEntry]),
     refs,
   );
   expect(userMessageContent(prompt)).toEqual({
     text: "请看这些问题",
-    annotations: [entry],
+    annotations: [entry, commentlessEntry],
     references: refs.map((r) => ({
       ...r,
       attachmentKind: undefined,
       mimeType: undefined,
     })),
   });
-  expect(annotationMessage(annotationPrompt("", [entry])).text).toBe(
+  expect(annotationMessage(annotationPrompt("", [commentlessEntry])).text).toBe(
     "请逐条回应以下注释。",
   );
+  expect(annotationError([commentlessEntry])).toBeNull();
   expect(annotationPrompt("ordinary", [])).toBe("ordinary");
 });
 it.each([
@@ -54,6 +61,12 @@ it.each([
   JSON.stringify({
     version: 1,
     annotations: [{ ...entry, quote: "", comment: "" }],
+  }),
+  JSON.stringify({
+    version: 1,
+    annotations: [
+      { ...entry, quote: "   ", source: { message: 3, start: 0, end: 3 } },
+    ],
   }),
   JSON.stringify({ version: 1, annotations: [entry], extra: true }),
   JSON.stringify({

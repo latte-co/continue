@@ -6,6 +6,7 @@ import {
   type Ref,
 } from "react";
 import { request, message } from "./api";
+import { useModelConfigVersion } from "./modelConfigVersion";
 import { modelOptions } from "./modelOptions";
 import { modelSelectionScope } from "./modelSelectionScope";
 import { ModelSelector, type ModelSelectorHandle } from "./ModelSelector";
@@ -26,10 +27,13 @@ export function ModelPicker({
   hostId,
   projectId,
   agent,
+  conversationKey,
   connected,
   settingsOpen,
+  preserveUnavailableModel = false,
   value,
   onChange,
+  onProviderFallback,
   effort,
   onEffortChange,
   onEffortInvalid,
@@ -40,10 +44,13 @@ export function ModelPicker({
   hostId: string;
   projectId?: string;
   agent: string;
+  conversationKey?: string;
   connected: boolean;
   settingsOpen: boolean;
+  preserveUnavailableModel?: boolean;
   value: string | null;
   onChange: (model: string | null) => void;
+  onProviderFallback?: (model: string | null) => void;
   effort: Effort | null;
   onEffortChange: (effort: Effort | null) => void;
   onEffortInvalid?: () => void;
@@ -52,13 +59,23 @@ export function ModelPicker({
   ref?: Ref<ModelPickerHandle>;
 }) {
   const selector = useRef<ModelSelectorHandle>(null);
+  const configVersion = useModelConfigVersion(hostId, agent);
   const scope = JSON.stringify([hostId, projectId, agent]);
+  const conversationScope = JSON.stringify([scope, conversationKey ?? ""]);
   const [loaded, setCatalog] = useState<{
     scope: string;
+    configVersion: number;
     model: string | null;
     catalog: Catalog;
   }>();
-  const cached = loaded?.scope === scope ? loaded : undefined;
+  const [settledScopes, setSettledScopes] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const settled = settledScopes.has(conversationScope);
+  const cached =
+    loaded?.scope === scope && loaded.configVersion === configVersion
+      ? loaded
+      : undefined;
   const catalog = cached?.catalog;
   // The catalog covers every model, but effort levels describe the queried model.
   const matchesSelectedModel = cached?.model === value;
@@ -92,6 +109,23 @@ export function ModelPicker({
       action: { label: "重新加载模型", run: () => setRetry((v) => v + 1) },
     },
   ]);
+  const agentConfigKey = JSON.stringify([hostId, agent]);
+  const seenConfigVersions = useRef(new Map<string, number>());
+  if (!seenConfigVersions.current.has(agentConfigKey)) {
+    seenConfigVersions.current.set(agentConfigKey, configVersion);
+  }
+  useEffect(() => {
+    const previousVersion = seenConfigVersions.current.get(agentConfigKey);
+    const configChanged = previousVersion !== configVersion;
+    seenConfigVersions.current.set(agentConfigKey, configVersion);
+    if ((!settingsOpen && !configChanged) || !value) return;
+    setSettledScopes((current) => {
+      if (current.has(conversationScope)) return current;
+      const next = new Set(current);
+      next.add(conversationScope);
+      return next;
+    });
+  }, [agentConfigKey, settingsOpen, configVersion, value, conversationScope]);
   useEffect(() => {
     if (!connected || settingsOpen) return;
     let disposed = false;
@@ -105,7 +139,17 @@ export function ModelPicker({
     })
       .then((result) => {
         if (result.kind !== "models") throw new Error("无法加载模型列表");
-        if (!disposed) setCatalog({ scope, model: value, catalog: result });
+        if (!disposed) {
+          setCatalog({ scope, configVersion, model: value, catalog: result });
+          if (value && result.models.includes(value)) {
+            setSettledScopes((current) => {
+              if (current.has(conversationScope)) return current;
+              const next = new Set(current);
+              next.add(conversationScope);
+              return next;
+            });
+          }
+        }
       })
       .catch((e) => {
         if (!disposed) setError(message(e) || "无法加载模型列表");
@@ -119,7 +163,17 @@ export function ModelPicker({
     return () => {
       disposed = true;
     };
-  }, [hostId, projectId, agent, connected, settingsOpen, retry, value]);
+  }, [
+    hostId,
+    projectId,
+    agent,
+    configVersion,
+    conversationScope,
+    connected,
+    settingsOpen,
+    retry,
+    value,
+  ]);
   const usableCatalog =
     !loading && !settingsOpen && connected && (error || matchesSelectedModel)
       ? catalog
@@ -133,15 +187,18 @@ export function ModelPicker({
   }, [freshCatalog, effort, onEffortInvalid]);
   const providerFallback =
     freshCatalog?.provider != null &&
-    (!value || !freshCatalog.models.includes(value))
+    (!value ||
+      (!preserveUnavailableModel &&
+        !settled &&
+        !freshCatalog.models.includes(value)))
       ? freshCatalog.models.includes(freshCatalog.default_model ?? "")
         ? freshCatalog.default_model
         : (freshCatalog.models[0] ?? null)
       : undefined;
   useEffect(() => {
     if (providerFallback !== undefined && providerFallback !== value)
-      onChange(providerFallback);
-  }, [providerFallback, value, onChange]);
+      (onProviderFallback ?? onChange)(providerFallback);
+  }, [providerFallback, value, onProviderFallback, onChange]);
   const readyScope = modelSelectionScope(
     hostId,
     projectId,
@@ -261,7 +318,7 @@ export function ModelPicker({
   if (
     value &&
     catalog &&
-    catalog.provider == null &&
+    providerFallback === undefined &&
     !catalog.models.includes(value)
   )
     groupedOptions.push({

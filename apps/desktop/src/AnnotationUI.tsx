@@ -6,7 +6,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
-import { MessageSquare, Pencil, Trash2, X } from "lucide-react";
+import { ArrowUp, MessageSquareText, Pencil, Trash2, X } from "lucide-react";
 import { Modal } from "./Modal";
 import { MessageContent } from "./MessageContent";
 import {
@@ -25,22 +25,32 @@ type Rect = Pick<DOMRect, "left" | "right" | "top" | "bottom">;
 function AnnotationPopover({
   anchor,
   label,
+  maxWidth = 440,
+  gap = 10,
+  className = "",
   close,
   children,
 }: {
   anchor: Rect;
   label: string;
+  maxWidth?: number;
+  gap?: number;
+  className?: string;
   close: () => void;
   children: ReactNode;
 }) {
   const content = useRef<HTMLDivElement>(null);
   const popover = useRef<HTMLDivElement>(null);
-  const [position, setPosition] = useState({ left: 8, top: 8, width: 400 });
+  const [position, setPosition] = useState({
+    left: 8,
+    top: 8,
+    width: maxWidth,
+  });
   useLayoutEffect(() => {
     const place = () => {
-      const width = Math.max(0, Math.min(440, window.innerWidth - 16));
+      const width = Math.max(0, Math.min(maxWidth, window.innerWidth - 16));
       const height = Math.min(
-        content.current?.offsetHeight ?? 260,
+        content.current?.offsetHeight ?? 56,
         window.innerHeight - 24,
       );
       setPosition({
@@ -49,9 +59,9 @@ function AnnotationPopover({
         top: Math.max(
           8,
           Math.min(
-            anchor.top >= height + 20
-              ? anchor.top - height - 12
-              : anchor.bottom + 12,
+            anchor.top >= height + gap + 8
+              ? anchor.top - height - gap
+              : anchor.bottom + gap,
             window.innerHeight - height - 8,
           ),
         ),
@@ -80,7 +90,7 @@ function AnnotationPopover({
       window.removeEventListener("resize", place);
       backdrop?.removeEventListener("wheel", stopBackgroundScroll);
     };
-  }, [anchor]);
+  }, [anchor, gap, maxWidth]);
   return createPortal(
     <div
       className="annotation-backdrop"
@@ -90,7 +100,7 @@ function AnnotationPopover({
       }}
     >
       <Modal
-        className="annotation-popover"
+        className={`annotation-popover${className ? ` ${className}` : ""}`}
         aria-label={label}
         style={position}
         onKeyDown={(e) => {
@@ -111,39 +121,149 @@ function AnnotationPopover({
 export function AnnotationEditor({
   entry,
   anchor,
+  gap = 10,
   onSave,
   onRemove,
   close,
 }: {
   entry: Annotation;
   anchor: Rect;
+  gap?: number;
   onSave: Change;
   onRemove?: () => void;
   close: () => void;
 }) {
   const [comment, setComment] = useState(entry.comment);
   const [error, setError] = useState("");
+  const input = useRef<HTMLTextAreaElement>(null);
   const composing = useRef(false);
+  useLayoutEffect(() => {
+    const el = input.current;
+    if (!el) return;
+    el.style.height = "0px";
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, 24), 120)}px`;
+  }, [comment]);
   function save() {
-    if (!comment.trim()) return;
-    const error = onSave({ ...entry, comment: comment.trim() });
-    if (error) setError(error);
+    const result = onSave({ ...entry, comment: comment.trim() });
+    if (result) setError(result);
     else close();
   }
   return (
     <AnnotationPopover
       anchor={anchor}
       label={entry.comment ? "编辑注释" : "添加注释"}
+      maxWidth={400}
+      gap={gap}
+      className="annotation-editor-popover"
       close={close}
     >
-      <div className="annotation-editor">
-        <label htmlFor={`annotation-${entry.id}`}>用户评论</label>
+      <div className="annotation-editor-shell">
+        <div className="annotation-editor">
+          <textarea
+            ref={input}
+            id={`annotation-${entry.id}`}
+            aria-label="添加可选评论"
+            autoFocus
+            rows={1}
+            maxLength={MAX_COMMENT}
+            placeholder="添加可选评论…"
+            value={comment}
+            onChange={(e) => {
+              setComment(e.target.value);
+              setError("");
+            }}
+            onCompositionStart={() => {
+              composing.current = true;
+            }}
+            onCompositionEnd={() => {
+              composing.current = false;
+            }}
+            onKeyDown={(e) => {
+              if (
+                e.key === "Enter" &&
+                (!e.shiftKey || e.metaKey || e.ctrlKey) &&
+                !e.nativeEvent.isComposing &&
+                !composing.current &&
+                e.keyCode !== 229
+              ) {
+                e.preventDefault();
+                save();
+              }
+            }}
+          />
+          {onRemove && (
+            <button
+              type="button"
+              className="icon-button annotation-editor-delete"
+              aria-label="删除注释"
+              title="删除注释"
+              onClick={() => {
+                onRemove();
+                close();
+              }}
+            >
+              <Trash2 size={15} />
+            </button>
+          )}
+          <button
+            type="button"
+            className="annotation-submit"
+            aria-label="提交注释"
+            title="提交注释（Enter）"
+            onClick={save}
+          >
+            <ArrowUp size={17} />
+          </button>
+        </div>
+        {error && (
+          <p role="alert" className="annotation-error">
+            {error}
+          </p>
+        )}
+      </div>
+    </AnnotationPopover>
+  );
+}
+
+function AnnotationInlineEditor({
+  entry,
+  number,
+  disabled,
+  onSave,
+  onCancel,
+}: {
+  entry: Annotation;
+  number: number;
+  disabled: boolean;
+  onSave: Change;
+  onCancel: () => void;
+}) {
+  const [comment, setComment] = useState(entry.comment);
+  const [error, setError] = useState("");
+  const input = useRef<HTMLTextAreaElement>(null);
+  const composing = useRef(false);
+  useLayoutEffect(() => {
+    const el = input.current;
+    if (!el) return;
+    el.style.height = "0px";
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, 24), 120)}px`;
+  }, [comment]);
+  function save() {
+    const result = onSave({ ...entry, comment: comment.trim() });
+    if (result) setError(result);
+    else onCancel();
+  }
+  return (
+    <div className="annotation-inline-editor-wrap">
+      <div className="annotation-inline-editor">
         <textarea
-          id={`annotation-${entry.id}`}
+          ref={input}
+          aria-label={`编辑注释 ${number} 评论`}
           autoFocus
-          rows={3}
+          rows={1}
+          disabled={disabled}
           maxLength={MAX_COMMENT}
-          placeholder="针对这段文字，写下你的问题或修改建议…"
+          placeholder="添加可选评论…"
           value={comment}
           onChange={(e) => {
             setComment(e.target.value);
@@ -156,9 +276,15 @@ export function AnnotationEditor({
             composing.current = false;
           }}
           onKeyDown={(e) => {
+            if (e.key === "Escape" && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              e.stopPropagation();
+              onCancel();
+              return;
+            }
             if (
               e.key === "Enter" &&
-              (e.metaKey || e.ctrlKey) &&
+              (!e.shiftKey || e.metaKey || e.ctrlKey) &&
               !e.nativeEvent.isComposing &&
               !composing.current &&
               e.keyCode !== 229
@@ -168,42 +294,33 @@ export function AnnotationEditor({
             }
           }}
         />
-        <blockquote>{entry.quote}</blockquote>
-        {error && (
-          <p role="alert" className="annotation-error">
-            {error}
-          </p>
-        )}
-        <footer>
-          {onRemove && (
-            <button
-              className="icon-button"
-              aria-label="删除注释"
-              onClick={() => {
-                onRemove();
-                close();
-              }}
-            >
-              <Trash2 size={16} />
-            </button>
-          )}
-          <span className="annotation-limit">
-            {comment.length}/{MAX_COMMENT}
-          </span>
-          <button className="secondary small" onClick={close}>
-            取消
-          </button>
-          <button
-            className="primary small"
-            disabled={!comment.trim()}
-            title="⌘/Ctrl + Enter 保存"
-            onClick={save}
-          >
-            保存
-          </button>
-        </footer>
+        <button
+          type="button"
+          className="icon-button annotation-inline-cancel"
+          aria-label="取消编辑"
+          title="取消编辑（Esc）"
+          disabled={disabled}
+          onClick={onCancel}
+        >
+          <X size={14} />
+        </button>
+        <button
+          type="button"
+          className="annotation-submit annotation-inline-submit"
+          aria-label="提交注释"
+          title="提交注释（Enter）"
+          disabled={disabled}
+          onClick={save}
+        >
+          <ArrowUp size={15} />
+        </button>
       </div>
-    </AnnotationPopover>
+      {error && (
+        <p role="alert" className="annotation-error">
+          {error}
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -212,6 +329,7 @@ export function AnnotationSummary({
   onSave,
   onRemove,
   onClear,
+  onFocusComposer,
   disabled = false,
   active = true,
 }: {
@@ -219,24 +337,64 @@ export function AnnotationSummary({
   onSave?: Change;
   onRemove?: (id: string) => void;
   onClear?: () => void;
+  onFocusComposer?: () => void;
   disabled?: boolean;
   active?: boolean;
 }) {
   const trigger = useRef<HTMLButtonElement>(null);
+  const list = useRef<HTMLOListElement>(null);
   const [anchor, setAnchor] = useState<Rect | null>(null);
-  const [editing, setEditing] = useState<Annotation | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
   useEffect(() => {
     if (!active || disabled || !entries.length) {
       setAnchor(null);
-      setEditing(null);
+      setEditingId(null);
     }
   }, [active, disabled, entries.length]);
+  useEffect(() => {
+    if (editingId && !entries.some((entry) => entry.id === editingId)) {
+      setEditingId(null);
+    }
+  }, [editingId, entries]);
   const close = () => {
     setAnchor(null);
-    setEditing(null);
+    setEditingId(null);
     queueMicrotask(() => {
       if (trigger.current?.isConnected && !trigger.current.closest("[inert]"))
         trigger.current.focus();
+    });
+  };
+  const focusRowEditButton = (id: string) => {
+    queueMicrotask(() => {
+      const button = Array.from(
+        list.current?.querySelectorAll<HTMLButtonElement>(
+          "button[data-edit-id]",
+        ) ?? [],
+      ).find((el) => el.dataset.editId === id);
+      button?.focus();
+    });
+  };
+  const removeItem = (id: string) => {
+    if (!onRemove) return;
+    const willEmpty = entries.length <= 1;
+    if (editingId === id) setEditingId(null);
+    onRemove(id);
+    if (willEmpty) {
+      setAnchor(null);
+      queueMicrotask(() => onFocusComposer?.());
+      return;
+    }
+    queueMicrotask(() => {
+      const dialog = list.current?.closest('[role="dialog"]') as
+        HTMLElement | null | undefined;
+      if (!dialog?.isConnected) return;
+      if (!dialog.contains(document.activeElement)) {
+        const nextControl =
+          list.current?.querySelector<HTMLElement>(
+            "button:not(:disabled), textarea:not(:disabled)",
+          ) ?? dialog;
+        nextControl.focus({ preventScroll: true });
+      }
     });
   };
   if (!entries.length) return null;
@@ -244,7 +402,9 @@ export function AnnotationSummary({
     <div className="annotation-summary">
       <div className="annotation-chip">
         <button
+          type="button"
           ref={trigger}
+          className="annotation-chip-trigger"
           aria-expanded={!!anchor}
           aria-haspopup="dialog"
           disabled={disabled}
@@ -253,71 +413,91 @@ export function AnnotationSummary({
             setAnchor(trigger.current!.getBoundingClientRect());
           }}
         >
-          <MessageSquare size={15} />
-          {entries.length} 条注释
+          <MessageSquareText size={14} />
+          <span>{entries.length} 条注释</span>
         </button>
         {onClear && (
           <button
+            type="button"
             disabled={disabled}
             className="annotation-clear"
             aria-label="移除全部注释"
-            onClick={onClear}
+            title="移除全部注释"
+            onClick={() => {
+              onClear();
+              queueMicrotask(() => onFocusComposer?.());
+            }}
           >
-            <X size={14} />
+            <X size={11} strokeWidth={2.4} />
           </button>
         )}
       </div>
-      {anchor &&
-        active &&
-        (editing && onSave ? (
-          <AnnotationEditor
-            key={editing.id}
-            entry={editing}
-            anchor={anchor}
-            onSave={onSave}
-            onRemove={onRemove ? () => onRemove(editing.id) : undefined}
-            close={close}
-          />
-        ) : (
-          <AnnotationPopover anchor={anchor} label="消息注释" close={close}>
-            <div className="annotation-list-heading">
-              <span>{entries.length} 条注释</span>
-              <button
-                className="icon-button"
-                aria-label="关闭注释"
-                onClick={close}
-              >
-                <X size={16} />
-              </button>
-            </div>
-            <ol className="annotation-list">
-              {entries.map((entry, index) => (
+      {anchor && active && (
+        <AnnotationPopover
+          anchor={anchor}
+          label="消息注释"
+          maxWidth={460}
+          gap={8}
+          className="annotation-list-popover"
+          close={close}
+        >
+          <ol className="annotation-list" ref={list}>
+            {entries.map((entry, index) => {
+              const comment = entry.comment.trim();
+              const isEditing = editingId === entry.id && !!onSave;
+              return (
                 <li key={entry.id}>
                   <span className="annotation-index">{index + 1}.</span>
                   <div className="annotation-copy">
-                    <span>所选文本</span>
+                    <span>所选文本：</span>
                     <blockquote>{entry.quote}</blockquote>
-                    <span>用户评论</span>
-                    <p>{entry.comment}</p>
+                    {isEditing ? (
+                      <>
+                        <span>用户评论：</span>
+                        <AnnotationInlineEditor
+                          key={entry.id}
+                          entry={entry}
+                          number={index + 1}
+                          disabled={disabled}
+                          onSave={onSave}
+                          onCancel={() => {
+                            setEditingId(null);
+                            focusRowEditButton(entry.id);
+                          }}
+                        />
+                      </>
+                    ) : (
+                      comment && (
+                        <>
+                          <span>用户评论：</span>
+                          <p>{comment}</p>
+                        </>
+                      )
+                    )}
                   </div>
-                  {(onSave || onRemove) && (
+                  {(onSave || onRemove) && !isEditing && (
                     <div className="annotation-entry-actions">
                       {onSave && (
                         <button
+                          type="button"
+                          data-edit-id={entry.id}
                           className="icon-button"
                           aria-label={`编辑注释 ${index + 1}`}
+                          title="编辑注释"
                           disabled={disabled}
-                          onClick={() => setEditing(entry)}
+                          onClick={() => setEditingId(entry.id)}
                         >
                           <Pencil size={15} />
                         </button>
                       )}
                       {onRemove && (
                         <button
+                          type="button"
                           className="icon-button"
                           aria-label={`删除注释 ${index + 1}`}
+                          title="删除注释"
                           disabled={disabled}
-                          onClick={() => onRemove(entry.id)}
+                          onClick={() => removeItem(entry.id)}
                         >
                           <Trash2 size={15} />
                         </button>
@@ -325,10 +505,11 @@ export function AnnotationSummary({
                     </div>
                   )}
                 </li>
-              ))}
-            </ol>
-          </AnnotationPopover>
-        ))}
+              );
+            })}
+          </ol>
+        </AnnotationPopover>
+      )}
     </div>
   );
 }
@@ -373,7 +554,9 @@ export function AnnotatedMessage({
     {
       entry: Annotation;
       number: number;
+      markerLeft: number;
       markerTop: number;
+      pending: boolean;
       rects: { left: number; top: number; width: number; height: number }[];
     }[]
   >([]);
@@ -439,42 +622,87 @@ export function AnnotatedMessage({
       document.removeEventListener("pointerdown", outside);
     };
   }, [selection, editing, message]);
+  const pendingEntry =
+    editing &&
+    selection &&
+    !entries.some((entry) => entry.id === selection.entry.id)
+      ? selection.entry
+      : null;
   useLayoutEffect(() => {
     const root = body.current;
-    if (!root) return;
-    if (!entries.some((entry) => entry.source.message === message)) {
+    const container = root?.parentElement;
+    if (!root || !container) return;
+    if (
+      !pendingEntry &&
+      !entries.some((entry) => entry.source.message === message)
+    ) {
       setMarks([]);
       return;
     }
     const measure = () => {
-      const origin = root.getBoundingClientRect();
-      const occupied: number[] = [];
-      setMarks(
-        entries.flatMap((entry, index) => {
-          if (entry.source.message !== message) return [];
-          const range = annotationRange(root, entry);
-          if (!range || typeof range.getClientRects !== "function") return [];
-          const rects = Array.from(range.getClientRects())
-            .filter((r) => r.width && r.height)
-            .slice(0, 500)
-            .map((r) => ({
-              left: Math.max(0, r.left - origin.left),
-              top: r.top - origin.top,
-              width: Math.max(
-                0,
-                Math.min(r.right, origin.right) - Math.max(r.left, origin.left),
-              ),
-              height: r.height,
-            }))
-            .filter((r) => r.width > 0);
-          if (!rects.length) return [];
-          let markerTop = rects[0].top;
-          while (occupied.some((top) => Math.abs(top - markerTop) < 32))
-            markerTop += 32;
-          occupied.push(markerTop);
-          return [{ entry, number: index + 1, rects, markerTop }];
-        }),
+      const origin = container.getBoundingClientRect();
+      const maxLeft = Math.max(0, container.clientWidth - 28);
+      const occupied: { left: number; top: number }[] = [];
+      const buildMark = (
+        entry: Annotation,
+        number: number,
+        pending: boolean,
+      ) => {
+        const range = annotationRange(root, entry);
+        if (!range || typeof range.getClientRects !== "function") return [];
+        const rects = Array.from(range.getClientRects())
+          .filter((r) => r.width && r.height)
+          .slice(0, 500)
+          .map((r) => ({
+            left: Math.max(0, r.left - origin.left),
+            top: r.top - origin.top,
+            width:
+              origin.width > 0
+                ? Math.max(
+                    0,
+                    Math.min(r.right, origin.right) -
+                      Math.max(r.left, origin.left),
+                  )
+                : r.width,
+            height: r.height,
+          }))
+          .filter((r) => r.width > 0);
+        if (!rects.length) return [];
+        const anchorRect = rects.at(-1)!;
+        const markerLeft = Math.max(
+          0,
+          Math.min(anchorRect.left + anchorRect.width - 8, maxLeft),
+        );
+        let markerTop = anchorRect.top - 22;
+        while (
+          occupied.some(
+            (pos) =>
+              Math.abs(pos.left - markerLeft) < 30 &&
+              Math.abs(pos.top - markerTop) < 30,
+          )
+        )
+          markerTop += 30;
+        occupied.push({ left: markerLeft, top: markerTop });
+        return [
+          {
+            entry,
+            number,
+            rects,
+            markerLeft,
+            markerTop,
+            pending,
+          },
+        ];
+      };
+      const savedMarks = entries.flatMap((entry, index) =>
+        entry.source.message === message
+          ? buildMark(entry, index + 1, false)
+          : [],
       );
+      const draftMarks = pendingEntry
+        ? buildMark(pendingEntry, entries.length + 1, true)
+        : [];
+      setMarks([...savedMarks, ...draftMarks]);
     };
     measure();
     let frame = 0;
@@ -486,6 +714,7 @@ export function AnnotatedMessage({
       typeof ResizeObserver === "undefined"
         ? undefined
         : new ResizeObserver(schedule);
+    observer?.observe(container);
     observer?.observe(root);
     root.addEventListener("scroll", schedule, true);
     return () => {
@@ -493,7 +722,7 @@ export function AnnotatedMessage({
       cancelAnimationFrame(frame);
       root.removeEventListener("scroll", schedule, true);
     };
-  }, [entries, message, text]);
+  }, [entries, message, pendingEntry, text]);
   function select(event?: React.MouseEvent<HTMLDivElement>) {
     const started = gesture.current;
     gesture.current = null;
@@ -547,7 +776,9 @@ export function AnnotatedMessage({
     <article
       className="assistant-message annotated-message"
       data-annotations={
-        enabled && entries.some((entry) => entry.source.message === message)
+        enabled &&
+        (!!pendingEntry ||
+          entries.some((entry) => entry.source.message === message))
       }
     >
       <div
@@ -599,33 +830,46 @@ export function AnnotatedMessage({
       </div>
       {enabled && (
         <div className="annotation-marks">
-          {marks.map(({ entry, number, rects, markerTop }) => (
-            <div key={entry.id}>
-              {rects.map((rect, index) => (
-                <span
-                  key={index}
-                  className="annotation-highlight"
-                  style={rect}
-                />
-              ))}
-              <button
-                className="annotation-marker"
-                aria-label={`编辑注释 ${number}`}
-                title={entry.comment}
-                style={{ top: markerTop, right: 0 }}
-                onClick={(e) => {
-                  e.currentTarget.focus();
-                  setSelection({
-                    entry,
-                    anchor: e.currentTarget.getBoundingClientRect(),
-                  });
-                  setEditing(true);
-                }}
-              >
-                {number}
-              </button>
-            </div>
-          ))}
+          {marks.map(
+            ({ entry, number, rects, markerLeft, markerTop, pending }) => (
+              <div key={entry.id}>
+                {rects.map((rect, index) => (
+                  <span
+                    key={index}
+                    className="annotation-highlight"
+                    style={rect}
+                  />
+                ))}
+                {pending ? (
+                  <span
+                    className="annotation-marker annotation-marker-pending"
+                    aria-hidden="true"
+                    style={{ left: markerLeft, top: markerTop }}
+                  >
+                    {number}
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    className="annotation-marker"
+                    aria-label={`编辑注释 ${number}`}
+                    title={entry.comment || entry.quote}
+                    style={{ left: markerLeft, top: markerTop }}
+                    onClick={(e) => {
+                      e.currentTarget.focus();
+                      setSelection({
+                        entry,
+                        anchor: e.currentTarget.getBoundingClientRect(),
+                      });
+                      setEditing(true);
+                    }}
+                  >
+                    {number}
+                  </button>
+                )}
+              </div>
+            ),
+          )}
         </div>
       )}
       {notice && (
@@ -639,6 +883,7 @@ export function AnnotatedMessage({
           <AnnotationEditor
             entry={selection.entry}
             anchor={selection.anchor}
+            gap={pendingEntry ? 34 : 10}
             onSave={(entry) => {
               const error = onSave(entry);
               if (!error) clearSelection();
@@ -696,7 +941,7 @@ export function AnnotatedMessage({
               }}
             >
               <button role="menuitem" onClick={() => setEditing(true)}>
-                <MessageSquare size={15} />
+                <MessageSquareText size={15} />
                 添加注释
               </button>
               {askInSideChat && (

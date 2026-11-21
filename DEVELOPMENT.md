@@ -214,9 +214,10 @@ and are not performed by deterministic fixtures. See [Cursor design](docs/cursor
 
 ## Session annotations
 
-`annotations.ts` captures exact rendered-text offsets within one assistant message;
-`AnnotationUI.tsx` provides selection actions, a shared-Modal editor, draft highlights
-and a read-only history disclosure. Main and side-chat drafts store annotations in
+`annotations.ts` captures exact rendered-text offsets within one assistant message
+with an optional user comment; `AnnotationUI.tsx` provides selection actions, a
+compact pill Modal editor, inline draft highlights with speech-bubble badges, and
+a read-only history disclosure. Main and side-chat drafts store annotations in
 the existing App-lifetime `DraftStore`; editing them advances the submission version.
 Cross-message selections and UI controls are excluded. Anchors validate the exact
 quote before highlighting, with no fuzzy relocation after history projection changes.
@@ -693,9 +694,9 @@ pending reveal work so a stale session cannot reveal the new conversation.
 
 ## Conversation lifetime and reading position
 
-Completed main and child transcripts fold earlier assistant prose, tools and
-ordinary notices together. A normal completed turn has one process disclosure;
-user handoffs, approvals, images, Skill-load notices and change results remain
+Completed main and child transcripts fold earlier assistant prose, tools, tool
+images and ordinary notices together. A normal completed turn has one process disclosure;
+user handoffs, approvals, Skill-load notices and change results remain
 visible boundaries. Empty file-change snapshots share the card's visibility rule
 and never split a process into adjacent disclosures. Projection preserves prose
 row breaks and retains the raw snapshots for change selection and undo state.
@@ -992,8 +993,10 @@ Claude tool-result images are converted in the adapter to agent-neutral
 `ToolOutputBlock` arrays (text or inline raster MIME/base64). Image bytes are bounded
 to four blocks and 384 KiB encoded per result. URL and SVG image sources are not
 loaded. Existing saved Claude results are projected on read without rewriting the
-original events. Transcript image rows remain visible outside folded tools and
-completed execution details; click opens the shared modal image view.
+original events. Tool-result image rows render as compact thumbnails outside
+folded tool groups while live and fold with the completed turn's execution
+process; click opens the shared modal image view with native clipboard copy and
+save-as download actions.
 
 The additive `preview_change` request reads the exact before/after version of a
 turn, task or Git comparison. It returns at most 64 KiB per chunk, rejects images
@@ -2118,7 +2121,9 @@ default CLI with an empty Agent environment and leaves the source unverified.
 Codex cold resumes reuse the side thread's Provider key for the same App
 Provider revision.
 The side chat shares the working directory, with an independent request ledger and
-transcript. Side chats do not take undo snapshots because main and side file activity can
+transcript, and inherits the parent conversation's model, effort, and permission mode by default
+(`side_chat_inherit_permission` in `Hello`; older v1 SSH Servers fall back to legacy `null` read-only).
+Side chats do not take undo snapshots because main and side file activity can
 overlap. The host rejects main-turn undo when write-capable side work on the
 same host overlaps the main turn. Native permissions and approvals can allow
 writes outside the side project's root. The host records possible writes just
@@ -2128,19 +2133,20 @@ with its own confirmation ID, because startup hooks can write without a user tur
 These launch records do not create user messages or change request deduplication.
 Confirmed historical intervals remain closed when a later process is opened.
 Any interval still awaiting confirmation blocks Undo independently of its start
-time, including side work started after the main turn's snapshot completed.
-Once confirmed, only intervals overlapping the main turn block historical Undo;
-the existing current-file conflict check still protects later edits.
+time, including side work started after the main turn's snapshot completed or across
+a Server restart. Once confirmed, only intervals overlapping the main turn block
+historical Undo; the existing current-file conflict check still protects later edits.
 Detached processes and external tools can keep writing after either normal completion
 or forced close. The host keeps the write interval open until the user verifies
-those tasks have stopped. A confirmed local close can return `SideChatClosed`
-with pending writes, so tabs can close and the parent can be archived. A side
-chat reopened from history displays the pending writes. `ConfirmSideWritesEnded`
-verifies the latest pending request ID, closes an idle local runtime when needed,
-and records a verified end separately from legacy inferred boundaries. Its
-response acknowledges whether this request closed an actor. Retrying a verified
-request preserves ownership of a reopened chat so the current App can close it
-on exit. Only verified ends count, including after running an older Server.
+those tasks have stopped. A confirmed local close returns `SideChatClosed` when
+writes are pending so tabs close quietly and the parent can be archived; ordinary
+completed side chats hide the confirmation prompt unless interrupted (`Status::Unknown`)
+or surfaced by a blocked main-turn Undo. `ConfirmSideWritesEnded` verifies the
+latest pending request ID, closes an idle local runtime when needed, and records
+a verified end separately from legacy inferred boundaries. Its response
+acknowledges whether this request closed an actor. Retrying a verified request
+preserves ownership of a reopened chat so the current App can close it on exit.
+Only verified ends count, including after running an older Server.
 Native resource cleanup captures a claim version before waiting for close.
 Every claim or adoption gets a new version, including by the same App; an older
 close acknowledgement cannot remove that newer ownership.
@@ -2184,7 +2190,6 @@ directly, including children of closed parents outside the 500-row navigation hi
 Pages contain at most 64 sessions and 256 KiB of stored metadata, ordered by session
 ID; failed reads or non-advancing cursors never produce a partial close inventory.
 Older Servers must update for this inventory. Processless actors remain closeable.
-It reports a confirmed local side close separately from pending background writes.
 Successful archive retires captured resource claims for the parent and every
 closed side chat. The desktop snapshots child IDs before archive, serializes it
 with Agent admission on the control lane, and removes that family from its quit

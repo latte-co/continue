@@ -17,6 +17,7 @@ pub struct Client {
     broken: bool,
     permission_settings: bool,
     custom_agent_environment: bool,
+    side_chat_inherit_permission: bool,
     server_id: String,
 }
 
@@ -78,6 +79,7 @@ impl Client {
             broken: false,
             permission_settings: false,
             custom_agent_environment: false,
+            side_chat_inherit_permission: false,
             server_id: String::new(),
         };
         match client.request(Request::Hello { version: VERSION }).await? {
@@ -85,12 +87,14 @@ impl Client {
                 version: VERSION,
                 permission_settings,
                 custom_agent_environment,
+                side_chat_inherit_permission,
                 server_id,
                 ..
             } => {
                 client.server_id = server_id;
                 client.permission_settings = permission_settings;
                 client.custom_agent_environment = custom_agent_environment;
+                client.side_chat_inherit_permission = side_chat_inherit_permission;
                 Ok(client)
             }
             Response::Error { code, message } if code == "version_mismatch" => bail!(
@@ -138,6 +142,21 @@ impl Client {
         ) && !self.permission_settings
         {
             bail!("此 Server 不支持权限设置，请更新 Server 后重新连接；任务未发送");
+        }
+        if matches!(
+            &request,
+            Request::Send {
+                permission_mode: Some(mode),
+                ..
+            } | Request::SendQueued {
+                permission_mode: Some(mode),
+                ..
+            } if mode == "inherit"
+        ) && !self.side_chat_inherit_permission
+        {
+            bail!(
+                "此 Server 不支持侧边聊天跟随 Agent 权限，请切换为只读或更新 Server 后重新连接；任务未发送"
+            );
         }
         self.exchange(&request).await
     }
@@ -758,6 +777,56 @@ for line in sys.stdin:
         assert!(matches!(
             client.request(Request::Projects).await.unwrap(),
             Response::Projects { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_permission_server_never_receives_inherit_permission() {
+        let mut command = Command::new("python3");
+        command.args([
+            "-u",
+            "-c",
+            r#"
+import sys,json
+for line in sys.stdin:
+    req=json.loads(line)
+    if req['method']=='hello':
+        print(json.dumps({'kind':'hello','version':1,'permission_settings':True,'server_id':'legacy','agents':[]}),flush=True)
+    else:
+        assert req.get('permission_mode') != 'inherit', 'inherit reached legacy server'
+        print(json.dumps({'kind':'accepted','duplicate':False}),flush=True)
+"#,
+        ]);
+        let mut client = Client::spawn(command).await.unwrap();
+        let error = client
+            .request(Request::Send {
+                session_id: "side".into(),
+                request_id: "r1".into(),
+                text: "hello".into(),
+                provider: None,
+                model: None,
+                effort: None,
+                permission_mode: Some("inherit".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("跟随 Agent 权限"));
+        assert!(!client.is_broken());
+        assert!(matches!(
+            client
+                .request(Request::Send {
+                    session_id: "side".into(),
+                    request_id: "r2".into(),
+                    text: "hello".into(),
+                    provider: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                })
+                .await
+                .unwrap(),
+            Response::Accepted { duplicate: false }
         ));
     }
 

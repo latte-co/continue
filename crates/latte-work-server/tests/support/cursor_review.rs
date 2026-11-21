@@ -16,10 +16,14 @@ async fn discovery_host(binary: &Path, incompatible: bool, explicit: bool) -> Ho
         .unwrap();
     let home = directory.path().join("home");
     std::fs::create_dir(&home).unwrap();
-    let path = OsString::from(format!(
-        "{}:/usr/bin:/bin",
-        binary.parent().unwrap().display()
-    ));
+    let python_bin = crate::isolated_python_bin(directory.path());
+    let path = std::env::join_paths([
+        binary.parent().unwrap(),
+        python_bin.as_path(),
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+    ])
+    .unwrap();
     let mut environment = vec![("HOME", home.as_os_str()), ("PATH", path.as_os_str())];
     if explicit {
         environment.push(("LATTE_WORK_CURSOR", binary.as_os_str()));
@@ -569,9 +573,11 @@ async fn cursor_review_permission_denied_path_entry_does_not_hide_later_cli() {
         .unwrap();
     let home = directory.path().join("home");
     std::fs::create_dir(&home).unwrap();
+    let python_bin = crate::isolated_python_bin(directory.path());
     let path = std::env::join_paths([
         denied.path(),
         usable.path(),
+        python_bin.as_path(),
         Path::new("/usr/bin"),
         Path::new("/bin"),
     ])
@@ -620,7 +626,7 @@ async fn cursor_review_configured_path_cannot_replace_the_discovered_executable(
     std::fs::write(
         &shadow_agent,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexec /usr/bin/python3 {} \"$@\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexec python3 {} \"$@\"\n",
             quote_path(&marker),
             quote_path(&source)
         ),
@@ -633,7 +639,16 @@ async fn cursor_review_configured_path_cannot_replace_the_discovered_executable(
     assert!(!marker.exists());
     let root = tempfile::tempdir().unwrap();
     let id = session(&mut client, root.path()).await;
-    let path = format!("{}:/usr/bin:/bin", shadow.path().display());
+    let python_bin = crate::isolated_python_bin(shadow.path());
+    let path = std::env::join_paths([
+        shadow.path(),
+        python_bin.as_path(),
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+    ])
+    .unwrap()
+    .into_string()
+    .unwrap();
     let environment = latte_work_protocol::AgentEnvironment(std::collections::BTreeMap::from([(
         "PATH".into(),
         path.clone(),

@@ -490,6 +490,9 @@ impl AgentAdapter for Claude {
         );
         let mut command = crate::agent_environment::command(binary);
         command.envs(&config.environment.0);
+        if self.side_parent.is_none() && config.permission_mode.as_deref() == Some("inherit") {
+            bail!("Agent 不支持所选权限模式");
+        }
         let mut instructions = crate::skills::platform_instructions(&config.settings_dir);
         if let Some(parent) = self.side_parent {
             // Claude reports the fork's identity in the first turn's init event.
@@ -557,7 +560,11 @@ impl AgentAdapter for Claude {
             .current_dir(cwd)
             .env_remove("CLAUDECODE")
             .env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
-        if let Some(mode) = &config.permission_mode {
+        if let Some(mode) = config
+            .permission_mode
+            .as_deref()
+            .filter(|mode| !(self.side_parent.is_some() && *mode == "inherit"))
+        {
             command.arg(format!("--permission-mode={mode}"));
         }
         if let Some(level) = config.effort {
@@ -3619,7 +3626,76 @@ mod tests {
             );
             assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"
                 || a == "--allow-dangerously-skip-permissions"));
+
+            let mut side_adapter = super::Claude::default();
+            super::AgentAdapter::set_side_parent(
+                &mut side_adapter,
+                "11111111-1111-4111-8111-111111111111".into(),
+            )
+            .unwrap();
+            let side_launch =
+                super::AgentAdapter::command(&mut side_adapter, "claude", "/tmp", None, &config)
+                    .unwrap();
+            let side_args: Vec<_> = side_launch
+                .command
+                .as_std()
+                .get_args()
+                .map(|v| v.to_string_lossy().into_owned())
+                .collect();
+            if let Some(mode) = mode {
+                assert_eq!(
+                    side_args
+                        .iter()
+                        .find(|a| a.starts_with("--permission-mode="))
+                        .cloned(),
+                    Some(format!("--permission-mode={mode}"))
+                );
+                assert!(!side_args.iter().any(|a| a == "--safe-mode"
+                    || a == "--strict-mcp-config"
+                    || a == "--no-chrome"
+                    || a == "--tools"));
+            } else {
+                assert!(side_args.contains(&"--permission-mode=plan".to_owned()));
+                assert!(side_args.contains(&"--safe-mode".to_owned()));
+                assert!(side_args.contains(&"--strict-mcp-config".to_owned()));
+                assert!(side_args.contains(&"--no-chrome".to_owned()));
+                assert!(side_args.contains(&"--tools".to_owned()));
+                assert!(side_args.contains(&"Read,Glob,Grep".to_owned()));
+            }
         }
+        config.permission_mode = Some("inherit".into());
+        assert!(
+            super::AgentAdapter::command(
+                &mut super::Claude::default(),
+                "claude",
+                "/tmp",
+                None,
+                &config
+            )
+            .is_err()
+        );
+        let mut side_inherit = super::Claude::default();
+        super::AgentAdapter::set_side_parent(
+            &mut side_inherit,
+            "11111111-1111-4111-8111-111111111111".into(),
+        )
+        .unwrap();
+        let side_launch =
+            super::AgentAdapter::command(&mut side_inherit, "claude", "/tmp", None, &config)
+                .unwrap();
+        let side_args: Vec<_> = side_launch
+            .command
+            .as_std()
+            .get_args()
+            .map(|v| v.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !side_args.iter().any(|a| a.starts_with("--permission-mode=")
+                || a == "--safe-mode"
+                || a == "--strict-mcp-config"
+                || a == "--no-chrome"
+                || a == "--tools")
+        );
     }
 
     #[test]
