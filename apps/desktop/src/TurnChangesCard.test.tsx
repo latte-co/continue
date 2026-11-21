@@ -547,3 +547,28 @@ it("offers jumping to the side chat and flags confirmation when undo is blocked 
   expect(readWorkspace("ws-undo").current).toBe("sideChat:side-42");
   clearSideWriteConfirmation("local", "side-42");
 });
+
+it("delegates blocking side-chat navigation to the owning session handler instead of the current workspace", async () => {
+  const { clearSideWriteConfirmation } = await import("./sideWritePrompts");
+  const openBlockingSideChat = vi.fn().mockResolvedValue(undefined);
+  mocks.request.mockRejectedValueOnce(
+    new Error(
+      "具备写权限的侧边聊天（side-cross）的写入结束时间待确认；请先核对后台进程并确认写入已结束",
+    ),
+  );
+  render(
+    <TurnChangesCard
+      {...props}
+      workspaceId="ws-project-b"
+      openBlockingSideChat={openBlockingSideChat}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "撤销" }));
+  fireEvent.click(await screen.findByRole("button", { name: /^状态提示（/ }));
+  fireEvent.click(screen.getByRole("button", { name: "核对侧边聊天" }));
+  await waitFor(() =>
+    expect(openBlockingSideChat).toHaveBeenCalledWith("side-cross"),
+  );
+  expect(readWorkspace("ws-project-b").tabs).toEqual([]);
+  clearSideWriteConfirmation("local", "side-cross");
+});

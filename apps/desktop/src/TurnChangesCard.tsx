@@ -19,6 +19,7 @@ import { openSideChatTab } from "./workspaceState";
 export function TurnChangesCard({
   changes: saved,
   open,
+  openBlockingSideChat,
   hostId,
   sessionId,
   workspaceId,
@@ -28,11 +29,13 @@ export function TurnChangesCard({
   hostId: string;
   sessionId: string;
   workspaceId?: string;
+  openBlockingSideChat?: (sideId: string) => void | Promise<void>;
   canUndo: boolean;
   open: (path?: string) => void;
 }) {
   const [changes, setChanges] = useState(saved);
   const [busy, setBusy] = useState(false);
+  const [navigatingSide, setNavigatingSide] = useState(false);
   const [error, setError] = useState("");
   const [expandedFor, setExpandedFor] = useState<string | null>(null);
   const filesId = useId();
@@ -74,17 +77,32 @@ export function TurnChangesCard({
     setPageBusy(null);
   }, [scope]);
   const pendingSideId = parsePendingSideWriteSessionId(error);
+  async function inspectBlockingSideChat(sideId: string) {
+    if (navigatingSide) return;
+    if (!openBlockingSideChat) {
+      if (workspaceId) openSideChatTab(workspaceId, sideId, false);
+      return;
+    }
+    setNavigatingSide(true);
+    try {
+      await openBlockingSideChat(sideId);
+    } catch (cause) {
+      if (mounted.current) setError(message(cause));
+    } finally {
+      if (mounted.current) setNavigatingSide(false);
+    }
+  }
   useStatusIssues([
     {
       id: `turn-undo:${hostId}:${sessionId}:${saved.request_id}`,
       title: "撤销本轮修改未完成",
       error: changes.undo === "reverted" ? "" : error,
-      pending: busy,
+      pending: busy || navigatingSide,
       action:
-        pendingSideId && workspaceId
+        pendingSideId && (openBlockingSideChat || workspaceId)
           ? {
               label: "核对侧边聊天",
-              run: () => openSideChatTab(workspaceId, pendingSideId, false),
+              run: () => void inspectBlockingSideChat(pendingSideId),
             }
           : { label: "查看变更", run: () => open() },
     },

@@ -52,6 +52,10 @@ export type Session = {
   unread: boolean;
   archived: boolean;
   /**
+   * Parent session ID when this session is a side chat; live server projection only.
+   */
+  parent_session_id?: string;
+  /**
    * Live server projection only; absent on older servers and in durable history.
    */
   agent_session_open?: boolean;

@@ -766,15 +766,18 @@ async fn check_side_write_undo(background: bool, main_in_subdir: Option<bool>) {
         side_dir.join("shared.txt")
     };
     std::fs::write(&file, "before\n").unwrap();
-    let parent = create_session(&mut client, side_project, "codex").await;
+    let parent = create_session(&mut client, side_project.clone(), "codex").await;
+    assert_eq!(parent.parent_session_id, None);
     send(&mut client, &parent.id, "parent-init", "hello").await;
     wait(&mut client, &parent.id, Status::Completed).await;
     let side = open_side(&mut client, &parent).await;
+    assert_eq!(side.parent_session_id.as_deref(), Some(parent.id.as_str()));
     if background {
         start_writable_side(&mut client, &side, "side-background-write").await;
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "before\n");
     }
     let main = create_session(&mut client, main_project, "codex").await;
+    assert_eq!(main.parent_session_id, None);
     send(&mut client, &main.id, "main-write", "approval").await;
     let pending = permission(&wait(&mut client, &main.id, Status::Waiting).await);
     if background {
@@ -828,6 +831,28 @@ async fn check_side_write_undo(background: bool, main_in_subdir: Option<bool>) {
     assert!(matches!(ask(&mut client, Request::UndoTurnChanges {
         session_id: main.id.clone(), request_id: "main-write".into(),
     }).await, Response::Error { message, .. } if message.contains("具备写权限的侧边聊天")));
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::Session {
+                session_id: side.id.clone(),
+            }
+        )
+        .await,
+        Response::Session { session }
+            if session.project_id == side_project
+                && session.parent_session_id.as_deref() == Some(parent.id.as_str())
+    ));
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::Session {
+                session_id: parent.id.clone(),
+            }
+        )
+        .await,
+        Response::Session { session } if session.parent_session_id.is_none()
+    ));
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "side edit\n");
 
     if background {
@@ -870,6 +895,156 @@ async fn undo_preserves_background_side_writes_after_native_exit() {
 async fn undo_fences_writable_side_chats_in_both_directions_of_nested_roots() {
     check_side_write_undo(false, Some(false)).await;
     check_side_write_undo(false, Some(true)).await;
+}
+
+#[tokio::test]
+async fn cross_project_unconfirmed_side_writes_expose_owning_parent_for_confirmation() {
+    let host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let project_a_dir = root.path().join("project-a");
+    let project_b_dir = root.path().join("project-b");
+    std::fs::create_dir(&project_a_dir).unwrap();
+    std::fs::create_dir(&project_b_dir).unwrap();
+    let file_b = project_b_dir.join("shared.txt");
+    std::fs::write(&file_b, "before\n").unwrap();
+
+    let mut client = host.client().await;
+    let project_a = terminal_project(&mut client, &project_a_dir).await;
+    let parent_a = create_session(&mut client, project_a.clone(), "codex").await;
+    send(&mut client, &parent_a.id, "parent-a-init", "hello").await;
+    wait(&mut client, &parent_a.id, Status::Completed).await;
+    let side_a = open_side(&mut client, &parent_a).await;
+    assert_eq!(
+        side_a.parent_session_id.as_deref(),
+        Some(parent_a.id.as_str())
+    );
+
+    // Project A's side chat exits with an unconfirmed background write interval.
+    start_writable_side(&mut client, &side_a, "side-background-write").await;
+    std::fs::write(project_a_dir.join("release-side-writer"), "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if matches!(
+            ask(
+                &mut client,
+                Request::CloseAgentSession {
+                    session_id: side_a.id.clone(),
+                    only_if_idle: Some(true),
+                }
+            )
+            .await,
+            Response::SideChatClosed
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "project A background writer never became idle"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Project B runs a foreground write and tries to undo while Project A's side write is unconfirmed.
+    let project_b = terminal_project(&mut client, &project_b_dir).await;
+    let main_b = create_session(&mut client, project_b.clone(), "codex").await;
+    send(
+        &mut client,
+        &main_b.id,
+        "main-b-first",
+        "main-foreground-write",
+    )
+    .await;
+    wait(&mut client, &main_b.id, Status::Completed).await;
+    assert_eq!(std::fs::read_to_string(&file_b).unwrap(), "main edit\n");
+
+    let blocked = ask(
+        &mut client,
+        Request::UndoTurnChanges {
+            session_id: main_b.id.clone(),
+            request_id: "main-b-first".into(),
+        },
+    )
+    .await;
+    let expected_tag = format!("具备写权限的侧边聊天（{}）", side_a.id);
+    assert!(
+        matches!(&blocked, Response::Error { message, .. } if message.contains(&expected_tag)),
+        "{blocked:?}"
+    );
+
+    // Navigating from Project B's error resolves Project A's side chat and owning parent session.
+    let side_lookup = ask(
+        &mut client,
+        Request::Session {
+            session_id: side_a.id.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            &side_lookup,
+            Response::Session { session }
+                if session.project_id == project_a
+                    && session.parent_session_id.as_deref() == Some(parent_a.id.as_str())
+                    && session.side_write_pending.as_deref() == Some("side-write")
+        ),
+        "{side_lookup:?}"
+    );
+    let side_poll = ask(
+        &mut client,
+        Request::Poll {
+            session_id: side_a.id.clone(),
+            after: 0.0,
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            &side_poll,
+            Response::Events { session, .. }
+                if session.project_id == project_a
+                    && session.parent_session_id.as_deref() == Some(parent_a.id.as_str())
+        ),
+        "{side_poll:?}"
+    );
+
+    // Confirming Project A's side writes clears the host-wide fence for subsequent turns in Project B.
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::ConfirmSideWritesEnded {
+                session_id: side_a.id,
+                request_id: "side-write".into(),
+            }
+        )
+        .await,
+        Response::Session { session } if session.side_write_pending.is_none()
+    ));
+    std::fs::write(&file_b, "clean\n").unwrap();
+    send(
+        &mut client,
+        &main_b.id,
+        "main-b-after",
+        "main-foreground-write",
+    )
+    .await;
+    wait(&mut client, &main_b.id, Status::Completed).await;
+    assert_eq!(std::fs::read_to_string(&file_b).unwrap(), "main edit\n");
+    let reverted = ask(
+        &mut client,
+        Request::UndoTurnChanges {
+            session_id: main_b.id,
+            request_id: "main-b-after".into(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            reverted,
+            Response::TurnChanges { ref changes } if changes.undo == TurnUndoStatus::Reverted
+        ),
+        "{reverted:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&file_b).unwrap(), "clean\n");
 }
 
 #[tokio::test]

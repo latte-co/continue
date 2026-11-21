@@ -245,7 +245,9 @@ export function SideChat({
           page.kind !== "events" ||
           page.session.id !== sideId ||
           page.session.id === parent.id ||
-          page.session.project_id !== parent.project_id
+          page.session.project_id !== parent.project_id ||
+          (page.session.parent_session_id !== undefined &&
+            page.session.parent_session_id !== parent.id)
         )
           throw new Error("侧边聊天记录不匹配");
         if (page.has_more && !page.events.length)

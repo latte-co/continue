@@ -569,6 +569,7 @@ impl Store {
             pinned_at: None,
             unread: false,
             archived: false,
+            parent_session_id: None,
             agent_session_open: None,
             agent_session_busy: None,
             side_write_pending: None,
@@ -1654,6 +1655,9 @@ impl Store {
         self.session(session_id)
     }
     pub fn project_session_recovery(&self, session: &mut Session) -> Result<()> {
+        session.parent_session_id = self
+            .side_parent(&session.id)?
+            .map(|(parent_id, _)| parent_id);
         session.side_write_pending = self.pending_side_write(&session.id)?;
         session.agent_close_pending = self
             .db

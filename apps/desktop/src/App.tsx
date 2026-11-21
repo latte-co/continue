@@ -357,6 +357,11 @@ export default function App() {
             }
             openSubagents={showSubagents}
             openSideChat={canOpenSide ? showSide : undefined}
+            openBlockingSideChat={
+              workbench.openSideChatSession
+                ? (sideId) => workbench.openSideChatSession(hostId, sideId)
+                : undefined
+            }
             quoteInSideChat={
               canOpenSide ? (text) => void showSide(text, true) : undefined
             }

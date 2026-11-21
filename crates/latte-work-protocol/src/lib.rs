@@ -72,6 +72,10 @@ pub struct Session {
     pub unread: bool,
     #[serde(default)]
     pub archived: bool,
+    /// Parent session ID when this session is a side chat; live server projection only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub parent_session_id: Option<String>,
     /// Live server projection only; absent on older servers and in durable history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

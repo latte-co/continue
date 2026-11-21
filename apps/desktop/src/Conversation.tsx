@@ -64,6 +64,7 @@ interface Props {
   composerPrediction?: ComposerPredictionResponse | null;
   captureQueuedPredictionRetirement?: (requestId: string) => () => void;
   openSideChat?: (draft?: string) => boolean | Promise<boolean>;
+  openBlockingSideChat?: (sideId: string) => void | Promise<void>;
   quoteInSideChat?: (text: string) => void;
   openSubagents?: () => void;
   openTurnChanges?: (changes: TurnChanges, path?: string) => void;
@@ -120,6 +121,7 @@ export function Conversation({
   captureQueuedPredictionRetirement,
   openSubagents,
   openSideChat,
+  openBlockingSideChat,
   quoteInSideChat,
   openTurnChanges,
   openFile,
@@ -829,6 +831,7 @@ export function Conversation({
                                 hostId={hostId}
                                 sessionId={session?.id ?? ""}
                                 workspaceId={conversationKey}
+                                openBlockingSideChat={openBlockingSideChat}
                                 canUndo={
                                   connected &&
                                   !!session &&
