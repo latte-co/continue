@@ -1218,6 +1218,7 @@ export function useWorkbench() {
         updateProjects(targetHostId, projectsResponse.projects);
     }
     if (navigationRevision.current !== revision) return;
+    if (modal) setModal(null);
     requestSideWriteConfirmation(targetHostId, sideId);
     openSideChatTab(workspaceKey(parent.id), sideId, false);
     openSession({ ...parent, hostId: targetHostId });
