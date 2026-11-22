@@ -23,6 +23,27 @@ export interface ModelPickerHandle {
 
 type Catalog = Extract<Response, { kind: "models" }>;
 const effortContextChanged = "模型设置已变化，请重新打开思考强度菜单。";
+const MAX_SETTLED_SCOPES = 64;
+
+function updateSettledModels(
+  current: Record<string, string>,
+  scope: string,
+  model: string | null,
+): Record<string, string> {
+  if (!model) {
+    if (!(scope in current)) return current;
+    const { [scope]: _, ...rest } = current;
+    return rest;
+  }
+  if (current[scope] === model) return current;
+  const entries = Object.entries(current).filter(([key]) => key !== scope);
+  const trimmed =
+    entries.length >= MAX_SETTLED_SCOPES
+      ? entries.slice(entries.length - MAX_SETTLED_SCOPES + 1)
+      : entries;
+  return Object.fromEntries([...trimmed, [scope, model]]);
+}
+
 export function ModelPicker({
   hostId,
   projectId,
@@ -68,16 +89,10 @@ export function ModelPicker({
     model: string | null;
     catalog: Catalog;
   }>();
-  const [settledSelection, setSettledSelection] = useState<{
-    scope: string;
-    model: string;
-  } | null>(null);
-  const settled =
-    settledSelection?.scope === conversationScope &&
-    settledSelection.model === value;
-  if (settledSelection && !settled) {
-    setSettledSelection(null);
-  }
+  const [settledModels, setSettledModels] = useState<Record<string, string>>(
+    {},
+  );
+  const settled = Boolean(value && settledModels[conversationScope] === value);
   const cached =
     loaded?.scope === scope && loaded.configVersion === configVersion
       ? loaded
@@ -131,10 +146,8 @@ export function ModelPicker({
         if (!disposed) {
           setCatalog({ scope, configVersion, model: value, catalog: result });
           if (value && result.models.includes(value)) {
-            setSettledSelection((current) =>
-              current?.scope === conversationScope && current.model === value
-                ? current
-                : { scope: conversationScope, model: value },
+            setSettledModels((current) =>
+              updateSettledModels(current, conversationScope, value),
             );
           }
         }
@@ -323,8 +336,8 @@ export function ModelPicker({
         options={groupedOptions}
         onChange={(id) => {
           const next = id || null;
-          setSettledSelection(
-            next ? { scope: conversationScope, model: next } : null,
+          setSettledModels((current) =>
+            updateSettledModels(current, conversationScope, next),
           );
           onChange(next);
         }}

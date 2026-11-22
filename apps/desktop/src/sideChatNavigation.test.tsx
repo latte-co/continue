@@ -10,7 +10,10 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import App from "./App";
 import { ServerRequestError } from "./api";
 import type { Event, Request, Response, Session } from "./protocol";
-import { resolveSideChatParentSession } from "./sideChatNavigation";
+import {
+  resolveSideChatNavigation,
+  resolveSideChatParentSession,
+} from "./sideChatNavigation";
 import { clearSideWriteConfirmation } from "./sideWritePrompts";
 import { openSideChatTab, readWorkspace } from "./workspaceState";
 
@@ -110,6 +113,7 @@ beforeEach(() => {
 
 afterEach(() => {
   clearSideWriteConfirmation("local", "side-a");
+  clearSideWriteConfirmation("local", "side-archived-501");
   cleanup();
 });
 
@@ -647,3 +651,422 @@ it("clears a stale draft flag when opening a persisted side-chat tab", () => {
     { id: "sideChat:side-persisted", kind: "sideChat", draft: false },
   ]);
 });
+
+it("falls back to standalone side-chat recovery when a legacy parent session is archived, closed, and beyond the 500-session cap", async () => {
+  const newerMains = Array.from({ length: 500 }, (_, index) =>
+    makeSession({
+      id: `main-cap-${index + 1}`,
+      project_id: "proj-a",
+    }),
+  );
+  const legacySide = makeSession({
+    id: "side-archived-501",
+    project_id: "proj-a",
+    side_write_pending: "side-turn-archived",
+  });
+
+  mocks.request.mockImplementation(
+    async (_hostId: string, req: Request): Promise<Response> => {
+      if (req.method === "session" && req.session_id === "side-archived-501")
+        return { kind: "session", session: legacySide };
+      if (req.method === "sessions" && req.project_id === "proj-a")
+        return { kind: "sessions", sessions: newerMains };
+      if (req.method === "recent_sessions")
+        return { kind: "recent_sessions", sessions: [], next: null };
+      if (
+        req.method === "project_agent_sessions" &&
+        req.project_id === "proj-a"
+      )
+        return { kind: "project_agent_sessions", sessions: [], next: null };
+      if (req.method === "side_chat_history")
+        return { kind: "side_chat_history", sessions: [], next: null };
+      throw new Error(`unexpected request: ${JSON.stringify(req)}`);
+    },
+  );
+
+  await expect(
+    resolveSideChatNavigation("remote", "side-archived-501"),
+  ).resolves.toEqual({
+    kind: "standalone",
+    side: legacySide,
+  });
+});
+
+it("rejects main sessions during legacy side-chat resolution instead of misrouting to standalone recovery", async () => {
+  const mainTarget = makeSession({
+    id: "main-not-side",
+    project_id: "proj-a",
+  });
+
+  mocks.request.mockImplementation(
+    async (_hostId: string, req: Request): Promise<Response> => {
+      if (req.method === "session" && req.session_id === "main-not-side")
+        return { kind: "session", session: mainTarget };
+      if (req.method === "sessions" && req.project_id === "proj-a")
+        return { kind: "sessions", sessions: [mainTarget] };
+      throw new Error(`unexpected request: ${JSON.stringify(req)}`);
+    },
+  );
+
+  await expect(
+    resolveSideChatNavigation("remote", "main-not-side"),
+  ).rejects.toThrow("侧边聊天记录不匹配");
+
+  // Even if an archived, closed main session is beyond the 500-session cap,
+  // owning child side chats proves it is a parent session rather than a side chat.
+  const archivedParent = makeSession({
+    id: "archived-parent-501",
+    project_id: "proj-a",
+    archived: true,
+  });
+  const childSide = makeSession({
+    id: "child-of-501",
+    project_id: "proj-a",
+  });
+  mocks.request.mockImplementation(
+    async (_hostId: string, req: Request): Promise<Response> => {
+      if (req.method === "session" && req.session_id === "archived-parent-501")
+        return { kind: "session", session: archivedParent };
+      if (req.method === "sessions" && req.project_id === "proj-a")
+        return { kind: "sessions", sessions: [] };
+      if (req.method === "recent_sessions")
+        return { kind: "recent_sessions", sessions: [], next: null };
+      if (req.method === "project_agent_sessions")
+        return { kind: "project_agent_sessions", sessions: [], next: null };
+      if (
+        req.method === "side_chat_history" &&
+        req.session_id === "archived-parent-501"
+      )
+        return {
+          kind: "side_chat_history",
+          sessions: [childSide],
+          next: null,
+        };
+      throw new Error(`unexpected request: ${JSON.stringify(req)}`);
+    },
+  );
+
+  await expect(
+    resolveSideChatNavigation("remote", "archived-parent-501"),
+  ).rejects.toThrow("侧边聊天记录不匹配");
+});
+
+it("reconciles a blocking legacy side chat via standalone recovery dialog when its archived closed parent is beyond the 500-session cap", async () => {
+  let pendingClose: string | undefined = "close-archived-1";
+  let pendingWrite: string | undefined = "side-turn-archived";
+  let sideOpen = true;
+  const newerMains = Array.from({ length: 500 }, (_, index) =>
+    makeSession({
+      id: `main-cap-e2e-${index + 1}`,
+      project_id: "proj-a",
+    }),
+  );
+  const legacySide = (): Session =>
+    makeSession({
+      id: "side-archived-501",
+      project_id: "proj-a",
+      title: "归档老父会话侧聊",
+      agent: "codex",
+      agent_session_open: sideOpen,
+      agent_close_pending: pendingClose,
+      side_write_pending: pendingWrite,
+    });
+  const mainB = (): Session =>
+    makeSession({
+      id: "main-b",
+      project_id: "proj-b",
+      title: "项目 B 主对话",
+      agent: "opencode",
+      agent_session_open: true,
+    });
+  const projectBChanges = {
+    request_id: "req-b",
+    undo: "ready" as const,
+    interrupted: false,
+    background_pending: false,
+    summary: {
+      baseline_at: 1,
+      added: 2,
+      removed: 0,
+      binary_files: 0,
+      truncated: false,
+      unavailable: null,
+      entries: [{ path: "b.txt", status: "M" as const, added: 2, removed: 0 }],
+    },
+  };
+  const projectBEvents: Event[] = [
+    {
+      seq: 1,
+      session_id: "main-b",
+      at: 1,
+      event: { kind: "user", text: "修改文件", request_id: "req-b" },
+    },
+    {
+      seq: 2,
+      session_id: "main-b",
+      at: 2,
+      event: { kind: "turn_changes", changes: projectBChanges },
+    },
+  ];
+  const sideEvents: Event[] = [
+    {
+      seq: 1,
+      session_id: "side-archived-501",
+      at: 1,
+      event: {
+        kind: "user",
+        text: "后台写入检查",
+        request_id: "side-turn-archived",
+      },
+    },
+    {
+      seq: 2,
+      session_id: "side-archived-501",
+      at: 2,
+      event: { kind: "text", text: "归档主会话侧聊输出完成" },
+    },
+  ];
+
+  mocks.request.mockImplementation(
+    async (_hostId: string, req: Request): Promise<Response> => {
+      switch (req.method) {
+        case "projects":
+          return {
+            kind: "projects",
+            projects: [
+              { id: "proj-b", name: "Project B", path: "/repo/b" },
+              { id: "proj-a", name: "Project A", path: "/repo/a" },
+            ],
+          };
+        case "pinned_sessions":
+          return { kind: "sessions", sessions: [] };
+        case "recent_sessions":
+          return {
+            kind: "recent_sessions",
+            sessions: [{ session: mainB(), updated_at: 20 }],
+            next: null,
+          };
+        case "project_agent_sessions":
+          return {
+            kind: "project_agent_sessions",
+            sessions: req.project_id === "proj-b" ? [mainB()] : [legacySide()],
+            next: null,
+          };
+        case "sessions":
+          return {
+            kind: "sessions",
+            sessions: req.project_id === "proj-b" ? [mainB()] : newerMains,
+          };
+        case "session":
+          if (req.session_id === "side-archived-501")
+            return { kind: "session", session: legacySide() };
+          if (req.session_id === "main-b")
+            return { kind: "session", session: mainB() };
+          throw new ServerRequestError("request_failed", "会话不存在");
+        case "history":
+          if (req.session_id === "main-b")
+            return {
+              kind: "history",
+              session: mainB(),
+              events: req.before == null ? projectBEvents : [],
+              has_more: false,
+              needs_earlier: false,
+              before: null,
+            };
+          if (req.session_id === "side-archived-501")
+            return {
+              kind: "history",
+              session: legacySide(),
+              events: req.before == null ? sideEvents : [],
+              has_more: false,
+              needs_earlier: false,
+              before: null,
+            };
+          throw new ServerRequestError("request_failed", "会话不存在");
+        case "side_chat_history":
+          return { kind: "side_chat_history", sessions: [], next: null };
+        case "subagents":
+          return { kind: "subagents", tasks: [], truncated: false };
+        case "skills":
+          return {
+            kind: "skills",
+            skills: [],
+            warnings: [],
+            truncated: false,
+          };
+        case "sources":
+          return { kind: "sources", entries: [], truncated: false };
+        case "message_queue":
+          return {
+            kind: "message_queue",
+            entries: [],
+            paused: false,
+            reason: null,
+          };
+        case "agent_commands":
+          return { kind: "agent_commands", commands: [] };
+        case "terminals":
+          return { kind: "terminals", terminals: [] };
+        case "models":
+          return {
+            kind: "models",
+            models: [],
+            provider: null,
+            default_model: null,
+            effort_levels: [],
+            model_labels: {},
+          };
+        case "agent_permissions":
+          return { kind: "agent_permissions", modes: [] };
+        case "git_info":
+          return {
+            kind: "git_info",
+            info: {
+              branch: "main",
+              head: null,
+              default_base: "main",
+              refs: [],
+              truncated: false,
+            },
+          };
+        case "open_agent_session":
+          return { kind: "ok" };
+        case "close_agent_session":
+          if (req.session_id === "side-archived-501") {
+            sideOpen = false;
+            return { kind: "side_chat_closed" };
+          }
+          return { kind: "ok" };
+        case "poll":
+          if (req.session_id === "main-b") {
+            const slice = projectBEvents.filter((e) => e.seq > req.after);
+            return {
+              kind: "events",
+              session: mainB(),
+              events: slice,
+              has_more: false,
+            };
+          }
+          if (req.session_id === "side-archived-501") {
+            const slice = sideEvents.filter((e) => e.seq > req.after);
+            return {
+              kind: "events",
+              session: legacySide(),
+              events: slice,
+              has_more: false,
+            };
+          }
+          throw new Error(`unexpected poll: ${req.session_id}`);
+        case "undo_turn_changes":
+          if (pendingClose || pendingWrite) {
+            throw new ServerRequestError(
+              "request_failed",
+              "具备写权限的侧边聊天（side-archived-501）的写入结束时间待确认，请打开该侧边聊天核对后再撤销修改",
+            );
+          }
+          return {
+            kind: "turn_changes",
+            changes: { ...projectBChanges, undo: "reverted" },
+          };
+        case "confirm_agent_closed":
+          expect(req.session_id).toBe("side-archived-501");
+          expect(req.close_id).toBe("close-archived-1");
+          expect(sideOpen).toBe(false);
+          pendingClose = undefined;
+          return { kind: "session", session: legacySide() };
+        case "confirm_side_writes_ended":
+          expect(req.session_id).toBe("side-archived-501");
+          expect(req.request_id).toBe("side-turn-archived");
+          pendingWrite = undefined;
+          return { kind: "session", session: legacySide() };
+        default:
+          throw new Error(`unexpected request: ${JSON.stringify(req)}`);
+      }
+    },
+  );
+
+  render(<App />);
+
+  fireEvent.click(await screen.findByText("项目 B 主对话", {}, UI_TIMEOUT));
+  fireEvent.click(
+    await screen.findByRole("button", { name: "撤销" }, UI_TIMEOUT),
+  );
+
+  const statusTrigger = await screen.findByRole(
+    "button",
+    { name: /^状态提示（/ },
+    UI_TIMEOUT,
+  );
+  fireEvent.click(statusTrigger);
+  fireEvent.click(
+    await screen.findByRole("button", { name: "核对侧边聊天" }, UI_TIMEOUT),
+  );
+
+  const dialog = await screen.findByRole(
+    "dialog",
+    { name: /核对侧边聊天/ },
+    UI_TIMEOUT,
+  );
+  expect(dialog.textContent).toContain(
+    "旧版 Server 未返回该侧边聊天所属的主会话",
+  );
+  await waitFor(() => {
+    expect(dialog.textContent).toContain("归档主会话侧聊输出完成");
+  }, UI_TIMEOUT);
+  expect(readWorkspace("main-b").tabs).toEqual([]);
+
+  // Close the managed native agent session before confirming agent_close_pending.
+  fireEvent.click(
+    await screen.findByRole("button", { name: "关闭原生会话" }, UI_TIMEOUT),
+  );
+  const confirmCloseBtn = await screen.findByRole<HTMLButtonElement>(
+    "button",
+    { name: "核对原生会话关闭" },
+    UI_TIMEOUT,
+  );
+  await waitFor(() => expect(confirmCloseBtn.disabled).toBe(false), UI_TIMEOUT);
+  fireEvent.click(confirmCloseBtn);
+  fireEvent.click(
+    await screen.findByRole(
+      "button",
+      { name: "我已核对，确认结束" },
+      UI_TIMEOUT,
+    ),
+  );
+
+  // Then confirm side_write_pending.
+  const confirmWriteBtn = await screen.findByRole<HTMLButtonElement>(
+    "button",
+    { name: "核对后台写入已结束" },
+    UI_TIMEOUT,
+  );
+  await waitFor(() => expect(confirmWriteBtn.disabled).toBe(false), UI_TIMEOUT);
+  fireEvent.click(confirmWriteBtn);
+  fireEvent.click(
+    await screen.findByRole(
+      "button",
+      { name: "我已核对，确认结束" },
+      UI_TIMEOUT,
+    ),
+  );
+
+  await screen.findByText(
+    "后台写入已确认结束，关闭此窗口后可继续原操作。",
+    {},
+    UI_TIMEOUT,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "完成" }));
+  await waitFor(
+    () =>
+      expect(screen.queryByRole("dialog", { name: /核对侧边聊天/ })).toBeNull(),
+    UI_TIMEOUT,
+  );
+
+  // Still on Project B's conversation — retrying undo now succeeds!
+  fireEvent.click(
+    await screen.findByRole("button", { name: "撤销" }, UI_TIMEOUT),
+  );
+  expect(
+    await screen.findByRole("button", { name: "已撤销" }, UI_TIMEOUT),
+  ).toBeTruthy();
+}, 15_000);

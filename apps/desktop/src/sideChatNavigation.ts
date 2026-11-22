@@ -45,11 +45,43 @@ async function ownsSideChat(
   }
 }
 
-/** Resolves the owning parent session of a side chat across projects and server versions. */
-export async function resolveSideChatParentSession(
+async function hasChildSideChats(
+  hostId: string,
+  sessionId: string,
+): Promise<boolean> {
+  try {
+    const page = await request(hostId, {
+      method: "side_chat_history",
+      session_id: sessionId,
+      before: null,
+    });
+    return page.kind === "side_chat_history" && page.sessions.length > 0;
+  } catch (cause) {
+    if (cause instanceof ServerRequestError && cause.code === "unsupported") {
+      const legacy = await request(hostId, {
+        method: "side_chats",
+        session_id: sessionId,
+      });
+      return legacy.kind === "sessions" && legacy.sessions.length > 0;
+    }
+    throw cause;
+  }
+}
+
+export type SideChatNavigation =
+  | { kind: "parent"; parent: Session; side: Session }
+  | { kind: "standalone"; side: Session };
+
+/**
+ * Resolves a side-chat navigation target across projects and server versions.
+ * When a legacy server omits `parent_session_id` and the owning parent session
+ * is archived, closed, and older than the 500-session project cap, falls back
+ * to a parent-independent standalone recovery target for `side`.
+ */
+export async function resolveSideChatNavigation(
   hostId: string,
   sideId: string,
-): Promise<Session> {
+): Promise<SideChatNavigation> {
   const sideResponse = await request(hostId, {
     method: "session",
     session_id: sideId,
@@ -69,7 +101,7 @@ export async function resolveSideChatParentSession(
       parentResponse.session.project_id !== side.project_id
     )
       throw new Error("侧边聊天记录不匹配");
-    return parentResponse.session;
+    return { kind: "parent", parent: parentResponse.session, side };
   }
   const checked = new Set<string>([sideId]);
   const sessionsResponse = await request(hostId, {
@@ -78,10 +110,14 @@ export async function resolveSideChatParentSession(
   });
   if (sessionsResponse.kind !== "sessions")
     throw new Error("无法读取侧边聊天所属项目的会话列表");
+  // `sessions` excludes side_chats in SQLite; matching `sideId` proves it is a main session.
+  if (sessionsResponse.sessions.some((item) => item.id === sideId))
+    throw new Error("侧边聊天记录不匹配");
   for (const candidate of sessionsResponse.sessions) {
     if (candidate.parent_session_id || checked.has(candidate.id)) continue;
     checked.add(candidate.id);
-    if (await ownsSideChat(hostId, candidate.id, sideId)) return candidate;
+    if (await ownsSideChat(hostId, candidate.id, sideId))
+      return { kind: "parent", parent: candidate, side };
   }
   const seenRecentCursors = new Set<string>();
   let before: RecentCursor | null = null;
@@ -95,6 +131,9 @@ export async function resolveSideChatParentSession(
       throw cause;
     }
     if (page.kind !== "recent_sessions") break;
+    // `recent_sessions` also excludes side_chats in SQLite.
+    if (page.sessions.some(({ session }) => session.id === sideId))
+      throw new Error("侧边聊天记录不匹配");
     for (const entry of page.sessions) {
       const candidate = entry.session;
       if (
@@ -104,7 +143,8 @@ export async function resolveSideChatParentSession(
       )
         continue;
       checked.add(candidate.id);
-      if (await ownsSideChat(hostId, candidate.id, sideId)) return candidate;
+      if (await ownsSideChat(hostId, candidate.id, sideId))
+        return { kind: "parent", parent: candidate, side };
     }
     if (!page.next || page.sessions.length === 0) break;
     const cursorKey = JSON.stringify([page.next.updated_at, page.next.id]);
@@ -131,7 +171,8 @@ export async function resolveSideChatParentSession(
     for (const candidate of page.sessions) {
       if (candidate.parent_session_id || checked.has(candidate.id)) continue;
       checked.add(candidate.id);
-      if (await ownsSideChat(hostId, candidate.id, sideId)) return candidate;
+      if (await ownsSideChat(hostId, candidate.id, sideId))
+        return { kind: "parent", parent: candidate, side };
     }
     if (
       !page.next ||
@@ -142,5 +183,17 @@ export async function resolveSideChatParentSession(
     seenAgentCursors.add(page.next);
     after = page.next;
   }
+  if (await hasChildSideChats(hostId, sideId))
+    throw new Error("侧边聊天记录不匹配");
+  return { kind: "standalone", side };
+}
+
+/** Resolves the owning parent session of a side chat across projects and server versions. */
+export async function resolveSideChatParentSession(
+  hostId: string,
+  sideId: string,
+): Promise<Session> {
+  const target = await resolveSideChatNavigation(hostId, sideId);
+  if (target.kind === "parent") return target.parent;
   throw new Error("未找到侧边聊天所属的主会话");
 }

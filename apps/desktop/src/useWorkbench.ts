@@ -11,7 +11,8 @@ import {
   useWorkspaceState,
   workspaceKey,
 } from "./workspaceState";
-import { resolveSideChatParentSession } from "./sideChatNavigation";
+import { resolveSideChatNavigation } from "./sideChatNavigation";
+import type { StandaloneSideChatTarget } from "./SideChatRecoveryDialog";
 import { requestSideWriteConfirmation } from "./sideWritePrompts";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -187,6 +188,8 @@ export function useWorkbench() {
     return result;
   }
   const [hostId, setHostId] = useState("local");
+  const [standaloneSideChat, setStandaloneSideChat] =
+    useState<StandaloneSideChatTarget | null>(null);
   const [retry, setRetry] = useState(0);
   const lastConnectionRetry = useRef(retry);
   const hostHellos = useRef(
@@ -1163,6 +1166,7 @@ export function useWorkbench() {
   }
   function openSession(target: HostedSession) {
     if (modal === "skills") setModal(null);
+    setStandaloneSideChat(null);
     const current = selection.current;
     const currentSessionId = selectedSessionId.current;
     if (target.hostId === current.hostId && target.id === currentSessionId) {
@@ -1205,10 +1209,10 @@ export function useWorkbench() {
     sideId: string,
   ): Promise<void> {
     const revision = navigationRevision.current;
-    const parent = await resolveSideChatParentSession(targetHostId, sideId);
+    const target = await resolveSideChatNavigation(targetHostId, sideId);
     if (
       !(catalogRef.current[targetHostId] ?? []).some(
-        (item) => item.id === parent.project_id,
+        (item) => item.id === target.side.project_id,
       )
     ) {
       const projectsResponse = await request(targetHostId, {
@@ -1220,8 +1224,17 @@ export function useWorkbench() {
     if (navigationRevision.current !== revision) return;
     if (modal) setModal(null);
     requestSideWriteConfirmation(targetHostId, sideId);
-    openSideChatTab(workspaceKey(parent.id), sideId, false);
-    openSession({ ...parent, hostId: targetHostId });
+    if (target.kind === "standalone") {
+      setStandaloneSideChat({
+        hostId: targetHostId,
+        sideId,
+        initialSession: target.side,
+      });
+      return;
+    }
+    setStandaloneSideChat(null);
+    openSideChatTab(workspaceKey(target.parent.id), sideId, false);
+    openSession({ ...target.parent, hostId: targetHostId });
   }
   async function loadEarlierHistory(): Promise<void> {
     const targetHost = hostId,
@@ -1301,6 +1314,7 @@ export function useWorkbench() {
     if (!hosts.some((h) => h.id === targetHostId))
       throw new Error("项目所在主机已移除");
     if (modal === "skills") setModal(null);
+    setStandaloneSideChat(null);
     pendingSession.current = null;
     draft.current = true;
     setDraftWorkspaceId(crypto.randomUUID());
@@ -1580,6 +1594,9 @@ export function useWorkbench() {
       return next;
     });
     if (projectHostId === id) setProjectHostId("local");
+    setStandaloneSideChat((current) =>
+      current?.hostId === id ? null : current,
+    );
     if (hostId === id) {
       activateHost("local");
       setProjectId("");
@@ -1830,6 +1847,8 @@ export function useWorkbench() {
     movePinnedSession,
     openSession,
     openSideChatSession,
+    standaloneSideChat,
+    closeStandaloneSideChat: () => setStandaloneSideChat(null),
     sessionAction,
     sessionId,
     workspaceId,

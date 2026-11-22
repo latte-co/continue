@@ -4267,6 +4267,35 @@ button[aria-checked="true"] .model-option-check {
 .pinned-session-list {
   min-height: 0;
 }
+
+.side-chat-recovery-modal {
+  width: min(680px, calc(100vw - 40px));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  overflow: hidden;
+}
+.side-chat-recovery-modal h2:not(:where(.markdown *)),
+.side-chat-recovery-modal p:not(:where(.markdown *)) {
+  margin: 0;
+}
+.side-chat-recovery-meta {
+  font-weight: 500;
+}
+.side-chat-recovery-transcript {
+  flex: 1;
+  min-height: 200px;
+  max-height: min(48dvh, 440px);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  background: var(--color-elevated);
+  padding: var(--space-3);
+}
+.side-chat-recovery-footer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
 .session-label {
   white-space: nowrap;
   min-width: 0;

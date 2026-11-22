@@ -817,3 +817,131 @@ it("re-applies transient Provider fallback across P1 -> P2 -> P1 draft switches 
     expect.objectContaining({ ready: false }),
   );
 });
+
+it("preserves a manually chosen and verified model across P1 -> P2 -> P1 draft switches after Provider removes it", async () => {
+  const { useAgentPreferences } = await import("./useAgentPreferences");
+  localStorage.clear();
+  let availableModels = ["model-a", "model-b"];
+  mocks.request.mockImplementation(async () => ({
+    kind: "models",
+    models: availableModels,
+    provider: "Team",
+    default_model: availableModels[0] ?? null,
+    effort_levels: [],
+    model_labels: {},
+  }));
+  const ready = vi.fn();
+  function DraftHarness({ projectId }: { projectId: string }) {
+    const preferences = useAgentPreferences(
+      "devbox",
+      "claude",
+      projectId,
+      undefined,
+      false,
+    );
+    return (
+      <ModelPicker
+        hostId="devbox"
+        projectId={projectId}
+        agent="claude"
+        conversationKey="draft"
+        connected
+        settingsOpen={false}
+        preserveUnavailableModel={false}
+        value={preferences.model}
+        onChange={preferences.chooseModel}
+        onProviderFallback={preferences.replaceUnsupportedModel}
+        effort={preferences.effort}
+        onEffortChange={preferences.chooseEffort}
+        onEffortInvalid={preferences.clearUnsupportedEffort}
+        disabled={false}
+        onReadyChange={ready}
+      />
+    );
+  }
+
+  // 1. Open draft in P1, manually select and verify model-a.
+  const view = render(<DraftHarness projectId="p1" />);
+  await act(async () => {});
+  await act(async () => {});
+  await act(async () => {
+    const lastCall = mocks.selector.mock.calls.at(-1)?.[0] as {
+      onChange: (value: string) => void;
+    };
+    lastCall.onChange("model-a");
+  });
+  await act(async () => {});
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  // 2. Provider removes model-a, keeping only model-b -> P1 shows model-a unavailable and blocks send.
+  availableModels = ["model-b"];
+  await act(async () => {
+    bumpModelConfigVersion();
+  });
+  await act(async () => {});
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      value: "model-a",
+      options: expect.arrayContaining([
+        expect.objectContaining({
+          value: "model-a",
+          label: "model-a (unavailable)",
+        }),
+      ]),
+    }),
+    undefined,
+  );
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+
+  // 3. Switch P1 -> P2 on the same draft -> P2 has never verified model-a, so it falls back to model-b.
+  view.rerender(<DraftHarness projectId="p2" />);
+  await act(async () => {});
+  await act(async () => {});
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({ value: "model-b" }),
+    undefined,
+  );
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  // 4. Switch P2 -> P1 on the same draft -> P1 restores model-a and must keep blocking send until user switches.
+  view.rerender(<DraftHarness projectId="p1" />);
+  await act(async () => {});
+  await act(async () => {});
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      value: "model-a",
+      options: expect.arrayContaining([
+        expect.objectContaining({
+          value: "model-a",
+          label: "model-a (unavailable)",
+        }),
+      ]),
+    }),
+    undefined,
+  );
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+
+  // Active user switch to model-b unblocks send.
+  await act(async () => {
+    const lastCall = mocks.selector.mock.calls.at(-1)?.[0] as {
+      onChange: (value: string) => void;
+    };
+    lastCall.onChange("model-b");
+  });
+  await act(async () => {});
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({ value: "model-b" }),
+    undefined,
+  );
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+});

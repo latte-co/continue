@@ -329,7 +329,11 @@ export function SideChat({
           session_id: sideId,
           close_id: closePending,
         },
-        () => clearSideWriteConfirmation(hostId, sideId),
+        () => {
+          if (!session?.side_write_pending) {
+            clearSideWriteConfirmation(hostId, sideId);
+          }
+        },
       );
       return;
     }
