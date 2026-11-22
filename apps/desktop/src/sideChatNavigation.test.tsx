@@ -1070,3 +1070,136 @@ it("reconciles a blocking legacy side chat via standalone recovery dialog when i
     await screen.findByRole("button", { name: "已撤销" }, UI_TIMEOUT),
   ).toBeTruthy();
 }, 15_000);
+
+it("renders post-approval tool execution failure details and full-output loader in standalone recovery dialog", async () => {
+  const { SideChatRecoveryDialog } = await import("./SideChatRecoveryDialog");
+  const sideSession = makeSession({
+    id: "side-approved-fail",
+    project_id: "proj-a",
+    title: "审批后失败的侧聊",
+    agent: "claude",
+    side_write_pending: "side-turn-fail",
+  });
+  const sideEvents: Event[] = [
+    {
+      seq: 1,
+      session_id: "side-approved-fail",
+      at: 1,
+      event: {
+        kind: "user",
+        text: "执行脚本",
+        request_id: "side-turn-fail",
+      },
+    },
+    {
+      seq: 2,
+      session_id: "side-approved-fail",
+      at: 2,
+      event: {
+        kind: "tool",
+        id: "tool-bash-1",
+        name: "Bash",
+        input: { command: "./deploy.sh", description: "运行部署检查" },
+      },
+    },
+    {
+      seq: 3,
+      session_id: "side-approved-fail",
+      at: 3,
+      event: {
+        kind: "approval",
+        request_id: "appr-bash-1",
+        tool_use_id: "tool-bash-1",
+        tool: "Bash",
+        input: { command: "./deploy.sh", description: "运行部署检查" },
+      },
+    },
+    {
+      seq: 4,
+      session_id: "side-approved-fail",
+      at: 4,
+      event: {
+        kind: "approval_resolved",
+        request_id: "appr-bash-1",
+        allow: true,
+      },
+    },
+    {
+      seq: 5,
+      session_id: "side-approved-fail",
+      at: 5,
+      content_size: 4096,
+      event: {
+        kind: "tool_result",
+        id: "tool-bash-1",
+        content: "deploy.sh: permission denied (preview)",
+        is_error: true,
+      },
+    },
+    {
+      seq: 6,
+      session_id: "side-approved-fail",
+      at: 6,
+      event: { kind: "state", status: "failed", message: "命令退出码非零" },
+    },
+  ];
+
+  mocks.request.mockImplementation(
+    async (_hostId: string, req: Request): Promise<Response> => {
+      if (req.method === "poll" && req.session_id === "side-approved-fail") {
+        return {
+          kind: "events",
+          session: sideSession,
+          events: sideEvents.filter((entry) => entry.seq > req.after),
+          has_more: false,
+        };
+      }
+      throw new Error(`unexpected request: ${JSON.stringify(req)}`);
+    },
+  );
+
+  const closeStandaloneSideChat = vi.fn();
+  render(
+    <SideChatRecoveryDialog
+      state={
+        {
+          hosts: [{ id: "remote", name: "Remote Box" }],
+          projects: [
+            {
+              id: "proj-a",
+              hostId: "remote",
+              name: "Project A",
+              path: "/repo/a",
+            },
+          ],
+          isHostConnected: () => true,
+          closeStandaloneSideChat,
+        } as unknown as Parameters<typeof SideChatRecoveryDialog>[0]["state"]
+      }
+      target={{
+        hostId: "remote",
+        sideId: "side-approved-fail",
+        initialSession: sideSession,
+      }}
+    />,
+  );
+
+  const dialog = await screen.findByRole(
+    "dialog",
+    { name: /核对侧边聊天/ },
+    UI_TIMEOUT,
+  );
+  await waitFor(() => {
+    expect(dialog.textContent).toContain("执行失败");
+  }, UI_TIMEOUT);
+  expect(dialog.textContent).not.toContain("已允许");
+  expect(dialog.textContent).toContain("错误输出");
+  expect(dialog.textContent).toContain(
+    "deploy.sh: permission denied (preview)",
+  );
+  expect(
+    screen.getByRole("button", {
+      name: "加载完整内容（已省略至预览，共 4 KB）",
+    }),
+  ).toBeTruthy();
+});

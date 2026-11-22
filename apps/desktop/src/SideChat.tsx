@@ -564,6 +564,8 @@ export function SideChat({
                     request={v}
                     resolved={item.resolved}
                     decision={item.decision}
+                    tool={item.approvalTool}
+                    loadContext={{ hostId, sessionId: session.id }}
                     disabled={disabled || !running}
                     busy={busy}
                     onDecision={(allow) =>

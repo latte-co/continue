@@ -227,3 +227,56 @@ it("remembers native permission ids per host/agent and restores session inherita
   );
   expect(inherited.result.current.permissionMode).toBeNull();
 });
+
+it("preserves transient fallback models per draft scope across project round-trips without overwriting localStorage", () => {
+  localStorage.setItem(
+    'latte-work.agent-selection.v1:["devbox","claude"]',
+    JSON.stringify({ model: "opus", effort: "high", permissionMode: null }),
+  );
+  const hook = renderHook(
+    ({ project, conversationKey }) =>
+      useAgentPreferences(
+        "devbox",
+        "claude",
+        project,
+        undefined,
+        false,
+        conversationKey,
+      ),
+    {
+      initialProps: { project: "p1", conversationKey: "draft-1" },
+    },
+  );
+  expect(hook.result.current.model).toBe("opus");
+  act(() => hook.result.current.replaceUnsupportedModel("real"));
+  expect(hook.result.current.model).toBe("real");
+
+  // Switching to an unvisited project P2 reads stored "opus" again.
+  hook.rerender({ project: "p2", conversationKey: "draft-1" });
+  expect(hook.result.current.model).toBe("opus");
+  act(() => hook.result.current.replaceUnsupportedModel("next-model"));
+  expect(hook.result.current.model).toBe("next-model");
+
+  // Returning to P1 on the same draft restores "real" while localStorage stays "opus".
+  hook.rerender({ project: "p1", conversationKey: "draft-1" });
+  expect(hook.result.current.model).toBe("real");
+  expect(hook.result.current.effort).toBe("high");
+  expect(
+    JSON.parse(
+      localStorage.getItem(
+        'latte-work.agent-selection.v1:["devbox","claude"]',
+      ) ?? "{}",
+    ).model,
+  ).toBe("opus");
+
+  // Rotating conversationKey for a new draft starts fresh from stored "opus".
+  hook.rerender({ project: "p1", conversationKey: "draft-2" });
+  expect(hook.result.current.model).toBe("opus");
+
+  // An explicit user choice clears stale transient overrides across projects.
+  hook.rerender({ project: "p2", conversationKey: "draft-1" });
+  expect(hook.result.current.model).toBe("next-model");
+  act(() => hook.result.current.chooseModel("chosen-model"));
+  hook.rerender({ project: "p1", conversationKey: "draft-1" });
+  expect(hook.result.current.model).toBe("chosen-model");
+});

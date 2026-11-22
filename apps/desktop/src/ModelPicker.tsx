@@ -197,9 +197,21 @@ export function ModelPicker({
         : (freshCatalog.models[0] ?? null)
       : undefined;
   useEffect(() => {
-    if (providerFallback !== undefined && providerFallback !== value)
+    if (providerFallback !== undefined && providerFallback !== value) {
+      if (providerFallback) {
+        setSettledModels((current) =>
+          updateSettledModels(current, conversationScope, providerFallback),
+        );
+      }
       (onProviderFallback ?? onChange)(providerFallback);
-  }, [providerFallback, value, onProviderFallback, onChange]);
+    }
+  }, [
+    providerFallback,
+    value,
+    conversationScope,
+    onProviderFallback,
+    onChange,
+  ]);
   const readyScope = modelSelectionScope(
     hostId,
     projectId,

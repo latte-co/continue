@@ -248,12 +248,14 @@ export function Conversation({
       : agentId === "claude"
         ? "Claude Code"
         : agentId;
+  const effectiveConversationKey = conversationKey ?? session?.id ?? draftKey;
   const preferences = useAgentPreferences(
     hostId,
     agentId,
     projectId,
     session,
     sending,
+    effectiveConversationKey,
   );
   const { model, effort, permissionMode } = preferences;
   const [modelReadiness, setModelReadiness] = useState<{
@@ -1218,7 +1220,7 @@ export function Conversation({
                 hostId={hostId}
                 projectId={projectId}
                 agent={agentId}
-                conversationKey={conversationKey ?? session?.id ?? draftKey}
+                conversationKey={effectiveConversationKey}
                 connected={connected}
                 settingsOpen={settingsOpen}
                 preserveUnavailableModel={!!session}

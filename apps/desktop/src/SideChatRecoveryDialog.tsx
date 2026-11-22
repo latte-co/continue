@@ -323,6 +323,8 @@ export function SideChatRecoveryDialog({
                       request={value}
                       resolved={item.resolved}
                       decision={item.decision}
+                      tool={item.approvalTool}
+                      loadContext={{ hostId, sessionId: session.id }}
                       disabled={!connected || busy || !running}
                       busy={busy}
                       onDecision={(allow) =>
