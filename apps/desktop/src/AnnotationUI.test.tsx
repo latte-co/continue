@@ -486,3 +486,231 @@ it("does not steal focus from the activated side-chat composer", async () => {
   );
   expect(window.getSelection()?.toString()).toBe("");
 });
+
+it("stacks annotation highlights above opaque code-block backgrounds and clips horizontally scrolled code highlights", () => {
+  // Simulate a fenced code block whose horizontal scroll shifts part of the annotated token past <pre>'s right edge.
+  Range.prototype.getClientRects = () =>
+    [
+      {
+        left: 140,
+        right: 360,
+        top: 290,
+        bottom: 308,
+        width: 220,
+        height: 18,
+        x: 140,
+        y: 290,
+        toJSON: () => ({}),
+      },
+    ] as unknown as DOMRectList;
+
+  const codeText = "```ts\nconst highlightedToken = 42;\n```";
+  const quote = "highlightedToken";
+  const view = render(
+    <AnnotatedMessage
+      text={codeText}
+      message={2}
+      entries={[]}
+      enabled
+      onSave={() => null}
+      onRemove={vi.fn()}
+    />,
+  );
+  const container = view.container.querySelector(
+    ".annotated-message",
+  ) as HTMLElement;
+  const body = view.container.querySelector(".annotation-body") as HTMLElement;
+  const pre = view.container.querySelector("pre") as HTMLElement;
+  const start = body.textContent!.indexOf(quote);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const codeAnnotation: Annotation = {
+    id: "code-1",
+    quote,
+    comment: "检查变量",
+    source: { message: 2, start, end: start + quote.length },
+  };
+  pre.style.overflowX = "auto";
+  Object.defineProperty(pre, "clientWidth", { configurable: true, value: 180 });
+  vi.spyOn(container, "getBoundingClientRect").mockReturnValue({
+    left: 100,
+    right: 328,
+    top: 280,
+    bottom: 340,
+    width: 228,
+    height: 60,
+    x: 100,
+    y: 280,
+    toJSON: () => ({}),
+  } as DOMRect);
+  vi.spyOn(body, "getBoundingClientRect").mockReturnValue({
+    left: 100,
+    right: 300,
+    top: 280,
+    bottom: 340,
+    width: 200,
+    height: 60,
+    x: 100,
+    y: 280,
+    toJSON: () => ({}),
+  } as DOMRect);
+  vi.spyOn(pre, "getBoundingClientRect").mockReturnValue({
+    left: 110,
+    right: 290,
+    top: 285,
+    bottom: 330,
+    width: 180,
+    height: 45,
+    x: 110,
+    y: 285,
+    toJSON: () => ({}),
+  } as DOMRect);
+
+  view.rerender(
+    <AnnotatedMessage
+      text={codeText}
+      message={2}
+      entries={[codeAnnotation]}
+      enabled
+      onSave={() => null}
+      onRemove={vi.fn()}
+    />,
+  );
+  const highlight = view.container.querySelector(
+    ".annotation-highlight",
+  ) as HTMLElement;
+  const marker = view.container.querySelector(
+    "button.annotation-marker",
+  ) as HTMLElement;
+  expect(highlight).toBeTruthy();
+  expect(marker).toBeTruthy();
+
+  const rootStyle = window.getComputedStyle(container);
+  const bodyZ = Number(window.getComputedStyle(body).zIndex);
+  const highlightZ = Number(window.getComputedStyle(highlight).zIndex);
+  const markerZ = Number(window.getComputedStyle(marker).zIndex);
+  expect(rootStyle.isolation).toBe("isolate");
+  expect(highlightZ).toBeGreaterThan(bodyZ);
+  expect(markerZ).toBeGreaterThan(highlightZ);
+
+  expect(highlight.style.left).toBe("40px");
+  // Clipped to <pre>'s right edge (290 - 140 = 150px) instead of overflowing to 328 - 140 = 188px.
+  expect(highlight.style.width).toBe("150px");
+});
+
+it("clips the code-block portion of a cross-scroller selection without clipping surrounding prose", () => {
+  const mixedText = "```ts\nconst highlightedToken = 42;\n```\n\n后续说明段落";
+  const view = render(
+    <AnnotatedMessage
+      text={mixedText}
+      message={2}
+      entries={[]}
+      enabled
+      onSave={() => null}
+      onRemove={vi.fn()}
+    />,
+  );
+  const container = view.container.querySelector(
+    ".annotated-message",
+  ) as HTMLElement;
+  const body = view.container.querySelector(".annotation-body") as HTMLElement;
+  const pre = view.container.querySelector("pre") as HTMLElement;
+  const start = body.textContent!.indexOf("highlightedToken");
+  const end = body.textContent!.indexOf("段落");
+  const quote = body.textContent!.slice(start, end);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+
+  pre.style.overflowX = "auto";
+  Range.prototype.getClientRects = function (this: Range) {
+    if (pre.contains(this.startContainer)) {
+      return [
+        {
+          left: 140,
+          right: 360,
+          top: 290,
+          bottom: 308,
+          width: 220,
+          height: 18,
+          x: 140,
+          y: 290,
+          toJSON: () => ({}),
+        },
+      ] as unknown as DOMRectList;
+    }
+    return [
+      {
+        left: 105,
+        right: 315,
+        top: 340,
+        bottom: 358,
+        width: 210,
+        height: 18,
+        x: 105,
+        y: 340,
+        toJSON: () => ({}),
+      },
+    ] as unknown as DOMRectList;
+  };
+
+  vi.spyOn(container, "getBoundingClientRect").mockReturnValue({
+    left: 100,
+    right: 328,
+    top: 280,
+    bottom: 380,
+    width: 228,
+    height: 100,
+    x: 100,
+    y: 280,
+    toJSON: () => ({}),
+  } as DOMRect);
+  vi.spyOn(body, "getBoundingClientRect").mockReturnValue({
+    left: 100,
+    right: 320,
+    top: 280,
+    bottom: 380,
+    width: 220,
+    height: 100,
+    x: 100,
+    y: 280,
+    toJSON: () => ({}),
+  } as DOMRect);
+  vi.spyOn(pre, "getBoundingClientRect").mockReturnValue({
+    left: 110,
+    right: 290,
+    top: 285,
+    bottom: 325,
+    width: 180,
+    height: 40,
+    x: 110,
+    y: 285,
+    toJSON: () => ({}),
+  } as DOMRect);
+
+  const crossAnnotation: Annotation = {
+    id: "cross-1",
+    quote,
+    comment: "跨代码块与段落",
+    source: { message: 2, start, end },
+  };
+  view.rerender(
+    <AnnotatedMessage
+      text={mixedText}
+      message={2}
+      entries={[crossAnnotation]}
+      enabled
+      onSave={() => null}
+      onRemove={vi.fn()}
+    />,
+  );
+
+  const highlights = Array.from(
+    view.container.querySelectorAll(".annotation-highlight"),
+  ) as HTMLElement[];
+  expect(highlights).toHaveLength(2);
+  // Code segment clipped to <pre> [110, 290]: left = 140 - 100 = 40px, width = 290 - 140 = 150px.
+  expect(highlights[0].style.left).toBe("40px");
+  expect(highlights[0].style.width).toBe("150px");
+  // Prose segment outside <pre> clipped only to .annotation-body [100, 320]: left = 105 - 100 = 5px, width = 210px.
+  expect(highlights[1].style.left).toBe("5px");
+  expect(highlights[1].style.width).toBe("210px");
+});

@@ -503,6 +503,140 @@ it("falls back to side_chats on older servers where side_chat_history is unsuppo
   ).resolves.toEqual(owner);
 });
 
+it("paginates beyond the 500-session project cap on legacy servers without re-checking the first 500 sessions", async () => {
+  const newerMains = Array.from({ length: 500 }, (_, index) =>
+    makeSession({
+      id: `main-new-${String(index + 1).padStart(3, "0")}`,
+      project_id: "proj-a",
+    }),
+  );
+  const otherProjectMain = makeSession({
+    id: "main-other-proj",
+    project_id: "proj-b",
+  });
+  const owner = makeSession({
+    id: "parent-501",
+    project_id: "proj-a",
+  });
+  const legacySide = makeSession({
+    id: "side-beyond-500",
+    project_id: "proj-a",
+  });
+  const allRecent = [...newerMains, otherProjectMain, owner].map(
+    (session, index, list) => ({
+      session,
+      updated_at: list.length - index,
+    }),
+  );
+  const historyChecks = new Map<string, number>();
+
+  mocks.request.mockImplementation(
+    async (_hostId: string, req: Request): Promise<Response> => {
+      if (req.method === "session" && req.session_id === "side-beyond-500")
+        return { kind: "session", session: legacySide };
+      if (req.method === "sessions" && req.project_id === "proj-a")
+        return { kind: "sessions", sessions: newerMains };
+      if (req.method === "recent_sessions") {
+        const startIndex =
+          req.before == null
+            ? 0
+            : allRecent.findIndex(
+                (item) =>
+                  item.updated_at === req.before!.updated_at &&
+                  item.session.id === req.before!.id,
+              ) + 1;
+        const slice = allRecent.slice(startIndex, startIndex + 100);
+        const last = slice.at(-1);
+        return {
+          kind: "recent_sessions",
+          sessions: slice,
+          next:
+            startIndex + slice.length < allRecent.length && last
+              ? { updated_at: last.updated_at, id: last.session.id }
+              : null,
+        };
+      }
+      if (req.method === "side_chat_history") {
+        historyChecks.set(
+          req.session_id,
+          (historyChecks.get(req.session_id) ?? 0) + 1,
+        );
+        return {
+          kind: "side_chat_history",
+          sessions: req.session_id === "parent-501" ? [legacySide] : [],
+          next: null,
+        };
+      }
+      throw new Error(`unexpected request: ${JSON.stringify(req)}`);
+    },
+  );
+
+  await expect(
+    resolveSideChatParentSession("remote", "side-beyond-500"),
+  ).resolves.toEqual(owner);
+  expect(historyChecks.get("parent-501")).toBe(1);
+  expect(historyChecks.has("main-other-proj")).toBe(false);
+  for (const session of newerMains) {
+    expect(historyChecks.get(session.id)).toBe(1);
+  }
+});
+
+it("falls back to project_agent_sessions when an active parent session in a hidden project is beyond the 500-session cap", async () => {
+  const newerMains = Array.from({ length: 500 }, (_, index) =>
+    makeSession({
+      id: `main-live-cap-${index + 1}`,
+      project_id: "proj-a",
+    }),
+  );
+  const liveHiddenOwner = makeSession({
+    id: "parent-live-501",
+    project_id: "proj-a",
+  });
+  const legacySide = makeSession({
+    id: "side-live-501",
+    project_id: "proj-a",
+  });
+
+  mocks.request.mockImplementation(
+    async (_hostId: string, req: Request): Promise<Response> => {
+      if (req.method === "session" && req.session_id === "side-live-501")
+        return { kind: "session", session: legacySide };
+      if (req.method === "sessions" && req.project_id === "proj-a")
+        return { kind: "sessions", sessions: newerMains };
+      if (req.method === "recent_sessions")
+        return { kind: "recent_sessions", sessions: [], next: null };
+      if (
+        req.method === "project_agent_sessions" &&
+        req.project_id === "proj-a"
+      ) {
+        if (req.after === null)
+          return {
+            kind: "project_agent_sessions",
+            sessions: [newerMains[0], legacySide],
+            next: legacySide.id,
+          };
+        if (req.after === legacySide.id)
+          return {
+            kind: "project_agent_sessions",
+            sessions: [liveHiddenOwner],
+            next: null,
+          };
+      }
+      if (req.method === "side_chat_history")
+        return {
+          kind: "side_chat_history",
+          sessions: req.session_id === "parent-live-501" ? [legacySide] : [],
+          next: null,
+        };
+      throw new Error(`unexpected request: ${JSON.stringify(req)}`);
+    },
+  );
+
+  await expect(
+    resolveSideChatParentSession("remote", "side-live-501"),
+  ).resolves.toEqual(liveHiddenOwner);
+});
+
 it("clears a stale draft flag when opening a persisted side-chat tab", () => {
   openSideChatTab("ws-parent", "side-persisted", true);
   expect(readWorkspace("ws-parent").tabs).toEqual([

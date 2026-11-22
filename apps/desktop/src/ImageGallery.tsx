@@ -31,6 +31,22 @@ export type ImagePayload = {
   mime: string;
 };
 
+function sameImagePayload(a?: ImagePayload, b?: ImagePayload): boolean {
+  if (a === b) return true;
+  if (
+    !a ||
+    !b ||
+    a.mime !== b.mime ||
+    a.bytes.byteLength !== b.bytes.byteLength
+  )
+    return false;
+  if (a.bytes === b.bytes) return true;
+  for (let index = 0; index < a.bytes.byteLength; index++) {
+    if (a.bytes[index] !== b.bytes[index]) return false;
+  }
+  return true;
+}
+
 type Entry = {
   id: string;
   trigger: RefObject<HTMLElement | null>;
@@ -79,9 +95,19 @@ function ImageDialog({
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState("");
-  const currentId = useRef(entry.id);
-  currentId.current = entry.id;
+  const previousResource = useRef<{ id: string; payload?: ImagePayload }>({
+    id: entry.id,
+    payload: entry.payload,
+  });
+  const actionToken = useRef(0);
   useEffect(() => {
+    if (
+      previousResource.current.id === entry.id &&
+      sameImagePayload(previousResource.current.payload, entry.payload)
+    )
+      return;
+    previousResource.current = { id: entry.id, payload: entry.payload };
+    actionToken.current += 1;
     setCopied(false);
     setBusy(false);
     setActionError("");
@@ -150,19 +176,19 @@ function ImageDialog({
               disabled={!payload || busy}
               onClick={() => {
                 if (!payload || busy) return;
-                const owner = entry.id;
+                const token = (actionToken.current += 1);
                 setBusy(true);
                 setActionError("");
                 void copyImageBytes(payload.bytes, payload.mime)
                   .then(() => {
-                    if (currentId.current === owner) setCopied(true);
+                    if (actionToken.current === token) setCopied(true);
                   })
                   .catch((cause) => {
-                    if (currentId.current === owner)
+                    if (actionToken.current === token)
                       setActionError(`复制失败：${message(cause)}`);
                   })
                   .finally(() => {
-                    if (currentId.current === owner) setBusy(false);
+                    if (actionToken.current === token) setBusy(false);
                   });
               }}
             >
@@ -176,16 +202,16 @@ function ImageDialog({
               disabled={!payload || busy}
               onClick={() => {
                 if (!payload || busy) return;
-                const owner = entry.id;
+                const token = (actionToken.current += 1);
                 setBusy(true);
                 setActionError("");
                 void saveImageBytes(entry.name, payload.bytes, payload.mime)
                   .catch((cause) => {
-                    if (currentId.current === owner)
+                    if (actionToken.current === token)
                       setActionError(`下载失败：${message(cause)}`);
                   })
                   .finally(() => {
-                    if (currentId.current === owner) setBusy(false);
+                    if (actionToken.current === token) setBusy(false);
                   });
               }}
             >

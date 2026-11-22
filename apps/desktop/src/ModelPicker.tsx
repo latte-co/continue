@@ -68,10 +68,16 @@ export function ModelPicker({
     model: string | null;
     catalog: Catalog;
   }>();
-  const [settledScopes, setSettledScopes] = useState<ReadonlySet<string>>(
-    () => new Set(),
-  );
-  const settled = settledScopes.has(conversationScope);
+  const [settledSelection, setSettledSelection] = useState<{
+    scope: string;
+    model: string;
+  } | null>(null);
+  const settled =
+    settledSelection?.scope === conversationScope &&
+    settledSelection.model === value;
+  if (settledSelection && !settled) {
+    setSettledSelection(null);
+  }
   const cached =
     loaded?.scope === scope && loaded.configVersion === configVersion
       ? loaded
@@ -109,23 +115,6 @@ export function ModelPicker({
       action: { label: "重新加载模型", run: () => setRetry((v) => v + 1) },
     },
   ]);
-  const agentConfigKey = JSON.stringify([hostId, agent]);
-  const seenConfigVersions = useRef(new Map<string, number>());
-  if (!seenConfigVersions.current.has(agentConfigKey)) {
-    seenConfigVersions.current.set(agentConfigKey, configVersion);
-  }
-  useEffect(() => {
-    const previousVersion = seenConfigVersions.current.get(agentConfigKey);
-    const configChanged = previousVersion !== configVersion;
-    seenConfigVersions.current.set(agentConfigKey, configVersion);
-    if ((!settingsOpen && !configChanged) || !value) return;
-    setSettledScopes((current) => {
-      if (current.has(conversationScope)) return current;
-      const next = new Set(current);
-      next.add(conversationScope);
-      return next;
-    });
-  }, [agentConfigKey, settingsOpen, configVersion, value, conversationScope]);
   useEffect(() => {
     if (!connected || settingsOpen) return;
     let disposed = false;
@@ -142,12 +131,11 @@ export function ModelPicker({
         if (!disposed) {
           setCatalog({ scope, configVersion, model: value, catalog: result });
           if (value && result.models.includes(value)) {
-            setSettledScopes((current) => {
-              if (current.has(conversationScope)) return current;
-              const next = new Set(current);
-              next.add(conversationScope);
-              return next;
-            });
+            setSettledSelection((current) =>
+              current?.scope === conversationScope && current.model === value
+                ? current
+                : { scope: conversationScope, model: value },
+            );
           }
         }
       })
@@ -333,7 +321,13 @@ export function ModelPicker({
         ref={selector}
         value={providerFallback ?? value ?? ""}
         options={groupedOptions}
-        onChange={(id) => onChange(id || null)}
+        onChange={(id) => {
+          const next = id || null;
+          setSettledSelection(
+            next ? { scope: conversationScope, model: next } : null,
+          );
+          onChange(next);
+        }}
         effort={effort}
         levels={effortLevels ?? []}
         canResetEffort={canResetEffort}

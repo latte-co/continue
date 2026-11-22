@@ -693,3 +693,127 @@ it("preserves another host's validated model cache when a different host or Agen
     expect.objectContaining({ ready: false }),
   );
 });
+
+it("re-applies transient Provider fallback across P1 -> P2 -> P1 draft switches without overwriting localStorage", async () => {
+  const { useAgentPreferences } = await import("./useAgentPreferences");
+  localStorage.clear();
+  localStorage.setItem(
+    'latte-work.agent-selection.v1:["devbox","claude"]',
+    JSON.stringify({ model: "opus", effort: null, permissionMode: null }),
+  );
+  let availableModels = ["real"];
+  mocks.request.mockImplementation(async () => ({
+    kind: "models",
+    models: availableModels,
+    provider: "Team",
+    default_model: availableModels[0] ?? null,
+    effort_levels: [],
+    model_labels: {},
+  }));
+  const ready = vi.fn();
+  function DraftHarness({
+    projectId,
+    settingsOpen = false,
+  }: {
+    projectId: string;
+    settingsOpen?: boolean;
+  }) {
+    const preferences = useAgentPreferences(
+      "devbox",
+      "claude",
+      projectId,
+      undefined,
+      false,
+    );
+    return (
+      <ModelPicker
+        hostId="devbox"
+        projectId={projectId}
+        agent="claude"
+        conversationKey="draft"
+        connected
+        settingsOpen={settingsOpen}
+        preserveUnavailableModel={false}
+        value={preferences.model}
+        onChange={preferences.chooseModel}
+        onProviderFallback={preferences.replaceUnsupportedModel}
+        effort={preferences.effort}
+        onEffortChange={preferences.chooseEffort}
+        onEffortInvalid={preferences.clearUnsupportedEffort}
+        disabled={false}
+        onReadyChange={ready}
+      />
+    );
+  }
+
+  const view = render(<DraftHarness projectId="p1" />);
+  await act(async () => {});
+  await act(async () => {});
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({ value: "real" }),
+    undefined,
+  );
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+  expect(
+    JSON.parse(
+      localStorage.getItem(
+        'latte-work.agent-selection.v1:["devbox","claude"]',
+      ) ?? "{}",
+    ).model,
+  ).toBe("opus");
+
+  // Switch P1 -> P2: preferences reload "opus", and P2 falls back to "real".
+  view.rerender(<DraftHarness projectId="p2" />);
+  await act(async () => {});
+  await act(async () => {});
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({ value: "real" }),
+    undefined,
+  );
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  // Switch P2 -> P1: preferences reload "opus" again; P1 must NOT stay stuck on "opus (unavailable)".
+  view.rerender(<DraftHarness projectId="p1" />);
+  await act(async () => {});
+  await act(async () => {});
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      value: "real",
+      options: [expect.objectContaining({ value: "real" })],
+    }),
+    undefined,
+  );
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+  expect(
+    JSON.parse(
+      localStorage.getItem(
+        'latte-work.agent-selection.v1:["devbox","claude"]',
+      ) ?? "{}",
+    ).model,
+  ).toBe("opus");
+
+  // While staying on the same open draft in P1, editing the Provider preserves the active "real" choice.
+  availableModels = ["next-model"];
+  await act(async () => {
+    bumpModelConfigVersion();
+  });
+  await act(async () => {});
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      value: "real",
+      options: expect.arrayContaining([
+        expect.objectContaining({ value: "real", label: "real (unavailable)" }),
+      ]),
+    }),
+    undefined,
+  );
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+});

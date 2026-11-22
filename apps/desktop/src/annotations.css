@@ -1,12 +1,13 @@
 .annotated-message {
   position: relative;
+  isolation: isolate;
 }
 .annotated-message[data-annotations="true"] {
   padding-right: 28px;
 }
 .annotation-body {
   position: relative;
-  z-index: 1;
+  z-index: 0;
   min-width: 0;
 }
 .annotation-marks {
@@ -16,7 +17,7 @@
 }
 .annotation-highlight {
   position: absolute;
-  z-index: 0;
+  z-index: 1;
   background: color-mix(in srgb, var(--color-unread) 32%, transparent);
   border-radius: 3px;
 }

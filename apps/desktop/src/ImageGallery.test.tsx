@@ -276,3 +276,144 @@ it("copies and downloads the active preview image, disables actions when unloade
   expect(within(dialog()).getByRole("alert").textContent).toContain("磁盘已满");
   expect(screen.getByRole("dialog")).toBeTruthy();
 });
+
+it("preserves action errors and in-flight busy state across streaming re-renders for attachment, Markdown, and tool images", async () => {
+  let rejectSave!: (reason?: unknown) => void;
+  let resolveCopy!: () => void;
+  const write = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        resolveCopy = resolve;
+      }),
+  );
+  vi.stubGlobal(
+    "ClipboardItem",
+    class {
+      items: Record<string, Blob>;
+      constructor(items: Record<string, Blob>) {
+        this.items = items;
+      }
+    },
+  );
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { write },
+  });
+
+  const renderStreamingView = (tick: number) => (
+    <ImageGallery>
+      <AttachmentImage
+        {...props}
+        reference={{
+          name: "shot.png",
+          path: "/images/shot.png",
+          directory: false,
+        }}
+      />
+      <MessageActionsProvider value={{ readProjectFile: async () => data }}>
+        <MessageContent text={`![diagram](diagram.png)\n\n流式段落 ${tick}`} />
+      </MessageActionsProvider>
+      <ToolImages
+        images={[
+          {
+            type: "image",
+            mime_type: "image/png",
+            data_base64: "iVBORw0KGgo=",
+          },
+        ]}
+      />
+    </ImageGallery>
+  );
+
+  const view = render(renderStreamingView(1));
+  await screen.findByRole("button", { name: "放大图片 diagram" });
+
+  // 1. Attachment image: in-flight copy stays busy across streaming re-renders, and subsequent download failure survives re-renders.
+  fireEvent.click(screen.getByRole("button", { name: "预览图片 shot.png" }));
+  await within(dialog()).findByRole("img", { name: "shot.png" });
+  fireEvent.click(within(dialog()).getByRole("button", { name: "复制图片" }));
+  expect(
+    (
+      within(dialog()).getByRole("button", {
+        name: "复制图片",
+      }) as HTMLButtonElement
+    ).disabled,
+  ).toBe(true);
+  expect(
+    (
+      within(dialog()).getByRole("button", {
+        name: "下载图片",
+      }) as HTMLButtonElement
+    ).disabled,
+  ).toBe(true);
+
+  view.rerender(renderStreamingView(2));
+  expect(
+    (
+      within(dialog()).getByRole("button", {
+        name: "复制图片",
+      }) as HTMLButtonElement
+    ).disabled,
+  ).toBe(true);
+  expect(
+    (
+      within(dialog()).getByRole("button", {
+        name: "下载图片",
+      }) as HTMLButtonElement
+    ).disabled,
+  ).toBe(true);
+
+  await act(async () => resolveCopy());
+  expect(within(dialog()).getByRole("button", { name: "已复制" })).toBeTruthy();
+
+  mocks.invoke.mockImplementationOnce(
+    () =>
+      new Promise<string>((_resolve, reject) => {
+        rejectSave = reject;
+      }),
+  );
+  fireEvent.click(within(dialog()).getByRole("button", { name: "下载图片" }));
+  view.rerender(renderStreamingView(3));
+  expect(
+    (
+      within(dialog()).getByRole("button", {
+        name: "下载图片",
+      }) as HTMLButtonElement
+    ).disabled,
+  ).toBe(true);
+  await act(async () => rejectSave(new Error("附件写入失败")));
+  expect(within(dialog()).getByRole("alert").textContent).toContain(
+    "附件写入失败",
+  );
+  view.rerender(renderStreamingView(4));
+  expect(within(dialog()).getByRole("alert").textContent).toContain(
+    "附件写入失败",
+  );
+
+  // 2. Markdown image: actionError survives streaming text updates on the same message.
+  fireEvent.click(next());
+  await within(dialog()).findByRole("img", { name: "diagram" });
+  expect(within(dialog()).queryByRole("alert")).toBeNull();
+  mocks.invoke.mockRejectedValueOnce(new Error("权限不足"));
+  await act(async () =>
+    fireEvent.click(within(dialog()).getByRole("button", { name: "下载图片" })),
+  );
+  expect(within(dialog()).getByRole("alert").textContent).toContain("权限不足");
+  view.rerender(renderStreamingView(5));
+  expect(within(dialog()).getByRole("alert").textContent).toContain("权限不足");
+
+  // 3. Tool image with fresh object identity per render: actionError also survives re-renders.
+  fireEvent.click(next());
+  await within(dialog()).findByRole("img", { name: "工具输出图片 1" });
+  mocks.invoke.mockRejectedValueOnce(new Error("路径不可写"));
+  await act(async () =>
+    fireEvent.click(within(dialog()).getByRole("button", { name: "下载图片" })),
+  );
+  expect(within(dialog()).getByRole("alert").textContent).toContain(
+    "路径不可写",
+  );
+  view.rerender(renderStreamingView(6));
+  expect(within(dialog()).getByRole("alert").textContent).toContain(
+    "路径不可写",
+  );
+});

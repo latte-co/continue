@@ -514,6 +514,158 @@ export function AnnotationSummary({
   );
 }
 
+function innermostClipScope(node: Node, root: HTMLElement): HTMLElement {
+  let ancestor: HTMLElement | null =
+    node instanceof HTMLElement ? node : node.parentElement;
+  while (ancestor && ancestor !== root) {
+    const style = window.getComputedStyle(ancestor);
+    if (
+      (style.overflowX !== "" && style.overflowX !== "visible") ||
+      (style.overflowY !== "" && style.overflowY !== "visible")
+    ) {
+      return ancestor;
+    }
+    ancestor = ancestor.parentElement;
+  }
+  return root;
+}
+
+function rangeClipSegments(
+  range: Range,
+  root: HTMLElement,
+): { range: Range; scope: HTMLElement }[] {
+  if (
+    range.startContainer === range.endContainer ||
+    range.startContainer.nodeType !== Node.TEXT_NODE ||
+    range.endContainer.nodeType !== Node.TEXT_NODE
+  ) {
+    return [
+      {
+        range,
+        scope: innermostClipScope(range.commonAncestorContainer, root),
+      },
+    ];
+  }
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  walker.currentNode = range.startContainer;
+  const groups: {
+    scope: HTMLElement;
+    startNode: Node;
+    startOffset: number;
+    endNode: Node;
+    endOffset: number;
+  }[] = [];
+  for (
+    let node: Node | null = walker.currentNode;
+    node;
+    node = walker.nextNode()
+  ) {
+    const startOffset = node === range.startContainer ? range.startOffset : 0;
+    const endOffset =
+      node === range.endContainer
+        ? range.endOffset
+        : (node.textContent?.length ?? 0);
+    if (endOffset > startOffset) {
+      const scope = innermostClipScope(node, root);
+      const prev = groups.at(-1);
+      if (prev && prev.scope === scope) {
+        groups[groups.length - 1] = {
+          ...prev,
+          endNode: node,
+          endOffset,
+        };
+      } else {
+        groups.push({
+          scope,
+          startNode: node,
+          startOffset,
+          endNode: node,
+          endOffset,
+        });
+      }
+    }
+    if (node === range.endContainer) break;
+  }
+  if (groups.length <= 1) {
+    return [
+      {
+        range,
+        scope:
+          groups[0]?.scope ??
+          innermostClipScope(range.commonAncestorContainer, root),
+      },
+    ];
+  }
+  return groups.map((group) => {
+    const sub = document.createRange();
+    sub.setStart(group.startNode, group.startOffset);
+    sub.setEnd(group.endNode, group.endOffset);
+    return { range: sub, scope: group.scope };
+  });
+}
+
+function clipRectsForScope(
+  range: Range,
+  scope: HTMLElement,
+  root: HTMLElement,
+  base: Rect,
+  origin: DOMRect,
+  limit: number,
+) {
+  let {
+    left: clipLeft,
+    right: clipRight,
+    top: clipTop,
+    bottom: clipBottom,
+  } = base;
+  let ancestor: HTMLElement | null = scope;
+  while (ancestor && ancestor !== root) {
+    const style = window.getComputedStyle(ancestor);
+    const clipX = style.overflowX !== "" && style.overflowX !== "visible";
+    const clipY = style.overflowY !== "" && style.overflowY !== "visible";
+    if (clipX || clipY) {
+      const box = ancestor.getBoundingClientRect();
+      if (clipX && box.width > 0) {
+        clipLeft = Math.max(clipLeft, box.left);
+        clipRight = Math.min(clipRight, box.right);
+      }
+      if (clipY && box.height > 0) {
+        clipTop = Math.max(clipTop, box.top);
+        clipBottom = Math.min(clipBottom, box.bottom);
+      }
+    }
+    ancestor = ancestor.parentElement;
+  }
+  return Array.from(range.getClientRects())
+    .filter((r) => r.width && r.height)
+    .slice(0, limit)
+    .map((r) => {
+      const leftEdge = Number.isFinite(clipLeft)
+        ? Math.max(r.left, clipLeft)
+        : r.left;
+      const rightEdge = Number.isFinite(clipRight)
+        ? Math.min(r.right, clipRight)
+        : r.right;
+      const topEdge = Number.isFinite(clipTop)
+        ? Math.max(r.top, clipTop)
+        : r.top;
+      const bottomEdge = Number.isFinite(clipBottom)
+        ? Math.min(r.bottom, clipBottom)
+        : r.bottom;
+      return {
+        left: Math.max(0, leftEdge - origin.left),
+        top: topEdge - origin.top,
+        width: Number.isFinite(clipRight)
+          ? Math.max(0, rightEdge - leftEdge)
+          : r.width,
+        height: Number.isFinite(clipBottom)
+          ? Math.max(0, bottomEdge - topEdge)
+          : r.height,
+      };
+    })
+    .filter((r) => r.width > 0 && r.height > 0);
+}
+
 export function AnnotatedMessage({
   text,
   message,
@@ -641,6 +793,33 @@ export function AnnotatedMessage({
     }
     const measure = () => {
       const origin = container.getBoundingClientRect();
+      const bodyRect = root.getBoundingClientRect();
+      const baseClip: Rect = {
+        left:
+          bodyRect.width > 0
+            ? bodyRect.left
+            : origin.width > 0
+              ? origin.left
+              : -Infinity,
+        right:
+          bodyRect.width > 0
+            ? bodyRect.right
+            : origin.width > 0
+              ? origin.right
+              : Infinity,
+        top:
+          bodyRect.height > 0
+            ? bodyRect.top
+            : origin.height > 0
+              ? origin.top
+              : -Infinity,
+        bottom:
+          bodyRect.height > 0
+            ? bodyRect.bottom
+            : origin.height > 0
+              ? origin.bottom
+              : Infinity,
+      };
       const maxLeft = Math.max(0, container.clientWidth - 28);
       const occupied: { left: number; top: number }[] = [];
       const buildMark = (
@@ -650,23 +829,25 @@ export function AnnotatedMessage({
       ) => {
         const range = annotationRange(root, entry);
         if (!range || typeof range.getClientRects !== "function") return [];
-        const rects = Array.from(range.getClientRects())
-          .filter((r) => r.width && r.height)
-          .slice(0, 500)
-          .map((r) => ({
-            left: Math.max(0, r.left - origin.left),
-            top: r.top - origin.top,
-            width:
-              origin.width > 0
-                ? Math.max(
-                    0,
-                    Math.min(r.right, origin.right) -
-                      Math.max(r.left, origin.left),
-                  )
-                : r.width,
-            height: r.height,
-          }))
-          .filter((r) => r.width > 0);
+        const rects: {
+          left: number;
+          top: number;
+          width: number;
+          height: number;
+        }[] = [];
+        for (const segment of rangeClipSegments(range, root)) {
+          if (rects.length >= 500) break;
+          rects.push(
+            ...clipRectsForScope(
+              segment.range,
+              segment.scope,
+              root,
+              baseClip,
+              origin,
+              500 - rects.length,
+            ),
+          );
+        }
         if (!rects.length) return [];
         const anchorRect = rects.at(-1)!;
         const markerLeft = Math.max(

@@ -1097,7 +1097,9 @@ impl AgentAdapter for AppServer {
         if !matches!(
             config.permission_mode.as_deref(),
             None | Some("default" | "bypass_permissions")
-        ) {
+        ) && !(self.side_parent.is_some()
+            && config.permission_mode.as_deref() == Some("inherit"))
+        {
             bail!("{} 不支持所选权限模式", self.name());
         }
         self.platform_instructions = crate::skills::platform_instructions(&config.settings_dir);
@@ -1383,6 +1385,66 @@ mod tests {
                 }
                 assert_eq!(params["sandbox"], expected_sandbox);
                 assert_eq!(params["approvalPolicy"], expected_approval);
+            }
+        }
+    }
+
+    #[test]
+    fn command_allows_inherit_permission_only_for_side_chat_create_and_reopen() {
+        let inherit = LaunchConfig {
+            permission_mode: Some("inherit".into()),
+            ..config()
+        };
+        let unsupported = LaunchConfig {
+            permission_mode: Some("accept_edits".into()),
+            ..config()
+        };
+        for (codex, binary, expected_name) in [(true, "codex", "Codex"), (false, "traex", "Traex")]
+        {
+            let mut main = AppServer {
+                codex,
+                ..Default::default()
+            };
+            let err = main
+                .command(binary, "/tmp", None, &inherit)
+                .err()
+                .expect("main session must reject inherit")
+                .to_string();
+            assert_eq!(err, format!("{expected_name} 不支持所选权限模式"));
+
+            for resume in [None, Some("side-thread-1")] {
+                let mut side = AppServer {
+                    codex,
+                    ..Default::default()
+                };
+                side.set_side_parent("parent-thread".into()).unwrap();
+                assert!(
+                    side.command(binary, "/tmp", resume, &unsupported).is_err(),
+                    "side chat must still reject unsupported modes"
+                );
+                side.command(binary, "/tmp", resume, &inherit).unwrap();
+                let init = encoded(&if resume.is_some() {
+                    side.advance(Input::Open).unwrap()
+                } else {
+                    side.advance(Input::Start { prompt: "side" }).unwrap()
+                });
+                assert_eq!(init[0]["method"], "initialize");
+                let read = encoded(&message(&mut side, json!({"id":"latte-1","result":{}})));
+                assert_eq!(read.last().unwrap()["method"], "config/read");
+                let open = encoded(&message(
+                    &mut side,
+                    json!({"id":"latte-2","result":{"config":{"developer_instructions":null,"model_provider":"native"}}}),
+                ));
+                assert_eq!(
+                    open[0]["method"],
+                    if resume.is_some() {
+                        "thread/resume"
+                    } else {
+                        "thread/fork"
+                    }
+                );
+                assert!(open[0]["params"].get("sandbox").is_none());
+                assert!(open[0]["params"].get("approvalPolicy").is_none());
             }
         }
     }

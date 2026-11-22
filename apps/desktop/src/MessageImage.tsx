@@ -1,6 +1,6 @@
 import type { ExtraProps } from "react-markdown";
 import { ImagePreview, useImagePreview } from "./ImageGallery";
-import { useContext, useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Image as ImageIcon, ImageOff, LoaderCircle } from "lucide-react";
 import { message } from "./api";
 import { imageRead } from "./AttachmentImage";
@@ -142,6 +142,13 @@ function MessageLocalImage({
     release();
     setState({ error: "图片格式无法解码" });
   };
+  const payload = useMemo(
+    () =>
+      state.url && state.bytes && state.mime
+        ? { bytes: state.bytes, mime: state.mime }
+        : undefined,
+    [state.url, state.bytes, state.mime],
+  );
   const error = state.error;
   const loading = !error && state.loading;
   const placeholder = (
@@ -219,11 +226,7 @@ function MessageLocalImage({
           preview={preview}
           name={name}
           title={path}
-          payload={
-            state.url && state.bytes && state.mime
-              ? { bytes: state.bytes, mime: state.mime }
-              : undefined
-          }
+          payload={payload}
         >
           {state.url ? (
             <img src={state.url} alt={name} onError={onError} />

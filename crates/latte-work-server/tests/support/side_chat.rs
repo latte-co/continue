@@ -1048,6 +1048,156 @@ async fn cross_project_unconfirmed_side_writes_expose_owning_parent_for_confirma
 }
 
 #[tokio::test]
+async fn default_inherit_side_chat_launches_and_reopens_for_codex_and_traex() {
+    for agent in ["codex", "traex"] {
+        let host = Host::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut client = host.client().await;
+        let project = terminal_project(&mut client, root.path()).await;
+        let parent = create_session(&mut client, project, agent).await;
+        assert!(parent.permission_mode.is_none());
+        assert!(matches!(
+            send(&mut client, &parent.id, "main-init", "hello").await,
+            Response::Accepted { duplicate: false }
+        ));
+        wait(&mut client, &parent.id, Status::Completed).await;
+
+        let side = open_side(&mut client, &parent).await;
+        assert_eq!(side.permission_mode.as_deref(), Some("inherit"));
+        assert!(side.native_id.is_none());
+
+        // New side chat sends the default `Some("inherit")` mode assigned by Store::open_side_chat.
+        let created_send = ask(
+            &mut client,
+            Request::Send {
+                session_id: side.id.clone(),
+                request_id: "side-inherit-create".into(),
+                text: "side-inherit-create".into(),
+                model: None,
+                effort: None,
+                permission_mode: side.permission_mode.clone(),
+                provider: Some(TurnProvider::Cli),
+            },
+        )
+        .await;
+        assert!(
+            matches!(created_send, Response::Accepted { duplicate: false }),
+            "{agent} create send: {created_send:?}"
+        );
+        let first_events = wait(&mut client, &side.id, Status::Completed).await;
+        assert!(
+            first_events.iter().any(|e| {
+                matches!(&e.event, EventKind::Text { text } if text.contains("side-inherit-create"))
+            }),
+            "{agent} first events: {first_events:?}"
+        );
+        let Response::Session {
+            session: created_side,
+        } = ask(
+            &mut client,
+            Request::Session {
+                session_id: side.id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("{agent} side session after create");
+        };
+        assert_eq!(created_side.permission_mode.as_deref(), Some("inherit"));
+        assert!(
+            created_side
+                .native_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("side-thread-"))
+        );
+
+        // Close and reopen via OpenAgentSession using the persisted `Some("inherit")` mode.
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::CloseAgentSession {
+                    session_id: side.id.clone(),
+                    only_if_idle: Some(true),
+                }
+            )
+            .await,
+            Response::SideChatClosed
+        ));
+        let reopened = ask(
+            &mut client,
+            Request::OpenAgentSession {
+                session_id: side.id.clone(),
+                provider: Some(TurnProvider::Cli),
+            },
+        )
+        .await;
+        assert!(
+            matches!(reopened, Response::Ok),
+            "{agent} reopen: {reopened:?}"
+        );
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::Session {
+                    session_id: side.id.clone()
+                }
+            )
+            .await,
+            Response::Session { session } if session.agent_session_open == Some(true)
+        ));
+
+        // Close again and reopen via a follow-up Send that explicitly passes `Some("inherit")`.
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::CloseAgentSession {
+                    session_id: side.id.clone(),
+                    only_if_idle: Some(true),
+                }
+            )
+            .await,
+            Response::SideChatClosed
+        ));
+        let resumed_send = ask(
+            &mut client,
+            Request::Send {
+                session_id: side.id.clone(),
+                request_id: "side-inherit-reopen".into(),
+                text: "side-inherit-reopen".into(),
+                model: None,
+                effort: None,
+                permission_mode: Some("inherit".into()),
+                provider: Some(TurnProvider::Cli),
+            },
+        )
+        .await;
+        assert!(
+            matches!(resumed_send, Response::Accepted { duplicate: false }),
+            "{agent} reopen send: {resumed_send:?}"
+        );
+        let resumed_events = wait(&mut client, &side.id, Status::Completed).await;
+        assert!(
+            resumed_events.iter().any(|e| {
+                matches!(&e.event, EventKind::Text { text } if text.contains("side-inherit-reopen"))
+            }),
+            "{agent} resumed events: {resumed_events:?}"
+        );
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::Session {
+                    session_id: side.id.clone()
+                }
+            )
+            .await,
+            Response::Session { session }
+                if session.native_id == created_side.native_id
+                    && session.permission_mode.as_deref() == Some("inherit")
+        ));
+    }
+}
+
+#[tokio::test]
 async fn undo_preserves_full_access_side_writes_in_an_unrelated_project() {
     let host = Host::start().await;
     let root = tempfile::tempdir().unwrap();
