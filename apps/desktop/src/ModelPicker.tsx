@@ -22,26 +22,65 @@ export interface ModelPickerHandle {
 }
 
 type Catalog = Extract<Response, { kind: "models" }>;
+type SettledModelEntry = {
+  conversationKey: string;
+  hostId: string;
+  agent: string;
+  model: string;
+};
 const effortContextChanged = "模型设置已变化，请重新打开思考强度菜单。";
 const MAX_SETTLED_SCOPES = 64;
 
 function updateSettledModels(
-  current: Record<string, string>,
+  current: Record<string, SettledModelEntry>,
   scope: string,
+  conversationKey: string,
+  hostId: string,
+  agent: string,
   model: string | null,
-): Record<string, string> {
+  clearHostAgent = false,
+): Record<string, SettledModelEntry> {
+  const shouldDrop = ([key, entry]: [string, SettledModelEntry]) =>
+    key === scope ||
+    (clearHostAgent && entry.hostId === hostId && entry.agent === agent);
   if (!model) {
-    if (!(scope in current)) return current;
-    const { [scope]: _, ...rest } = current;
-    return rest;
+    if (!Object.entries(current).some(shouldDrop)) return current;
+    return Object.fromEntries(
+      Object.entries(current).filter((item) => !shouldDrop(item)),
+    );
   }
-  if (current[scope] === model) return current;
-  const entries = Object.entries(current).filter(([key]) => key !== scope);
+  const existing = current[scope];
+  if (
+    !clearHostAgent &&
+    existing &&
+    existing.model === model &&
+    existing.conversationKey === conversationKey
+  ) {
+    return current;
+  }
+  const entries = Object.entries(current).filter((item) => !shouldDrop(item));
   const trimmed =
     entries.length >= MAX_SETTLED_SCOPES
       ? entries.slice(entries.length - MAX_SETTLED_SCOPES + 1)
       : entries;
-  return Object.fromEntries([...trimmed, [scope, model]]);
+  return Object.fromEntries([
+    ...trimmed,
+    [scope, { conversationKey, hostId, agent, model }],
+  ]);
+}
+
+function pruneConversationEntries(
+  current: Record<string, SettledModelEntry>,
+  firstConversationKey: string,
+  secondConversationKey: string,
+): Record<string, SettledModelEntry> {
+  const entries = Object.entries(current);
+  const kept = entries.filter(
+    ([, entry]) =>
+      entry.conversationKey !== firstConversationKey &&
+      entry.conversationKey !== secondConversationKey,
+  );
+  return kept.length === entries.length ? current : Object.fromEntries(kept);
 }
 
 export function ModelPicker({
@@ -81,18 +120,61 @@ export function ModelPicker({
 }) {
   const selector = useRef<ModelSelectorHandle>(null);
   const configVersion = useModelConfigVersion(hostId, agent);
+  const normalizedConversationKey = conversationKey ?? "";
   const scope = JSON.stringify([hostId, projectId, agent]);
-  const conversationScope = JSON.stringify([scope, conversationKey ?? ""]);
+  const conversationScope = JSON.stringify([scope, normalizedConversationKey]);
+  const latestScope = useRef({
+    conversationScope,
+    conversationKey: normalizedConversationKey,
+    preserveUnavailableModel,
+    hostId,
+    agent,
+  });
+  latestScope.current = {
+    conversationScope,
+    conversationKey: normalizedConversationKey,
+    preserveUnavailableModel,
+    hostId,
+    agent,
+  };
   const [loaded, setCatalog] = useState<{
     scope: string;
     configVersion: number;
     model: string | null;
     catalog: Catalog;
   }>();
-  const [settledModels, setSettledModels] = useState<Record<string, string>>(
-    {},
+  const [settledModels, setSettledModels] = useState<
+    Record<string, SettledModelEntry>
+  >({});
+  const [draftTracking, setDraftTracking] = useState({
+    preserveUnavailableModel,
+    conversationKey: normalizedConversationKey,
+  });
+  if (
+    draftTracking.preserveUnavailableModel !== preserveUnavailableModel ||
+    draftTracking.conversationKey !== normalizedConversationKey
+  ) {
+    const exitedDraftKey =
+      !draftTracking.preserveUnavailableModel && preserveUnavailableModel
+        ? draftTracking.conversationKey
+        : null;
+    setDraftTracking({
+      preserveUnavailableModel,
+      conversationKey: normalizedConversationKey,
+    });
+    if (exitedDraftKey !== null) {
+      setSettledModels((current) =>
+        pruneConversationEntries(
+          current,
+          exitedDraftKey,
+          normalizedConversationKey,
+        ),
+      );
+    }
+  }
+  const settled = Boolean(
+    value && settledModels[conversationScope]?.model === value,
   );
-  const settled = Boolean(value && settledModels[conversationScope] === value);
   const cached =
     loaded?.scope === scope && loaded.configVersion === configVersion
       ? loaded
@@ -145,9 +227,21 @@ export function ModelPicker({
         if (result.kind !== "models") throw new Error("无法加载模型列表");
         if (!disposed) {
           setCatalog({ scope, configVersion, model: value, catalog: result });
-          if (value && result.models.includes(value)) {
+          const activeScope = latestScope.current;
+          if (
+            !activeScope.preserveUnavailableModel &&
+            value &&
+            result.models.includes(value)
+          ) {
             setSettledModels((current) =>
-              updateSettledModels(current, conversationScope, value),
+              updateSettledModels(
+                current,
+                activeScope.conversationScope,
+                activeScope.conversationKey,
+                activeScope.hostId,
+                activeScope.agent,
+                value,
+              ),
             );
           }
         }
@@ -169,7 +263,6 @@ export function ModelPicker({
     projectId,
     agent,
     configVersion,
-    conversationScope,
     connected,
     settingsOpen,
     retry,
@@ -182,6 +275,32 @@ export function ModelPicker({
   // Cached choices can be submitted after a failed refresh. Leave automatic
   // model and effort changes to a successful refresh.
   const freshCatalog = error ? undefined : usableCatalog;
+  useEffect(() => {
+    if (
+      !preserveUnavailableModel &&
+      value &&
+      freshCatalog?.models.includes(value)
+    ) {
+      setSettledModels((current) =>
+        updateSettledModels(
+          current,
+          conversationScope,
+          normalizedConversationKey,
+          hostId,
+          agent,
+          value,
+        ),
+      );
+    }
+  }, [
+    preserveUnavailableModel,
+    conversationScope,
+    normalizedConversationKey,
+    hostId,
+    agent,
+    value,
+    freshCatalog,
+  ]);
   useEffect(() => {
     if (freshCatalog && effort && !freshCatalog.effort_levels.includes(effort))
       onEffortInvalid?.();
@@ -198,9 +317,16 @@ export function ModelPicker({
       : undefined;
   useEffect(() => {
     if (providerFallback !== undefined && providerFallback !== value) {
-      if (providerFallback) {
+      if (providerFallback && !preserveUnavailableModel) {
         setSettledModels((current) =>
-          updateSettledModels(current, conversationScope, providerFallback),
+          updateSettledModels(
+            current,
+            conversationScope,
+            normalizedConversationKey,
+            hostId,
+            agent,
+            providerFallback,
+          ),
         );
       }
       (onProviderFallback ?? onChange)(providerFallback);
@@ -208,7 +334,11 @@ export function ModelPicker({
   }, [
     providerFallback,
     value,
+    preserveUnavailableModel,
     conversationScope,
+    normalizedConversationKey,
+    hostId,
+    agent,
     onProviderFallback,
     onChange,
   ]);
@@ -349,7 +479,15 @@ export function ModelPicker({
         onChange={(id) => {
           const next = id || null;
           setSettledModels((current) =>
-            updateSettledModels(current, conversationScope, next),
+            updateSettledModels(
+              current,
+              conversationScope,
+              normalizedConversationKey,
+              hostId,
+              agent,
+              next,
+              true,
+            ),
           );
           onChange(next);
         }}

@@ -1177,3 +1177,152 @@ it("keeps each project's initial Provider fallback across P1 -> P2 -> P1 when st
     localStorage.getItem('latte-work.agent-selection.v1:["devbox","claude"]'),
   ).toBeNull();
 });
+
+it("clears settled draft models after transitioning to a session without refetching models on key change, and invalidates other projects on manual choice", async () => {
+  const { useAgentPreferences } = await import("./useAgentPreferences");
+  localStorage.clear();
+  localStorage.setItem(
+    'latte-work.agent-selection.v1:["devbox","claude"]',
+    JSON.stringify({ model: "model-a", effort: null, permissionMode: null }),
+  );
+  let p1Models = ["model-a", "model-b"];
+  const p2Models = ["model-a", "model-c"];
+  mocks.request.mockImplementation(
+    async (_host: string, req: { project_id?: string | null }) => ({
+      kind: "models",
+      models: req.project_id === "p2" ? p2Models : p1Models,
+      provider: "Team",
+      default_model: (req.project_id === "p2" ? p2Models : p1Models)[0] ?? null,
+      effort_levels: [],
+      model_labels: {},
+    }),
+  );
+  const ready = vi.fn();
+  const saved = {
+    id: "s1",
+    model: "model-a",
+    effort: null,
+    permission_mode: null,
+  } as import("./protocol").Session;
+
+  function Harness({
+    projectId,
+    session,
+    conversationKey,
+  }: {
+    projectId: string;
+    session?: import("./protocol").Session;
+    conversationKey: string;
+  }) {
+    const preferences = useAgentPreferences(
+      "devbox",
+      "claude",
+      projectId,
+      session,
+      false,
+      conversationKey,
+    );
+    return (
+      <ModelPicker
+        hostId="devbox"
+        projectId={projectId}
+        agent="claude"
+        conversationKey={conversationKey}
+        connected
+        settingsOpen={false}
+        preserveUnavailableModel={!!session}
+        value={preferences.model}
+        onChange={preferences.chooseModel}
+        onProviderFallback={preferences.replaceUnsupportedModel}
+        effort={preferences.effort}
+        onEffortChange={preferences.chooseEffort}
+        onEffortInvalid={preferences.clearUnsupportedEffort}
+        disabled={false}
+        onReadyChange={ready}
+      />
+    );
+  }
+
+  // 1. Draft on P1 settles "model-a".
+  const view = render(<Harness projectId="p1" conversationKey="new-task" />);
+  await act(async () => {});
+  await act(async () => {});
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  // 2. Transitioning the draft to persisted session "s1" with the same model must not issue a redundant models RPC.
+  mocks.request.mockClear();
+  view.rerender(
+    <Harness projectId="p1" session={saved} conversationKey="s1" />,
+  );
+  await act(async () => {});
+  expect(mocks.request).not.toHaveBeenCalled();
+
+  // 3. Provider on P1 removes "model-a"; returning to a fresh "new-task" draft must fall back to "model-b" instead of reusing the consumed draft's settled state.
+  p1Models = ["model-b"];
+  await act(async () => {
+    bumpModelConfigVersion();
+  });
+  await act(async () => {});
+  view.rerender(<Harness projectId="p1" conversationKey="new-task" />);
+  await act(async () => {});
+  await act(async () => {});
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({ value: "model-b" }),
+    undefined,
+  );
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+
+  // 4. Re-add "model-a" on P1 so the new draft settles "model-a", then remove it on P1 so P1 holds unavailable "model-a".
+  p1Models = ["model-a", "model-b"];
+  await act(async () => {
+    bumpModelConfigVersion();
+  });
+  await act(async () => {});
+  await act(async () => {
+    const lastCall = mocks.selector.mock.calls.at(-1)?.[0] as {
+      onChange: (value: string) => void;
+    };
+    lastCall.onChange("model-a");
+  });
+  await act(async () => {});
+  p1Models = ["model-b"];
+  await act(async () => {
+    bumpModelConfigVersion();
+  });
+  await act(async () => {});
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: false }),
+  );
+
+  // 5. On P2, user manually switches to "model-c" then "model-a"; returning to P1 treats "model-a" as a fresh cross-project choice and falls back to "model-b".
+  view.rerender(<Harness projectId="p2" conversationKey="new-task" />);
+  await act(async () => {});
+  await act(async () => {
+    const lastCall = mocks.selector.mock.calls.at(-1)?.[0] as {
+      onChange: (value: string) => void;
+    };
+    lastCall.onChange("model-c");
+  });
+  await act(async () => {});
+  await act(async () => {
+    const lastCall = mocks.selector.mock.calls.at(-1)?.[0] as {
+      onChange: (value: string) => void;
+    };
+    lastCall.onChange("model-a");
+  });
+  await act(async () => {});
+  view.rerender(<Harness projectId="p1" conversationKey="new-task" />);
+  await act(async () => {});
+  await act(async () => {});
+  expect(mocks.selector).toHaveBeenLastCalledWith(
+    expect.objectContaining({ value: "model-b" }),
+    undefined,
+  );
+  expect(ready).toHaveBeenLastCalledWith(
+    expect.objectContaining({ ready: true }),
+  );
+});

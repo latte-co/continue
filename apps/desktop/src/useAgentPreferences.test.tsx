@@ -280,3 +280,52 @@ it("preserves transient fallback models per draft scope across project round-tri
   hook.rerender({ project: "p1", conversationKey: "draft-1" });
   expect(hook.result.current.model).toBe("chosen-model");
 });
+
+it("prunes the exited draft's transient fallback when transitioning to a session", () => {
+  localStorage.setItem(
+    'latte-work.agent-selection.v1:["devbox","claude"]',
+    JSON.stringify({ model: "opus", effort: "high", permissionMode: null }),
+  );
+  const hook = renderHook(
+    ({ session, sending, conversationKey }) =>
+      useAgentPreferences(
+        "devbox",
+        "claude",
+        "p1",
+        session,
+        sending,
+        conversationKey,
+      ),
+    {
+      initialProps: {
+        session: undefined as Session | undefined,
+        sending: false,
+        conversationKey: "new-task",
+      },
+    },
+  );
+  act(() => hook.result.current.replaceUnsupportedModel("real"));
+  expect(hook.result.current.model).toBe("real");
+
+  // Draft persists into a session while sending, keeping in-flight selection.
+  hook.rerender({
+    session: savedSession(null, null),
+    sending: true,
+    conversationKey: "s1",
+  });
+  expect(hook.result.current.model).toBe("real");
+  hook.rerender({
+    session: savedSession("real", "high"),
+    sending: false,
+    conversationKey: "s1",
+  });
+  expect(hook.result.current.model).toBe("real");
+
+  // Starting a fresh draft later must read "opus" from localStorage rather than the consumed draft's "real".
+  hook.rerender({
+    session: undefined,
+    sending: false,
+    conversationKey: "new-task",
+  });
+  expect(hook.result.current.model).toBe("opus");
+});

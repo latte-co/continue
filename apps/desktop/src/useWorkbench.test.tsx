@@ -4048,3 +4048,109 @@ it("reads skill support independently from each connected host hello", async () 
   expect(hook.result.current.hostSupportsSkillFiles("remote")).toBe(false);
   expect(hook.result.current.hostSupportsSkillFiles("missing")).toBe(false);
 });
+
+it("keeps draft workspaceId stable across selectTaskProject round-trips and rotates it after exiting a draft or closing a session", async () => {
+  const createdSession: Session = {
+    ...session(),
+    id: "created-session",
+    project_id: "p1",
+  };
+  const base = mocks.request.getMockImplementation()!;
+  mocks.request.mockImplementation(async (host: string, r: Request) => {
+    if (r.method === "projects")
+      return {
+        kind: "projects",
+        projects: [
+          { id: "p1", name: "P1", path: "/p1" },
+          { id: "p2", name: "P2", path: "/p2" },
+        ],
+      };
+    if (r.method === "sessions")
+      return { kind: "sessions", sessions: [session()] };
+    if (r.method === "create_session")
+      return { kind: "session", session: createdSession };
+    if (r.method === "send") return { kind: "accepted", duplicate: false };
+    if (r.method === "archive_session")
+      return {
+        kind: "session",
+        session: {
+          ...createdSession,
+          id: r.session_id,
+          archived: true,
+          agent_session_open: false,
+        },
+      };
+    return base(host, r);
+  });
+
+  const hook = renderHook(useWorkbench);
+  await act(async () => {});
+  await act(async () =>
+    hook.result.current.createSession({
+      id: "p1",
+      name: "P1",
+      path: "/p1",
+      hostId: "local",
+    }),
+  );
+  const firstDraftWorkspaceId = hook.result.current.workspaceId;
+  expect(firstDraftWorkspaceId).toMatch(/^draft:/);
+
+  // Project round-trip within the same open draft preserves workspaceId.
+  act(() =>
+    hook.result.current.selectTaskProject({
+      id: "p2",
+      name: "P2",
+      path: "/p2",
+      hostId: "local",
+    }),
+  );
+  expect(hook.result.current.workspaceId).toBe(firstDraftWorkspaceId);
+  act(() =>
+    hook.result.current.selectTaskProject({
+      id: "p1",
+      name: "P1",
+      path: "/p1",
+      hostId: "local",
+    }),
+  );
+  expect(hook.result.current.workspaceId).toBe(firstDraftWorkspaceId);
+
+  // Persisting the draft into a session switches to the session workspaceId, and closing that session enters a brand-new draft workspaceId.
+  await act(async () => {
+    await hook.result.current.send("Start task", null, null, null);
+  });
+  expect(hook.result.current.workspaceId).toBe("created-session");
+  await act(async () => {
+    await hook.result.current.sessionAction("local", {
+      method: "close_agent_session",
+      session_id: "created-session",
+    });
+  });
+  expect(hook.result.current.sessionId).toBe("");
+  const secondDraftWorkspaceId = hook.result.current.workspaceId;
+  expect(secondDraftWorkspaceId).toMatch(/^draft:/);
+  expect(secondDraftWorkspaceId).not.toBe(firstDraftWorkspaceId);
+
+  // Opening an existing session from the second draft and archiving it also yields a fresh draft workspaceId.
+  act(() =>
+    hook.result.current.openSession({
+      ...session(),
+      id: "existing-session",
+      project_id: "p1",
+      hostId: "local",
+    }),
+  );
+  expect(hook.result.current.workspaceId).toBe("existing-session");
+  await act(async () => {
+    await hook.result.current.sessionAction("local", {
+      method: "archive_session",
+      session_id: "existing-session",
+      archived: true,
+    });
+  });
+  expect(hook.result.current.sessionId).toBe("");
+  const thirdDraftWorkspaceId = hook.result.current.workspaceId;
+  expect(thirdDraftWorkspaceId).toMatch(/^draft:/);
+  expect(thirdDraftWorkspaceId).not.toBe(secondDraftWorkspaceId);
+});

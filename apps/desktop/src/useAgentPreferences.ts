@@ -15,6 +15,7 @@ type TransientModelEntry = {
 };
 type HookState = {
   source: string;
+  conversationKey: string;
   selection: Selection;
   error: string;
   transientModels: TransientModelEntry[];
@@ -122,6 +123,7 @@ export function useAgentPreferences(
   ]);
   const [state, setState] = useState<HookState>(() => ({
     source,
+    conversationKey: normalizedConversationKey,
     selection: initialSelection(host, agent, session, draftScope, []),
     error: "",
     transientModels: [],
@@ -133,17 +135,21 @@ export function useAgentPreferences(
     // Keep the in-flight draft's choices until that transition is complete.
     const nextTransientModels = session
       ? state.transientModels.filter(
-          (entry) => entry.conversationKey !== normalizedConversationKey,
+          (entry) =>
+            entry.conversationKey !== normalizedConversationKey &&
+            entry.conversationKey !== state.conversationKey,
         )
       : state.transientModels;
     active = sending
       ? {
           ...state,
           source,
+          conversationKey: normalizedConversationKey,
           transientModels: nextTransientModels,
         }
       : {
           source,
+          conversationKey: normalizedConversationKey,
           selection: initialSelection(
             host,
             agent,

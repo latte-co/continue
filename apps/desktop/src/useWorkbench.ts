@@ -1154,6 +1154,7 @@ export function useWorkbench() {
         selectedSessionId.current === action.session_id
       ) {
         draft.current = true;
+        setDraftWorkspaceId(crypto.randomUUID());
         resetConversationView();
         setSessionId("");
         setEvents([]);
@@ -1179,6 +1180,7 @@ export function useWorkbench() {
       return;
     }
     selectProject(target.hostId, target.project_id);
+    if (draft.current) setDraftWorkspaceId(crypto.randomUUID());
     draft.current = false;
     if (target.id !== currentSessionId) resetConversationView();
     pendingSession.current = {
@@ -1370,6 +1372,7 @@ export function useWorkbench() {
         ]);
         if (navigationRevision.current === revision) {
           copyWorkspace(workspaceId, workspaceKey(r.session.id));
+          setDraftWorkspaceId(crypto.randomUUID());
           draft.current = false;
           selectedSessionId.current = r.session.id;
           setSessionId(r.session.id);
@@ -1617,6 +1620,7 @@ export function useWorkbench() {
     const current = selection.current;
     if (id === current.projectId && targetHostId === current.hostId) return;
     draft.current = false;
+    setDraftWorkspaceId(crypto.randomUUID());
     resetConversationView();
     if (targetHostId !== current.hostId) {
       activateHost(targetHostId);
