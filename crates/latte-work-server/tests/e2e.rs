@@ -4717,10 +4717,40 @@ async fn native_idle_shutdown_preserves_busy_terminal_then_exits_after_close() {
     );
 }
 
+pub(crate) fn isolated_python_bin(root: &Path) -> PathBuf {
+    let dir = root.join("python-bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    if let Some(paths) = std::env::var_os("PATH") {
+        for entry in std::env::split_paths(&paths) {
+            let candidate = entry.join("python3");
+            if candidate.is_file() && candidate != Path::new("/usr/bin/python3") {
+                let _ = std::os::unix::fs::symlink(&candidate, dir.join("python3"));
+                break;
+            }
+        }
+    }
+    dir
+}
+
 #[tokio::test]
 async fn agents_inherit_shell_exports_with_a_minimal_daemon_path() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
+    let python_root = tempfile::tempdir().unwrap();
+    let python_bin = isolated_python_bin(python_root.path());
+    let daemon_path = std::env::join_paths([
+        python_bin.as_path(),
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+    ])
+    .unwrap();
+    let shell_path = std::env::join_paths([
+        dir.path(),
+        python_bin.as_path(),
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+    ])
+    .unwrap();
     let shell = dir.path().join("bash");
     let tool = dir.path().join("latte-env-fixture");
     std::fs::write(
@@ -4730,13 +4760,20 @@ printf '%s' "$LATTE_TEST_VALUE"
 "#,
     )
     .unwrap();
-    std::fs::write(&shell, format!("#!/bin/sh\nexport PATH='{}':/usr/bin:/bin\nexport LATTE_TEST_VALUE='shell-loaded'\necho startup-banner\nexec /bin/sh -c \"$2\"\n", dir.path().display())).unwrap();
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nexport PATH='{}'\nexport LATTE_TEST_VALUE='shell-loaded'\necho startup-banner\nexec /bin/sh -c \"$2\"\n",
+            shell_path.to_str().unwrap()
+        ),
+    )
+    .unwrap();
     for path in [&shell, &tool] {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let host = Host::start_with_environment(&[
         ("SHELL", shell.as_os_str()),
-        ("PATH", std::ffi::OsStr::new("/usr/bin:/bin")),
+        ("PATH", daemon_path.as_os_str()),
         ("LATTE_WORK_AGENT_ENV", std::ffi::OsStr::new("shell")),
     ])
     .await;

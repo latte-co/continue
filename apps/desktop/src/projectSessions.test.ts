@@ -123,14 +123,10 @@ it("reads all managed pages including processless actors and side chats", async 
     project_id: "p",
     after: "a-processless",
   });
-  const close = vi
-    .fn()
-    .mockResolvedValueOnce({ kind: "ok" })
-    .mockResolvedValueOnce({ kind: "side_chat_closed" });
+  const close = vi.fn().mockResolvedValue({ kind: "ok" });
   const result = await closeProjectSessions("remote", "p", sessions, close);
   expect(result.closed).toEqual(["a-processless", "running-side"]);
   expect(result.failed).toEqual([]);
-  expect(result.pendingWrites.map((s) => s.id)).toEqual(["running-side"]);
 });
 
 it("fails incomplete side inventory instead of closing a partial project", async () => {

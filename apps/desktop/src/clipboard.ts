@@ -1,3 +1,6 @@
+import { invoke } from "@tauri-apps/api/core";
+import { native } from "./api";
+
 export async function copyText(text: string): Promise<void> {
   const focused = document.activeElement;
   const selection = window.getSelection();
@@ -28,4 +31,64 @@ export async function copyText(text: string): Promise<void> {
     }
   }
   if (!copied) await navigator.clipboard.writeText(text);
+}
+
+const MIME_EXTENSIONS: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+  "image/bmp": "bmp",
+  "image/tiff": "tiff",
+  "image/avif": "avif",
+  "image/heic": "heic",
+  "image/heif": "heif",
+};
+
+export function imageDownloadName(name: string, mime: string): string {
+  const base =
+    name
+      .split("/")
+      .filter(Boolean)
+      .at(-1)
+      ?.replace(/[\x00-\x1f/\\:]/g, "")
+      .trim() || "图片";
+  const ext = MIME_EXTENSIONS[mime.toLowerCase()];
+  if (!ext || /\.[a-z0-9]{2,5}$/i.test(base)) return base;
+  return `${base}.${ext}`;
+}
+
+export async function copyImageBytes(
+  bytes: Uint8Array,
+  mime: string,
+): Promise<void> {
+  if (!bytes.byteLength) throw new Error("图片内容为空，无法复制");
+  if (native) {
+    await invoke("copy_image", { mime, data: Array.from(bytes) });
+    return;
+  }
+  if (
+    typeof ClipboardItem !== "undefined" &&
+    typeof navigator.clipboard?.write === "function"
+  ) {
+    await navigator.clipboard.write([
+      new ClipboardItem({
+        [mime]: new Blob([bytes as BlobPart], { type: mime }),
+      }),
+    ]);
+    return;
+  }
+  await invoke("copy_image", { mime, data: Array.from(bytes) });
+}
+
+export async function saveImageBytes(
+  name: string,
+  bytes: Uint8Array,
+  mime: string,
+): Promise<boolean> {
+  const saved = await invoke<string | null>("save_file_as", {
+    name: imageDownloadName(name, mime),
+    data: Array.from(bytes),
+  });
+  return saved !== null && saved !== undefined;
 }

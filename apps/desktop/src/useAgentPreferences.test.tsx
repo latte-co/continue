@@ -90,13 +90,21 @@ it("capability cleanup does not erase the user's remembered choice and storage f
   const hook = renderHook(() =>
     useAgentPreferences("local", "claude", "p", undefined, false),
   );
-  act(() => hook.result.current.chooseEffort("high"));
-  act(() => hook.result.current.clearUnsupportedEffort());
+  act(() => {
+    hook.result.current.chooseModel("opus");
+    hook.result.current.chooseEffort("high");
+  });
+  act(() => {
+    hook.result.current.replaceUnsupportedModel("provider-default");
+    hook.result.current.clearUnsupportedEffort();
+  });
+  expect(hook.result.current.model).toBe("provider-default");
   expect(hook.result.current.effort).toBeNull();
   hook.unmount();
   const restored = renderHook(() =>
     useAgentPreferences("local", "claude", "p", undefined, false),
   );
+  expect(restored.result.current.model).toBe("opus");
   expect(restored.result.current.effort).toBe("high");
   vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
     throw new Error("quota");
@@ -218,4 +226,106 @@ it("remembers native permission ids per host/agent and restores session inherita
     useAgentPreferences("local", "claude", "p3", undefined, false),
   );
   expect(inherited.result.current.permissionMode).toBeNull();
+});
+
+it("preserves transient fallback models per draft scope across project round-trips without overwriting localStorage", () => {
+  localStorage.setItem(
+    'latte-work.agent-selection.v1:["devbox","claude"]',
+    JSON.stringify({ model: "opus", effort: "high", permissionMode: null }),
+  );
+  const hook = renderHook(
+    ({ project, conversationKey }) =>
+      useAgentPreferences(
+        "devbox",
+        "claude",
+        project,
+        undefined,
+        false,
+        conversationKey,
+      ),
+    {
+      initialProps: { project: "p1", conversationKey: "draft-1" },
+    },
+  );
+  expect(hook.result.current.model).toBe("opus");
+  act(() => hook.result.current.replaceUnsupportedModel("real"));
+  expect(hook.result.current.model).toBe("real");
+
+  // Switching to an unvisited project P2 reads stored "opus" again.
+  hook.rerender({ project: "p2", conversationKey: "draft-1" });
+  expect(hook.result.current.model).toBe("opus");
+  act(() => hook.result.current.replaceUnsupportedModel("next-model"));
+  expect(hook.result.current.model).toBe("next-model");
+
+  // Returning to P1 on the same draft restores "real" while localStorage stays "opus".
+  hook.rerender({ project: "p1", conversationKey: "draft-1" });
+  expect(hook.result.current.model).toBe("real");
+  expect(hook.result.current.effort).toBe("high");
+  expect(
+    JSON.parse(
+      localStorage.getItem(
+        'latte-work.agent-selection.v1:["devbox","claude"]',
+      ) ?? "{}",
+    ).model,
+  ).toBe("opus");
+
+  // Rotating conversationKey for a new draft starts fresh from stored "opus".
+  hook.rerender({ project: "p1", conversationKey: "draft-2" });
+  expect(hook.result.current.model).toBe("opus");
+
+  // An explicit user choice clears stale transient overrides across projects.
+  hook.rerender({ project: "p2", conversationKey: "draft-1" });
+  expect(hook.result.current.model).toBe("next-model");
+  act(() => hook.result.current.chooseModel("chosen-model"));
+  hook.rerender({ project: "p1", conversationKey: "draft-1" });
+  expect(hook.result.current.model).toBe("chosen-model");
+});
+
+it("prunes the exited draft's transient fallback when transitioning to a session", () => {
+  localStorage.setItem(
+    'latte-work.agent-selection.v1:["devbox","claude"]',
+    JSON.stringify({ model: "opus", effort: "high", permissionMode: null }),
+  );
+  const hook = renderHook(
+    ({ session, sending, conversationKey }) =>
+      useAgentPreferences(
+        "devbox",
+        "claude",
+        "p1",
+        session,
+        sending,
+        conversationKey,
+      ),
+    {
+      initialProps: {
+        session: undefined as Session | undefined,
+        sending: false,
+        conversationKey: "new-task",
+      },
+    },
+  );
+  act(() => hook.result.current.replaceUnsupportedModel("real"));
+  expect(hook.result.current.model).toBe("real");
+
+  // Draft persists into a session while sending, keeping in-flight selection.
+  hook.rerender({
+    session: savedSession(null, null),
+    sending: true,
+    conversationKey: "s1",
+  });
+  expect(hook.result.current.model).toBe("real");
+  hook.rerender({
+    session: savedSession("real", "high"),
+    sending: false,
+    conversationKey: "s1",
+  });
+  expect(hook.result.current.model).toBe("real");
+
+  // Starting a fresh draft later must read "opus" from localStorage rather than the consumed draft's "real".
+  hook.rerender({
+    session: undefined,
+    sending: false,
+    conversationKey: "new-task",
+  });
+  expect(hook.result.current.model).toBe("opus");
 });

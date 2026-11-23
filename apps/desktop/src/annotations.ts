@@ -28,7 +28,6 @@ function validAnnotation(value: unknown): value is Annotation {
     !!a.quote.trim() &&
     a.quote.length <= MAX_QUOTE &&
     typeof a.comment === "string" &&
-    !!a.comment.trim() &&
     a.comment.length <= MAX_COMMENT &&
     !!a.source &&
     typeof a.source === "object" &&
@@ -49,7 +48,7 @@ export function annotationError(entries: Annotation[]): string | null {
   if (entries.length > MAX_ANNOTATIONS)
     return `最多添加 ${MAX_ANNOTATIONS} 条注释`;
   if (!entries.every(validAnnotation))
-    return "请填写评论，并缩短过长的原文或评论。";
+    return "请选择有效原文，并缩短过长的原文或评论。";
   if (new Set(entries.map((entry) => entry.id)).size !== entries.length)
     return "注释标识重复，请重新添加。";
   if (

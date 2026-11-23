@@ -1158,8 +1158,8 @@ button.recent-notice {
 .tool-images {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-3);
-  margin-block: var(--space-3);
+  gap: var(--space-2);
+  margin-block: var(--space-2);
 }
 .raster-image {
   display: flex;
@@ -1180,7 +1180,27 @@ button.recent-notice {
   object-fit: contain;
 }
 .tool-images .raster-image {
-  max-width: min(100%, 420px);
+  width: clamp(80px, 20cqw, 112px);
+  height: clamp(80px, 20cqw, 112px);
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+  border-radius: var(--radius-control);
+}
+.tool-images .raster-image > img {
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  object-fit: cover;
+}
+.tool-images .raster-image > span {
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+  padding: 0 var(--space-2);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .review-image-diff {
   display: grid;
@@ -1233,10 +1253,12 @@ button.recent-notice {
 }
 .markdown .message-image {
   display: block;
-  max-width: min(100%, 480px);
-  max-height: 360px;
+  max-width: min(100%, 360px);
+  max-height: 220px;
+  object-fit: contain;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-panel);
+  background: var(--color-input);
 }
 .markdown .message-image-placeholder {
   display: inline-flex;
@@ -1304,6 +1326,18 @@ button.recent-notice {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.attachment-image-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: none;
+}
+.attachment-image-action-error {
+  margin: 0 0 var(--space-2);
+  color: var(--color-danger);
+  font-size: var(--text-sm);
+  flex: none;
 }
 .attachment-image-stage {
   flex: 1;
@@ -4064,7 +4098,9 @@ button.recent-notice {
 @container conversation (max-width: 320px) {
   .messages,
   .welcome,
-  .composer-wrap {
+  .composer-wrap,
+  .side-chat-messages,
+  .side-chat-compose {
     --content-gutter: var(--space-2);
   }
 }
@@ -4230,6 +4266,35 @@ button[aria-checked="true"] .model-option-check {
 }
 .pinned-session-list {
   min-height: 0;
+}
+
+.side-chat-recovery-modal {
+  width: min(680px, calc(100vw - 40px));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  overflow: hidden;
+}
+.side-chat-recovery-modal h2:not(:where(.markdown *)),
+.side-chat-recovery-modal p:not(:where(.markdown *)) {
+  margin: 0;
+}
+.side-chat-recovery-meta {
+  font-weight: 500;
+}
+.side-chat-recovery-transcript {
+  flex: 1;
+  min-height: 200px;
+  max-height: min(48dvh, 440px);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  background: var(--color-elevated);
+  padding: var(--space-3);
+}
+.side-chat-recovery-footer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
 }
 .session-label {
   white-space: nowrap;
@@ -6249,26 +6314,43 @@ button.task-info-row:not(:disabled):hover,
 }
 
 .side-chat {
+  container-type: inline-size;
+  container-name: conversation;
+  --content-gutter: clamp(16px, 4cqw, 48px);
   display: flex;
   flex: 1;
   flex-direction: column;
   min-height: 0;
+  margin-bottom: var(--space-2);
 }
 .side-chat-transcript {
   flex: 1;
   min-height: 0;
   overflow: auto;
   overscroll-behavior: contain;
-  padding: var(--space-4);
+  scrollbar-gutter: stable both-edges;
 }
 .side-chat-messages {
-  width: min(100%, var(--content-width));
-  margin-inline: auto;
+  font-family: var(--font-content);
+  font-weight: var(--weight-content);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  width: 100%;
+  max-width: calc(var(--content-width) + 2 * var(--content-gutter));
+  margin: 0 auto;
+  padding: var(--space-4) var(--content-gutter) var(--space-2);
+  font-size: var(--text-body);
+  line-height: 1.8;
 }
 .side-chat-compose {
-  width: min(100%, var(--content-width));
-  align-self: center;
-  padding: var(--space-3);
+  --composer-radius: 14px;
+  container-type: inline-size;
+  container-name: composer;
+  padding: var(--space-3) var(--content-gutter) var(--space-4);
+  max-width: calc(var(--content-width) + 2 * var(--content-gutter));
+  width: 100%;
+  margin: 0 auto;
+  flex: none;
 }
 .side-chat-quotes details {
   min-width: 0;

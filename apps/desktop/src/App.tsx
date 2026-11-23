@@ -19,6 +19,7 @@ import { useSidebarPreview } from "./useSidebarPreview";
 import { SkillsPage } from "./SkillsPage";
 import { SettingsPage } from "./SettingsPage";
 import { HostDialogs } from "./HostDialogs";
+import { SideChatRecoveryDialog } from "./SideChatRecoveryDialog";
 import { SshPasswordDialog } from "./SshPasswordDialog";
 import { useWorkbench } from "./useWorkbench";
 import { useSubagents } from "./useSubagents";
@@ -79,9 +80,11 @@ export default function App() {
   } = workbench;
   const [sidebarInteraction, setSidebarInteraction] = useState(false);
   const [statusOpen, setStatusOpen] = useState(false);
+  const dialogOpen =
+    !!workbench.passwordPrompt || !!workbench.standaloneSideChat;
   const sidebarPreview = useSidebarPreview({
     open: sidebarOpen,
-    enabled: (!workbench.modal || skillsOpen) && !workbench.passwordPrompt,
+    enabled: (!workbench.modal || skillsOpen) && !dialogOpen,
     interactionLocked: sidebarInteraction || statusOpen,
     toggle: toggleSidebar,
   });
@@ -96,7 +99,7 @@ export default function App() {
         workbench.workspace.expanded && workbench.workspace.conversationActive
       ) &&
       !workbench.modal &&
-      !workbench.passwordPrompt &&
+      !dialogOpen &&
       workbench.workspace.tabs.some(
         (tab) =>
           tab.id === workbench.workspace.current &&
@@ -185,7 +188,7 @@ export default function App() {
   useStatusNotices(statusNotices);
   const sidebarVisible = sidebarOpen || sidebarPreview.visible;
   const statusCenter =
-    (!workbench.modal || skillsOpen) && !workbench.passwordPrompt ? (
+    (!workbench.modal || skillsOpen) && !dialogOpen ? (
       <StatusCenter onOpenChange={setStatusOpen} />
     ) : null;
   const collapsedStatusCenter = sidebarPreview.visible ? (
@@ -196,12 +199,16 @@ export default function App() {
   const conversationHidden = merged && !workbench.workspace.conversationActive;
   useEffect(() => {
     workbench.setPredictionVisible(
-      !conversationHidden && !skillsOpen && workbench.modal !== "settings",
+      !conversationHidden &&
+        !skillsOpen &&
+        workbench.modal !== "settings" &&
+        !workbench.standaloneSideChat,
     );
   }, [
     conversationHidden,
     skillsOpen,
     workbench.modal,
+    workbench.standaloneSideChat,
     workbench.setPredictionVisible,
   ]);
   const supportsSide =
@@ -235,7 +242,7 @@ export default function App() {
     return true;
   };
   const conversationActions =
-    !workbench.modal && !workbench.passwordPrompt ? (
+    !workbench.modal && !dialogOpen ? (
       <SessionMenuButton state={workbench} />
     ) : null;
   const overview = (
@@ -357,6 +364,11 @@ export default function App() {
             }
             openSubagents={showSubagents}
             openSideChat={canOpenSide ? showSide : undefined}
+            openBlockingSideChat={
+              workbench.openSideChatSession
+                ? (sideId) => workbench.openSideChatSession(hostId, sideId)
+                : undefined
+            }
             quoteInSideChat={
               canOpenSide ? (text) => void showSide(text, true) : undefined
             }
@@ -380,6 +392,7 @@ export default function App() {
             agents={workbench.agents}
             selectAgent={workbench.selectAgent}
             session={session}
+            conversationKey={workbench.workspaceId}
             hostId={hostId}
             agentSessionState={
               session
@@ -501,11 +514,12 @@ export default function App() {
                     isDraft={tab.draft}
                     hostId={hostId}
                     drafts={drafts}
-                    active={
-                      active && !workbench.modal && !workbench.passwordPrompt
-                    }
+                    active={active && !workbench.modal && !dialogOpen}
                     connected={connected}
                     supported={supportsSide}
+                    supportsInheritPermission={
+                      workbench.supportsSideChatInheritPermission
+                    }
                   />
                 )
               : undefined
@@ -525,7 +539,7 @@ export default function App() {
                 ) &&
                 workbench.modal !== "settings" &&
                 !skillsOpen &&
-                !workbench.passwordPrompt
+                !dialogOpen
               }
               running={
                 session?.status === "running" || session?.status === "waiting"
@@ -615,6 +629,13 @@ export default function App() {
           active={workbench.modal === "settings"}
         />
       </div>
+      {workbench.standaloneSideChat && (
+        <SideChatRecoveryDialog
+          key={`${workbench.standaloneSideChat.hostId}:${workbench.standaloneSideChat.sideId}`}
+          state={workbench}
+          target={workbench.standaloneSideChat}
+        />
+      )}
       {workbench.passwordPrompt && (
         <SshPasswordDialog
           key={workbench.passwordPrompt.id}

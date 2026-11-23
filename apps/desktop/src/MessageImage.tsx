@@ -1,6 +1,6 @@
 import type { ExtraProps } from "react-markdown";
 import { ImagePreview, useImagePreview } from "./ImageGallery";
-import { useContext, useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Image as ImageIcon, ImageOff, LoaderCircle } from "lucide-react";
 import { message } from "./api";
 import { imageRead } from "./AttachmentImage";
@@ -16,7 +16,13 @@ export function isPreviewableImage(data: SourceData): boolean {
   return IMAGE_MIME.test(data.mime) && !data.truncated;
 }
 
-type LoadState = { url?: string; error?: string; loading?: boolean };
+type LoadState = {
+  url?: string;
+  bytes?: Uint8Array;
+  mime?: string;
+  error?: string;
+  loading?: boolean;
+};
 
 /** A path that can never render as an image; explain instead of offering a grant. */
 function UnavailableImage({ path, hint }: { path: string; hint: string }) {
@@ -120,7 +126,7 @@ function MessageLocalImage({
         // Latch activation before replacing its observed placeholder, so
         // decode retries remain enabled after the dialog closes.
         setVisible(true);
-        setState({ url });
+        setState({ url, bytes: data.bytes, mime: data.mime });
       })
       .catch((error) => {
         if (!disposed) {
@@ -136,6 +142,13 @@ function MessageLocalImage({
     release();
     setState({ error: "图片格式无法解码" });
   };
+  const payload = useMemo(
+    () =>
+      state.url && state.bytes && state.mime
+        ? { bytes: state.bytes, mime: state.mime }
+        : undefined,
+    [state.url, state.bytes, state.mime],
+  );
   const error = state.error;
   const loading = !error && state.loading;
   const placeholder = (
@@ -209,7 +222,12 @@ function MessageLocalImage({
       {/* Keep the selected logical owner registered during async reloads;
           unviewed lazy images still join only after loading. */}
       {(state.url || preview.open) && (
-        <ImagePreview preview={preview} name={name} title={path}>
+        <ImagePreview
+          preview={preview}
+          name={name}
+          title={path}
+          payload={payload}
+        >
           {state.url ? (
             <img src={state.url} alt={name} onError={onError} />
           ) : (

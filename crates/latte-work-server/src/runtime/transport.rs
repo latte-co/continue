@@ -152,10 +152,11 @@ impl Transport {
             .await
             .context("Agent stdout已结束，但进程退出未确认")??;
         // Retire inherited writers immediately at the reap boundary, before any
-        // stderr/auxiliary await. Subsequent close retries are observation-only.
+        // stderr/auxiliary await. Subsequent close retries are observation-only;
+        // Darwin's EPERM on reparented zombie groups still requires ESRCH later.
         self.retirement_signalled = matches!(
             killpg(Pid::from_raw(self.group.pid), Signal::SIGKILL),
-            Ok(()) | Err(Errno::ESRCH)
+            Ok(()) | Err(Errno::ESRCH) | Err(Errno::EPERM)
         );
         let stderr = tokio::time::timeout(REAP_LIMIT, &mut self.drain)
             .await
@@ -219,19 +220,7 @@ impl Transport {
         confirmed && group_confirmed
     }
     async fn observe_group_retirement(&self, deadline: tokio::time::Instant) -> bool {
-        tokio::time::timeout_at(deadline, async {
-            loop {
-                match killpg(Pid::from_raw(self.group.pid), None) {
-                    Err(Errno::ESRCH) => return true,
-                    Ok(()) | Err(Errno::EPERM) => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    Err(_) => return false,
-                }
-            }
-        })
-        .await
-        .unwrap_or(false)
+        super::observe_group_retirement(Pid::from_raw(self.group.pid), deadline).await
     }
 }
 
