@@ -129,6 +129,7 @@ export function ChangesView({
     setInfo(undefined);
     setBase("");
     setCommit(undefined);
+    setScope((previous) => (previous === "commit" ? "branch" : previous));
     setSnapshot(undefined);
     select(initialPath ?? "");
     setError("");
@@ -174,6 +175,7 @@ export function ChangesView({
           (scope === "branch" && !base)))
     )
       return;
+    if (scope === "commit" && !commit) return;
     let disposed = false;
     setLoading(true);
     setError("");
@@ -221,8 +223,8 @@ export function ChangesView({
                 base:
                   scope === "branch"
                     ? base
-                    : scope === "commit"
-                      ? commit!.oid
+                    : scope === "commit" && commit
+                      ? commit.oid
                       : null,
               },
     )

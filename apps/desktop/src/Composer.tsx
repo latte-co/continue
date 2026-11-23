@@ -55,6 +55,36 @@ import {
   type InlineSelection,
 } from "./InlineReferenceInput";
 
+export function composerReferenceScope(
+  hostId: string,
+  projectId: string | undefined,
+  agent: string,
+  projectPath?: string,
+): string {
+  return projectPath === undefined
+    ? `${hostId}:${projectId}:${agent}`
+    : `${hostId}:${projectId}:${agent}:${projectPath}`;
+}
+
+export function resolveComposerReferences(
+  references: { scope: string; entries: ComposerReference[] },
+  hostId: string,
+  projectId: string | undefined,
+  agent: string,
+  projectPath?: string,
+): ComposerReference[] {
+  const scope = composerReferenceScope(hostId, projectId, agent, projectPath);
+  if (references.scope === scope) return references.entries;
+  const projectScopePrefix = `${hostId}:${projectId}:${agent}:`;
+  if (
+    projectPath !== undefined &&
+    references.scope.startsWith(projectScopePrefix)
+  ) {
+    return references.entries.filter((entry) => entry.path.startsWith("/"));
+  }
+  return [];
+}
+
 const EXPANDED_TOOLBAR_CONTROL =
   '.composer-toolbar [aria-haspopup][aria-expanded="true"], .composer-toolbar [role="combobox"][aria-expanded="true"]';
 
@@ -190,11 +220,7 @@ export function Composer(props: Props) {
     return () => element?.removeEventListener("cancel", cancel);
   }, []);
   const submitting = useRef(false);
-  const projectScopePrefix = `${hostId}:${projectId}:${agent}:`;
-  const scope =
-    projectPath === undefined
-      ? `${hostId}:${projectId}:${agent}`
-      : `${projectScopePrefix}${projectPath}`;
+  const scope = composerReferenceScope(hostId, projectId, agent, projectPath);
   const currentScope = useRef(scope);
   currentScope.current = scope;
   const [localReferences, setLocalReferences] = useState<{
@@ -203,13 +229,13 @@ export function Composer(props: Props) {
   }>({ scope, entries: [] });
   const references = props.referenceState ?? localReferences;
   const setReferences = props.onReferencesChange ?? setLocalReferences;
-  const attached =
-    references.scope === scope
-      ? references.entries
-      : projectPath !== undefined &&
-          references.scope.startsWith(projectScopePrefix)
-        ? references.entries.filter((entry) => entry.path.startsWith("/"))
-        : [];
+  const attached = resolveComposerReferences(
+    references,
+    hostId,
+    projectId,
+    agent,
+    projectPath,
+  );
   const inlineAttached = attached.filter((entry) => !entry.attachmentKind);
   const separateAttached = attached.filter((entry) => !!entry.attachmentKind);
   const inlineMode = !concealSubmitted && !!inlineAttached.length;
@@ -409,12 +435,16 @@ export function Composer(props: Props) {
     // A different project never inherits references; moving a project directory
     // drops stale project-relative references while keeping absolute attachments.
     if (references.scope !== scope) {
-      const preserved =
-        projectPath !== undefined &&
-        references.scope.startsWith(projectScopePrefix)
-          ? references.entries.filter((entry) => entry.path.startsWith("/"))
-          : [];
-      setReferences({ scope, entries: preserved });
+      setReferences({
+        scope,
+        entries: resolveComposerReferences(
+          references,
+          hostId,
+          projectId,
+          agent,
+          projectPath,
+        ),
+      });
     }
   }, [scope]);
   useEffect(() => {

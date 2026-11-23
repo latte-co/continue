@@ -37,7 +37,11 @@ import type {
 } from "./protocol";
 import type { Host } from "./api";
 import type { HostedProject } from "./projectCatalog";
-import { Composer } from "./Composer";
+import {
+  Composer,
+  composerReferenceScope,
+  resolveComposerReferences,
+} from "./Composer";
 import {
   useComposerPrediction,
   type ComposerPredictionResponse,
@@ -1102,11 +1106,19 @@ export function Conversation({
           onEdit={(entry) => {
             const current = drafts.get(draftKey);
             const restored = userMessageContent(entry.text);
-            const scope = `${hostId}:${projectId}:${agentId}`;
-            const existing =
-              current.references.scope === scope
-                ? current.references.entries
-                : [];
+            const scope = composerReferenceScope(
+              hostId,
+              projectId,
+              agentId,
+              projectPath,
+            );
+            const existing = resolveComposerReferences(
+              current.references,
+              hostId,
+              projectId,
+              agentId,
+              projectPath,
+            );
             const combined = [
               ...existing,
               ...restored.references.filter(

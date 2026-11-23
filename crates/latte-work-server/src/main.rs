@@ -526,6 +526,11 @@ async fn dispatch_reserved(
             | Request::WriteTerminal { .. }
             | Request::Approve { .. }
             | Request::AnswerQuestion { .. }
+            | Request::TakeQueuedMessage { .. }
+            | Request::ReorderMessageQueue { .. }
+            | Request::EditQueuedMessage { .. }
+            | Request::CancelQueuedMessage { .. }
+            | Request::ClearMessageQueue { .. }
             | Request::ResumeMessageQueue { .. }
             | Request::DispatchQueuedMessage { .. }
     ) {
@@ -2713,6 +2718,242 @@ mod send_admission_tests {
             crate::admission::active(&service.database, "old-control"),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn queue_mutations_serialize_with_project_path_updates_and_leave_idle_actor_closable() {
+        #[derive(Clone, Copy)]
+        enum Variant {
+            Take,
+            Reorder,
+            Edit,
+            Cancel,
+            Clear,
+        }
+
+        let enqueue_paused = |service: &Service, session_id: &str, ids: &[&str]| {
+            let config = service
+                .providers
+                .lock()
+                .unwrap()
+                .turn_config("codex", None, Some(latte_work_protocol::TurnProvider::Cli))
+                .unwrap();
+            let fingerprint =
+                providers::turn_fingerprint(Some(&latte_work_protocol::TurnProvider::Cli)).unwrap();
+            db(&service.database, |store| {
+                for &id in ids {
+                    store.enqueue(
+                        session_id,
+                        &runtime::SendTurn {
+                            request_id: id.into(),
+                            text: format!("queued {id}"),
+                            model: None,
+                            fingerprint: fingerprint.clone(),
+                            config: config.clone(),
+                        },
+                    )?;
+                }
+                store.pause_queue(session_id, Some("paused for test"))?;
+                Ok(())
+            })
+            .unwrap();
+        };
+
+        let build_request =
+            |variant: Variant, session_id: &str, first: &str, second: &str| match variant {
+                Variant::Take => Request::TakeQueuedMessage {
+                    session_id: session_id.into(),
+                    request_id: first.into(),
+                    revision: 0,
+                },
+                Variant::Reorder => Request::ReorderMessageQueue {
+                    session_id: session_id.into(),
+                    expected: vec![first.into(), second.into()],
+                    order: vec![second.into(), first.into()],
+                },
+                Variant::Edit => Request::EditQueuedMessage {
+                    session_id: session_id.into(),
+                    request_id: first.into(),
+                    revision: 0,
+                    text: "edited".into(),
+                },
+                Variant::Cancel => Request::CancelQueuedMessage {
+                    session_id: session_id.into(),
+                    request_id: first.into(),
+                    revision: 0,
+                },
+                Variant::Clear => Request::ClearMessageQueue {
+                    session_id: session_id.into(),
+                },
+            };
+
+        for variant in [
+            Variant::Take,
+            Variant::Reorder,
+            Variant::Edit,
+            Variant::Cancel,
+            Variant::Clear,
+        ] {
+            // 1. Forward interleaving: UpdateProject holds exclusive file_admission while closing
+            // an idle session; a concurrent queue mutation on another session must wait and must
+            // not spawn an actor bound to the old directory.
+            let root = tempfile::tempdir().unwrap();
+            let dir_a = root.path().join("dir-a");
+            let dir_b = root.path().join("dir-b");
+            let dir_c = root.path().join("dir-c");
+            std::fs::create_dir_all(&dir_a).unwrap();
+            std::fs::create_dir_all(&dir_b).unwrap();
+            std::fs::create_dir_all(&dir_c).unwrap();
+            let service = Arc::new(service(root.path()));
+            let (project, gate_session, target_session, reverse_session) =
+                db(&service.database, |store| {
+                    let project = store.add_project(&dir_a)?;
+                    let gate = store.create_session(project.id.clone(), "codex".into())?;
+                    let target = store.create_session(project.id.clone(), "codex".into())?;
+                    let reverse = store.create_session(project.id.clone(), "codex".into())?;
+                    Ok((project, gate, target, reverse))
+                })
+                .unwrap();
+            enqueue_paused(&service, &target_session.id, &["q1", "q2"]);
+            enqueue_paused(&service, &reverse_session.id, &["r1", "r2"]);
+
+            let (gate_control, mut gate_rx) = tokio::sync::mpsc::channel(1);
+            service.runs.lock().unwrap().insert(
+                gate_session.id.clone(),
+                runtime::Run {
+                    control: gate_control,
+                    safe_to_close: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                    session_open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                },
+            );
+
+            let update_service = service.clone();
+            let project_id = project.id.clone();
+            let dir_b_str = dir_b.to_string_lossy().into_owned();
+            let update_task = tokio::spawn(async move {
+                dispatch(
+                    &update_service,
+                    Request::UpdateProject {
+                        project_id,
+                        name: "Moved".into(),
+                        path: dir_b_str,
+                    },
+                    &mut upgrade::ConnectionClaims::default(),
+                )
+                .await
+            });
+
+            let Control::Cancel {
+                only_if_idle: true,
+                reply: gate_reply,
+            } = gate_rx.recv().await.unwrap()
+            else {
+                panic!("expected UpdateProject to pause on idle gate session close");
+            };
+
+            let queue_service = service.clone();
+            let queue_request = build_request(variant, &target_session.id, "q1", "q2");
+            let queue_task = tokio::spawn(async move {
+                dispatch(
+                    &queue_service,
+                    queue_request,
+                    &mut upgrade::ConnectionClaims::default(),
+                )
+                .await
+            });
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !queue_task.is_finished(),
+                "queue mutation bypassed file_admission while UpdateProject was in progress"
+            );
+
+            drop(gate_rx);
+            service.runs.lock().unwrap().remove(&gate_session.id);
+            gate_reply.unwrap().send(Ok(())).unwrap();
+
+            assert!(matches!(
+                update_task.await.unwrap().unwrap(),
+                Response::ProjectUpdated { .. }
+            ));
+            queue_task.await.unwrap().unwrap();
+
+            // Opening the session directly reuses the actor spawned by the queue mutation;
+            // its real subprocess cwd must be dir_b, never the stale dir_a.
+            dispatch(
+                &service,
+                Request::OpenAgentSession {
+                    session_id: target_session.id.clone(),
+                    provider: Some(latte_work_protocol::TurnProvider::Cli),
+                },
+                &mut upgrade::ConnectionClaims::default(),
+            )
+            .await
+            .unwrap();
+            assert!(!dir_a.join("codex-opens").exists());
+            assert!(dir_b.join("codex-opens").exists());
+
+            dispatch(
+                &service,
+                Request::CloseAgentSession {
+                    session_id: target_session.id.clone(),
+                    only_if_idle: Some(false),
+                },
+                &mut upgrade::ConnectionClaims::default(),
+            )
+            .await
+            .unwrap();
+
+            // 2. Reverse interleaving: immediately after a fresh queue mutation spawns an actor
+            // and returns, safe_to_close is already synchronized so an immediate UpdateProject
+            // succeeds without falsely rejecting the paused/empty session as busy.
+            dispatch(
+                &service,
+                build_request(variant, &reverse_session.id, "r1", "r2"),
+                &mut upgrade::ConnectionClaims::default(),
+            )
+            .await
+            .unwrap();
+            let dir_c_str = dir_c.to_string_lossy().into_owned();
+            assert!(matches!(
+                dispatch(
+                    &service,
+                    Request::UpdateProject {
+                        project_id: project.id.clone(),
+                        name: "MovedAgain".into(),
+                        path: dir_c_str,
+                    },
+                    &mut upgrade::ConnectionClaims::default(),
+                )
+                .await
+                .unwrap(),
+                Response::ProjectUpdated { .. }
+            ));
+
+            dispatch(
+                &service,
+                Request::OpenAgentSession {
+                    session_id: reverse_session.id.clone(),
+                    provider: Some(latte_work_protocol::TurnProvider::Cli),
+                },
+                &mut upgrade::ConnectionClaims::default(),
+            )
+            .await
+            .unwrap();
+            assert!(dir_c.join("codex-opens").exists());
+
+            dispatch(
+                &service,
+                Request::CloseAgentSession {
+                    session_id: reverse_session.id.clone(),
+                    only_if_idle: Some(false),
+                },
+                &mut upgrade::ConnectionClaims::default(),
+            )
+            .await
+            .unwrap();
+        }
     }
 }
 

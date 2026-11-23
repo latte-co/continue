@@ -2814,6 +2814,17 @@ async fn actor(
                         }
                         d.queue_snapshot(&session.id)
                     });
+                    let queue_idle = db(&database, |d| {
+                        Ok(d.queue_state(&session.id)?.0 || d.queued(&session.id)?.is_empty())
+                    })
+                    .unwrap_or(false);
+                    safe_to_close.store(
+                        queue_idle
+                            && immediate.is_none()
+                            && forwarded.is_empty()
+                            && process.as_ref().is_none_or(Process::idle_for_close),
+                        Ordering::SeqCst,
+                    );
                     let _=reply.send(result.map_err(|e|e.to_string()));
                     Ok(())
                 }
