@@ -13,6 +13,7 @@ export function UserMessage({
   at,
   hostId = "local",
   projectId,
+  projectPath,
   sessionId,
   connected = false,
   active = true,
@@ -21,6 +22,7 @@ export function UserMessage({
   at: number;
   hostId?: string;
   projectId?: string;
+  projectPath?: string;
   sessionId?: string;
   connected?: boolean;
   active?: boolean;
@@ -40,6 +42,7 @@ export function UserMessage({
                   variant="thumbnail"
                   hostId={hostId}
                   projectId={projectId}
+                  projectPath={projectPath}
                   sessionId={sessionId}
                   connected={connected}
                   active={active}

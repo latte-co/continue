@@ -166,16 +166,19 @@ export function Workspace({
   >([]);
   useEffect(() => {
     const key = workspaceId;
-    setPages((pages) =>
-      pages.some((p) => p.key === key)
-        ? pages.map((page) =>
-            page.key === key
-              ? { ...page, hostId, hostName, project, sessionId }
-              : page,
-          )
-        : [...pages, { key, hostId, hostName, project, sessionId }],
-    );
-  }, [workspaceId, hostId, hostName, project]);
+    setPages((pages) => {
+      const synced = pages.map((page) =>
+        page.key === key
+          ? { ...page, hostId, hostName, project, sessionId }
+          : page.hostId === hostId && project && page.project?.id === project.id
+            ? { ...page, hostName, project }
+            : page,
+      );
+      return pages.some((p) => p.key === key)
+        ? synced
+        : [...synced, { key, hostId, hostName, project, sessionId }];
+    });
+  }, [workspaceId, hostId, hostName, project, sessionId]);
   return (
     <aside
       id="project-workspace"
@@ -638,136 +641,156 @@ function WorkspacePage({
           choose={(kind) => void add(kind)}
         />
       )}
-      {tabs.map((tab) => (
-        <section
-          key={tab.id}
-          id={`pane-${tabPrefix}-${tab.id}`}
-          role="tabpanel"
-          aria-labelledby={`tab-${tabPrefix}-${tab.id}`}
-          className="workspace-pane"
-          hidden={conversationActive || current !== tab.id}
-        >
-          {["files", "diff", "turnChanges"].includes(tab.kind) &&
-          !(tab.project ?? project) ? (
-            <div className="workspace-empty">选择项目后打开此标签。</div>
-          ) : tab.kind === "sideChat" ? (
-            renderSideChat?.(
-              tab,
-              active && !conversationActive && current === tab.id && !busy,
-            )
-          ) : tab.kind === "taskInfo" ? (
-            taskInfo
-          ) : tab.kind === "artifact" ? (
-            (tab.project ?? project) ? (
-              <SourcePreview
-                hostId={tab.hostId ?? hostId}
-                projectId={(tab.project ?? project)!.id}
-                sessionId={tab.sessionId ?? sessionId}
-                source={{
-                  path: tab.path,
-                  name: tab.name,
-                  directory: tab.directory,
-                }}
+      {tabs.map((tab) => {
+        const tabHostId = tab.hostId ?? hostId;
+        const tabProject =
+          tab.project && tabHostId === hostId && project?.id === tab.project.id
+            ? project
+            : (tab.project ?? project);
+        return (
+          <section
+            key={tab.id}
+            id={`pane-${tabPrefix}-${tab.id}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${tabPrefix}-${tab.id}`}
+            className="workspace-pane"
+            hidden={conversationActive || current !== tab.id}
+          >
+            {["files", "diff", "turnChanges"].includes(tab.kind) &&
+            !tabProject ? (
+              <div className="workspace-empty">选择项目后打开此标签。</div>
+            ) : tab.kind === "sideChat" ? (
+              renderSideChat?.(
+                tab,
+                active && !conversationActive && current === tab.id && !busy,
+              )
+            ) : tab.kind === "taskInfo" ? (
+              taskInfo
+            ) : tab.kind === "artifact" ? (
+              tabProject ? (
+                <SourcePreview
+                  hostId={tabHostId}
+                  projectId={tabProject.id}
+                  projectPath={tabProject.path}
+                  sessionId={tab.sessionId ?? sessionId}
+                  source={{
+                    path: tab.path,
+                    name: tab.name,
+                    directory: tab.directory,
+                  }}
+                  active={
+                    active &&
+                    !conversationActive &&
+                    current === tab.id &&
+                    connected
+                  }
+                  open={(file) =>
+                    openArtifact(workspaceId, file, {
+                      hostId: tabHostId,
+                      project: tabProject,
+                      sessionId: tab.sessionId ?? sessionId,
+                    })
+                  }
+                />
+              ) : (
+                <div className="workspace-empty">选择项目后查看文件产物。</div>
+              )
+            ) : tab.kind === "browser" ? (
+              <BrowserPane
+                workspaceId={workspaceId}
+                tab={tab}
+                active={
+                  active && !conversationActive && current === tab.id && !menu
+                }
+              />
+            ) : tab.kind === "terminal" ? (
+              <TerminalPane
+                hostId={tabHostId}
+                terminal={tab.terminal}
+                active={
+                  active && !conversationActive && current === tab.id && !busy
+                }
+                connected={connected}
+                onExited={() => void remove(tab)}
+              />
+            ) : tab.kind === "turnChanges" ? (
+              <TaskChangesView
+                hostId={hostId}
+                project={tabProject!}
+                sessionId={tab.sessionId}
+                requestId={tab.requestId}
+                initialPath={tab.file}
                 active={
                   active &&
                   !conversationActive &&
                   current === tab.id &&
                   connected
                 }
-                open={(file) =>
-                  openArtifact(workspaceId, file, {
-                    hostId: tab.hostId ?? hostId,
-                    project: tab.project ?? project,
-                    sessionId: tab.sessionId ?? sessionId,
-                  })
+              />
+            ) : tab.kind === "diff" ? (
+              <ChangesView
+                key={tab.requestId ?? "git"}
+                requestId={tab.requestId}
+                snapshotAt={tab.snapshotAt}
+                initialPath={tab.file}
+                sessionId={tab.snapshotSessionId ?? sessionId}
+                lastTurnVersion={lastTurnVersion}
+                hostId={tabHostId}
+                project={tabProject!}
+                active={
+                  active &&
+                  !conversationActive &&
+                  current === tab.id &&
+                  connected
+                }
+              />
+            ) : tab.kind === "subagents" || tab.kind === "subagent" ? (
+              <SubagentsPanel
+                taskId={tab.kind === "subagent" ? tab.taskId : undefined}
+                hostId={hostId}
+                sessionId={sessionId}
+                connected={connected}
+                active={
+                  active &&
+                  !conversationActive &&
+                  current === tab.id &&
+                  connected
+                }
+                onOpen={(task) => openSubagent(workspaceId, task)}
+                state={
+                  subagents ?? {
+                    tasks: [],
+                    loading: false,
+                    error: "",
+                    truncated: false,
+                  }
                 }
               />
             ) : (
-              <div className="workspace-empty">选择项目后查看文件产物。</div>
-            )
-          ) : tab.kind === "browser" ? (
-            <BrowserPane
-              workspaceId={workspaceId}
-              tab={tab}
-              active={
-                active && !conversationActive && current === tab.id && !menu
-              }
-            />
-          ) : tab.kind === "terminal" ? (
-            <TerminalPane
-              hostId={tab.hostId ?? hostId}
-              terminal={tab.terminal}
-              active={
-                active && !conversationActive && current === tab.id && !busy
-              }
-              connected={connected}
-              onExited={() => void remove(tab)}
-            />
-          ) : tab.kind === "turnChanges" ? (
-            <TaskChangesView
-              hostId={hostId}
-              project={tab.project ?? project!}
-              sessionId={tab.sessionId}
-              requestId={tab.requestId}
-              initialPath={tab.file}
-              active={
-                active && !conversationActive && current === tab.id && connected
-              }
-            />
-          ) : tab.kind === "diff" ? (
-            <ChangesView
-              key={tab.requestId ?? "git"}
-              requestId={tab.requestId}
-              snapshotAt={tab.snapshotAt}
-              initialPath={tab.file}
-              sessionId={tab.snapshotSessionId ?? sessionId}
-              lastTurnVersion={lastTurnVersion}
-              hostId={tab.hostId ?? hostId}
-              project={tab.project ?? project!}
-              active={
-                active && !conversationActive && current === tab.id && connected
-              }
-            />
-          ) : tab.kind === "subagents" || tab.kind === "subagent" ? (
-            <SubagentsPanel
-              taskId={tab.kind === "subagent" ? tab.taskId : undefined}
-              hostId={hostId}
-              sessionId={sessionId}
-              connected={connected}
-              active={
-                active && !conversationActive && current === tab.id && connected
-              }
-              onOpen={(task) => openSubagent(workspaceId, task)}
-              state={
-                subagents ?? {
-                  tasks: [],
-                  loading: false,
-                  error: "",
-                  truncated: false,
+              <WorkspaceFiles
+                hostId={tabHostId}
+                project={tabProject!}
+                tab={tab.kind}
+                reference={tab.reference}
+                sessionId={tab.sessionId ?? sessionId}
+                path={tab.path ?? ""}
+                file={tab.file ?? ""}
+                navigate={(value) =>
+                  setTabs((tabs) =>
+                    tabs.map((t) => (t.id === tab.id ? { ...t, ...value } : t)),
+                  )
                 }
-              }
-            />
-          ) : (
-            <WorkspaceFiles
-              hostId={tab.hostId ?? hostId}
-              project={tab.project ?? project!}
-              tab={tab.kind}
-              reference={tab.reference}
-              sessionId={tab.sessionId ?? sessionId}
-              path={tab.path ?? ""}
-              file={tab.file ?? ""}
-              navigate={(value) =>
-                setTabs((tabs) =>
-                  tabs.map((t) => (t.id === tab.id ? { ...t, ...value } : t)),
-                )
-              }
-              active={
-                active && !conversationActive && current === tab.id && connected
-              }
-            />
-          )}
-        </section>
-      ))}
+                active={
+                  active &&
+                  !conversationActive &&
+                  current === tab.id &&
+                  connected
+                }
+              />
+            )}
+          </section>
+        );
+      })}
       {!tabs.length && !conversationActive && (
         <div className="workspace-empty" aria-label="工作区入口">
           <div className="workspace-launchers">

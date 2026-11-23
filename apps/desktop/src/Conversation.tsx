@@ -37,7 +37,11 @@ import type {
 } from "./protocol";
 import type { Host } from "./api";
 import type { HostedProject } from "./projectCatalog";
-import { Composer } from "./Composer";
+import {
+  Composer,
+  composerReferenceScope,
+  resolveComposerReferences,
+} from "./Composer";
 import {
   useComposerPrediction,
   type ComposerPredictionResponse,
@@ -162,12 +166,18 @@ export function Conversation({
   approve,
   answerQuestion,
 }: Props) {
+  const projectPath = project?.path;
   const draftKey = session ? JSON.stringify([hostId, session.id]) : "new-task";
-  const submissionScope = JSON.stringify([
-    hostId,
-    projectId,
-    session?.agent ?? agent?.id ?? "claude",
-  ]);
+  const submissionScope = JSON.stringify(
+    projectPath === undefined
+      ? [hostId, projectId, session?.agent ?? agent?.id ?? "claude"]
+      : [
+          hostId,
+          projectId,
+          projectPath,
+          session?.agent ?? agent?.id ?? "claude",
+        ],
+  );
   const draft = useDraft(drafts, draftKey);
   const editingScope = useRef(draftKey);
   editingScope.current = draftKey;
@@ -268,6 +278,7 @@ export function Conversation({
     agentId,
     model,
     effort,
+    projectPath,
   );
   const modelReady =
     modelReadiness?.scope === modelScope && modelReadiness.ready;
@@ -776,6 +787,7 @@ export function Conversation({
                           at={item.at}
                           hostId={hostId}
                           projectId={projectId}
+                          projectPath={project?.path}
                           sessionId={session?.id}
                           connected={connected}
                           active={!settingsOpen && !preparingHistory}
@@ -1094,11 +1106,19 @@ export function Conversation({
           onEdit={(entry) => {
             const current = drafts.get(draftKey);
             const restored = userMessageContent(entry.text);
-            const scope = `${hostId}:${projectId}:${agentId}`;
-            const existing =
-              current.references.scope === scope
-                ? current.references.entries
-                : [];
+            const scope = composerReferenceScope(
+              hostId,
+              projectId,
+              agentId,
+              projectPath,
+            );
+            const existing = resolveComposerReferences(
+              current.references,
+              hostId,
+              projectId,
+              agentId,
+              projectPath,
+            );
             const combined = [
               ...existing,
               ...restored.references.filter(
@@ -1162,6 +1182,7 @@ export function Conversation({
           agent={agentId}
           hostId={hostId}
           projectId={projectId}
+          projectPath={projectPath}
           sessionId={session?.id}
           connected={connected}
           hidden={settingsOpen}
@@ -1219,6 +1240,7 @@ export function Conversation({
                 onReadyChange={setModelReadiness}
                 hostId={hostId}
                 projectId={projectId}
+                projectPath={projectPath}
                 agent={agentId}
                 conversationKey={effectiveConversationKey}
                 connected={connected}

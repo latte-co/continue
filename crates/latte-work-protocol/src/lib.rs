@@ -615,6 +615,11 @@ pub enum Request {
         project_id: String,
         name: String,
     },
+    UpdateProject {
+        project_id: String,
+        name: String,
+        path: String,
+    },
     RemoveProject {
         project_id: String,
     },
@@ -1321,6 +1326,13 @@ pub enum Response {
     Project {
         project: Project,
     },
+    ProjectUpdated {
+        project: Project,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        closed_session_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        closed_terminal_ids: Vec<String>,
+    },
     Sessions {
         sessions: Vec<Session>,
     },
@@ -1542,6 +1554,25 @@ mod tests {
         assert!(serde_json::from_str::<Request>(r#"{"method":"shell","command":"rm"}"#).is_err());
         assert!(!Status::Unknown.active());
         assert!(Status::Waiting.active());
+        let minimal: Response = serde_json::from_value(serde_json::json!({
+            "kind": "project_updated",
+            "project": { "id": "p", "name": "Alpha", "path": "/tmp/alpha" }
+        }))
+        .unwrap();
+        assert!(matches!(
+            &minimal,
+            Response::ProjectUpdated {
+                closed_session_ids,
+                closed_terminal_ids,
+                ..
+            } if closed_session_ids.is_empty() && closed_terminal_ids.is_empty()
+        ));
+        assert!(
+            serde_json::to_value(&minimal)
+                .unwrap()
+                .get("closed_terminal_ids")
+                .is_none()
+        );
     }
 }
 

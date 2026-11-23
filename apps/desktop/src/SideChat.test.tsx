@@ -142,6 +142,7 @@ vi.mock("./ModelPicker", async () => {
     ModelPicker: ({
       hostId,
       projectId,
+      projectPath,
       agent,
       settingsOpen,
       preserveUnavailableModel,
@@ -161,10 +162,26 @@ vi.mock("./ModelPicker", async () => {
       useEffect(
         () =>
           onReadyChange?.({
-            scope: modelSelectionScope(hostId, projectId, agent, value, effort),
+            scope: modelSelectionScope(
+              hostId,
+              projectId,
+              agent,
+              value,
+              effort,
+              projectPath,
+            ),
             ready: !settingsOpen,
           }),
-        [hostId, projectId, agent, settingsOpen, value, effort, onReadyChange],
+        [
+          hostId,
+          projectId,
+          projectPath,
+          agent,
+          settingsOpen,
+          value,
+          effort,
+          onReadyChange,
+        ],
       );
       return (
         <>

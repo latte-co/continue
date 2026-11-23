@@ -35,6 +35,7 @@ vi.mock("./ModelPicker", async () => {
     ModelPicker: (props: {
       hostId: string;
       projectId?: string;
+      projectPath?: string;
       agent: string;
       value: null;
       effort: null;
@@ -49,12 +50,14 @@ vi.mock("./ModelPicker", async () => {
               props.agent,
               props.value,
               props.effort,
+              props.projectPath,
             ),
             ready: true,
           }),
         [
           props.hostId,
           props.projectId,
+          props.projectPath,
           props.agent,
           props.value,
           props.effort,
@@ -2090,6 +2093,96 @@ it("takes a queued message into the composer, retains existing draft, annotation
         restoredAnnotations,
       ),
       [old, added],
+    ),
+    null,
+    null,
+    null,
+  );
+});
+
+it("retains draft and restored references when taking a queued message with an active project", async () => {
+  const p = props();
+  const project = {
+    id: "p",
+    hostId: "local",
+    name: "Test",
+    path: "/project",
+  };
+  const old = { name: "existing.txt", path: "existing.txt", directory: false };
+  const queuedProjectRef = {
+    name: "queued.rs",
+    path: "src/queued.rs",
+    directory: false,
+  };
+  const queuedExternalRef = {
+    name: "input.pdf",
+    path: "/host/input.pdf",
+    directory: false,
+  };
+  const entry = {
+    request_id: "queued",
+    text: referencePrompt(
+      annotationPrompt("Queued instruction", [annotation]),
+      [queuedProjectRef, queuedExternalRef],
+    ),
+    model: null,
+    effort: null,
+    permission_mode: null,
+    revision: 0,
+    created_at: 1,
+  };
+  let pending = [entry];
+  mocks.request.mockImplementation(async (_, command) => {
+    if (command.method === "message_queue")
+      return {
+        kind: "message_queue",
+        entries: pending,
+        paused: false,
+        reason: null,
+      };
+    if (command.method === "take_queued_message") {
+      pending = [];
+      return { kind: "queued_message_taken", entry };
+    }
+    return { kind: "files", entries: [] };
+  });
+  const key = JSON.stringify(["local", "s"]);
+  p.drafts.update(key, {
+    text: "Existing draft",
+    references: { scope: "local:p:claude:/project", entries: [old] },
+  });
+  render(
+    <Conversation
+      {...p}
+      project={project}
+      session={{ ...session("s"), status: "running" }}
+    />,
+  );
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: "排队消息更多操作：Queued instruction",
+    }),
+  );
+  fireEvent.click(screen.getByRole("menuitem", { name: "编辑消息" }));
+  await waitFor(() =>
+    expect(inputText()).toBe("Existing draft\n\nQueued instruction"),
+  );
+  expect(p.drafts.get(key).references.entries.map((e) => e.path)).toEqual([
+    "existing.txt",
+    "src/queued.rs",
+    "/host/input.pdf",
+  ]);
+  const restoredAnnotations = p.drafts.get(key).annotations!;
+  await act(async () =>
+    fireEvent.click(screen.getByRole("button", { name: "加入队列" })),
+  );
+  expect(p.send).toHaveBeenCalledWith(
+    referencePrompt(
+      annotationPrompt(
+        "Existing draft\n\nQueued instruction",
+        restoredAnnotations,
+      ),
+      [old, queuedProjectRef, queuedExternalRef],
     ),
     null,
     null,

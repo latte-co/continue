@@ -43,9 +43,11 @@ impl ToolImages {
     }
 }
 pub(crate) use opencode::commands as opencode_commands;
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn opencode_child_history(
     binary: &str,
     cwd: &std::path::Path,
+    former_paths: &[String],
     parent: &str,
     child: &str,
     known_children: &std::collections::HashSet<String>,
@@ -56,6 +58,7 @@ pub(crate) async fn opencode_child_history(
     opencode::child_history(
         binary,
         cwd,
+        former_paths,
         parent,
         child,
         known_children,
@@ -109,7 +112,7 @@ pub fn confirmed_child_report(
 ) -> Option<String> {
     claude::confirmed_child_report(tool, result)
 }
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChildHistoryCursor {
     pub offset: u64,
     pub identity: String,
@@ -124,8 +127,10 @@ pub struct ChildHistoryPage {
     pub cursor: ChildHistoryCursor,
     pub has_more: bool,
 }
+#[allow(clippy::too_many_arguments)]
 pub async fn child_history(
     cwd: std::path::PathBuf,
+    former_paths: Vec<String>,
     parent: String,
     child: String,
     session_id: String,
@@ -139,6 +144,7 @@ pub async fn child_history(
             let _permit = permit;
             let Some(raw) = claude_sessions::read_child_page(
                 &cwd,
+                &former_paths,
                 &parent,
                 &child,
                 &config.environment,
@@ -176,6 +182,7 @@ pub fn child_read_permit() -> Result<tokio::sync::OwnedSemaphorePermit> {
 /// Read only a child owned by the caller's existing runtime/redaction context.
 pub async fn child_transcript(
     cwd: std::path::PathBuf,
+    former_paths: Vec<String>,
     parent: String,
     child: String,
     session_id: String,
@@ -186,8 +193,13 @@ pub async fn child_transcript(
         std::time::Duration::from_secs(3),
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let Some(bytes) =
-                claude_sessions::read_child(&cwd, &parent, &child, &config.environment)?
+            let Some(bytes) = claude_sessions::read_child(
+                &cwd,
+                &former_paths,
+                &parent,
+                &child,
+                &config.environment,
+            )?
             else {
                 return Ok(None);
             };
@@ -350,25 +362,39 @@ pub use claude_sessions::Title as NativeTitle;
 pub fn session_title(
     agent: &str,
     path: &std::path::Path,
+    former_paths: &[String],
     id: &str,
     environment: &latte_work_protocol::AgentEnvironment,
 ) -> Result<Option<NativeTitle>> {
     match agent {
-        "claude" => claude_sessions::read(path, id, environment),
+        "claude" => claude_sessions::read(path, former_paths, id, environment),
         _ => bail!("此 Agent 尚不支持读取会话标题"),
     }
 }
 pub fn rename_saved_session(
     agent: &str,
     path: &std::path::Path,
+    former_paths: &[String],
     id: &str,
     title: &str,
     environment: &latte_work_protocol::AgentEnvironment,
 ) -> Result<String> {
     match agent {
-        "claude" => claude_sessions::rename(path, id, title, environment),
+        "claude" => claude_sessions::rename(path, former_paths, id, title, environment),
         _ => bail!("此 Agent 尚不支持修改会话标题"),
     }
+}
+pub fn ensure_claude_resumable(
+    agent: &str,
+    cwd: &std::path::Path,
+    former_paths: &[String],
+    id: &str,
+    environment: &latte_work_protocol::AgentEnvironment,
+) -> Result<()> {
+    if agent == "claude" && !former_paths.is_empty() {
+        claude_sessions::ensure_resumable_in_cwd(cwd, former_paths, id, environment)?;
+    }
+    Ok(())
 }
 
 // Before relaunching a saved conversation, an agent may reveal the directory
@@ -377,11 +403,12 @@ pub async fn resume_directory(
     agent: &str,
     binary: &str,
     project: &std::path::Path,
+    former_paths: &[String],
     id: &str,
     config: &crate::providers::LaunchConfig,
 ) -> Result<Option<String>> {
     match agent {
-        "opencode" => opencode::resume_directory(binary, project, id, config).await,
+        "opencode" => opencode::resume_directory(binary, project, former_paths, id, config).await,
         _ => Ok(None),
     }
 }

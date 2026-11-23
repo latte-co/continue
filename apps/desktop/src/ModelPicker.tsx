@@ -86,6 +86,7 @@ function pruneConversationEntries(
 export function ModelPicker({
   hostId,
   projectId,
+  projectPath,
   agent,
   conversationKey,
   connected,
@@ -103,6 +104,7 @@ export function ModelPicker({
 }: {
   hostId: string;
   projectId?: string;
+  projectPath?: string;
   agent: string;
   conversationKey?: string;
   connected: boolean;
@@ -121,7 +123,11 @@ export function ModelPicker({
   const selector = useRef<ModelSelectorHandle>(null);
   const configVersion = useModelConfigVersion(hostId, agent);
   const normalizedConversationKey = conversationKey ?? "";
-  const scope = JSON.stringify([hostId, projectId, agent]);
+  const scope = JSON.stringify(
+    projectPath === undefined
+      ? [hostId, projectId, agent]
+      : [hostId, projectId, projectPath, agent],
+  );
   const conversationScope = JSON.stringify([scope, normalizedConversationKey]);
   const latestScope = useRef({
     conversationScope,
@@ -261,6 +267,7 @@ export function ModelPicker({
   }, [
     hostId,
     projectId,
+    projectPath,
     agent,
     configVersion,
     connected,
@@ -348,6 +355,7 @@ export function ModelPicker({
     agent,
     value,
     effort,
+    projectPath,
   );
   const ready =
     !!usableCatalog &&

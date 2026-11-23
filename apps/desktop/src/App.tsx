@@ -513,6 +513,7 @@ export default function App() {
                     workspaceId={workbench.workspaceId}
                     isDraft={tab.draft}
                     hostId={hostId}
+                    projectPath={project?.path}
                     drafts={drafts}
                     active={active && !workbench.modal && !dialogOpen}
                     connected={connected}

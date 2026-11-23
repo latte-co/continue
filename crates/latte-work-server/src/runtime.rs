@@ -485,10 +485,12 @@ pub async fn rename_title(
             return db(database, |s| s.session(&session.id));
         }
         let agent = session.agent.clone();
+        let former_paths = db(database, |s| s.project_former_paths(&session.project_id))?;
         let actual = tokio::task::spawn_blocking(move || {
             agents::rename_saved_session(
                 &agent,
                 std::path::Path::new(&path),
+                &former_paths,
                 &id,
                 &title,
                 &config.environment,
@@ -507,6 +509,7 @@ pub async fn rename_title(
 struct TitleSource {
     session: Session,
     path: String,
+    former_paths: Vec<String>,
     config: Option<LaunchConfig>,
     control: Option<mpsc::Sender<Control>>,
     fingerprint: Option<String>,
@@ -516,6 +519,7 @@ async fn title_source(
     database: &Database,
     session: Session,
     path: String,
+    former_paths: Vec<String>,
     control: Option<mpsc::Sender<Control>>,
 ) -> Result<Option<TitleSource>> {
     let config = if let Some(control) = &control {
@@ -546,6 +550,7 @@ async fn title_source(
     Ok(Some(TitleSource {
         session,
         path,
+        former_paths,
         config,
         control,
         fingerprint,
@@ -596,15 +601,17 @@ pub async fn refresh_titles(
     let candidates = db(database, |s| {
         due.into_iter()
             .map(|session| {
-                s.project(&session.project_id)
-                    .map(|project| (session, project.path))
+                s.project_with_former_paths(&session.project_id)
+                    .map(|(project, former_paths)| (session, project.path, former_paths))
             })
             .collect::<Result<Vec<_>>>()
     })?;
-    let sources = futures_util::future::join_all(candidates.into_iter().map(|(session, path)| {
-        let control = controls.get(&session.id).cloned();
-        title_source(database, session, path, control)
-    }))
+    let sources = futures_util::future::join_all(candidates.into_iter().map(
+        |(session, path, former_paths)| {
+            let control = controls.get(&session.id).cloned();
+            title_source(database, session, path, former_paths, control)
+        },
+    ))
     .await
     .into_iter()
     .collect::<Result<Vec<_>>>()?;
@@ -616,6 +623,7 @@ pub async fn refresh_titles(
                 let mut title = agents::session_title(
                     &source.session.agent,
                     std::path::Path::new(&source.path),
+                    &source.former_paths,
                     source.session.native_id.as_deref()?,
                     &source
                         .config
@@ -1040,16 +1048,19 @@ impl TurnState {
                     {
                         let source = db(database, |d| {
                             let session = d.session(session_id)?;
-                            let cwd = d.project(&session.project_id)?.path;
+                            let (project, former_paths) =
+                                d.project_with_former_paths(&session.project_id)?;
                             Ok((
                                 d.native_subagent(session_id, &native_id)?,
                                 session.native_id,
-                                cwd,
+                                project.path,
+                                former_paths,
                             ))
                         });
-                        if let Ok((child, Some(parent), cwd)) = source {
+                        if let Ok((child, Some(parent), cwd, former_paths)) = source {
                             let snapshot = agents::child_transcript(
                                 std::path::PathBuf::from(&cwd),
+                                former_paths.clone(),
                                 parent.clone(),
                                 child.native_id.clone(),
                                 session_id.into(),
@@ -1085,6 +1096,7 @@ impl TurnState {
                                     })?;
                                     let page = agents::child_history(
                                         std::path::PathBuf::from(&cwd),
+                                        former_paths.clone(),
                                         parent.clone(),
                                         child.native_id.clone(),
                                         session_id.into(),
@@ -1366,11 +1378,13 @@ impl Process {
             }
             Ok(())
         })?;
+        let former_paths = db(database, |s| s.project_former_paths(&session.project_id))?;
         let agent_cwd = match session.native_id.as_deref() {
             Some(id) => agents::resume_directory(
                 &session.agent,
                 binary,
                 std::path::Path::new(path),
+                &former_paths,
                 id,
                 &config,
             )
@@ -1414,7 +1428,24 @@ impl Process {
             session.native_id.is_some(),
             session.title_requested,
         );
-        if let Some((parent, native)) = db(database, |s| s.side_parent(&session.id))? {
+        let side_parent = db(database, |s| s.side_parent(&session.id))?;
+        let resume_source = session
+            .native_id
+            .as_deref()
+            .or_else(|| side_parent.as_ref().map(|(_, native)| native.as_str()));
+        if session.agent == "claude"
+            && let Some(resume_id) = resume_source
+        {
+            let former_paths = db(database, |s| s.project_former_paths(&session.project_id))?;
+            agents::ensure_claude_resumable(
+                &session.agent,
+                std::path::Path::new(agent_cwd),
+                &former_paths,
+                resume_id,
+                &config.environment,
+            )?;
+        }
+        if let Some((parent, native)) = side_parent {
             let (owner, source) = session
                 .native_id
                 .as_ref()
@@ -2649,18 +2680,18 @@ async fn actor(
                     }
                 }.await,
                 Some(Control::SubagentHistory { task_id, permit, reply }) => {
-                    let source=db(&database,|d|Ok((d.subagent(&session.id,&task_id)?,d.session(&session.id)?.native_id,d.child_history_cursor(&session.id,&task_id)?))).map(|(child,parent,cursor)|{
+                    let source=db(&database,|d|Ok((d.subagent(&session.id,&task_id)?,d.session(&session.id)?.native_id,d.child_history_cursor(&session.id,&task_id)?,d.project_former_paths(&session.project_id)?))).map(|(child,parent,cursor,former_paths)|{
                         let process=process.as_ref().filter(|p|p.adapter.knows_subagent(&child.native_id));
                         let config=process.map(|p|p.config.clone());
                         // A resumed OpenCode session may run from its recorded
                         // directory; children export from that same directory.
                         let cwd=process.map(|p|p.agent_cwd.clone()).unwrap_or_else(||path.clone());
-                        (child,parent,cursor,config,cwd)
+                        (child,parent,cursor,config,cwd,former_paths)
                     });
                     let result=async {
-                        let (child,parent,cursor,config,cwd)=source?;
+                        let (child,parent,cursor,config,cwd,former_paths)=source?;
                         let (Some(config),Some(parent))=(config,parent) else {return Ok(false);};
-                        let page=agents::child_history(std::path::PathBuf::from(cwd),parent,child.native_id,session.id.clone(),config,cursor,permit).await?;
+                        let page=agents::child_history(std::path::PathBuf::from(cwd),former_paths,parent,child.native_id,session.id.clone(),config,cursor,permit).await?;
                         if let Some(page)=page {
                             db(&database,|d|d.cache_child_history(&session.id,&task_id,&page))?;
                             return Ok(page.has_more);
@@ -2671,14 +2702,14 @@ async fn actor(
                     Ok(())
                 }
                 Some(Control::SubagentTranscript { task_id, permit, reply }) => {
-                    let source = db(&database, |d| Ok((d.subagent(&session.id, &task_id)?, d.session(&session.id)?.native_id))).map(|(child,parent)| {
+                    let source = db(&database, |d| Ok((d.subagent(&session.id, &task_id)?, d.session(&session.id)?.native_id, d.project_former_paths(&session.project_id)?))).map(|(child,parent,former_paths)| {
                         let config = process.as_ref().filter(|p| p.adapter.knows_subagent(&child.native_id)).map(|p| p.config.clone());
-                        (child, parent, config)
+                        (child, parent, config, former_paths)
                     });
                     let result = async {
-                        let (child, parent, config) = source?;
+                        let (child, parent, config, former_paths) = source?;
                         let (Some(config), Some(parent)) = (config, parent) else { return Ok(None); };
-                        let snapshot = agents::child_transcript(std::path::PathBuf::from(&path), parent, child.native_id, session.id.clone(), config, permit).await?;
+                        let snapshot = agents::child_transcript(std::path::PathBuf::from(&path), former_paths, parent, child.native_id, session.id.clone(), config, permit).await?;
                         if let Some(snapshot) = &snapshot && !snapshot.0.is_empty() {
                             db(&database, |d| d.cache_subagent_transcript(&session.id, &task_id, snapshot))?;
                         }
@@ -2783,6 +2814,17 @@ async fn actor(
                         }
                         d.queue_snapshot(&session.id)
                     });
+                    let queue_idle = db(&database, |d| {
+                        Ok(d.queue_state(&session.id)?.0 || d.queued(&session.id)?.is_empty())
+                    })
+                    .unwrap_or(false);
+                    safe_to_close.store(
+                        queue_idle
+                            && immediate.is_none()
+                            && forwarded.is_empty()
+                            && process.as_ref().is_none_or(Process::idle_for_close),
+                        Ordering::SeqCst,
+                    );
                     let _=reply.send(result.map_err(|e|e.to_string()));
                     Ok(())
                 }

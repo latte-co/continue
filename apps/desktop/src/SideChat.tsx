@@ -110,6 +110,7 @@ export function SideChat({
   workspaceId,
   isDraft = false,
   hostId,
+  projectPath,
   drafts,
   active,
   connected,
@@ -121,6 +122,7 @@ export function SideChat({
   workspaceId: string;
   isDraft?: boolean;
   hostId: string;
+  projectPath?: string;
   drafts: DraftStore;
   active: boolean;
   connected: boolean;
@@ -422,6 +424,7 @@ export function SideChat({
         parent.agent,
         model,
         effort,
+        projectPath,
       ) && modelReadiness.ready;
   function submit(prompt: string) {
     if (
@@ -513,6 +516,7 @@ export function SideChat({
                     at={item.at}
                     hostId={hostId}
                     projectId={parent.project_id}
+                    projectPath={projectPath}
                     sessionId={session?.id}
                     connected={connected}
                     active={active}
@@ -712,6 +716,7 @@ export function SideChat({
           agent={parent.agent}
           hostId={hostId}
           projectId={parent.project_id}
+          projectPath={projectPath}
           sessionId={session?.id}
           connected={connected}
           hidden={!active}
@@ -744,6 +749,7 @@ export function SideChat({
                 onReadyChange={setModelReadiness}
                 hostId={hostId}
                 projectId={parent.project_id}
+                projectPath={projectPath}
                 agent={parent.agent}
                 conversationKey={key}
                 connected={connected}

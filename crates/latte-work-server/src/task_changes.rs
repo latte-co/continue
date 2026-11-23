@@ -269,6 +269,24 @@ pub struct Snapshot {
     pub unavailable: Option<String>,
 }
 impl Snapshot {
+    pub async fn ensure_same_root(&self, root: &Path) -> Result<()> {
+        let snapshot = self.clone();
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let loaded = snapshot.materialized()?;
+            if let Some(error) = &loaded.unavailable {
+                bail!("{error}");
+            }
+            if let Some(expected) = loaded.root_identity {
+                let metadata = std::fs::metadata(&root).context("项目目录不存在或无法访问")?;
+                if expected != (metadata.dev(), metadata.ino()) {
+                    bail!("项目目录已改变，无法确认本轮变更");
+                }
+            }
+            Ok(())
+        })
+        .await?
+    }
     pub async fn image_chunk(
         &self,
         path: &str,
@@ -604,6 +622,12 @@ impl Snapshot {
     }
     async fn patch_loaded(&self, current: &Self, path: &str) -> Result<(String, bool)> {
         validate_path(path)?;
+        if self.root_identity.is_some()
+            && current.root_identity.is_some()
+            && self.root_identity != current.root_identity
+        {
+            bail!("项目目录已改变，无法确认本轮变更");
+        }
         if let Some(error) = self.unavailable.as_ref().or(current.unavailable.as_ref()) {
             bail!("{error}");
         }
@@ -1790,6 +1814,38 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(external.join("dirty.txt")).unwrap(),
             "after\n"
+        );
+    }
+    #[tokio::test]
+    async fn snapshot_patch_and_root_guard_refuse_replaced_project_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let storage = state.join("snapshots");
+        std::fs::create_dir_all(&storage).unwrap();
+        let root_a = dir.path().join("project-a");
+        let root_b = dir.path().join("project-b");
+        std::fs::create_dir(&root_a).unwrap();
+        std::fs::create_dir(&root_b).unwrap();
+        repository(&root_a);
+        repository(&root_b);
+
+        let before = Snapshot::capture_stored(&root_a, &storage).await.unwrap();
+        std::fs::write(root_a.join("dirty.txt"), "edited in a\n").unwrap();
+        let after = Snapshot::capture_stored(&root_a, &storage).await.unwrap();
+        let turn = FrozenTurn::freeze("turn-a".into(), before.clone(), after, false, false)
+            .await
+            .unwrap();
+
+        std::fs::write(root_b.join("dirty.txt"), "unrelated file in b\n").unwrap();
+        before.ensure_same_root(&root_a).await.unwrap();
+        assert!(before.ensure_same_root(&root_b).await.is_err());
+        assert!(before.patch(&root_b, "dirty.txt").await.is_err());
+        assert!(
+            turn.patch("dirty.txt")
+                .await
+                .unwrap()
+                .0
+                .contains("+edited in a")
         );
     }
 }

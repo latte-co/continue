@@ -167,3 +167,63 @@ it("bounds concurrent image reads and never starts queued work after disposal", 
   expect(mocks.load).toHaveBeenCalledTimes(2);
   expect(URL.createObjectURL).not.toHaveBeenCalled();
 });
+
+it("refreshes project-relative attachment previews when projectPath changes while keeping absolute attachments cached", async () => {
+  let seq = 0;
+  URL.createObjectURL = vi.fn(() => `blob:att-${++seq}`);
+  const relativeRef = {
+    name: "diagram.png",
+    path: "docs/diagram.png",
+    directory: false,
+  };
+  const view = render(
+    <>
+      <AttachmentImage
+        {...props}
+        reference={relativeRef}
+        projectPath="/workspace/old"
+        variant="thumbnail"
+      />
+      <AttachmentImage
+        {...props}
+        projectPath="/workspace/old"
+        variant="thumbnail"
+      />
+    </>,
+  );
+  await screen.findByRole("img", { name: "diagram.png" });
+  await screen.findByRole("img", { name: "image.png" });
+  expect(mocks.load).toHaveBeenCalledTimes(2);
+
+  view.rerender(
+    <>
+      <AttachmentImage
+        {...props}
+        reference={relativeRef}
+        projectPath="/workspace/new"
+        variant="thumbnail"
+      />
+      <AttachmentImage
+        {...props}
+        projectPath="/workspace/new"
+        variant="thumbnail"
+      />
+    </>,
+  );
+  await waitFor(() => expect(mocks.load).toHaveBeenCalledTimes(3));
+  expect(mocks.load).toHaveBeenLastCalledWith(
+    "ssh",
+    "p",
+    "s",
+    "docs/diagram.png",
+    expect.any(Function),
+  );
+  expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:att-1");
+  expect(URL.revokeObjectURL).not.toHaveBeenCalledWith("blob:att-2");
+  expect(
+    screen.getByRole("img", { name: "diagram.png" }).getAttribute("src"),
+  ).toBe("blob:att-3");
+  expect(
+    screen.getByRole("img", { name: "image.png" }).getAttribute("src"),
+  ).toBe("blob:att-2");
+});

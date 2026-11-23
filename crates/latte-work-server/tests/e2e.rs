@@ -9471,3 +9471,693 @@ async fn skill_file_upload_installs_globally_and_rejects_foreign_attachment_path
     );
     assert!(!home.path().join(".claude/skills/upload-e2e").exists());
 }
+
+#[tokio::test]
+async fn update_project_directory_closes_idle_sessions_blocks_active_turns_and_guards_task_baselines()
+ {
+    let host = Host::start().await;
+    let mut c = host.client().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let dir_a = workspace.path().join("alpha");
+    let dir_b = workspace.path().join("beta");
+    let dir_c = workspace.path().join("gamma");
+    for path in [&dir_a, &dir_b, &dir_c] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let png_1x1: &[u8] = &[
+        0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, b'I', b'D', b'A', b'T', 0x78, 0x9c, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, b'I',
+        b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+    ];
+    std::fs::write(dir_a.join("task.txt"), "before in a\n").unwrap();
+    std::fs::write(dir_a.join("icon.png"), png_1x1).unwrap();
+    std::fs::write(dir_b.join("task.txt"), "secret in b\n").unwrap();
+    std::fs::write(dir_b.join("icon.png"), png_1x1).unwrap();
+
+    let sid = session(&mut c, &dir_a).await;
+    let _other_sid = session(&mut c, &dir_c).await;
+    let pid = match ask(&mut c, Request::Projects).await {
+        Response::Projects { projects } => {
+            projects
+                .into_iter()
+                .find(|p| p.path == dir_a.canonicalize().unwrap().to_string_lossy())
+                .unwrap()
+                .id
+        }
+        _ => unreachable!(),
+    };
+
+    // Capture a task baseline and a frozen turn in dir_a.
+    send(&mut c, &sid, "turn-a", "task-edit").await;
+    wait(&mut c, &sid, Status::Completed).await;
+
+    // Open an idle session in dir_a so an actor is retained in memory.
+    let idle_sid = match ask(
+        &mut c,
+        Request::CreateSession {
+            project_id: pid.clone(),
+            agent: "claude".into(),
+        },
+    )
+    .await
+    {
+        Response::Session { session } => session.id,
+        other => panic!("unexpected create session: {other:?}"),
+    };
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::OpenAgentSession {
+                session_id: idle_sid.clone(),
+                provider: None,
+            },
+        )
+        .await,
+        Response::Ok
+    ));
+
+    // Active session must block directory updates without closing the idle session.
+    send(&mut c, &sid, "running-turn", "hang").await;
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::UpdateProject {
+                project_id: pid.clone(),
+                name: "Moved".into(),
+                path: dir_b.to_string_lossy().into_owned(),
+            },
+        )
+        .await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::ProjectAgentSessions {
+                project_id: pid.clone(),
+                after: None,
+            },
+        )
+        .await,
+        Response::ProjectAgentSessions { sessions, .. }
+            if sessions.iter().any(|s| s.id == idle_sid && s.agent_session_open == Some(true))
+    ));
+    ask(
+        &mut c,
+        Request::Cancel {
+            session_id: sid.clone(),
+        },
+    )
+    .await;
+    wait(&mut c, &sid, Status::Stopped).await;
+
+    // Conflicting directory (dir_c) is rejected.
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::UpdateProject {
+                project_id: pid.clone(),
+                name: "Conflict".into(),
+                path: dir_c.to_string_lossy().into_owned(),
+            },
+        )
+        .await,
+        Response::Error { .. }
+    ));
+
+    // A removed (hidden) project with historical sessions rejects directory reclamation with
+    // an actionable hint, while an empty removed project is reclaimed cleanly (including its
+    // exited terminals).
+    let dir_hidden_hist = workspace.path().join("hidden-with-history");
+    std::fs::create_dir_all(&dir_hidden_hist).unwrap();
+    let _hidden_hist_sid = session(&mut c, &dir_hidden_hist).await;
+    let hidden_hist_pid = match ask(&mut c, Request::Projects).await {
+        Response::Projects { projects } => {
+            projects
+                .into_iter()
+                .find(|p| p.path == dir_hidden_hist.canonicalize().unwrap().to_string_lossy())
+                .unwrap()
+                .id
+        }
+        _ => unreachable!(),
+    };
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::RemoveProject {
+                project_id: hidden_hist_pid,
+            },
+        )
+        .await,
+        Response::Projects { .. }
+    ));
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::UpdateProject {
+                project_id: pid.clone(),
+                name: "Hidden History Conflict".into(),
+                path: dir_hidden_hist.to_string_lossy().into_owned(),
+            },
+        )
+        .await,
+        Response::Error { message, .. }
+            if message.contains("已移除的项目") && message.contains("历史会话")
+    ));
+
+    // Move project to dir_b: idle open session is closed and reported in closed_session_ids.
+    let canonical_b = dir_b.canonicalize().unwrap().to_string_lossy().into_owned();
+    let Response::ProjectUpdated {
+        project,
+        closed_session_ids,
+        closed_terminal_ids,
+    } = ask(
+        &mut c,
+        Request::UpdateProject {
+            project_id: pid.clone(),
+            name: "  Beta Project  ".into(),
+            path: dir_b.to_string_lossy().into_owned(),
+        },
+    )
+    .await
+    else {
+        panic!("expected ProjectUpdated");
+    };
+    assert!(closed_terminal_ids.is_empty());
+    assert_eq!(project.id, pid);
+    assert_eq!(project.name, "Beta Project");
+    assert_eq!(project.path, canonical_b);
+    assert!(closed_session_ids.contains(&idle_sid));
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::ProjectAgentSessions {
+                project_id: pid.clone(),
+                after: None,
+            },
+        )
+        .await,
+        Response::ProjectAgentSessions { sessions, .. } if sessions.is_empty()
+    ));
+
+    // Sending on idle_sid now spawns in dir_b rather than the old dir_a.
+    send(&mut c, &idle_sid, "turn-b", "task-edit").await;
+    wait(&mut c, &idle_sid, Status::Completed).await;
+    assert_eq!(
+        std::fs::read_to_string(dir_b.join("task.txt")).unwrap(),
+        "agent change\nsecond line\n"
+    );
+
+    // Old session's task baseline diff & live task image preview reject the changed root,
+    // while frozen turn diff remains readable.
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::TaskChangeDiff {
+                session_id: sid.clone(),
+                path: "task.txt".into(),
+            },
+        )
+        .await,
+        Response::Error { message, .. } if message.contains("项目目录已改变")
+    ));
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::PreviewChange {
+                target: latte_work_protocol::ChangePreviewTarget::Task {
+                    session_id: sid.clone(),
+                },
+                path: "icon.png".into(),
+                before: false,
+                offset: 0,
+            },
+        )
+        .await,
+        Response::Error { message, .. } if message.contains("项目目录已改变")
+    ));
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::TurnChangeDiff {
+                session_id: sid.clone(),
+                request_id: "turn-a".into(),
+                path: "task.txt".into(),
+            },
+        )
+        .await,
+        Response::Content { text, .. } if text.contains("+agent change")
+    ));
+}
+
+#[tokio::test]
+async fn update_project_directory_guards_terminals_and_preserves_claude_resume_fork_and_offline_metadata()
+ {
+    let host = Host::start_with_environment(&[(
+        "LATTE_FIXTURE_CHILD_NATIVE_FILE",
+        std::ffi::OsStr::new("1"),
+    )])
+    .await;
+    let mut c = host.client().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let dir_a = workspace.path().join("claude-old");
+    let dir_b = workspace.path().join("claude-new");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    let sid = session(&mut c, &dir_a).await;
+    let pid = match ask(&mut c, Request::Projects).await {
+        Response::Projects { projects } => {
+            projects
+                .into_iter()
+                .find(|p| p.path == dir_a.canonicalize().unwrap().to_string_lossy())
+                .unwrap()
+                .id
+        }
+        _ => unreachable!(),
+    };
+
+    // Seed a saved Claude session with a native subagent transcript in dir_a, then close it.
+    ask(
+        &mut c,
+        Request::Send {
+            provider: Some(latte_work_protocol::TurnProvider::Cli),
+            session_id: sid.clone(),
+            request_id: "seed-subagent".into(),
+            text: "subagent-process".into(),
+            model: None,
+            effort: None,
+            permission_mode: None,
+        },
+    )
+    .await;
+    wait(&mut c, &sid, Status::Completed).await;
+    let subagent_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match ask(
+            &mut c,
+            Request::CloseAgentSession {
+                session_id: sid.clone(),
+                only_if_idle: Some(true),
+            },
+        )
+        .await
+        {
+            Response::Ok => break,
+            Response::Error { message, .. } if message.contains("请确认后关闭") => {
+                assert!(
+                    Instant::now() < subagent_deadline,
+                    "fixture did not become idle: {message}"
+                );
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            other => panic!("unexpected close response: {other:?}"),
+        }
+    }
+    let Response::Subagents { tasks, .. } = ask(
+        &mut c,
+        Request::Subagents {
+            session_id: sid.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("subagents");
+    };
+    let child_task_id = tasks
+        .iter()
+        .find(|t| t.native_id == "process-native")
+        .expect("native child task")
+        .id
+        .clone();
+    // Drop SQLite stream rows so SubagentHistory exercises native JSONL fallback in former_paths.
+    let database = rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
+    database
+        .execute("DELETE FROM subagent_history WHERE session_id=?1", [&sid])
+        .unwrap();
+    database
+        .execute(
+            "DELETE FROM subagent_history_sources WHERE session_id=?1",
+            [&sid],
+        )
+        .unwrap();
+    drop(database);
+
+    // Open a live terminal in dir_a and an idle agent session: UpdateProject must reject
+    // the directory move while the terminal is running without closing the idle session.
+    let idle_sid = match ask(
+        &mut c,
+        Request::CreateSession {
+            project_id: pid.clone(),
+            agent: "claude".into(),
+        },
+    )
+    .await
+    {
+        Response::Session { session } => session.id,
+        other => panic!("create idle session: {other:?}"),
+    };
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::OpenAgentSession {
+                session_id: idle_sid.clone(),
+                provider: None,
+            },
+        )
+        .await,
+        Response::Ok
+    ));
+    let term_id = uuid::Uuid::new_v4().to_string();
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::CreateTerminal {
+                project_id: pid.clone(),
+                terminal_id: term_id.clone(),
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await,
+        Response::Terminal { .. }
+    ));
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::UpdateProject {
+                project_id: pid.clone(),
+                name: "Blocked By Terminal".into(),
+                path: dir_b.to_string_lossy().into_owned(),
+            },
+        )
+        .await,
+        Response::Error { message, .. } if message.contains("运行中的终端")
+    ));
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::ProjectAgentSessions {
+                project_id: pid.clone(),
+                after: None,
+            },
+        )
+        .await,
+        Response::ProjectAgentSessions { sessions, .. }
+            if sessions.iter().any(|s| s.id == idle_sid && s.agent_session_open == Some(true))
+    ));
+
+    // Let the shell exit naturally so an exited PTY entry remains in Host memory.
+    terminal_write(&mut c, &term_id, b"exit\n").await;
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let Response::Terminals { terminals } = ask(
+            &mut c,
+            Request::Terminals {
+                project_id: pid.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("terminals");
+        };
+        if terminals.iter().any(|t| t.id == term_id && t.exited) {
+            break;
+        }
+        assert!(Instant::now() < exit_deadline, "terminal did not exit");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Moving the project purges the exited terminal and closes the idle session cleanly.
+    let Response::ProjectUpdated {
+        closed_session_ids,
+        closed_terminal_ids,
+        ..
+    } = ask(
+        &mut c,
+        Request::UpdateProject {
+            project_id: pid.clone(),
+            name: "Claude Moved".into(),
+            path: dir_b.to_string_lossy().into_owned(),
+        },
+    )
+    .await
+    else {
+        panic!("expected ProjectUpdated");
+    };
+    assert!(closed_session_ids.contains(&idle_sid));
+    assert_eq!(closed_terminal_ids, vec![term_id]);
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::Terminals {
+                project_id: pid.clone(),
+            },
+        )
+        .await,
+        Response::Terminals { terminals } if terminals.is_empty()
+    ));
+
+    // Remove the old directory from disk to simulate a real folder move/rename.
+    std::fs::remove_dir_all(&dir_a).unwrap();
+
+    // Offline rename & subagent native history still resolve via former_paths.
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::RenameSession {
+                session_id: sid.clone(),
+                title: "Renamed After Move".into(),
+                provider: None,
+            },
+        )
+        .await,
+        Response::Session { session } if session.title == "Renamed After Move" && session.custom_title
+    ));
+    let Response::SubagentHistory { events, source, .. } = ask(
+        &mut c,
+        Request::SubagentHistory {
+            session_id: sid.clone(),
+            task_id: child_task_id,
+            after: None,
+            source: None,
+            provider: Some(latte_work_protocol::TurnProvider::Cli),
+        },
+    )
+    .await
+    else {
+        panic!("subagent history");
+    };
+    assert_eq!(source, "native");
+    assert!(events.iter().any(
+        |e| matches!(&e.event, EventKind::Text { text } if text.contains("text only in native file"))
+    ));
+
+    // Forking a brand-new side chat BEFORE resuming the parent session copies the parent's
+    // native transcript into the new cwd bucket so `--fork-session` succeeds in dir_b.
+    let Response::Session { session: side } = ask(
+        &mut c,
+        Request::OpenSideChat {
+            session_id: sid.clone(),
+            side_id: None,
+        },
+    )
+    .await
+    else {
+        panic!("open side chat");
+    };
+    assert!(matches!(
+        send(&mut c, &side.id, "side-after-move", "hello").await,
+        Response::Accepted { .. }
+    ));
+    let side_events = wait(&mut c, &side.id, Status::Completed).await;
+    assert!(
+        side_events
+            .iter()
+            .any(|e| matches!(&e.event, EventKind::Text { text } if !text.is_empty())),
+        "expected side chat text event, got: {side_events:?}"
+    );
+    let Response::Session {
+        session: parent_after_move,
+    } = ask(
+        &mut c,
+        Request::Session {
+            session_id: sid.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("parent session");
+    };
+    let Response::Session {
+        session: completed_side,
+    } = ask(
+        &mut c,
+        Request::Session {
+            session_id: side.id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("completed side session");
+    };
+    assert!(completed_side.native_id.is_some());
+    assert_ne!(completed_side.native_id, parent_after_move.native_id);
+
+    // Resuming the main session also migrates and runs in dir_b.
+    assert!(matches!(
+        send(&mut c, &sid, "main-after-move", "task-edit").await,
+        Response::Accepted { .. }
+    ));
+    wait(&mut c, &sid, Status::Completed).await;
+    assert!(dir_b.join("task.txt").exists());
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::RenameSession {
+                session_id: sid.clone(),
+                title: "Updated In B".into(),
+                provider: None,
+            },
+        )
+        .await,
+        Response::Session { session } if session.title == "Updated In B"
+    ));
+
+    // Round-trip `/A -> /B -> /A` (also reclaiming an empty removed project on recreated dir_a
+    // with an exited terminal): moving back to dir_a must overwrite the stale transcript left in
+    // dir_a's Claude bucket with the fresher dir_b transcript before resuming.
+    std::fs::create_dir_all(&dir_a).unwrap();
+    let Response::Project {
+        project: temp_hidden,
+    } = ask(
+        &mut c,
+        Request::AddProject {
+            name: Some("Temp Hidden".into()),
+            path: dir_a.to_string_lossy().into_owned(),
+        },
+    )
+    .await
+    else {
+        panic!("create temp hidden project");
+    };
+    let hidden_term_id = uuid::Uuid::new_v4().to_string();
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::CreateTerminal {
+                project_id: temp_hidden.id.clone(),
+                terminal_id: hidden_term_id.clone(),
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await,
+        Response::Terminal { .. }
+    ));
+    terminal_write(&mut c, &hidden_term_id, b"exit\n").await;
+    let hidden_exit_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let Response::Terminals { terminals } = ask(
+            &mut c,
+            Request::Terminals {
+                project_id: temp_hidden.id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("hidden terminals");
+        };
+        if terminals.iter().any(|t| t.id == hidden_term_id && t.exited) {
+            break;
+        }
+        assert!(
+            Instant::now() < hidden_exit_deadline,
+            "hidden terminal did not exit"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::RemoveProject {
+                project_id: temp_hidden.id.clone(),
+            },
+        )
+        .await,
+        Response::Projects { .. }
+    ));
+
+    let canonical_a = dir_a.canonicalize().unwrap().to_string_lossy().into_owned();
+    let Response::ProjectUpdated {
+        project: returned_a,
+        closed_session_ids: roundtrip_closed_sessions,
+        closed_terminal_ids: roundtrip_closed_terminals,
+    } = ask(
+        &mut c,
+        Request::UpdateProject {
+            project_id: pid.clone(),
+            name: "Claude Returned".into(),
+            path: dir_a.to_string_lossy().into_owned(),
+        },
+    )
+    .await
+    else {
+        panic!("expected ProjectUpdated back to dir_a");
+    };
+    assert_eq!(returned_a.path, canonical_a);
+    assert!(roundtrip_closed_sessions.contains(&sid));
+    assert_eq!(roundtrip_closed_terminals, vec![hidden_term_id]);
+
+    let native_id = parent_after_move.native_id.expect("parent native_id");
+    let escaped_a: String = canonical_a
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect();
+    let transcript_a = host
+        .directory
+        .path()
+        .join("claude-config/projects")
+        .join(escaped_a)
+        .join(format!("{native_id}.jsonl"));
+
+    // Forking a new side chat on the `/A -> /B -> /A` return leg before resuming the main session
+    // refreshes the stale dir_a parent transcript from dir_b first.
+    let Response::Session {
+        session: roundtrip_side,
+    } = ask(
+        &mut c,
+        Request::OpenSideChat {
+            session_id: sid.clone(),
+            side_id: Some(uuid::Uuid::new_v4().to_string()),
+        },
+    )
+    .await
+    else {
+        panic!("open roundtrip side chat");
+    };
+    assert!(matches!(
+        send(&mut c, &roundtrip_side.id, "side-roundtrip-a", "hello").await,
+        Response::Accepted { .. }
+    ));
+    wait(&mut c, &roundtrip_side.id, Status::Completed).await;
+    let refreshed_before_resume = std::fs::read_to_string(&transcript_a).unwrap();
+    assert!(
+        refreshed_before_resume.contains("Updated In B"),
+        "expected side-chat fork on return leg to refresh stale dir_a transcript, got:\n{refreshed_before_resume}"
+    );
+
+    assert!(matches!(
+        send(&mut c, &sid, "main-roundtrip-a", "task-edit").await,
+        Response::Accepted { .. }
+    ));
+    wait(&mut c, &sid, Status::Completed).await;
+    assert!(dir_a.join("task.txt").exists());
+    let transcript_text = std::fs::read_to_string(&transcript_a).unwrap();
+    assert!(
+        transcript_text.contains("Updated In B"),
+        "expected stale dir_a transcript to be overwritten with fresher dir_b history, got:\n{transcript_text}"
+    );
+}

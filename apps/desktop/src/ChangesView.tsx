@@ -59,6 +59,7 @@ export function ChangesView({
   const context = JSON.stringify([
     hostId,
     project.id,
+    project.path,
     scope,
     gitMode ? null : sessionId,
     scope === "turn" ? requestId : null,
@@ -127,10 +128,12 @@ export function ChangesView({
     infoContext.current = "";
     setInfo(undefined);
     setBase("");
+    setCommit(undefined);
+    setScope((previous) => (previous === "commit" ? "branch" : previous));
     setSnapshot(undefined);
     select(initialPath ?? "");
     setError("");
-  }, [hostId, project.id]);
+  }, [hostId, project.id, project.path]);
   useEffect(() => {
     if (!active || !gitMode) return;
     setLoading(true);
@@ -141,7 +144,11 @@ export function ChangesView({
         if (response.kind !== "git_info")
           throw new Error("Server 不支持分支审阅，请更新后重试");
         if (!disposed) {
-          infoContext.current = JSON.stringify([hostId, project.id]);
+          infoContext.current = JSON.stringify([
+            hostId,
+            project.id,
+            project.path,
+          ]);
           setInfo({ ...response.info });
           setBase(
             (previous) => previous || response.info.default_base || "HEAD",
@@ -157,16 +164,18 @@ export function ChangesView({
     return () => {
       disposed = true;
     };
-  }, [active, hostId, project.id, revision, gitMode]);
+  }, [active, hostId, project.id, project.path, revision, gitMode]);
   useEffect(() => {
     if (
       !active ||
       (gitMode &&
         (!info ||
-          infoContext.current !== JSON.stringify([hostId, project.id]) ||
+          infoContext.current !==
+            JSON.stringify([hostId, project.id, project.path]) ||
           (scope === "branch" && !base)))
     )
       return;
+    if (scope === "commit" && !commit) return;
     let disposed = false;
     setLoading(true);
     setError("");
@@ -214,8 +223,8 @@ export function ChangesView({
                 base:
                   scope === "branch"
                     ? base
-                    : scope === "commit"
-                      ? commit!.oid
+                    : scope === "commit" && commit
+                      ? commit.oid
                       : null,
               },
     )
@@ -291,6 +300,7 @@ export function ChangesView({
     active,
     hostId,
     project.id,
+    project.path,
     scope,
     base,
     info,
@@ -337,7 +347,16 @@ export function ChangesView({
       if (response.kind !== "content") throw new Error("无法读取文件差异");
       return response;
     },
-    [hostId, project.id, scope, snapshot, turn, review, fullContext],
+    [
+      hostId,
+      project.id,
+      project.path,
+      scope,
+      snapshot,
+      turn,
+      review,
+      fullContext,
+    ],
   );
   const loadImage = useCallback(
     (path: string, before: boolean, valid: () => boolean) =>
@@ -365,7 +384,7 @@ export function ChangesView({
         before,
         valid,
       ),
-    [hostId, project.id, scope, snapshot, turn, review],
+    [hostId, project.id, project.path, scope, snapshot, turn, review],
   );
   const options = info
     ? [
@@ -393,7 +412,13 @@ export function ChangesView({
   );
   return (
     <ReviewWorkspace
-      key={JSON.stringify([hostId, project.id, sessionId, requestId])}
+      key={JSON.stringify([
+        hostId,
+        project.id,
+        project.path,
+        sessionId,
+        requestId,
+      ])}
       scopeControl={scopeControl}
       comparisonControl={
         scope === "branch" ? (

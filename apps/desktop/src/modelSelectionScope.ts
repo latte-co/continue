@@ -5,4 +5,10 @@ export const modelSelectionScope = (
   agent: string,
   model: string | null,
   effort: Effort | null,
-) => JSON.stringify([host, project, agent, model, effort]);
+  projectPath?: string,
+) =>
+  JSON.stringify(
+    projectPath === undefined
+      ? [host, project, agent, model, effort]
+      : [host, project, projectPath, agent, model, effort],
+  );

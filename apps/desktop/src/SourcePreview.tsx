@@ -13,12 +13,13 @@ import type { SourceItem } from "./useTaskSources";
 function usePreview(
   hostId: string,
   projectId: string,
+  projectPath: string | undefined,
   sessionId: string | undefined,
   source: SourceItem,
   active: boolean,
   revision = 0,
 ) {
-  const scope = `${hostId}:${projectId}:${sessionId}:${source.path}:${revision}`;
+  const scope = `${hostId}:${projectId}:${projectPath ?? ""}:${sessionId}:${source.path}:${revision}`;
   const [state, setState] = useState<{
     scope: string;
     data?: SourceData;
@@ -73,11 +74,13 @@ export function SourceThumbnail({
   source,
   hostId,
   projectId,
+  projectPath,
   sessionId,
 }: {
   source: SourceItem;
   hostId: string;
   projectId: string;
+  projectPath?: string;
   sessionId?: string;
 }) {
   const isImage =
@@ -107,6 +110,7 @@ export function SourceThumbnail({
   const preview = usePreview(
     hostId,
     projectId,
+    projectPath,
     sessionId,
     source,
     isImage && visible,
@@ -128,6 +132,7 @@ export function SourceThumbnail({
 export function SourcePreview({
   hostId,
   projectId,
+  projectPath,
   sessionId,
   source,
   active,
@@ -138,6 +143,7 @@ export function SourcePreview({
 }: {
   hostId: string;
   projectId: string;
+  projectPath?: string;
   sessionId?: string;
   source: SourceItem;
   active: boolean;
@@ -150,6 +156,7 @@ export function SourcePreview({
   const preview = usePreview(
     hostId,
     projectId,
+    projectPath,
     sessionId,
     source,
     active,
@@ -158,7 +165,7 @@ export function SourcePreview({
   const [systemError, setSystemError] = useState("");
   const [busy, setBusy] = useState(false);
   const current = useRef("");
-  current.current = `${hostId}:${projectId}:${sessionId}:${source.path}:${active}:${revision}`;
+  current.current = `${hostId}:${projectId}:${projectPath ?? ""}:${sessionId}:${source.path}:${active}:${revision}`;
   const scope = current.current;
   useEffect(() => {
     setBusy(false);
@@ -169,7 +176,7 @@ export function SourcePreview({
     embedded
       ? [
           {
-            id: `reference-file:${hostId}:${projectId}:${source.path}`,
+            id: `reference-file:${hostId}:${projectId}:${projectPath ?? ""}:${source.path}`,
             title: `${source.name} 未能读取`,
             error: active ? (preview.error ?? "") : "",
             pending: active && !data && !preview.error,

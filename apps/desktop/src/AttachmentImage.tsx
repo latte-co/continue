@@ -43,6 +43,7 @@ export function AttachmentImage({
   reference,
   hostId,
   projectId,
+  projectPath,
   sessionId,
   connected,
   active: enabled = true,
@@ -52,6 +53,7 @@ export function AttachmentImage({
   reference: ComposerReference;
   hostId: string;
   projectId?: string;
+  projectPath?: string;
   sessionId?: string;
   connected: boolean;
   active?: boolean;
@@ -61,9 +63,13 @@ export function AttachmentImage({
   const target = useRef<HTMLButtonElement>(null);
   const [visible, setVisible] = useState(false);
   const [revision, retry] = useState(0);
+  const relativeProjectPath = reference.path.startsWith("/")
+    ? null
+    : (projectPath ?? null);
   const scope = JSON.stringify([
     hostId,
     projectId,
+    relativeProjectPath,
     sessionId,
     reference.path,
     revision,
@@ -71,6 +77,7 @@ export function AttachmentImage({
   const identity = JSON.stringify([
     hostId,
     projectId,
+    relativeProjectPath,
     sessionId,
     reference.path,
     enabled,

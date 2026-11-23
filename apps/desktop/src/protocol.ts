@@ -463,6 +463,7 @@ export type Request =
     }
   | { method: "add_project"; path: string; name: string | null }
   | { method: "rename_project"; project_id: string; name: string }
+  | { method: "update_project"; project_id: string; name: string; path: string }
   | { method: "remove_project"; project_id: string }
   | { method: "browse_directories"; path: string | null }
   | { method: "sessions"; project_id: string }
@@ -832,6 +833,12 @@ export type Response =
     }
   | { kind: "projects"; projects: Array<Project> }
   | { kind: "project"; project: Project }
+  | {
+      kind: "project_updated";
+      project: Project;
+      closed_session_ids?: Array<string>;
+      closed_terminal_ids?: Array<string>;
+    }
   | { kind: "sessions"; sessions: Array<Session> }
   | { kind: "session"; session: Session }
   | { kind: "queued_message_taken"; entry: QueuedMessage }

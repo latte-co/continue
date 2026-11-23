@@ -61,6 +61,7 @@ function MessageLocalImage({
     loaderRef.current = loader;
   });
   const hasLoader = loader !== undefined;
+  const projectScope = granted ? (actions.projectRoot ?? null) : null;
   const [revision, retry] = useState(0);
   const [state, setState] = useState<LoadState>({});
   const resource = useRef<{ url: string } | undefined>(undefined);
@@ -137,7 +138,7 @@ function MessageLocalImage({
     return () => {
       disposed = true;
     };
-  }, [path, enabled, revision]);
+  }, [path, granted, projectScope, enabled, revision]);
   const onError = () => {
     release();
     setState({ error: "图片格式无法解码" });

@@ -510,6 +510,7 @@ async fn dispatch_reserved(
             | Request::CloseTerminal { .. }
             | Request::ArchiveSession { archived: true, .. }
             | Request::RenameSession { .. }
+            | Request::UpdateProject { .. }
     );
     let _exclusive_guard = if exclusive {
         Some(s.file_admission.write().await)
@@ -525,6 +526,11 @@ async fn dispatch_reserved(
             | Request::WriteTerminal { .. }
             | Request::Approve { .. }
             | Request::AnswerQuestion { .. }
+            | Request::TakeQueuedMessage { .. }
+            | Request::ReorderMessageQueue { .. }
+            | Request::EditQueuedMessage { .. }
+            | Request::CancelQueuedMessage { .. }
+            | Request::ClearMessageQueue { .. }
             | Request::ResumeMessageQueue { .. }
             | Request::DispatchQueuedMessage { .. }
     ) {
@@ -863,6 +869,102 @@ async fn dispatch_admitted(
         Request::RenameProject { project_id, name } => Response::Project {
             project: db(&s.database, |d| d.rename_project(&project_id, &name))?,
         },
+        Request::UpdateProject {
+            project_id,
+            name,
+            path,
+        } => {
+            let prepared = db(&s.database, |d| {
+                d.prepare_project_update(&project_id, &name, Path::new(&path))
+            })?;
+            let mut closed_session_ids = Vec::new();
+            let mut closed_terminal_ids = Vec::new();
+            if prepared.path_changed {
+                {
+                    let terminals = s
+                        .terminals
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("终端锁异常"))?;
+                    if terminals.has_open_for_project(&project_id)
+                        || prepared
+                            .reclaim_hidden_project_id
+                            .as_deref()
+                            .is_some_and(|id| terminals.has_open_for_project(id))
+                    {
+                        bail!("项目中还有运行中的终端，请关闭后再修改目录");
+                    }
+                }
+                let open_ids: std::collections::HashSet<String> = {
+                    let runs = s
+                        .runs
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("执行状态锁异常"))?;
+                    let mut ids = std::collections::HashSet::new();
+                    for id in &prepared.session_ids {
+                        if let Some(run) = runs.get(id).filter(|run| !run.control.is_closed()) {
+                            if !run.safe_to_close.load(std::sync::atomic::Ordering::SeqCst) {
+                                bail!("项目中还有忙碌的 Agent 会话，请等待空闲或关闭后再修改目录");
+                            }
+                            ids.insert(id.clone());
+                        }
+                    }
+                    ids
+                };
+                let mut targets = Vec::new();
+                for id in &prepared.session_ids {
+                    let resource = upgrade::Resource::AgentSession(id.clone());
+                    let version = s.lifecycle.claim_version(&resource)?;
+                    let has_codex_job = !agents::codex_jobs::registry()
+                        .scope_confirmed(&agents::codex_jobs::JobScope::session(id));
+                    if open_ids.contains(id) || version.is_some() || has_codex_job {
+                        targets.push((id.clone(), resource, version));
+                    }
+                }
+                for (id, resource, version) in targets {
+                    runtime::close(&s.database, &s.runs, &id, true).await?;
+                    s.lifecycle.forget_claim(&resource, version, claims)?;
+                    closed_session_ids.push(id);
+                }
+                let exited_terminals = {
+                    let mut terminals = s
+                        .terminals
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("终端锁异常"))?;
+                    if terminals.has_open_for_project(&project_id)
+                        || prepared
+                            .reclaim_hidden_project_id
+                            .as_deref()
+                            .is_some_and(|id| terminals.has_open_for_project(id))
+                    {
+                        bail!("项目中还有运行中的终端，请关闭后再修改目录");
+                    }
+                    let mut purged = terminals.purge_exited_for_project(&project_id);
+                    if let Some(reclaim_id) = prepared.reclaim_hidden_project_id.as_deref() {
+                        purged.extend(terminals.purge_exited_for_project(reclaim_id));
+                    }
+                    purged
+                };
+                for terminal_id in exited_terminals {
+                    let resource = upgrade::Resource::Terminal(terminal_id.clone());
+                    let version = s.lifecycle.claim_version(&resource)?;
+                    s.lifecycle.forget_claim(&resource, version, claims)?;
+                    closed_terminal_ids.push(terminal_id);
+                }
+                let project = db(&s.database, |d| d.commit_project_update(&prepared))?;
+                Response::ProjectUpdated {
+                    project,
+                    closed_session_ids,
+                    closed_terminal_ids,
+                }
+            } else {
+                let project = db(&s.database, |d| d.commit_project_update(&prepared))?;
+                Response::ProjectUpdated {
+                    project,
+                    closed_session_ids,
+                    closed_terminal_ids,
+                }
+            }
+        }
         Request::RemoveProject { project_id } => {
             db(&s.database, |d| d.remove_project(&project_id))?;
             Response::Projects {
@@ -1443,14 +1545,15 @@ async fn dispatch_admitted(
                 && let Some(parent) = session.native_id.as_deref()
                 && let Ok(binary) = s.agent_binary("opencode")
             {
-                let (child, cwd, accepted, known_children) = db(&s.database, |d| {
-                    Ok((
-                        d.subagent(&session_id, &task_id)?,
-                        d.project(&session.project_id)?.path,
-                        d.child_provider_fingerprint(&session_id, &task_id)?,
-                        d.child_native_ids(&session_id)?,
-                    ))
-                })?;
+                let (child, (project, former_paths), accepted, known_children) =
+                    db(&s.database, |d| {
+                        Ok((
+                            d.subagent(&session_id, &task_id)?,
+                            d.project_with_former_paths(&session.project_id)?,
+                            d.child_provider_fingerprint(&session_id, &task_id)?,
+                            d.child_native_ids(&session_id)?,
+                        ))
+                    })?;
                 let fingerprint = providers::turn_fingerprint(provider.as_ref())?;
                 if !child.status.active() && accepted == Some(fingerprint.clone()) {
                     let config = s
@@ -1461,7 +1564,8 @@ async fn dispatch_admitted(
                     if (fingerprint.is_some() || config.provider.is_none())
                         && let Ok(Some(page)) = agents::opencode_child_history(
                             binary,
-                            std::path::Path::new(&cwd),
+                            std::path::Path::new(&project.path),
+                            &former_paths,
                             parent,
                             &child.native_id,
                             &known_children,
@@ -1507,15 +1611,16 @@ async fn dispatch_admitted(
                     && (fingerprint.is_some() || config.provider.is_none())
                     && let Some(parent) = session.native_id
                 {
-                    let (child, cwd) = db(&s.database, |d| {
+                    let (child, (project, former_paths)) = db(&s.database, |d| {
                         Ok((
                             d.subagent(&session_id, &task_id)?,
-                            d.project(&session.project_id)?.path,
+                            d.project_with_former_paths(&session.project_id)?,
                         ))
                     })?;
                     let permit = agents::child_read_permit()?;
                     if let Some(page) = agents::child_history(
-                        std::path::PathBuf::from(cwd),
+                        std::path::PathBuf::from(project.path),
+                        former_paths,
                         parent,
                         child.native_id,
                         session_id.clone(),
@@ -1975,11 +2080,12 @@ async fn dispatch_admitted(
                         let project = db(&s.database, |d| d.project(&session.project_id))?;
                         let baseline = db(&s.database, |d| d.baseline(&session_id))?
                             .context("此任务没有记录文件基线")?;
+                        let root = Path::new(&project.path);
+                        baseline.ensure_same_root(root).await?;
                         if before {
                             baseline.image_chunk(&path, offset).await
                         } else {
                             task_changes::validate_path(&path)?;
-                            let root = Path::new(&project.path);
                             let mut target = root.to_path_buf();
                             for component in Path::new(&path).components() {
                                 target.push(component);
@@ -2612,6 +2718,242 @@ mod send_admission_tests {
             crate::admission::active(&service.database, "old-control"),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn queue_mutations_serialize_with_project_path_updates_and_leave_idle_actor_closable() {
+        #[derive(Clone, Copy)]
+        enum Variant {
+            Take,
+            Reorder,
+            Edit,
+            Cancel,
+            Clear,
+        }
+
+        let enqueue_paused = |service: &Service, session_id: &str, ids: &[&str]| {
+            let config = service
+                .providers
+                .lock()
+                .unwrap()
+                .turn_config("codex", None, Some(latte_work_protocol::TurnProvider::Cli))
+                .unwrap();
+            let fingerprint =
+                providers::turn_fingerprint(Some(&latte_work_protocol::TurnProvider::Cli)).unwrap();
+            db(&service.database, |store| {
+                for &id in ids {
+                    store.enqueue(
+                        session_id,
+                        &runtime::SendTurn {
+                            request_id: id.into(),
+                            text: format!("queued {id}"),
+                            model: None,
+                            fingerprint: fingerprint.clone(),
+                            config: config.clone(),
+                        },
+                    )?;
+                }
+                store.pause_queue(session_id, Some("paused for test"))?;
+                Ok(())
+            })
+            .unwrap();
+        };
+
+        let build_request =
+            |variant: Variant, session_id: &str, first: &str, second: &str| match variant {
+                Variant::Take => Request::TakeQueuedMessage {
+                    session_id: session_id.into(),
+                    request_id: first.into(),
+                    revision: 0,
+                },
+                Variant::Reorder => Request::ReorderMessageQueue {
+                    session_id: session_id.into(),
+                    expected: vec![first.into(), second.into()],
+                    order: vec![second.into(), first.into()],
+                },
+                Variant::Edit => Request::EditQueuedMessage {
+                    session_id: session_id.into(),
+                    request_id: first.into(),
+                    revision: 0,
+                    text: "edited".into(),
+                },
+                Variant::Cancel => Request::CancelQueuedMessage {
+                    session_id: session_id.into(),
+                    request_id: first.into(),
+                    revision: 0,
+                },
+                Variant::Clear => Request::ClearMessageQueue {
+                    session_id: session_id.into(),
+                },
+            };
+
+        for variant in [
+            Variant::Take,
+            Variant::Reorder,
+            Variant::Edit,
+            Variant::Cancel,
+            Variant::Clear,
+        ] {
+            // 1. Forward interleaving: UpdateProject holds exclusive file_admission while closing
+            // an idle session; a concurrent queue mutation on another session must wait and must
+            // not spawn an actor bound to the old directory.
+            let root = tempfile::tempdir().unwrap();
+            let dir_a = root.path().join("dir-a");
+            let dir_b = root.path().join("dir-b");
+            let dir_c = root.path().join("dir-c");
+            std::fs::create_dir_all(&dir_a).unwrap();
+            std::fs::create_dir_all(&dir_b).unwrap();
+            std::fs::create_dir_all(&dir_c).unwrap();
+            let service = Arc::new(service(root.path()));
+            let (project, gate_session, target_session, reverse_session) =
+                db(&service.database, |store| {
+                    let project = store.add_project(&dir_a)?;
+                    let gate = store.create_session(project.id.clone(), "codex".into())?;
+                    let target = store.create_session(project.id.clone(), "codex".into())?;
+                    let reverse = store.create_session(project.id.clone(), "codex".into())?;
+                    Ok((project, gate, target, reverse))
+                })
+                .unwrap();
+            enqueue_paused(&service, &target_session.id, &["q1", "q2"]);
+            enqueue_paused(&service, &reverse_session.id, &["r1", "r2"]);
+
+            let (gate_control, mut gate_rx) = tokio::sync::mpsc::channel(1);
+            service.runs.lock().unwrap().insert(
+                gate_session.id.clone(),
+                runtime::Run {
+                    control: gate_control,
+                    safe_to_close: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                    session_open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                },
+            );
+
+            let update_service = service.clone();
+            let project_id = project.id.clone();
+            let dir_b_str = dir_b.to_string_lossy().into_owned();
+            let update_task = tokio::spawn(async move {
+                dispatch(
+                    &update_service,
+                    Request::UpdateProject {
+                        project_id,
+                        name: "Moved".into(),
+                        path: dir_b_str,
+                    },
+                    &mut upgrade::ConnectionClaims::default(),
+                )
+                .await
+            });
+
+            let Control::Cancel {
+                only_if_idle: true,
+                reply: gate_reply,
+            } = gate_rx.recv().await.unwrap()
+            else {
+                panic!("expected UpdateProject to pause on idle gate session close");
+            };
+
+            let queue_service = service.clone();
+            let queue_request = build_request(variant, &target_session.id, "q1", "q2");
+            let queue_task = tokio::spawn(async move {
+                dispatch(
+                    &queue_service,
+                    queue_request,
+                    &mut upgrade::ConnectionClaims::default(),
+                )
+                .await
+            });
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !queue_task.is_finished(),
+                "queue mutation bypassed file_admission while UpdateProject was in progress"
+            );
+
+            drop(gate_rx);
+            service.runs.lock().unwrap().remove(&gate_session.id);
+            gate_reply.unwrap().send(Ok(())).unwrap();
+
+            assert!(matches!(
+                update_task.await.unwrap().unwrap(),
+                Response::ProjectUpdated { .. }
+            ));
+            queue_task.await.unwrap().unwrap();
+
+            // Opening the session directly reuses the actor spawned by the queue mutation;
+            // its real subprocess cwd must be dir_b, never the stale dir_a.
+            dispatch(
+                &service,
+                Request::OpenAgentSession {
+                    session_id: target_session.id.clone(),
+                    provider: Some(latte_work_protocol::TurnProvider::Cli),
+                },
+                &mut upgrade::ConnectionClaims::default(),
+            )
+            .await
+            .unwrap();
+            assert!(!dir_a.join("codex-opens").exists());
+            assert!(dir_b.join("codex-opens").exists());
+
+            dispatch(
+                &service,
+                Request::CloseAgentSession {
+                    session_id: target_session.id.clone(),
+                    only_if_idle: Some(false),
+                },
+                &mut upgrade::ConnectionClaims::default(),
+            )
+            .await
+            .unwrap();
+
+            // 2. Reverse interleaving: immediately after a fresh queue mutation spawns an actor
+            // and returns, safe_to_close is already synchronized so an immediate UpdateProject
+            // succeeds without falsely rejecting the paused/empty session as busy.
+            dispatch(
+                &service,
+                build_request(variant, &reverse_session.id, "r1", "r2"),
+                &mut upgrade::ConnectionClaims::default(),
+            )
+            .await
+            .unwrap();
+            let dir_c_str = dir_c.to_string_lossy().into_owned();
+            assert!(matches!(
+                dispatch(
+                    &service,
+                    Request::UpdateProject {
+                        project_id: project.id.clone(),
+                        name: "MovedAgain".into(),
+                        path: dir_c_str,
+                    },
+                    &mut upgrade::ConnectionClaims::default(),
+                )
+                .await
+                .unwrap(),
+                Response::ProjectUpdated { .. }
+            ));
+
+            dispatch(
+                &service,
+                Request::OpenAgentSession {
+                    session_id: reverse_session.id.clone(),
+                    provider: Some(latte_work_protocol::TurnProvider::Cli),
+                },
+                &mut upgrade::ConnectionClaims::default(),
+            )
+            .await
+            .unwrap();
+            assert!(dir_c.join("codex-opens").exists());
+
+            dispatch(
+                &service,
+                Request::CloseAgentSession {
+                    session_id: reverse_session.id.clone(),
+                    only_if_idle: Some(false),
+                },
+                &mut upgrade::ConnectionClaims::default(),
+            )
+            .await
+            .unwrap();
+        }
     }
 }
 

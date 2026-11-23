@@ -677,3 +677,140 @@ it("opens a later frozen-file page and replaces page DOM instead of accumulating
   });
   expect(document.querySelectorAll(".review-file-section")).toHaveLength(64);
 });
+
+it("refreshes git info and branch review when project.path changes for the same project id", async () => {
+  let currentBranch = "branch-old";
+  let changedPath = "old-dir.ts";
+  mocks.request.mockImplementation(async (_host: string, req: Request) => {
+    if (req.method === "git_info")
+      return {
+        kind: "git_info",
+        info: { ...info, branch: currentBranch },
+      };
+    if (req.method === "git_review")
+      return {
+        kind: "git_review",
+        review: {
+          ...review,
+          entries: [
+            {
+              path: changedPath,
+              previous_path: null,
+              status: "M",
+              added: 1,
+              removed: 0,
+              binary: false,
+              untracked: false,
+            },
+          ],
+        },
+      };
+    return {
+      kind: "content",
+      text: `--- a/${"path" in req ? req.path : ""}\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n`,
+      truncated: false,
+    };
+  });
+  const view = render(
+    <ChangesView
+      hostId="local"
+      project={{ id: "p", name: "Project", path: "/dir-old" }}
+      active
+    />,
+  );
+  await screen.findByText("branch-old");
+  expect((await screen.findAllByText("old-dir.ts")).length).toBeGreaterThan(0);
+
+  currentBranch = "branch-new";
+  changedPath = "new-dir.ts";
+  view.rerender(
+    <ChangesView
+      hostId="local"
+      project={{ id: "p", name: "Project", path: "/dir-new" }}
+      active
+    />,
+  );
+  await screen.findByText("branch-new");
+  expect((await screen.findAllByText("new-dir.ts")).length).toBeGreaterThan(0);
+});
+
+it("resets commit scope to branch review instead of dereferencing an empty commit when project.path changes", async () => {
+  const commit = { oid: "c".repeat(40), subject: "Fix review" };
+  let currentBranch = "branch-old";
+  let changedPath = "old-dir.ts";
+  mocks.request.mockImplementation(async (_host: string, req: Request) => {
+    if (req.method === "git_info")
+      return {
+        kind: "git_info",
+        info: { ...info, branch: currentBranch },
+      };
+    if (req.method === "git_commits")
+      return {
+        kind: "git_commits",
+        head: commit.oid,
+        commits: [commit],
+        has_more: false,
+      };
+    if (req.method === "git_review")
+      return {
+        kind: "git_review",
+        review: {
+          ...review,
+          entries: [
+            {
+              path: changedPath,
+              previous_path: null,
+              status: "M",
+              added: 1,
+              removed: 0,
+              binary: false,
+              untracked: false,
+            },
+          ],
+        },
+      };
+    return {
+      kind: "content",
+      text: `--- a/${"path" in req ? req.path : ""}\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n`,
+      truncated: false,
+    };
+  });
+  const view = render(
+    <ChangesView
+      hostId="local"
+      project={{ id: "p", name: "Project", path: "/dir-old" }}
+      active
+    />,
+  );
+  await screen.findAllByRole("region", { name: "统一文件差异" });
+  fireEvent.click(screen.getByRole("combobox", { name: "变更范围" }));
+  fireEvent.click(screen.getByRole("option", { name: "已提交" }));
+  fireEvent.click(await screen.findByRole("option", { name: /Fix review/ }));
+  await waitFor(() =>
+    expect(
+      screen.getByRole("combobox", { name: "变更范围" }).textContent,
+    ).toContain("已提交 · cccccccc"),
+  );
+
+  mocks.request.mockClear();
+  currentBranch = "branch-new";
+  changedPath = "new-dir.ts";
+  view.rerender(
+    <ChangesView
+      hostId="local"
+      project={{ id: "p", name: "Project", path: "/dir-new" }}
+      active
+    />,
+  );
+  await screen.findByText("branch-new");
+  expect((await screen.findAllByText("new-dir.ts")).length).toBeGreaterThan(0);
+  expect(
+    screen.getByRole("combobox", { name: "变更范围" }).textContent,
+  ).not.toContain("已提交");
+  expect(mocks.request).toHaveBeenCalledWith("local", {
+    method: "git_review",
+    project_id: "p",
+    scope: "branch",
+    base: info.default_base,
+  });
+});

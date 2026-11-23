@@ -17,6 +17,7 @@ pub fn lane(request: &Request) -> Lane {
         | Request::ConfirmSideWritesEnded { .. }
         | Request::ConfirmAgentClosed { .. }
         | Request::ArchiveSession { archived: true, .. }
+        | Request::UpdateProject { .. }
         | Request::Send { .. }
         | Request::SendQueued { .. }
         | Request::ResumeMessageQueue { .. }
@@ -97,6 +98,12 @@ mod tests {
             provider: None,
         };
         assert!(matches!(lane(&request), Lane::Metadata));
+        let update = Request::UpdateProject {
+            project_id: "p1".into(),
+            name: "Project".into(),
+            path: "/tmp/project".into(),
+        };
+        assert!(matches!(lane(&update), Lane::Control));
     }
     #[tokio::test]
     async fn slow_control_does_not_block_history_or_metadata_and_connections_are_reused() {

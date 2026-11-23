@@ -29,6 +29,7 @@ export function TaskFileRow({
     workspaceId,
     hostId,
     project?.id,
+    project?.path,
     sessionId,
     active,
     connected,
@@ -79,7 +80,7 @@ export function TaskFileRow({
   }
   useStatusIssues([
     {
-      id: `task-file:${hostId}:${project?.id}:${file.path}`,
+      id: `task-file:${hostId}:${project?.id}:${project?.path ?? ""}:${file.path}`,
       title: `${file.name} 未能打开`,
       error: active ? error : "",
       pending: busy,

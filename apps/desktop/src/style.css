@@ -3479,6 +3479,58 @@ button.recent-notice {
 .manual-path summary {
   cursor: pointer;
 }
+.project-folder-list {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  overflow: hidden;
+  background: var(--color-input);
+}
+.project-folder-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 44px;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+}
+.project-folder-row > svg {
+  flex-shrink: 0;
+  color: var(--color-text-secondary);
+}
+.project-folder-name {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-md);
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-folder-clear {
+  flex-shrink: 0;
+  color: var(--color-text-muted);
+}
+.project-folder-clear:not(:disabled):hover {
+  color: var(--color-text);
+}
+.project-folder-action {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  min-height: 44px;
+  padding: var(--space-2) var(--space-3);
+  border-radius: 0;
+  font-size: var(--text-md);
+  color: var(--color-text-secondary);
+  text-align: left;
+}
+.project-folder-action:not(:disabled):hover,
+.project-folder-action:not(:disabled):focus-visible {
+  background: var(--color-hover);
+  color: var(--color-text);
+  outline: none;
+}
 .modal-actions {
   margin-top: var(--space-6);
   display: flex;
@@ -3490,6 +3542,28 @@ button.recent-notice {
   border-radius: var(--radius-control);
   font-size: var(--text-md);
   min-height: var(--button-height);
+}
+.project-edit-actions {
+  justify-content: space-between;
+  align-items: center;
+}
+.project-edit-submit {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+button.danger-soft {
+  background: color-mix(in srgb, var(--color-danger) 12%, var(--color-surface));
+  color: var(--color-danger);
+  border: 1px solid transparent;
+}
+button.danger-soft:disabled {
+  background: var(--color-hover);
+  color: var(--color-disabled-text);
+}
+button.danger-soft:not(:disabled):hover {
+  background: color-mix(in srgb, var(--color-danger) 18%, var(--color-surface));
 }
 .folder-browser-host {
   display: flex;
@@ -3760,9 +3834,6 @@ button.recent-notice {
   height: 1px;
   margin: 5px var(--space-2);
   background: var(--color-border);
-}
-.project-path-note {
-  overflow-wrap: anywhere;
 }
 .project-heading {
   user-select: none;

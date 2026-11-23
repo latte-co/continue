@@ -14,6 +14,7 @@ export function TaskChangesView(props: {
       key={JSON.stringify([
         props.hostId,
         props.project.id,
+        props.project.path,
         props.sessionId,
         props.requestId,
       ])}

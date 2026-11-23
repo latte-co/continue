@@ -474,3 +474,128 @@ export function openArtifact(
     conversationActive: false,
   }));
 }
+
+export function syncProjectInWorkspaces(
+  hostId: string,
+  project: Project,
+  options: {
+    pathChanged?: boolean;
+    ownedWorkspaceKeys?: Iterable<string>;
+  } = {},
+) {
+  const owned = new Set(options.ownedWorkspaceKeys ?? []);
+  const keys = new Set<string>([...cache.keys(), ...owned]);
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const storageKey = localStorage.key(i);
+      if (
+        storageKey?.startsWith(prefix) &&
+        !storageKey.startsWith(prefix + "[")
+      ) {
+        keys.add(storageKey.slice(prefix.length));
+      }
+    }
+  } catch {
+    /* Ignore unavailable storage and synchronize in-memory workspaces. */
+  }
+  let changed = false;
+  for (const key of keys) {
+    const current = readWorkspace(key);
+    if (!current.tabs.length) continue;
+    const workspaceOwnedByProject =
+      owned.has(key) ||
+      current.tabs.some(
+        (tab) =>
+          (tab.hostId === undefined || tab.hostId === hostId) &&
+          (tab.project?.id === project.id ||
+            (tab.kind === "terminal" &&
+              tab.terminal.project_id === project.id)),
+      );
+    let keyChanged = false;
+    const tabs = current.tabs.flatMap((tab): WorkspaceTab[] => {
+      const sameHost = tab.hostId === undefined || tab.hostId === hostId;
+      if (!sameHost) return [tab];
+      const hasMatchingProject = tab.project?.id === project.id;
+      const isMatchingTerminal =
+        tab.kind === "terminal" && tab.terminal.project_id === project.id;
+      const belongsToProject =
+        hasMatchingProject ||
+        isMatchingTerminal ||
+        (tab.project === undefined && workspaceOwnedByProject);
+      if (!belongsToProject) return [tab];
+      const tabPathChanged =
+        Boolean(options.pathChanged) ||
+        (hasMatchingProject && tab.project!.path !== project.path);
+      if (tab.kind === "terminal" && tabPathChanged) {
+        keyChanged = true;
+        return [];
+      }
+      let nextTab: WorkspaceTab = tab;
+      if (
+        hasMatchingProject &&
+        (tab.project!.name !== project.name ||
+          tab.project!.path !== project.path)
+      ) {
+        nextTab = { ...nextTab, project };
+        keyChanged = true;
+      }
+      if (tabPathChanged) {
+        if (nextTab.kind === "artifact" && !nextTab.path.startsWith("/")) {
+          keyChanged = true;
+          return [];
+        }
+        if (nextTab.kind === "files") {
+          if (
+            nextTab.path !== undefined ||
+            nextTab.file !== undefined ||
+            nextTab.reference !== undefined ||
+            nextTab.sessionId !== undefined
+          ) {
+            nextTab = {
+              ...nextTab,
+              path: undefined,
+              file: undefined,
+              reference: undefined,
+              sessionId: undefined,
+            };
+            keyChanged = true;
+          }
+        } else if (nextTab.kind === "diff" && nextTab.requestId === undefined) {
+          if (
+            nextTab.path !== undefined ||
+            nextTab.file !== undefined ||
+            nextTab.reference !== undefined
+          ) {
+            nextTab = {
+              ...nextTab,
+              path: undefined,
+              file: undefined,
+              reference: undefined,
+            };
+            keyChanged = true;
+          }
+        }
+      }
+      return [nextTab];
+    });
+    if (!keyChanged) continue;
+    const next: WorkspaceState = { ...current, tabs };
+    if (!next.tabs.some((tab) => tab.id === next.current))
+      next.current = next.tabs.at(-1)?.id ?? "";
+    if (current.tabs.length && !next.tabs.length) {
+      next.visible = false;
+      next.expanded = false;
+      next.conversationActive = false;
+    } else if (next.expanded && !next.tabs.length) {
+      next.conversationActive = true;
+    }
+    cache.set(key, next);
+    try {
+      localStorage.setItem(prefix + key, JSON.stringify(next));
+    } catch {
+      /* Keep synchronized in-memory state when storage is unavailable. */
+    }
+    changed = true;
+  }
+  if (changed) listeners.forEach((listener) => listener());
+}

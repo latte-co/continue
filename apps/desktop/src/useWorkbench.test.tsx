@@ -4049,6 +4049,123 @@ it("reads skill support independently from each connected host hello", async () 
   expect(hook.result.current.hostSupportsSkillFiles("missing")).toBe(false);
 });
 
+it("updates project directory via update_project, clears closed idle agent sessions while keeping history open, and reuses rename_project when path is unchanged", async () => {
+  const pinnedRow: Session = {
+    ...session(),
+    id: "s",
+    pinned_at: 10,
+    agent_session_open: true,
+    agent_session_busy: false,
+  };
+  let projectRow = { id: "p", name: "P", path: "/p" };
+  const base = mocks.request.getMockImplementation()!;
+  mocks.request.mockImplementation(async (host: string, r: Request) => {
+    if (r.method === "projects")
+      return { kind: "projects", projects: [projectRow] };
+    if (r.method === "sessions")
+      return { kind: "sessions", sessions: [pinnedRow] };
+    if (r.method === "pinned_sessions")
+      return { kind: "sessions", sessions: [pinnedRow] };
+    if (r.method === "poll")
+      return {
+        kind: "events",
+        session: pinnedRow,
+        events: [userEvent("r1", 1)],
+        has_more: false,
+      };
+    if (r.method === "rename_project") {
+      projectRow = { ...projectRow, name: r.name };
+      return { kind: "project", project: projectRow };
+    }
+    if (r.method === "update_project") {
+      projectRow = { ...projectRow, name: r.name, path: r.path };
+      return {
+        kind: "project_updated",
+        project: projectRow,
+        closed_session_ids: ["s"],
+      };
+    }
+    return base(host, r);
+  });
+
+  const hook = renderHook(useWorkbench);
+  await act(async () => {});
+  await act(async () =>
+    hook.result.current.openSession({ ...pinnedRow, hostId: "local" }),
+  );
+  expect(hook.result.current.sessionId).toBe("s");
+  expect(hook.result.current.pinned[0]?.agent_session_open).toBe(true);
+
+  mocks.request.mockClear();
+  let closed = await act(async () =>
+    hook.result.current.updateProject("local", "p", "Renamed", "/p"),
+  );
+  expect(closed).toEqual([]);
+  expect(mocks.request).toHaveBeenCalledWith("local", {
+    method: "rename_project",
+    project_id: "p",
+    name: "Renamed",
+  });
+  expect(hook.result.current.project).toMatchObject({
+    id: "p",
+    name: "Renamed",
+    path: "/p",
+  });
+
+  mocks.request.mockClear();
+  closed = await act(async () =>
+    hook.result.current.updateProject("local", "p", "Moved", "/moved"),
+  );
+  expect(closed).toEqual(["s"]);
+  expect(mocks.request).toHaveBeenCalledWith("local", {
+    method: "update_project",
+    project_id: "p",
+    name: "Moved",
+    path: "/moved",
+  });
+  expect(hook.result.current.project).toMatchObject({
+    id: "p",
+    name: "Moved",
+    path: "/moved",
+  });
+  expect(hook.result.current.sessionId).toBe("s");
+  expect(hook.result.current.events).toHaveLength(1);
+  expect(hook.result.current.sessions[0]?.agent_session_open).toBe(false);
+  expect(hook.result.current.pinned[0]?.agent_session_open).toBe(false);
+});
+
+it.each([
+  new ServerRequestError(
+    "invalid_request",
+    "unknown variant `update_project`, expected one of `hello`, `projects`",
+  ),
+  new ServerRequestError(
+    "unsupported",
+    "Server does not support update_project",
+  ),
+])(
+  "maps unsupported update_project error ($code) from older servers to a clear upgrade message",
+  async (serverError) => {
+    const base = mocks.request.getMockImplementation()!;
+    mocks.request.mockImplementation(async (host: string, r: Request) => {
+      if (r.method === "update_project") throw serverError;
+      return base(host, r);
+    });
+    const hook = renderHook(useWorkbench);
+    await act(async () => {});
+    let caught: unknown;
+    await act(async () => {
+      try {
+        await hook.result.current.updateProject("local", "p", "P", "/next");
+      } catch (cause) {
+        caught = cause;
+      }
+    });
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("不支持修改项目目录");
+  },
+);
+
 it("keeps draft workspaceId stable across selectTaskProject round-trips and rotates it after exiting a draft or closing a session", async () => {
   const createdSession: Session = {
     ...session(),

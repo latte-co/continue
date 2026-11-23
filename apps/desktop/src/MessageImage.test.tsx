@@ -300,4 +300,67 @@ describe("MessageContent markdown images", () => {
     expect(screen.getByRole("alert").textContent).toContain("图片格式无法解码");
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:mock");
   });
+
+  it("reloads project-relative images when projectRoot changes without reloading external absolute images", async () => {
+    let urlSeq = 0;
+    Object.defineProperty(URL, "createObjectURL", {
+      value: vi.fn(() => `blob:mock-${++urlSeq}`),
+      configurable: true,
+    });
+    const makeActions = (projectRoot: string) => ({
+      projectRoot,
+      readProjectFile: (path: string, valid?: () => boolean) =>
+        readProjectFile(`${projectRoot}/${path}`, valid),
+      loadExternalImage: (path: string, valid?: () => boolean) =>
+        loadExternal(path, valid),
+    });
+    const text = "![架构](docs/arch.png)\n\n![外部](/tmp/ext.png)";
+    const view = render(
+      <MessageActionsProvider value={makeActions("/workspace/old")}>
+        <MessageContent text={text} />
+      </MessageActionsProvider>,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(readProjectFile).toHaveBeenCalledTimes(1);
+    expect(readProjectFile).toHaveBeenLastCalledWith(
+      "/workspace/old/docs/arch.png",
+      expect.any(Function),
+    );
+    expect(loadExternal).toHaveBeenCalledTimes(1);
+    const archImgBefore = view.container.querySelector(
+      "img[alt='架构']",
+    ) as HTMLImageElement;
+    const extImgBefore = view.container.querySelector(
+      "img[alt='外部']",
+    ) as HTMLImageElement;
+    expect(archImgBefore.getAttribute("src")).toBe("blob:mock-1");
+    expect(extImgBefore.getAttribute("src")).toBe("blob:mock-2");
+
+    view.rerender(
+      <MessageActionsProvider value={makeActions("/workspace/new")}>
+        <MessageContent text={text} />
+      </MessageActionsProvider>,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(readProjectFile).toHaveBeenCalledTimes(2);
+    expect(readProjectFile).toHaveBeenLastCalledWith(
+      "/workspace/new/docs/arch.png",
+      expect.any(Function),
+    );
+    expect(loadExternal).toHaveBeenCalledTimes(1);
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:mock-1");
+    expect(URL.revokeObjectURL).not.toHaveBeenCalledWith("blob:mock-2");
+    expect(
+      view.container.querySelector("img[alt='架构']")?.getAttribute("src"),
+    ).toBe("blob:mock-3");
+    expect(
+      view.container.querySelector("img[alt='外部']")?.getAttribute("src"),
+    ).toBe("blob:mock-2");
+  });
 });

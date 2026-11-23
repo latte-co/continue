@@ -633,3 +633,56 @@ it("releases a pending project read when switching to an external reference", as
   ).toBe(false);
   expect(screen.queryByRole("button", { name: "返回所选目录" })).toBeNull();
 });
+
+it("reloads the open file and tree and resets Markdown preview when project.path changes", async () => {
+  let root = "/project-a";
+  mocks.request.mockImplementation(async (_host, r) => {
+    if (r.method === "read_file")
+      return {
+        kind: "content",
+        text: `# From ${root}`,
+        truncated: false,
+      };
+    return {
+      kind: "files",
+      entries: [
+        {
+          name: root === "/project-a" ? "alpha.md" : "beta.md",
+          path: root === "/project-a" ? "alpha.md" : "beta.md",
+          directory: false,
+        },
+      ],
+    };
+  });
+  const baseProps = {
+    hostId: "local",
+    tab: "files" as const,
+    active: true,
+    path: "",
+    file: "README.md",
+    navigate: vi.fn(),
+  };
+  const view = render(
+    <WorkspaceFiles
+      {...baseProps}
+      project={{ id: "p", name: "Project", path: "/project-a" }}
+    />,
+  );
+  await screen.findByText("# From /project-a");
+  expect(await screen.findByRole("button", { name: "alpha.md" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "预览 Markdown" }));
+  expect(
+    await screen.findByRole("heading", { name: "From /project-a" }),
+  ).toBeTruthy();
+
+  root = "/project-b";
+  view.rerender(
+    <WorkspaceFiles
+      {...baseProps}
+      project={{ id: "p", name: "Project", path: "/project-b" }}
+    />,
+  );
+  expect(await screen.findByText("# From /project-b")).toBeTruthy();
+  expect(screen.queryByRole("region", { name: "Markdown 预览" })).toBeNull();
+  expect(await screen.findByRole("button", { name: "beta.md" })).toBeTruthy();
+});

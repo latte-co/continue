@@ -51,9 +51,10 @@ export function SideChatRecoveryDialog({
 
   const hostName =
     state.hosts.find((item) => item.id === hostId)?.name ?? hostId;
-  const projectName = state.projects.find(
+  const project = state.projects.find(
     (item) => item.hostId === hostId && item.id === session.project_id,
-  )?.name;
+  );
+  const projectName = project?.name;
 
   const running = session.status === "running" || session.status === "waiting";
   const closePending = session.agent_close_pending;
@@ -275,6 +276,7 @@ export function SideChatRecoveryDialog({
                       at={item.at}
                       hostId={hostId}
                       projectId={session.project_id}
+                      projectPath={project?.path}
                       sessionId={session.id}
                       connected={connected}
                       active

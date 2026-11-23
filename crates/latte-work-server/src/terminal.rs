@@ -158,6 +158,25 @@ impl Terminals {
             .get(id)
             .is_some_and(|t| t.control.lock().is_ok_and(|c| !c.exited))
     }
+    pub fn has_open_for_project(&self, project_id: &str) -> bool {
+        self.entries.values().any(|t| {
+            t.info.project_id == project_id && t.control.lock().map_or(true, |c| !c.exited)
+        })
+    }
+    pub fn purge_exited_for_project(&mut self, project_id: &str) -> Vec<String> {
+        let ids: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, t)| {
+                t.info.project_id == project_id && t.control.lock().is_ok_and(|c| c.exited)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            self.entries.remove(id);
+        }
+        ids
+    }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
