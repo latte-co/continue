@@ -1499,6 +1499,7 @@ export function Composer(props: Props) {
                     variant="chip"
                     hostId={hostId}
                     projectId={projectId}
+                    projectPath={projectPath}
                     sessionId={sessionId}
                     connected={connected}
                     active={!hidden}
@@ -1594,6 +1595,7 @@ export function Composer(props: Props) {
                 variant="chip"
                 hostId={hostId}
                 projectId={projectId}
+                projectPath={projectPath}
                 sessionId={sessionId}
                 connected={connected}
                 active={!hidden}

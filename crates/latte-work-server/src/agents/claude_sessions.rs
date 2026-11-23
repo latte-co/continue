@@ -199,8 +199,26 @@ fn former_canonical(former: &str) -> Option<PathBuf> {
 fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
 }
+type TranscriptStamp = (u64, i64, i64);
+
+fn open_verified_transcript(path: &Path) -> Result<(std::fs::File, TranscriptStamp)> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != nix::unistd::Uid::current().as_raw() {
+        bail!("Claude 原生会话文件不可用");
+    }
+    Ok((file, (meta.len(), meta.mtime(), meta.mtime_nsec())))
+}
+
 fn locate_in(projects: &Path, cwd: &Path, id: &str) -> Result<Option<PathBuf>> {
-    let canonical = cwd.canonicalize()?;
+    let canonical = match cwd.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
     locate_in_canonical(projects, &canonical, id)
 }
 fn locate_in_canonical(projects: &Path, canonical: &Path, id: &str) -> Result<Option<PathBuf>> {
@@ -246,31 +264,38 @@ fn locate_in_canonical(projects: &Path, canonical: &Path, id: &str) -> Result<Op
     }
     Ok(Some(target))
 }
-fn locate_in_former(
+fn collect_transcript_candidates(
     cwd: &Path,
     former_paths: &[String],
     id: &str,
     environment: &latte_work_protocol::AgentEnvironment,
-) -> Result<Option<PathBuf>> {
+) -> Result<(Option<PathBuf>, Vec<PathBuf>)> {
     let projects = configured_projects(cwd, environment)?;
+    let primary = locate_in(&projects, cwd, id)?;
+    let mut former_candidates = Vec::new();
     for former in former_paths {
         let Some(canonical) = former_canonical(former) else {
             continue;
         };
-        if let Some(found) = locate_in_canonical(&projects, &canonical, id)? {
-            return Ok(Some(found));
+        if let Some(found) = locate_in_canonical(&projects, &canonical, id)?
+            && primary.as_ref() != Some(&found)
+            && !former_candidates.contains(&found)
+        {
+            former_candidates.push(found);
         }
         let raw = Path::new(former);
         if is_real_dir(raw) {
             let alt_projects = configured_projects(raw, environment)?;
             if alt_projects != projects
                 && let Some(found) = locate_in_canonical(&alt_projects, &canonical, id)?
+                && primary.as_ref() != Some(&found)
+                && !former_candidates.contains(&found)
             {
-                return Ok(Some(found));
+                former_candidates.push(found);
             }
         }
     }
-    Ok(None)
+    Ok((primary, former_candidates))
 }
 fn locate_any(
     cwd: &Path,
@@ -278,11 +303,23 @@ fn locate_any(
     id: &str,
     environment: &latte_work_protocol::AgentEnvironment,
 ) -> Result<Option<PathBuf>> {
-    let projects = configured_projects(cwd, environment)?;
-    if let Some(found) = locate_in(&projects, cwd, id)? {
-        return Ok(Some(found));
+    if former_paths.is_empty() {
+        let projects = configured_projects(cwd, environment)?;
+        return locate_in(&projects, cwd, id);
     }
-    locate_in_former(cwd, former_paths, id, environment)
+    let (primary, former_candidates) =
+        collect_transcript_candidates(cwd, former_paths, id, environment)?;
+    let mut best: Option<(PathBuf, TranscriptStamp)> = None;
+    for candidate in primary.into_iter().chain(former_candidates) {
+        let (_, stamp) = open_verified_transcript(&candidate)?;
+        if best
+            .as_ref()
+            .is_none_or(|(_, best_stamp)| stamp > *best_stamp)
+        {
+            best = Some((candidate, stamp));
+        }
+    }
+    Ok(best.map(|(path, _)| path))
 }
 fn target_bucket_dir(root: &Path, canonical_cwd: &Path) -> Result<PathBuf> {
     let sanitized = sanitize_project_path(canonical_cwd);
@@ -320,21 +357,28 @@ pub fn ensure_resumable_in_cwd(
     }
     let parsed = uuid::Uuid::parse_str(id).context("原生会话 ID 无效")?;
     let projects = configured_projects(cwd, environment)?;
-    if locate_in(&projects, cwd, id)?.is_some() {
-        return Ok(());
+    let (primary, former_candidates) =
+        collect_transcript_candidates(cwd, former_paths, id, environment)?;
+    let mut best_former: Option<(std::fs::File, TranscriptStamp)> = None;
+    for candidate in former_candidates {
+        let (file, stamp) = open_verified_transcript(&candidate)?;
+        if best_former
+            .as_ref()
+            .is_none_or(|(_, best_stamp)| stamp > *best_stamp)
+        {
+            best_former = Some((file, stamp));
+        }
     }
-    let Some(source_path) = locate_in_former(cwd, former_paths, id, environment)? else {
+    let Some((source, source_stamp)) = best_former else {
         return Ok(());
     };
-    let source = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(&source_path)?;
-    let source_meta = source.metadata()?;
-    if !source_meta.is_file() || source_meta.uid() != nix::unistd::Uid::current().as_raw() {
-        bail!("Claude 原生会话文件不可用");
+    if let Some(primary_path) = &primary {
+        let (_, primary_stamp) = open_verified_transcript(primary_path)?;
+        if source_stamp <= primary_stamp {
+            return Ok(());
+        }
     }
-    if source_meta.len() > MAX_SESSION_COPY {
+    if source_stamp.0 > MAX_SESSION_COPY {
         bail!("Claude 原生会话文件超出迁移大小上限");
     }
     std::fs::create_dir_all(&projects)?;
@@ -368,11 +412,20 @@ pub fn ensure_resumable_in_cwd(
     }
     temp.as_file_mut().sync_all()?;
     let destination = bucket.join(format!("{parsed}.jsonl"));
-    match temp.persist_noclobber(&destination) {
-        Ok(_) => Ok(()),
-        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e.error.into()),
+    match destination.symlink_metadata() {
+        Ok(meta) => {
+            if meta.file_type().is_symlink()
+                || !meta.is_file()
+                || meta.uid() != nix::unistd::Uid::current().as_raw()
+            {
+                bail!("拒绝覆盖非普通 Claude 会话文件");
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
+    temp.persist(&destination).map_err(|e| e.error)?;
+    Ok(())
 }
 fn read_path(path: &Path) -> Result<Option<Title>> {
     let mut file = OpenOptions::new()
@@ -456,32 +509,19 @@ fn candidate_parents(
     parent: &str,
     environment: &latte_work_protocol::AgentEnvironment,
 ) -> Result<Vec<PathBuf>> {
-    let mut parents = Vec::new();
-    let projects = configured_projects(cwd, environment)?;
-    if let Some(primary) = locate_in(&projects, cwd, parent)? {
-        parents.push(primary);
+    if former_paths.is_empty() {
+        let projects = configured_projects(cwd, environment)?;
+        return Ok(locate_in(&projects, cwd, parent)?.into_iter().collect());
     }
-    for former in former_paths {
-        let Some(canonical) = former_canonical(former) else {
-            continue;
-        };
-        if let Some(found) = locate_in_canonical(&projects, &canonical, parent)?
-            && !parents.contains(&found)
-        {
-            parents.push(found);
-        }
-        let raw = Path::new(former);
-        if is_real_dir(raw) {
-            let alt = configured_projects(raw, environment)?;
-            if alt != projects
-                && let Some(found) = locate_in_canonical(&alt, &canonical, parent)?
-                && !parents.contains(&found)
-            {
-                parents.push(found);
-            }
-        }
+    let (primary, former_candidates) =
+        collect_transcript_candidates(cwd, former_paths, parent, environment)?;
+    let mut stamped = Vec::new();
+    for (index, candidate) in primary.into_iter().chain(former_candidates).enumerate() {
+        let (_, stamp) = open_verified_transcript(&candidate)?;
+        stamped.push((candidate, stamp, index));
     }
-    Ok(parents)
+    stamped.sort_by_key(|(_, stamp, index)| (std::cmp::Reverse(*stamp), *index));
+    Ok(stamped.into_iter().map(|(path, _, _)| path).collect())
 }
 
 /// Construct the native child path from registered identities, never output_file.
@@ -644,6 +684,12 @@ pub fn rename(
     title: &str,
     environment: &latte_work_protocol::AgentEnvironment,
 ) -> Result<String> {
+    if !valid_title(title) {
+        bail!("原生会话标题无效");
+    }
+    if !former_paths.is_empty() && is_real_dir(cwd) {
+        ensure_resumable_in_cwd(cwd, former_paths, id, environment)?;
+    }
     let path =
         locate_any(cwd, former_paths, id, environment)?.context("未找到原生会话，标题未修改")?;
     append(&path, id, title)?;
@@ -1123,5 +1169,128 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(resumed_page.bytes, b"{\"n\":2}\n");
+    }
+
+    #[test]
+    fn round_trip_project_move_picks_freshest_transcript_and_atomically_updates_stale_bucket() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("claude-config");
+        let dir_a = root.path().join("project-a");
+        let dir_b = root.path().join("project-b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let canonical_a = dir_a.canonicalize().unwrap();
+        let canonical_b = dir_b.canonicalize().unwrap();
+        let bucket_a = config_dir
+            .join("projects")
+            .join(sanitize_project_path(&canonical_a));
+        let bucket_b = config_dir
+            .join("projects")
+            .join(sanitize_project_path(&canonical_b));
+        std::fs::create_dir_all(&bucket_a).unwrap();
+        let env = latte_work_protocol::AgentEnvironment(std::collections::BTreeMap::from([(
+            "CLAUDE_CONFIG_DIR".into(),
+            config_dir.to_string_lossy().into(),
+        )]));
+
+        let id = "33333333-3333-4333-8333-333333333333";
+        let path_a = bucket_a.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &path_a,
+            "{\"type\":\"user\",\"text\":\"turn-a\"}\n{\"type\":\"ai-title\",\"aiTitle\":\"Title in A\"}\n",
+        )
+        .unwrap();
+        let sub_a = path_a.with_extension("").join("subagents");
+        std::fs::create_dir_all(&sub_a).unwrap();
+        std::fs::write(sub_a.join("agent-suba.jsonl"), "{\"sub\":\"a\"}\n").unwrap();
+
+        // Move /A -> /B and advance session in /B while stale copy in /A remains on disk.
+        let former_a = vec![canonical_a.to_string_lossy().into_owned()];
+        ensure_resumable_in_cwd(&canonical_b, &former_a, id, &env).unwrap();
+        let path_b = bucket_b.join(format!("{id}.jsonl"));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path_b)
+            .unwrap()
+            .write_all(
+                b"{\"type\":\"user\",\"text\":\"turn-b\"}\n{\"type\":\"ai-title\",\"aiTitle\":\"Title in B\"}\n",
+            )
+            .unwrap();
+        let sub_b = path_b.with_extension("").join("subagents");
+        std::fs::create_dir_all(&sub_b).unwrap();
+        std::fs::write(sub_b.join("agent-subb.jsonl"), "{\"sub\":\"b\"}\n").unwrap();
+
+        // Move /B -> /A: cwd is /A again, former_paths has /B, and stale path_a still exists.
+        let former_b = vec![canonical_b.to_string_lossy().into_owned()];
+        assert_eq!(
+            read(&canonical_a, &former_b, id, &env)
+                .unwrap()
+                .unwrap()
+                .text,
+            "Title in B"
+        );
+        assert_eq!(
+            read_child(&canonical_a, &former_b, id, "suba", &env)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"{\"sub\":\"a\"}\n"
+        );
+        assert_eq!(
+            read_child(&canonical_a, &former_b, id, "subb", &env)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"{\"sub\":\"b\"}\n"
+        );
+
+        // Offline rename in /A migrates the fresher /B transcript into /A first instead of
+        // appending onto the stale /A file or mutating the historical /B file.
+        let b_before_rename = std::fs::read_to_string(&path_b).unwrap();
+        assert_eq!(
+            rename(&canonical_a, &former_b, id, "Renamed back in A", &env).unwrap(),
+            "Renamed back in A"
+        );
+        let a_after_rename = std::fs::read_to_string(&path_a).unwrap();
+        assert!(a_after_rename.contains("\"turn-b\""));
+        assert!(a_after_rename.contains("\"Renamed back in A\""));
+        assert_eq!(std::fs::read_to_string(&path_b).unwrap(), b_before_rename);
+
+        // Direct resume/fork migration also overwrites a stale primary copy, then preserves
+        // subsequent turns written in /A without copying /B over them again.
+        let id2 = "44444444-4444-4444-8444-444444444444";
+        let path2_a = bucket_a.join(format!("{id2}.jsonl"));
+        let path2_b = bucket_b.join(format!("{id2}.jsonl"));
+        std::fs::write(&path2_a, "{\"turn\":1}\n").unwrap();
+        std::fs::write(&path2_b, "{\"turn\":1}\n{\"turn\":2}\n").unwrap();
+        ensure_resumable_in_cwd(&canonical_a, &former_b, id2, &env).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path2_a).unwrap(),
+            "{\"turn\":1}\n{\"turn\":2}\n"
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path2_a)
+            .unwrap()
+            .write_all(b"{\"turn\":3}\n")
+            .unwrap();
+        ensure_resumable_in_cwd(&canonical_a, &former_b, id2, &env).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path2_a).unwrap(),
+            "{\"turn\":1}\n{\"turn\":2}\n{\"turn\":3}\n"
+        );
+
+        // Never overwrite a symlink planted at the destination path.
+        let id3 = "55555555-5555-4555-8555-555555555555";
+        let victim = root.path().join("victim.jsonl");
+        std::fs::write(&victim, "keep\n").unwrap();
+        std::os::unix::fs::symlink(&victim, bucket_a.join(format!("{id3}.jsonl"))).unwrap();
+        std::fs::write(
+            bucket_b.join(format!("{id3}.jsonl")),
+            "{\"turn\":1}\n{\"turn\":2}\n",
+        )
+        .unwrap();
+        assert!(ensure_resumable_in_cwd(&canonical_a, &former_b, id3, &env).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
     }
 }

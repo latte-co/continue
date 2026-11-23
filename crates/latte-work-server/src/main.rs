@@ -872,13 +872,21 @@ async fn dispatch_admitted(
                 d.prepare_project_update(&project_id, &name, Path::new(&path))
             })?;
             let mut closed_session_ids = Vec::new();
+            let mut closed_terminal_ids = Vec::new();
             if prepared.path_changed {
-                if s.terminals
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("终端锁异常"))?
-                    .has_open_for_project(&project_id)
                 {
-                    bail!("项目中还有运行中的终端，请关闭后再修改目录");
+                    let terminals = s
+                        .terminals
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("终端锁异常"))?;
+                    if terminals.has_open_for_project(&project_id)
+                        || prepared
+                            .reclaim_hidden_project_id
+                            .as_deref()
+                            .is_some_and(|id| terminals.has_open_for_project(id))
+                    {
+                        bail!("项目中还有运行中的终端，请关闭后再修改目录");
+                    }
                 }
                 let open_ids: std::collections::HashSet<String> = {
                     let runs = s
@@ -900,7 +908,9 @@ async fn dispatch_admitted(
                 for id in &prepared.session_ids {
                     let resource = upgrade::Resource::AgentSession(id.clone());
                     let version = s.lifecycle.claim_version(&resource)?;
-                    if open_ids.contains(id) || version.is_some() {
+                    let has_codex_job = !agents::codex_jobs::registry()
+                        .scope_confirmed(&agents::codex_jobs::JobScope::session(id));
+                    if open_ids.contains(id) || version.is_some() || has_codex_job {
                         targets.push((id.clone(), resource, version));
                     }
                 }
@@ -914,26 +924,38 @@ async fn dispatch_admitted(
                         .terminals
                         .lock()
                         .map_err(|_| anyhow::anyhow!("终端锁异常"))?;
-                    if terminals.has_open_for_project(&project_id) {
+                    if terminals.has_open_for_project(&project_id)
+                        || prepared
+                            .reclaim_hidden_project_id
+                            .as_deref()
+                            .is_some_and(|id| terminals.has_open_for_project(id))
+                    {
                         bail!("项目中还有运行中的终端，请关闭后再修改目录");
                     }
-                    terminals.purge_exited_for_project(&project_id)
+                    let mut purged = terminals.purge_exited_for_project(&project_id);
+                    if let Some(reclaim_id) = prepared.reclaim_hidden_project_id.as_deref() {
+                        purged.extend(terminals.purge_exited_for_project(reclaim_id));
+                    }
+                    purged
                 };
                 for terminal_id in exited_terminals {
-                    let resource = upgrade::Resource::Terminal(terminal_id);
+                    let resource = upgrade::Resource::Terminal(terminal_id.clone());
                     let version = s.lifecycle.claim_version(&resource)?;
                     s.lifecycle.forget_claim(&resource, version, claims)?;
+                    closed_terminal_ids.push(terminal_id);
                 }
-                let project = db(&s.database, |d| d.commit_project_update(&prepared.project))?;
+                let project = db(&s.database, |d| d.commit_project_update(&prepared))?;
                 Response::ProjectUpdated {
                     project,
                     closed_session_ids,
+                    closed_terminal_ids,
                 }
             } else {
-                let project = db(&s.database, |d| d.commit_project_update(&prepared.project))?;
+                let project = db(&s.database, |d| d.commit_project_update(&prepared))?;
                 Response::ProjectUpdated {
                     project,
                     closed_session_ids,
+                    closed_terminal_ids,
                 }
             }
         }

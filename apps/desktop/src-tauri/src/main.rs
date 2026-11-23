@@ -739,11 +739,14 @@ async fn host_request(
         forget_archived_sessions(&state, &host_id, &ids).await;
     }
     if let Response::ProjectUpdated {
-        closed_session_ids, ..
+        closed_session_ids,
+        closed_terminal_ids,
+        ..
     } = &response
-        && !closed_session_ids.is_empty()
+        && (!closed_session_ids.is_empty() || !closed_terminal_ids.is_empty())
     {
-        forget_archived_sessions(&state, &host_id, closed_session_ids).await;
+        forget_project_update_resources(&state, &host_id, closed_session_ids, closed_terminal_ids)
+            .await;
     }
     ui_response(response)
 }
@@ -794,6 +797,31 @@ async fn forget_archived_sessions(state: &Connections, host: &str, ids: &[String
             host.to_owned(),
             latte_work_protocol::lifecycle::Resource::AgentSession(id.clone()),
         ));
+    }
+}
+async fn forget_project_update_resources(
+    state: &Connections,
+    host: &str,
+    session_ids: &[String],
+    terminal_ids: &[String],
+) {
+    if !session_ids.is_empty() {
+        forget_archived_sessions(state, host, session_ids).await;
+    }
+    if !terminal_ids.is_empty() {
+        {
+            let mut terminals = state.terminals.lock().await;
+            for id in terminal_ids {
+                terminals.remove(&(host.to_owned(), id.clone()));
+            }
+        }
+        let mut owned = state.owned_instances.lock().await;
+        for id in terminal_ids {
+            owned.remove(&(
+                host.to_owned(),
+                latte_work_protocol::lifecycle::Resource::Terminal(id.clone()),
+            ));
+        }
     }
 }
 fn acknowledges_agent_close(response: &Response, confirms_side_writes: bool) -> bool {
@@ -1468,6 +1496,64 @@ mod tests {
             }),
             request_channels::Lane::Control
         ));
+    }
+
+    #[tokio::test]
+    async fn project_update_forgets_closed_sessions_and_terminals_only_for_target_host() {
+        use latte_work_protocol::lifecycle::Resource;
+        let state = Connections::default();
+        for host in ["local", "remote"] {
+            state
+                .turns
+                .lock()
+                .await
+                .insert((host.into(), "session-1".into()), "req".into());
+            state.owned_instances.lock().await.insert(
+                (host.into(), Resource::AgentSession("session-1".into())),
+                "srv".into(),
+            );
+            state
+                .terminals
+                .lock()
+                .await
+                .insert((host.into(), "term-1".into()));
+            state
+                .terminals
+                .lock()
+                .await
+                .insert((host.into(), "term-keep".into()));
+            state.owned_instances.lock().await.insert(
+                (host.into(), Resource::Terminal("term-1".into())),
+                "srv".into(),
+            );
+            state.owned_instances.lock().await.insert(
+                (host.into(), Resource::Terminal("term-keep".into())),
+                "srv".into(),
+            );
+        }
+
+        forget_project_update_resources(
+            &state,
+            "remote",
+            &["session-1".into()],
+            &["term-1".into()],
+        )
+        .await;
+
+        let turns = state.turns.lock().await;
+        let terminals = state.terminals.lock().await;
+        let owned = state.owned_instances.lock().await;
+        assert!(!turns.contains_key(&("remote".into(), "session-1".into())));
+        assert!(turns.contains_key(&("local".into(), "session-1".into())));
+        assert!(!terminals.contains(&("remote".into(), "term-1".into())));
+        assert!(terminals.contains(&("remote".into(), "term-keep".into())));
+        assert!(terminals.contains(&("local".into(), "term-1".into())));
+        assert!(
+            !owned.contains_key(&("remote".into(), Resource::AgentSession("session-1".into())))
+        );
+        assert!(!owned.contains_key(&("remote".into(), Resource::Terminal("term-1".into()))));
+        assert!(owned.contains_key(&("remote".into(), Resource::Terminal("term-keep".into()))));
+        assert!(owned.contains_key(&("local".into(), Resource::Terminal("term-1".into()))));
     }
 
     #[tokio::test]

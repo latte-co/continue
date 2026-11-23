@@ -9550,11 +9550,52 @@ async fn update_project_directory_closes_idle_sessions_blocks_active_turns_and_g
         Response::Error { .. }
     ));
 
+    // A removed (hidden) project with historical sessions rejects directory reclamation with
+    // an actionable hint, while an empty removed project is reclaimed cleanly (including its
+    // exited terminals).
+    let dir_hidden_hist = workspace.path().join("hidden-with-history");
+    std::fs::create_dir_all(&dir_hidden_hist).unwrap();
+    let _hidden_hist_sid = session(&mut c, &dir_hidden_hist).await;
+    let hidden_hist_pid = match ask(&mut c, Request::Projects).await {
+        Response::Projects { projects } => {
+            projects
+                .into_iter()
+                .find(|p| p.path == dir_hidden_hist.canonicalize().unwrap().to_string_lossy())
+                .unwrap()
+                .id
+        }
+        _ => unreachable!(),
+    };
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::RemoveProject {
+                project_id: hidden_hist_pid,
+            },
+        )
+        .await,
+        Response::Projects { .. }
+    ));
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::UpdateProject {
+                project_id: pid.clone(),
+                name: "Hidden History Conflict".into(),
+                path: dir_hidden_hist.to_string_lossy().into_owned(),
+            },
+        )
+        .await,
+        Response::Error { message, .. }
+            if message.contains("已移除的项目") && message.contains("历史会话")
+    ));
+
     // Move project to dir_b: idle open session is closed and reported in closed_session_ids.
     let canonical_b = dir_b.canonicalize().unwrap().to_string_lossy().into_owned();
     let Response::ProjectUpdated {
         project,
         closed_session_ids,
+        closed_terminal_ids,
     } = ask(
         &mut c,
         Request::UpdateProject {
@@ -9567,6 +9608,7 @@ async fn update_project_directory_closes_idle_sessions_blocks_active_turns_and_g
     else {
         panic!("expected ProjectUpdated");
     };
+    assert!(closed_terminal_ids.is_empty());
     assert_eq!(project.id, pid);
     assert_eq!(project.name, "Beta Project");
     assert_eq!(project.path, canonical_b);
@@ -9813,7 +9855,9 @@ async fn update_project_directory_guards_terminals_and_preserves_claude_resume_f
 
     // Moving the project purges the exited terminal and closes the idle session cleanly.
     let Response::ProjectUpdated {
-        closed_session_ids, ..
+        closed_session_ids,
+        closed_terminal_ids,
+        ..
     } = ask(
         &mut c,
         Request::UpdateProject {
@@ -9827,6 +9871,7 @@ async fn update_project_directory_guards_terminals_and_preserves_claude_resume_f
         panic!("expected ProjectUpdated");
     };
     assert!(closed_session_ids.contains(&idle_sid));
+    assert_eq!(closed_terminal_ids, vec![term_id]);
     assert!(matches!(
         ask(
             &mut c,
@@ -9931,4 +9976,151 @@ async fn update_project_directory_guards_terminals_and_preserves_claude_resume_f
     ));
     wait(&mut c, &sid, Status::Completed).await;
     assert!(dir_b.join("task.txt").exists());
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::RenameSession {
+                session_id: sid.clone(),
+                title: "Updated In B".into(),
+                provider: None,
+            },
+        )
+        .await,
+        Response::Session { session } if session.title == "Updated In B"
+    ));
+
+    // Round-trip `/A -> /B -> /A` (also reclaiming an empty removed project on recreated dir_a
+    // with an exited terminal): moving back to dir_a must overwrite the stale transcript left in
+    // dir_a's Claude bucket with the fresher dir_b transcript before resuming.
+    std::fs::create_dir_all(&dir_a).unwrap();
+    let Response::Project {
+        project: temp_hidden,
+    } = ask(
+        &mut c,
+        Request::AddProject {
+            name: Some("Temp Hidden".into()),
+            path: dir_a.to_string_lossy().into_owned(),
+        },
+    )
+    .await
+    else {
+        panic!("create temp hidden project");
+    };
+    let hidden_term_id = uuid::Uuid::new_v4().to_string();
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::CreateTerminal {
+                project_id: temp_hidden.id.clone(),
+                terminal_id: hidden_term_id.clone(),
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await,
+        Response::Terminal { .. }
+    ));
+    terminal_write(&mut c, &hidden_term_id, b"exit\n").await;
+    let hidden_exit_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let Response::Terminals { terminals } = ask(
+            &mut c,
+            Request::Terminals {
+                project_id: temp_hidden.id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("hidden terminals");
+        };
+        if terminals.iter().any(|t| t.id == hidden_term_id && t.exited) {
+            break;
+        }
+        assert!(
+            Instant::now() < hidden_exit_deadline,
+            "hidden terminal did not exit"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::RemoveProject {
+                project_id: temp_hidden.id.clone(),
+            },
+        )
+        .await,
+        Response::Projects { .. }
+    ));
+
+    let canonical_a = dir_a.canonicalize().unwrap().to_string_lossy().into_owned();
+    let Response::ProjectUpdated {
+        project: returned_a,
+        closed_session_ids: roundtrip_closed_sessions,
+        closed_terminal_ids: roundtrip_closed_terminals,
+    } = ask(
+        &mut c,
+        Request::UpdateProject {
+            project_id: pid.clone(),
+            name: "Claude Returned".into(),
+            path: dir_a.to_string_lossy().into_owned(),
+        },
+    )
+    .await
+    else {
+        panic!("expected ProjectUpdated back to dir_a");
+    };
+    assert_eq!(returned_a.path, canonical_a);
+    assert!(roundtrip_closed_sessions.contains(&sid));
+    assert_eq!(roundtrip_closed_terminals, vec![hidden_term_id]);
+
+    let native_id = parent_after_move.native_id.expect("parent native_id");
+    let escaped_a: String = canonical_a
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect();
+    let transcript_a = host
+        .directory
+        .path()
+        .join("claude-config/projects")
+        .join(escaped_a)
+        .join(format!("{native_id}.jsonl"));
+
+    // Forking a new side chat on the `/A -> /B -> /A` return leg before resuming the main session
+    // refreshes the stale dir_a parent transcript from dir_b first.
+    let Response::Session {
+        session: roundtrip_side,
+    } = ask(
+        &mut c,
+        Request::OpenSideChat {
+            session_id: sid.clone(),
+            side_id: Some(uuid::Uuid::new_v4().to_string()),
+        },
+    )
+    .await
+    else {
+        panic!("open roundtrip side chat");
+    };
+    assert!(matches!(
+        send(&mut c, &roundtrip_side.id, "side-roundtrip-a", "hello").await,
+        Response::Accepted { .. }
+    ));
+    wait(&mut c, &roundtrip_side.id, Status::Completed).await;
+    let refreshed_before_resume = std::fs::read_to_string(&transcript_a).unwrap();
+    assert!(
+        refreshed_before_resume.contains("Updated In B"),
+        "expected side-chat fork on return leg to refresh stale dir_a transcript, got:\n{refreshed_before_resume}"
+    );
+
+    assert!(matches!(
+        send(&mut c, &sid, "main-roundtrip-a", "task-edit").await,
+        Response::Accepted { .. }
+    ));
+    wait(&mut c, &sid, Status::Completed).await;
+    assert!(dir_a.join("task.txt").exists());
+    let transcript_text = std::fs::read_to_string(&transcript_a).unwrap();
+    assert!(
+        transcript_text.contains("Updated In B"),
+        "expected stale dir_a transcript to be overwritten with fresher dir_b history, got:\n{transcript_text}"
+    );
 }

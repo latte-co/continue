@@ -777,6 +777,7 @@ export function Conversation({
                           at={item.at}
                           hostId={hostId}
                           projectId={projectId}
+                          projectPath={project?.path}
                           sessionId={session?.id}
                           connected={connected}
                           active={!settingsOpen && !preparingHistory}

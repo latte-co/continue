@@ -132,6 +132,7 @@ pub struct PreparedProjectUpdate {
     pub project: Project,
     pub path_changed: bool,
     pub session_ids: Vec<String>,
+    pub reclaim_hidden_project_id: Option<String>,
 }
 
 impl Store {
@@ -481,13 +482,33 @@ impl Store {
         let current = self.project(id)?;
         let path_changed = canonical_path != current.path;
         let mut session_ids = Vec::new();
+        let mut reclaim_hidden_project_id = None;
         if path_changed {
-            if self
+            if let Some(other) = self
                 .all_projects()?
-                .iter()
-                .any(|p| p.id != id && p.path == canonical_path)
+                .into_iter()
+                .find(|p| p.id != id && p.path == canonical_path)
             {
-                bail!("该目录已关联其他项目");
+                let is_hidden: bool = self.db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM hidden_projects WHERE project_id=?1)",
+                    [&other.id],
+                    |row| row.get(0),
+                )?;
+                if !is_hidden {
+                    bail!("该目录已关联其他项目");
+                }
+                let has_sessions: bool = self.db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE project_id=?1)",
+                    [&other.id],
+                    |row| row.get(0),
+                )?;
+                if has_sessions {
+                    bail!(
+                        "该目录曾关联已移除的项目「{}」（含历史会话），请先重新添加该项目并调整其目录",
+                        other.name
+                    );
+                }
+                reclaim_hidden_project_id = Some(other.id);
             }
             let rows = self
                 .db
@@ -516,12 +537,45 @@ impl Store {
             },
             path_changed,
             session_ids,
+            reclaim_hidden_project_id,
         })
     }
-    pub fn commit_project_update(&self, project: &Project) -> Result<Project> {
+    pub fn commit_project_update(&self, prepared: &PreparedProjectUpdate) -> Result<Project> {
+        let project = &prepared.project;
         self.db.execute_batch("SAVEPOINT commit_project_update")?;
         let outcome = (|| -> Result<Project> {
             let current = self.project(&project.id)?;
+            if current.path != project.path
+                && let Some(reclaim_id) = prepared.reclaim_hidden_project_id.as_deref()
+            {
+                let still_hidden: bool = self.db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM hidden_projects WHERE project_id=?1)",
+                    [reclaim_id],
+                    |row| row.get(0),
+                )?;
+                let has_sessions: bool = self.db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE project_id=?1)",
+                    [reclaim_id],
+                    |row| row.get(0),
+                )?;
+                if !still_hidden || has_sessions {
+                    bail!("该目录已关联其他项目");
+                }
+                self.db.execute(
+                    "DELETE FROM hidden_projects WHERE project_id=?1",
+                    [reclaim_id],
+                )?;
+                self.db.execute(
+                    "DELETE FROM project_former_paths WHERE project_id=?1",
+                    [reclaim_id],
+                )?;
+                self.db.execute(
+                    "DELETE FROM reference_access WHERE project_id=?1",
+                    [reclaim_id],
+                )?;
+                self.db
+                    .execute("DELETE FROM projects WHERE id=?1", [reclaim_id])?;
+            }
             let updated = self.db.execute(
                 "UPDATE projects SET name=?1, path=?2 WHERE id=?3",
                 params![project.name, project.path, project.id],
@@ -2681,8 +2735,15 @@ mod tests {
         let root_a = dir.path().join("alpha");
         let root_b = dir.path().join("beta");
         let root_c = dir.path().join("gamma");
-        let root_hidden = dir.path().join("hidden");
-        for path in [&root_a, &root_b, &root_c, &root_hidden] {
+        let root_hidden = dir.path().join("hidden-empty");
+        let root_hidden_history = dir.path().join("hidden-history");
+        for path in [
+            &root_a,
+            &root_b,
+            &root_c,
+            &root_hidden,
+            &root_hidden_history,
+        ] {
             std::fs::create_dir_all(path.join("nested")).unwrap();
         }
         let file_path = dir.path().join("plain.txt");
@@ -2691,10 +2752,35 @@ mod tests {
         let mut store = Store::open(&dir.path().join("state.sqlite")).unwrap();
         let project = store.add_project(&root_a).unwrap();
         let _other = store.add_project(&root_c).unwrap();
-        let hidden = store.add_project(&root_hidden).unwrap();
-        store.remove_project(&hidden.id).unwrap();
+        let hidden_empty = store
+            .add_named_project(&root_hidden, Some("Empty Removed"))
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO project_former_paths(project_id, path, updated_at) VALUES(?1, ?2, ?3)",
+                params![hidden_empty.id, "/tmp/former-hidden", 1.0],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO reference_access(project_id, path, directory) VALUES(?1, ?2, 0)",
+                params![hidden_empty.id, "/tmp/allowed.txt"],
+            )
+            .unwrap();
+        store.remove_project(&hidden_empty.id).unwrap();
 
-        // Reject invalid names, missing project, relative/missing/file paths, and conflicting roots.
+        let hidden_history = store
+            .add_named_project(&root_hidden_history, Some("Archived Alpha"))
+            .unwrap();
+        store
+            .create_session(hidden_history.id.clone(), "codex".into())
+            .unwrap();
+        store.remove_project(&hidden_history.id).unwrap();
+
+        // Reject invalid names, missing project, relative/missing/file paths, visible conflicts,
+        // and hidden projects that still own historical sessions (with an actionable message).
         assert!(
             store
                 .prepare_project_update("missing", "Valid", &root_b)
@@ -2730,15 +2816,20 @@ mod tests {
                 .prepare_project_update(&project.id, "Valid", &file_path)
                 .is_err()
         );
+        let visible_err = store
+            .prepare_project_update(&project.id, "Valid", &root_c)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(visible_err, "该目录已关联其他项目");
+        let hidden_history_err = store
+            .prepare_project_update(&project.id, "Valid", &root_hidden_history)
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
-            store
-                .prepare_project_update(&project.id, "Valid", &root_c)
-                .is_err()
-        );
-        assert!(
-            store
-                .prepare_project_update(&project.id, "Valid", &root_hidden)
-                .is_err()
+            hidden_history_err.contains("已移除的项目「Archived Alpha」（含历史会话）"),
+            "unexpected error for hidden project with history: {hidden_history_err}"
         );
 
         // Equivalent canonical path keeps path_changed = false even while a session is running.
@@ -2810,7 +2901,7 @@ mod tests {
         assert!(prepared.path_changed);
         assert!(prepared.session_ids.contains(&main.id));
         assert!(prepared.session_ids.contains(&side.id));
-        let updated = store.commit_project_update(&prepared.project).unwrap();
+        let updated = store.commit_project_update(&prepared).unwrap();
         assert_eq!(updated.name, "Beta Workspace");
         assert_eq!(
             updated.path,
@@ -2819,6 +2910,28 @@ mod tests {
         let persisted = store.project(&project.id).unwrap();
         assert_eq!(persisted.name, updated.name);
         assert_eq!(persisted.path, updated.path);
+
+        // Moving into an empty hidden project's directory reclaims its stale DB rows atomically.
+        let reclaim_prepared = store
+            .prepare_project_update(&project.id, "Reclaimed Workspace", &root_hidden)
+            .unwrap();
+        assert!(reclaim_prepared.path_changed);
+        assert_eq!(
+            reclaim_prepared.reclaim_hidden_project_id.as_deref(),
+            Some(hidden_empty.id.as_str())
+        );
+        let reclaimed = store.commit_project_update(&reclaim_prepared).unwrap();
+        assert_eq!(
+            reclaimed.path,
+            root_hidden.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert!(store.project(&hidden_empty.id).is_err());
+        assert!(
+            store
+                .project_former_paths(&project.id)
+                .unwrap()
+                .contains(&updated.path)
+        );
     }
 
     #[test]

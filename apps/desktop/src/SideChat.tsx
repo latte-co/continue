@@ -470,6 +470,7 @@ export function SideChat({
                     at={item.at}
                     hostId={hostId}
                     projectId={parent.project_id}
+                    projectPath={projectPath}
                     sessionId={session?.id}
                     connected={connected}
                     active={active}

@@ -832,6 +832,7 @@ export type Response =
       kind: "project_updated";
       project: Project;
       closed_session_ids?: Array<string>;
+      closed_terminal_ids?: Array<string>;
     }
   | { kind: "sessions"; sessions: Array<Session> }
   | { kind: "session"; session: Session }
