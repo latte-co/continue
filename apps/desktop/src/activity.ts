@@ -32,7 +32,12 @@ export type ActivityItem =
 /** Candidates for a confirmed completed process, never a live-turn classifier. */
 export function isProcessActivity(item: ActivityItem): boolean {
   if (item.type === "assistant") return true;
-  if (item.type === "tool" || item.type === "tools") return true;
+  if (
+    item.type === "tool" ||
+    item.type === "tools" ||
+    item.type === "tool_images"
+  )
+    return true;
   if (item.type !== "event") return false;
   if (item.value.kind === "progress" || item.value.kind === "usage")
     return true;
@@ -49,6 +54,7 @@ export function finalReplyItems(items: ActivityItem[]) {
       item.type === "user" ||
       item.type === "tool" ||
       item.type === "tools" ||
+      item.type === "tool_images" ||
       (item.type === "event" && !!item.approvalTool)
     )
       barrier = index;

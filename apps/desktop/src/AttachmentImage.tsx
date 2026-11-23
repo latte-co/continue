@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Image, LoaderCircle } from "lucide-react";
 import { message } from "./api";
 import { loadSource } from "./sourceLoader";
@@ -113,6 +113,8 @@ export function AttachmentImage({
   const [state, setState] = useState<{
     scope: string;
     url?: string;
+    bytes?: Uint8Array;
+    mime?: string;
     error?: string;
     loading?: boolean;
   }>({ scope });
@@ -159,7 +161,7 @@ export function AttachmentImage({
           new Blob([data.bytes as BlobPart], { type: data.mime }),
         );
         resource.current = { scope, url };
-        setState({ scope, url });
+        setState({ scope, url, bytes: data.bytes, mime: data.mime });
       })
       .catch((error) => {
         if (!disposed) setState({ scope, error: message(error) });
@@ -169,6 +171,13 @@ export function AttachmentImage({
     };
   }, [scope, reading, connected, projectId, hostId, sessionId, reference.path]);
   const preview = state.scope === scope && reading ? state : { scope };
+  const payload = useMemo(
+    () =>
+      preview.url && preview.bytes && preview.mime
+        ? { bytes: preview.bytes, mime: preview.mime }
+        : undefined,
+    [preview.url, preview.bytes, preview.mime],
+  );
   function failedImage() {
     release();
     setState({ scope, error: "图片格式无法解码，请重试" });
@@ -207,6 +216,7 @@ export function AttachmentImage({
         preview={previewDialog}
         name={reference.name}
         title={reference.path}
+        payload={payload}
       >
         {preview.url ? (
           <img src={preview.url} alt={reference.name} onError={failedImage} />

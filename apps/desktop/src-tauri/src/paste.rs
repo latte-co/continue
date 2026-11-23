@@ -219,3 +219,69 @@ pub async fn import_clipboard_file(
     )
     .await
 }
+
+#[tauri::command]
+pub fn copy_image(view: tauri::Webview, mime: String, data: Vec<u8>) -> Result<(), String> {
+    crate::browser::check_caller(&view)?;
+    copy_image_bytes(&mime, &data)
+}
+
+fn pasteboard_image_type(mime: &str) -> Result<&'static str, String> {
+    match mime.trim().to_ascii_lowercase().as_str() {
+        "image/png" => Ok("public.png"),
+        "image/jpeg" => Ok("public.jpeg"),
+        "image/gif" => Ok("com.compuserve.gif"),
+        "image/webp" => Ok("org.webmproject.webp"),
+        "image/bmp" => Ok("com.microsoft.bmp"),
+        "image/tiff" => Ok("public.tiff"),
+        "image/avif" => Ok("public.avif"),
+        "image/heic" => Ok("public.heic"),
+        "image/heif" => Ok("public.heif"),
+        _ => Err("不支持复制该图片格式".into()),
+    }
+}
+
+fn copy_image_bytes(mime: &str, data: &[u8]) -> Result<(), String> {
+    if data.is_empty() {
+        return Err("图片内容为空，无法复制".into());
+    }
+    if data.len() > 32 * 1024 * 1024 {
+        return Err("图片超过 32MB，不支持复制到剪贴板".into());
+    }
+    let uti = pasteboard_image_type(mime)?;
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::NSPasteboard;
+        use objc2_foundation::{NSData, NSString};
+        let raw = NSData::with_bytes(data);
+        let uti_type = NSString::from_str(uti);
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        if !pasteboard.setData_forType(Some(&raw), &uti_type) {
+            return Err("无法写入系统剪贴板".into());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = uti;
+        Err("当前系统暂不支持原生剪贴板图片复制".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_clipboard_image_mime_and_bounds() {
+        assert_eq!(pasteboard_image_type("image/png").unwrap(), "public.png");
+        assert_eq!(
+            pasteboard_image_type("IMAGE/WEBP").unwrap(),
+            "org.webmproject.webp"
+        );
+        assert!(pasteboard_image_type("image/svg+xml").is_err());
+        assert!(pasteboard_image_type("text/plain").is_err());
+        assert!(copy_image_bytes("image/png", &[]).is_err());
+    }
+}

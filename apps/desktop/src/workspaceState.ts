@@ -289,7 +289,13 @@ export function openSideChatTab(
   const id = sideTabPrefix + sideId;
   updateWorkspace(workspaceId, (state) => ({
     tabs: state.tabs.some((tab) => tab.id === id)
-      ? state.tabs
+      ? draft
+        ? state.tabs
+        : state.tabs.map((tab) =>
+            tab.kind === "sideChat" && tab.id === id && tab.draft
+              ? { ...tab, draft: false }
+              : tab,
+          )
       : [...state.tabs, { id, kind: "sideChat", draft }],
     current: id,
     visible: true,

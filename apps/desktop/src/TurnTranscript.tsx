@@ -48,7 +48,9 @@ export function turnTranscript(events: Event[]) {
           ),
       );
     const isTool = (item: ActivityItem) =>
-      item.type === "tool" || item.type === "tools";
+      item.type === "tool" ||
+      item.type === "tools" ||
+      item.type === "tool_images";
     const duration = end && user ? end.at - events[0].at : null;
     const elapsed = stopped
       ? `已停止${duration != null && duration >= 1000 ? ` · ${formatElapsed(duration)}` : ""}`

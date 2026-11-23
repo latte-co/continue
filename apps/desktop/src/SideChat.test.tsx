@@ -6,7 +6,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
 import type { ModelPicker } from "./ModelPicker";
 import { modelSelectionScope } from "./modelSelectionScope";
@@ -144,12 +144,21 @@ vi.mock("./ModelPicker", async () => {
       projectId,
       projectPath,
       agent,
+      settingsOpen,
+      preserveUnavailableModel,
       value,
       effort,
       onReadyChange,
       onChange,
+      onProviderFallback,
       onEffortChange,
     }: ComponentProps<typeof ModelPicker>) => {
+      pickerSpy({
+        settingsOpen,
+        preserveUnavailableModel,
+        value,
+        onProviderFallback,
+      });
       useEffect(
         () =>
           onReadyChange?.({
@@ -161,9 +170,18 @@ vi.mock("./ModelPicker", async () => {
               effort,
               projectPath,
             ),
-            ready: true,
+            ready: !settingsOpen,
           }),
-        [hostId, projectId, projectPath, agent, value, effort, onReadyChange],
+        [
+          hostId,
+          projectId,
+          projectPath,
+          agent,
+          settingsOpen,
+          value,
+          effort,
+          onReadyChange,
+        ],
       );
       return (
         <>
@@ -178,7 +196,10 @@ vi.mock("./ModelPicker", async () => {
     },
   };
 });
-const { request } = vi.hoisted(() => ({ request: vi.fn() }));
+const { request, pickerSpy } = vi.hoisted(() => ({
+  request: vi.fn(),
+  pickerSpy: vi.fn(),
+}));
 vi.mock("./api", () => ({
   request,
   message: String,
@@ -191,6 +212,9 @@ vi.mock("./api", () => ({
     }
   },
 }));
+beforeEach(() => {
+  Element.prototype.scrollIntoView = vi.fn();
+});
 afterEach(() => {
   cleanup();
   request.mockReset();
@@ -420,7 +444,7 @@ it("stops only the side turn and never reads a hidden tab", async () => {
   });
 });
 
-it("retains unsent read-only, model and effort choices across main conversation navigation", async () => {
+it("inherits parent permission mode on new draft side chats while keeping legacy read-only side chats read-only", async () => {
   HTMLElement.prototype.scrollIntoView = vi.fn();
   const drafts = new DraftStore();
   const workspaceId = crypto.randomUUID();
@@ -439,18 +463,82 @@ it("retains unsent read-only, model and effort choices across main conversation 
           },
         ],
       };
+    if (action.method === "open_side_chat")
+      return {
+        kind: "session",
+        session: { ...child, id: action.side_id, permission_mode: "inherit" },
+      };
     if (action.method === "send") return { kind: "accepted" };
     if (action.method === "poll")
       return {
         kind: "events",
-        session: { ...child, permission_mode: "bypass_permissions" },
+        session: { ...child, permission_mode: null },
         events: [],
         has_more: false,
       };
     throw new Error("unexpected request");
   });
+  const elevatedDraftId = "draft-elevated";
+  openSideChatTab(workspaceId, elevatedDraftId, true);
+  const draftView = render(
+    <ChatTab
+      parent={{ ...parent, permission_mode: "bypass_permissions" }}
+      workspaceId={workspaceId}
+      sideId={elevatedDraftId}
+      hostId="local"
+      drafts={drafts}
+      active
+      connected
+      supported
+    />,
+  );
+  await waitFor(() =>
+    expect(
+      screen.getByRole("combobox", { name: "侧边聊天权限" }).textContent,
+    ).toContain("完全访问权限"),
+  );
+  draftView.unmount();
+
+  const inheritDraftId = "draft-inherit";
+  openSideChatTab(workspaceId, inheritDraftId, true);
+  drafts.update(sideDraftKey("local", parent.id, inheritDraftId), {
+    text: "align with main",
+  });
+  const inheritView = render(
+    <ChatTab
+      parent={{ ...parent, permission_mode: null }}
+      workspaceId={workspaceId}
+      sideId={inheritDraftId}
+      hostId="local"
+      drafts={drafts}
+      active
+      connected
+      supported
+    />,
+  );
+  const inheritSend = screen.getByRole<HTMLButtonElement>("button", {
+    name: "发送侧边聊天消息",
+  });
+  await waitFor(() => expect(inheritSend.disabled).toBe(false));
+  expect(
+    screen.getByRole("combobox", { name: "侧边聊天权限" }).textContent,
+  ).toContain("跟随 Agent");
+  fireEvent.click(inheritSend);
+  await waitFor(() =>
+    expect(request).toHaveBeenCalledWith(
+      "local",
+      expect.objectContaining({
+        method: "send",
+        session_id: inheritDraftId,
+        text: "align with main",
+        permission_mode: "inherit",
+      }),
+    ),
+  );
+  inheritView.unmount();
+
   const props = {
-    parent,
+    parent: { ...parent, permission_mode: "bypass_permissions" },
     workspaceId,
     sideId: child.id,
     hostId: "local",
@@ -459,14 +547,15 @@ it("retains unsent read-only, model and effort choices across main conversation 
     connected: true,
     supported: true,
   };
-  // Workspace removes the old page's SideChat renderer when a different main
-  // conversation is selected. Recreate that actual unmount/remount boundary.
+  // Historical read-only side chats stored permission_mode: null and must stay
+  // read-only on restore even when the parent session has write permissions.
   const view = render(<SideChat {...props} />);
   const send = () =>
     screen.getByRole<HTMLButtonElement>("button", { name: "发送侧边聊天消息" });
   await waitFor(() => expect(send().disabled).toBe(false));
-  fireEvent.click(screen.getByRole("combobox", { name: "侧边聊天权限" }));
-  fireEvent.click(screen.getByRole("option", { name: /只读/ }));
+  expect(
+    screen.getByRole("combobox", { name: "侧边聊天权限" }).textContent,
+  ).toContain("只读");
   fireEvent.click(screen.getByRole("button", { name: "选择侧边聊天模型" }));
   fireEvent.click(screen.getByRole("button", { name: "选择侧边聊天思考强度" }));
   view.rerender(<div>另一主会话</div>);
@@ -490,6 +579,55 @@ it("retains unsent read-only, model and effort choices across main conversation 
         permission_mode: null,
         model: "chosen-model",
         effort: "high",
+      }),
+    ),
+  );
+});
+
+it("waits for an existing side chat session before activating ModelPicker and preserves its model", async () => {
+  const drafts = new DraftStore();
+  let resolvePoll: ((value: unknown) => void) | undefined;
+  request.mockImplementation((_host: string, action: Request) => {
+    if (action.method === "agent_permissions")
+      return Promise.resolve({ kind: "agent_permissions", modes: [] });
+    if (action.method === "poll")
+      return new Promise((resolve) => {
+        resolvePoll = resolve;
+      });
+    throw new Error("unexpected request");
+  });
+  pickerSpy.mockClear();
+  render(
+    <SideChat
+      parent={{ ...parent, model: "parent-model" }}
+      sideId={child.id}
+      workspaceId={crypto.randomUUID()}
+      hostId="local"
+      drafts={drafts}
+      active
+      connected
+      supported
+    />,
+  );
+  expect(pickerSpy).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      settingsOpen: true,
+      preserveUnavailableModel: true,
+    }),
+  );
+  await waitFor(() => expect(resolvePoll).toBeTypeOf("function"));
+  resolvePoll?.({
+    kind: "events",
+    session: { ...child, model: "side-model" },
+    events: [],
+    has_more: false,
+  });
+  await waitFor(() =>
+    expect(pickerSpy).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        settingsOpen: false,
+        preserveUnavailableModel: true,
+        value: "side-model",
       }),
     ),
   );
@@ -567,19 +705,155 @@ it("closes an unsent draft locally and waits for the first send before closing t
   });
 });
 
-it("closes locally with a warning and requires explicit confirmation after reopening", async () => {
+it.each(["ok", "side_chat_closed"] as const)(
+  "closes a side chat cleanly with %s response and confirms unverified native agent close after reopening",
+  async (closeResponseKind) => {
+    const drafts = new DraftStore();
+    const workspaceId = crypto.randomUUID();
+    openSideChatTab(workspaceId, child.id, false);
+    let closePending: string | undefined = "close-1";
+    request.mockImplementation(async (_host: string, action: Request) => {
+      if (action.method === "close_agent_session")
+        return { kind: closeResponseKind };
+      if (action.method === "confirm_agent_closed") {
+        closePending = undefined;
+        return {
+          kind: "session",
+          session: child,
+        };
+      }
+      if (action.method === "poll")
+        return {
+          kind: "events",
+          session: {
+            ...child,
+            agent_close_pending: closePending,
+            agent_session_open: false,
+          },
+          events: [],
+          has_more: false,
+        };
+      return { kind: "agent_permissions", modes: [] };
+    });
+    await expect(
+      closeSideChat(
+        drafts,
+        "local",
+        parent.id,
+        workspaceId,
+        `sideChat:${child.id}`,
+      ),
+    ).resolves.toBeUndefined();
+    render(
+      <SideChat
+        parent={parent}
+        workspaceId={workspaceId}
+        sideId={child.id}
+        hostId="local"
+        drafts={drafts}
+        active
+        connected
+        supported
+      />,
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "核对原生会话关闭" }),
+    );
+    expect(
+      request.mock.calls.some(
+        ([, action]) => action.method === "confirm_agent_closed",
+      ),
+    ).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "我已核对，确认结束" }));
+    await waitFor(() =>
+      expect(request).toHaveBeenCalledWith("local", {
+        method: "confirm_agent_closed",
+        session_id: child.id,
+        close_id: "close-1",
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText(/原生会话的关闭状态待确认/)).toBeNull(),
+    );
+    expect(
+      request.mock.calls.filter(
+        ([, action]) => action.method === "close_agent_session",
+      ),
+    ).toHaveLength(1);
+  },
+);
+
+it("falls back to legacy read-only permission on older SSH Servers that do not advertise inherit", async () => {
   const drafts = new DraftStore();
   const workspaceId = crypto.randomUUID();
-  openSideChatTab(workspaceId, child.id, false);
-  let pending: string | undefined = "write-1";
+  const legacyDraftId = "draft-legacy-server";
+  openSideChatTab(workspaceId, legacyDraftId, true);
+  drafts.update(sideDraftKey("legacy-ssh", parent.id, legacyDraftId), {
+    text: "run on old v1 server",
+  });
   request.mockImplementation(async (_host: string, action: Request) => {
-    if (action.method === "close_agent_session")
-      return { kind: "side_chat_closed" };
-    if (action.method === "confirm_side_writes_ended") {
-      pending = undefined;
+    if (action.method === "agent_permissions")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.method === "open_side_chat")
       return {
         kind: "session",
-        session: child,
+        session: { ...child, id: action.side_id, permission_mode: null },
+      };
+    if (action.method === "send") return { kind: "accepted" };
+    if (action.method === "poll")
+      return {
+        kind: "events",
+        session: { ...child, id: legacyDraftId, permission_mode: null },
+        events: [],
+        has_more: false,
+      };
+    throw new Error("unexpected request");
+  });
+  render(
+    <ChatTab
+      parent={{ ...parent, permission_mode: null }}
+      workspaceId={workspaceId}
+      sideId={legacyDraftId}
+      hostId="legacy-ssh"
+      drafts={drafts}
+      active
+      connected
+      supported
+      supportsInheritPermission={false}
+    />,
+  );
+  const send = screen.getByRole<HTMLButtonElement>("button", {
+    name: "发送侧边聊天消息",
+  });
+  await waitFor(() => expect(send.disabled).toBe(false));
+  expect(
+    screen.getByRole("combobox", { name: "侧边聊天权限" }).textContent,
+  ).toContain("只读");
+  fireEvent.click(send);
+  await waitFor(() =>
+    expect(request).toHaveBeenCalledWith(
+      "legacy-ssh",
+      expect.objectContaining({
+        method: "send",
+        session_id: legacyDraftId,
+        text: "run on old v1 server",
+        permission_mode: null,
+      }),
+    ),
+  );
+});
+
+it("keeps ordinary completed writable side chats banner-free until undo conflict or unknown status requires confirmation", async () => {
+  const { requestSideWriteConfirmation } = await import("./sideWritePrompts");
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  let sideWritePending: string | undefined = "write-1";
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method === "confirm_side_writes_ended") {
+      sideWritePending = undefined;
+      return {
+        kind: "session",
+        session: { ...child, status: "completed", permission_mode: "inherit" },
       };
     }
     if (action.method === "poll")
@@ -587,23 +861,15 @@ it("closes locally with a warning and requires explicit confirmation after reope
         kind: "events",
         session: {
           ...child,
-          side_write_pending: pending,
-          agent_session_open: false,
+          status: "completed",
+          permission_mode: "inherit",
+          side_write_pending: sideWritePending,
         },
         events: [],
         has_more: false,
       };
     return { kind: "agent_permissions", modes: [] };
   });
-  await expect(
-    closeSideChat(
-      drafts,
-      "local",
-      parent.id,
-      workspaceId,
-      `sideChat:${child.id}`,
-    ),
-  ).resolves.toContain("后台写入待确认");
   render(
     <SideChat
       parent={parent}
@@ -616,14 +882,19 @@ it("closes locally with a warning and requires explicit confirmation after reope
       supported
     />,
   );
-  fireEvent.click(
-    await screen.findByRole("button", { name: "确认后台写入已结束" }),
-  );
-  expect(
-    request.mock.calls.some(
-      ([, action]) => action.method === "confirm_side_writes_ended",
+  await waitFor(() =>
+    expect(request).toHaveBeenCalledWith(
+      "local",
+      expect.objectContaining({ method: "poll" }),
     ),
-  ).toBe(false);
+  );
+  expect(screen.queryByText(/侧边聊天后台写入待确认/)).toBeNull();
+
+  // When main-turn undo hits an unconfirmed side-write interval, the confirmation bar appears on demand.
+  requestSideWriteConfirmation("local", child.id);
+  fireEvent.click(
+    await screen.findByRole("button", { name: "核对后台写入已结束" }),
+  );
   fireEvent.click(screen.getByRole("button", { name: "我已核对，确认结束" }));
   await waitFor(() =>
     expect(request).toHaveBeenCalledWith("local", {
@@ -632,10 +903,7 @@ it("closes locally with a warning and requires explicit confirmation after reope
       request_id: "write-1",
     }),
   );
-  await waitFor(() => expect(screen.queryByText(/后台写入待确认/)).toBeNull());
-  expect(
-    request.mock.calls.filter(
-      ([, action]) => action.method === "close_agent_session",
-    ),
-  ).toHaveLength(1);
+  await waitFor(() =>
+    expect(screen.queryByText(/侧边聊天后台写入待确认/)).toBeNull(),
+  );
 });

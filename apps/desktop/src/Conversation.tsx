@@ -64,6 +64,7 @@ interface Props {
   composerPrediction?: ComposerPredictionResponse | null;
   captureQueuedPredictionRetirement?: (requestId: string) => () => void;
   openSideChat?: (draft?: string) => boolean | Promise<boolean>;
+  openBlockingSideChat?: (sideId: string) => void | Promise<void>;
   quoteInSideChat?: (text: string) => void;
   openSubagents?: () => void;
   openTurnChanges?: (changes: TurnChanges, path?: string) => void;
@@ -73,6 +74,7 @@ interface Props {
   agents?: AgentInfo[];
   selectAgent?: (id: string) => void;
   session?: Session;
+  conversationKey?: string;
   hostId: string;
   settingsOpen: boolean;
   events: Event[];
@@ -119,6 +121,7 @@ export function Conversation({
   captureQueuedPredictionRetirement,
   openSubagents,
   openSideChat,
+  openBlockingSideChat,
   quoteInSideChat,
   openTurnChanges,
   openFile,
@@ -127,6 +130,7 @@ export function Conversation({
   agents = [],
   selectAgent,
   session,
+  conversationKey,
   hostId,
   settingsOpen,
   events,
@@ -250,12 +254,14 @@ export function Conversation({
       : agentId === "claude"
         ? "Claude Code"
         : agentId;
+  const effectiveConversationKey = conversationKey ?? session?.id ?? draftKey;
   const preferences = useAgentPreferences(
     hostId,
     agentId,
     projectId,
     session,
     sending,
+    effectiveConversationKey,
   );
   const { model, effort, permissionMode } = preferences;
   const [modelReadiness, setModelReadiness] = useState<{
@@ -834,6 +840,8 @@ export function Conversation({
                                 key={`${hostId}:${session?.id}:${item.key}`}
                                 hostId={hostId}
                                 sessionId={session?.id ?? ""}
+                                workspaceId={conversationKey}
+                                openBlockingSideChat={openBlockingSideChat}
                                 canUndo={
                                   connected &&
                                   !!session &&
@@ -1144,6 +1152,7 @@ export function Conversation({
                 onSave={saveAnnotation}
                 onRemove={removeAnnotation}
                 onClear={() => drafts.update(draftKey, { annotations: [] })}
+                onFocusComposer={() => setComposerFocus((value) => value + 1)}
                 disabled={sending || queueEditing || !!session?.archived}
                 active={!settingsOpen}
               />
@@ -1221,10 +1230,13 @@ export function Conversation({
                 projectId={projectId}
                 projectPath={projectPath}
                 agent={agentId}
+                conversationKey={effectiveConversationKey}
                 connected={connected}
                 settingsOpen={settingsOpen}
+                preserveUnavailableModel={!!session}
                 value={model}
                 onChange={preferences.chooseModel}
+                onProviderFallback={preferences.replaceUnsupportedModel}
                 effort={effort}
                 onEffortChange={preferences.chooseEffort}
                 onEffortInvalid={preferences.clearUnsupportedEffort}

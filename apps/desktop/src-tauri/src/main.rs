@@ -863,9 +863,28 @@ fn load_hosts(app: tauri::AppHandle) -> Result<Vec<Host>, String> {
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     serde_json::from_slice(&data).map_err(|e| e.to_string())
 }
+fn changed_host_ids(previous: &[Host], hosts: &[Host]) -> Vec<String> {
+    let mut changed = std::collections::BTreeSet::new();
+    for old in previous {
+        match hosts.iter().find(|host| host.id == old.id) {
+            Some(next) if next == old => {}
+            _ => {
+                changed.insert(old.id.clone());
+            }
+        }
+    }
+    for next in hosts {
+        if !previous.iter().any(|old| old.id == next.id) {
+            changed.insert(next.id.clone());
+        }
+    }
+    changed.into_iter().collect()
+}
 #[tauri::command]
-async fn save_hosts(app: tauri::AppHandle, hosts: Vec<Host>) -> Result<(), String> {
-    let removed: Vec<_> = load_hosts(app.clone())?
+async fn save_hosts(app: tauri::AppHandle, hosts: Vec<Host>) -> Result<Vec<String>, String> {
+    let previous = load_hosts(app.clone())?;
+    let changed = changed_host_ids(&previous, &hosts);
+    let removed: Vec<_> = previous
         .into_iter()
         .filter(|old| !hosts.iter().any(|host| host.id == old.id))
         .collect();
@@ -886,7 +905,8 @@ async fn save_hosts(app: tauri::AppHandle, hosts: Vec<Host>) -> Result<(), Strin
         serde_json::to_vec_pretty(&hosts).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    std::fs::rename(temp, path).map_err(|e| e.to_string())
+    std::fs::rename(temp, path).map_err(|e| e.to_string())?;
+    Ok(changed)
 }
 #[tauri::command]
 async fn choose_reference_path(
@@ -1298,6 +1318,46 @@ mod reveal_path_tests {
         let _ = std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644));
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn acknowledges_legacy_and_current_side_chat_close_responses() {
+        use latte_work_protocol::Response;
+        assert!(super::acknowledges_agent_close(&Response::Ok, false));
+        assert!(super::acknowledges_agent_close(
+            &Response::SideChatClosed,
+            false
+        ));
+        assert!(!super::acknowledges_agent_close(
+            &Response::Error {
+                code: "busy".into(),
+                message: "busy".into(),
+            },
+            false
+        ));
+    }
+    #[test]
+    fn changed_host_ids_reports_only_added_removed_or_modified_hosts() {
+        use super::{Host, SshAuthMode, changed_host_ids};
+        let host = |id: &str, ssh: &str| Host {
+            id: id.into(),
+            name: id.into(),
+            ssh: Some(ssh.into()),
+            server_path: None,
+            auth: SshAuthMode::None,
+            identity_file: None,
+            port: None,
+        };
+        let previous = vec![host("alpha", "dev@alpha"), host("beta", "dev@beta")];
+        let next = vec![
+            host("alpha", "dev@alpha"),
+            host("beta", "ops@beta"),
+            host("gamma", "dev@gamma"),
+        ];
+        assert_eq!(changed_host_ids(&previous, &next), vec!["beta", "gamma"]);
+        assert_eq!(
+            changed_host_ids(&next, &[host("alpha", "dev@alpha")]),
+            vec!["beta", "gamma"]
+        );
+    }
 }
 fn main() {
     if std::env::var("LATTE_WORK_SSH_ASKPASS").as_deref() == Ok("1") {
@@ -1414,6 +1474,7 @@ fn main() {
             source_preview::system_preview,
             source_preview::preview_pdf,
             paste::clipboard_file_paths,
+            paste::copy_image,
             paste::paste_stage,
             paste::finish_paste_upload,
             paste::import_clipboard_file,

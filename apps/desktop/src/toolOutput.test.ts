@@ -8,7 +8,7 @@ const image = {
   mime_type: "image/png",
   data_base64: "iVBORw0KGgo=",
 };
-it("projects normalized image blocks independently of collapsed tools and completed process", () => {
+it("projects normalized image blocks outside collapsed tool groups and folds them into the completed process", () => {
   const events: Event[] = [
     { kind: "user", text: "make image", request_id: "r" },
     {
@@ -31,10 +31,17 @@ it("projects normalized image blocks independently of collapsed tools and comple
     at: i * 1000,
     event,
   })) as Event[];
+  const runningTurn = turnTranscript(events.slice(0, -1))[0];
+  expect(runningTurn.visible.some((item) => item.type === "tool_images")).toBe(
+    true,
+  );
   const turn = turnTranscript(events)[0];
-  expect(turn.visible.some((item) => item.type === "tool_images")).toBe(true);
-  expect(turn.process.some((item) => item.type === "tool_images")).toBe(false);
-  expect(JSON.stringify(turn.process)).not.toContain("iVBOR");
+  expect(turn.processCount).toBe(1);
+  expect(turn.process.some((item) => item.type === "tool_images")).toBe(true);
+  expect(turn.visible.some((item) => item.type === "tool_images")).toBe(false);
+  expect(
+    JSON.stringify(turn.process.filter((item) => item.type !== "tool_images")),
+  ).not.toContain("iVBOR");
 });
 it("keeps text and unfamiliar blocks while excluding image payloads from raw output", () => {
   const parsed = toolOutput([

@@ -1358,10 +1358,6 @@ impl Process {
     // project directory, so a conversation that moved into a worktree keeps
     // working after its process was restarted. A failed lookup keeps the
     // project directory; the adapter's mismatch repair recovers from there.
-    // Resume the native session where it now lives instead of only the
-    // project directory, so a conversation that moved into a worktree keeps
-    // working after its process was restarted. A failed lookup keeps the
-    // project directory; the adapter's mismatch repair recovers from there.
     // The agent cwd only steers the native process: snapshots, undo and task
     // changes stay rooted at the project path so a turn's before and after
     // are always captured in the same directory.
@@ -1596,7 +1592,7 @@ impl Process {
                     prepared,
                     self.adapter.frame_limit(),
                     &self.config,
-                    None,
+                    self.active_request_id.as_deref(),
                     agents::TransportLifetime::PerTurn,
                     self.active_request_id.as_deref(),
                 )?);
@@ -2119,7 +2115,13 @@ async fn close_group(
         group.child.wait(),
     )
     .await;
-    let group_signaled = matches!(killpg(pid, Signal::SIGKILL), Ok(()) | Err(Errno::ESRCH));
+    let group_signaled = match killpg(pid, Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => true,
+        // Darwin's killpg returns EPERM while only reparented child zombies
+        // remain in the group awaiting PID 1 reap; confirm the group vanishes.
+        Err(Errno::EPERM) => observe_group_retirement(pid, deadline).await,
+        Err(_) => false,
+    };
     let native_confirmed = match exit {
         Ok(Ok(status)) => !expect_clean_exit || status.success(),
         _ => {
@@ -2135,6 +2137,21 @@ async fn close_group(
         }
     };
     native_confirmed && group_signaled && auxiliary_reaped
+}
+pub(super) async fn observe_group_retirement(pid: Pid, deadline: tokio::time::Instant) -> bool {
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            match killpg(pid, None) {
+                Err(Errno::ESRCH) => return true,
+                Ok(()) | Err(Errno::EPERM) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 fn finish_native_close(database: &Database, id: &str, confirmed: bool) -> Result<()> {
     if !confirmed {
@@ -3323,6 +3340,30 @@ mod tests {
                 "auxiliary await must not retain a reusable native PID"
             );
             assert!(group.child.id().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn close_group_confirms_reparented_descendant_zombies_after_leader_exit() {
+        use tokio::io::AsyncBufReadExt;
+        for _ in 0..40 {
+            let mut child = tokio::process::Command::new("/bin/sh")
+                .args(["-c", "printf 'init\\n'; sleep 30"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = i32::try_from(child.id().unwrap()).unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("init"));
+            let mut group = Group { child, pid };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            assert!(close_group(&mut group, deadline, false, std::future::ready(true)).await);
+            assert!(observe_group_retirement(Pid::from_raw(pid), deadline).await);
         }
     }
 

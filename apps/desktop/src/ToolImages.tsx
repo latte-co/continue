@@ -19,7 +19,7 @@ function ToolImagePreview({
     } catch {
       return undefined;
     }
-  }, [image]);
+  }, [image.data_base64, image.mime_type]);
   return content ? (
     <RasterImage
       bytes={content}

@@ -235,7 +235,8 @@ impl Store {
         // Older versions can still write inferred side_write_end values after a
         // downgrade. Only zero (never started) and verified ends carry evidence.
         migration.execute_batch(
-            "CREATE INDEX IF NOT EXISTS unverified_side_writes ON requests(session_id)
+            "DROP INDEX IF EXISTS unverified_side_writes_v2;
+             CREATE INDEX IF NOT EXISTS unverified_side_writes ON requests(session_id)
              WHERE permission_mode IS NOT NULL AND side_write_end IS NOT 0 AND side_write_verified_end IS NULL;",
         )?;
         if !migration.query_row(
@@ -743,6 +744,7 @@ impl Store {
             pinned_at: None,
             unread: false,
             archived: false,
+            parent_session_id: None,
             agent_session_open: None,
             agent_session_busy: None,
             side_write_pending: None,
@@ -844,6 +846,7 @@ impl Store {
         side.title = "侧边聊天".into();
         side.model = parent.model;
         side.effort = parent.effort;
+        side.permission_mode = Some(parent.permission_mode.unwrap_or_else(|| "inherit".into()));
         self.save(&side)?;
         tx.execute(
             "INSERT INTO side_chats(parent_id,session_id,parent_native_id) VALUES (?1,?2,?3)",
@@ -1735,7 +1738,7 @@ impl Store {
     /// an admitted side request that has not reached this point.
     pub fn start_side_write(&self, request_id: &str) -> Result<()> {
         self.db.execute(
-            "UPDATE requests SET side_write_start=(SELECT MAX(seq) FROM events),
+            "UPDATE requests SET side_write_start=COALESCE((SELECT MAX(seq) FROM events),0),
                  side_write_end=NULL WHERE id=?1 AND side_write_end=0",
             [request_id],
         )?;
@@ -1812,8 +1815,8 @@ impl Store {
         }
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
-            "UPDATE requests SET side_write_verified_end=(SELECT MAX(seq) FROM events),
-                side_write_end=(SELECT MAX(seq) FROM events)
+            "UPDATE requests SET side_write_verified_end=COALESCE((SELECT MAX(seq) FROM events),0),
+                side_write_end=COALESCE((SELECT MAX(seq) FROM events),0)
              WHERE session_id=?1 AND permission_mode IS NOT NULL
                 AND side_write_end IS NOT 0 AND side_write_verified_end IS NULL",
             [session_id],
@@ -1827,6 +1830,9 @@ impl Store {
         self.session(session_id)
     }
     pub fn project_session_recovery(&self, session: &mut Session) -> Result<()> {
+        session.parent_session_id = self
+            .side_parent(&session.id)?
+            .map(|(parent_id, _)| parent_id);
         session.side_write_pending = self.pending_side_write(&session.id)?;
         session.agent_close_pending = self
             .db
@@ -1946,7 +1952,6 @@ impl Store {
             )
             .context("读取请求持久化身份失败")
     }
-
     pub fn latest_request(&self, id: &str) -> Result<String> {
         self.db
             .query_row(
@@ -3280,6 +3285,44 @@ mod tests {
             !store
                 .check_side_write_confirmation(&side.id, &latest)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn open_side_chat_inherits_for_new_chats_and_preserves_legacy_readonly_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let store = super::Store::open(&path).unwrap();
+        let project = store.add_project(directory.path()).unwrap();
+        let mut parent = store.create_session(project.id, "codex".into()).unwrap();
+        parent.native_id = Some("native-main".into());
+        store.save(&parent).unwrap();
+
+        let default_side = store.open_side_chat(&parent.id, None).unwrap();
+        assert_eq!(default_side.permission_mode.as_deref(), Some("inherit"));
+
+        // Simulate a historical pre-upgrade read-only side chat (`permission_mode: null`).
+        let mut legacy_readonly = default_side;
+        legacy_readonly.permission_mode = None;
+        store.save(&legacy_readonly).unwrap();
+
+        parent.model = Some("gpt-5".into());
+        parent.effort = Some(latte_work_protocol::Effort::High);
+        parent.permission_mode = Some("bypass_permissions".into());
+        store.save(&parent).unwrap();
+
+        let restored_legacy = store
+            .open_side_chat(&parent.id, Some(&legacy_readonly.id))
+            .unwrap();
+        assert_eq!(restored_legacy.permission_mode, None);
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let inherited = store.open_side_chat(&parent.id, Some(&new_id)).unwrap();
+        assert_eq!(inherited.model.as_deref(), Some("gpt-5"));
+        assert_eq!(inherited.effort, Some(latte_work_protocol::Effort::High));
+        assert_eq!(
+            inherited.permission_mode.as_deref(),
+            Some("bypass_permissions")
         );
     }
 

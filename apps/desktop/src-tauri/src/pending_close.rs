@@ -56,7 +56,18 @@ fn prepare_directory(directory: &Path) -> Result<(), String> {
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| e.to_string())
 }
-fn lock(directory: &Path) -> Result<File, String> {
+struct DirectoryLock(File);
+
+impl Drop for DirectoryLock {
+    fn drop(&mut self) {
+        // Release flock before closing the descriptor so transient file-table
+        // duplication during concurrent subprocess spawns cannot extend the
+        // lock past this guard's lifetime.
+        let _ = self.0.unlock();
+    }
+}
+
+fn lock(directory: &Path) -> Result<DirectoryLock, String> {
     prepare_directory(directory)?;
     let path = directory.join("pending.lock");
     regular(&path)?;
@@ -70,7 +81,7 @@ fn lock(directory: &Path) -> Result<File, String> {
         .map_err(|e| e.to_string())?;
     file.try_lock()
         .map_err(|_| "关闭记录正在处理，请稍后重新连接".to_string())?;
-    Ok(file)
+    Ok(DirectoryLock(file))
 }
 fn regular(path: &Path) -> Result<(), String> {
     match path.symlink_metadata() {
@@ -1323,6 +1334,19 @@ for line in sys.stdin:
             RECOVERY_PAGE_LIMIT
         );
         drop(client);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn directory_lock_releases_flock_even_while_duplicated_descriptor_is_open() {
+        let directory = std::env::temp_dir().join(format!("lw-lock-dup-{}", uuid::Uuid::new_v4()));
+        let guard = lock(&directory).unwrap();
+        let duplicated = guard.0.try_clone().unwrap();
+        assert!(lock(&directory).is_err());
+        drop(guard);
+        let reacquired = lock(&directory).unwrap();
+        drop(duplicated);
+        drop(reacquired);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

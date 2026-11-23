@@ -135,7 +135,7 @@ export function Workspace({
   taskInfo?: React.ReactNode;
   renderSideChat?: (tab: SideTab, active: boolean) => React.ReactNode;
   canOpenSideChat?: boolean;
-  closeSideChat?: (id: string) => Promise<void | string>;
+  closeSideChat?: (id: string) => Promise<void>;
   conversationActions?: React.ReactNode;
   statusCenter?: React.ReactNode;
   sessionId?: string;
@@ -255,7 +255,7 @@ function WorkspacePage({
   taskInfo?: React.ReactNode;
   renderSideChat?: (tab: SideTab, active: boolean) => React.ReactNode;
   canOpenSideChat?: boolean;
-  closeSideChat?: (id: string) => Promise<void | string>;
+  closeSideChat?: (id: string) => Promise<void>;
   conversationActions?: React.ReactNode;
   statusCenter?: React.ReactNode;
   sessionId?: string;
@@ -305,15 +305,7 @@ function WorkspacePage({
   };
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [closeNotice, setCloseNotice] = useState("");
   useStatusIssues([
-    {
-      id: `side-chat-close:${workspaceId}`,
-      title: "侧边聊天后台写入待确认",
-      level: "warning",
-      error: selected ? closeNotice : "",
-      action: { label: "知道了", run: () => setCloseNotice("") },
-    },
     {
       id: `workspace:${workspaceId}`,
       title: "工作区操作未完成",
@@ -488,8 +480,7 @@ function WorkspacePage({
         });
       if (tab.kind === "sideChat") {
         if (!closeSideChat) throw new Error("无法关闭侧边聊天");
-        const notice = await closeSideChat(tab.id);
-        if (notice) setCloseNotice(notice);
+        await closeSideChat(tab.id);
       }
       setTabs((tabs) => tabs.filter((t) => t.id !== tab.id));
     } catch (e) {

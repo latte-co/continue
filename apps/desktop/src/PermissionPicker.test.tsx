@@ -122,3 +122,58 @@ it("hides an old permission error while disconnected", async () => {
   view.rerender(<PermissionPicker {...props} connected={false} />);
   expect(screen.queryByRole("button", { name: "重新加载权限选项" })).toBeNull();
 });
+it("offers both read-only and follow-Agent in side chats without marking inherit unavailable", async () => {
+  mocks.request
+    .mockRejectedValueOnce(new Error("发现失败"))
+    .mockResolvedValue(catalog);
+  const view = render(<PermissionPicker {...props} sideChat value="inherit" />);
+  await act(async () => {});
+  expect(
+    screen.getByRole("combobox", { name: "侧边聊天权限" }).textContent,
+  ).toContain("跟随 Agent");
+  fireEvent.click(screen.getByRole("button", { name: "状态提示（1）" }));
+  fireEvent.click(screen.getByRole("button", { name: "重新加载权限选项" }));
+  await act(async () => {});
+  fireEvent.click(screen.getByRole("combobox", { name: "侧边聊天权限" }));
+  expect(screen.getByRole("option", { name: /^只读/ })).toBeTruthy();
+  expect(screen.getByRole("option", { name: /^跟随 Agent/ })).toBeTruthy();
+  expect(screen.queryByText("权限模式不可用")).toBeNull();
+  expect(
+    screen.getByText("跳过常规确认 侧边聊天与主聊使用同一个工作目录。"),
+  ).toBeTruthy();
+  fireEvent.click(screen.getByRole("option", { name: /^只读/ }));
+  expect(props.onChange).toHaveBeenCalledWith(null);
+  view.rerender(<PermissionPicker {...props} sideChat value="stale-mode" />);
+  expect(
+    screen.getByRole("combobox", { name: "侧边聊天权限" }).textContent,
+  ).toContain("权限模式不可用");
+  fireEvent.click(screen.getByRole("combobox", { name: "侧边聊天权限" }));
+  expect(
+    screen.getByText("此选择尚未验证；可切换为只读或跟随 Agent。"),
+  ).toBeTruthy();
+});
+it("omits follow-Agent in side chats when connected to an older Server without inherit support", async () => {
+  mocks.request.mockResolvedValue(catalog);
+  const view = render(
+    <PermissionPicker {...props} sideChat allowInherit={false} value={null} />,
+  );
+  await act(async () => {});
+  fireEvent.click(screen.getByRole("combobox", { name: "侧边聊天权限" }));
+  expect(screen.getByRole("option", { name: /^只读/ })).toBeTruthy();
+  expect(screen.queryByRole("option", { name: /^跟随 Agent/ })).toBeNull();
+  expect(screen.getByRole("option", { name: /^完全访问/ })).toBeTruthy();
+  fireEvent.click(screen.getByRole("option", { name: /^只读/ }));
+  view.rerender(
+    <PermissionPicker
+      {...props}
+      sideChat
+      allowInherit={false}
+      value="inherit"
+    />,
+  );
+  expect(
+    screen.getByRole("combobox", { name: "侧边聊天权限" }).textContent,
+  ).toContain("权限模式不可用");
+  fireEvent.click(screen.getByRole("combobox", { name: "侧边聊天权限" }));
+  expect(screen.getByText("此选择尚未验证；可切换为只读。")).toBeTruthy();
+});

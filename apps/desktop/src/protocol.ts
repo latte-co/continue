@@ -52,6 +52,10 @@ export type Session = {
   unread: boolean;
   archived: boolean;
   /**
+   * Parent session ID when this session is a side chat; live server projection only.
+   */
+  parent_session_id?: string;
+  /**
    * Live server projection only; absent on older servers and in durable history.
    */
   agent_session_open?: boolean;
@@ -371,6 +375,7 @@ export type ProviderDraft = {
 };
 export type ProviderTarget = { ssh: string; server_path: string };
 export type AgentProviderBinding = {
+  host_id?: string;
   agent: string;
   provider_id: string;
   provider_revision: string;
@@ -705,7 +710,6 @@ export type Request =
       section: ChangeSection;
     };
 export type Response =
-  | { kind: "side_chat_closed" }
   | {
       kind: "recent_sessions";
       sessions: Array<RecentSession>;
@@ -825,6 +829,7 @@ export type Response =
       change_preview: boolean;
       side_chat_controls: boolean;
       claude_side_chat: boolean;
+      side_chat_inherit_permission: boolean;
     }
   | { kind: "projects"; projects: Array<Project> }
   | { kind: "project"; project: Project }
@@ -895,5 +900,6 @@ export type Response =
       truncated: boolean;
     }
   | { kind: "content"; text: string; truncated: boolean }
+  | { kind: "side_chat_closed" }
   | { kind: "ok" }
   | { kind: "error"; code: string; message: string };

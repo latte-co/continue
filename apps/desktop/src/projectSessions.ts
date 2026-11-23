@@ -3,7 +3,6 @@ import type { Response, Session } from "./protocol";
 export type CloseProjectResult = {
   closed: string[];
   failed: { session: Session; error: string }[];
-  pendingWrites: Session[];
 };
 export async function openProjectSessions(
   host: string,
@@ -61,7 +60,6 @@ export async function closeProjectSessions(
   const result: CloseProjectResult = {
     closed: [],
     failed: [],
-    pendingWrites: [],
   };
   for (const session of sessions) {
     if (session.project_id !== project) throw new Error("会话不属于此项目");
@@ -71,10 +69,8 @@ export async function closeProjectSessions(
     )
       continue;
     try {
-      const response = await close(host, session.id);
+      await close(host, session.id);
       result.closed.push(session.id);
-      if (response?.kind === "side_chat_closed")
-        result.pendingWrites.push(session);
     } catch (error) {
       result.failed.push({ session, error: message(error) });
     }

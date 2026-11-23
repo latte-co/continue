@@ -2,7 +2,20 @@
 import { afterEach, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
-import { connect, disconnect, request, ServerRequestError } from "./api";
+import {
+  agentEnvironments,
+  agentProviders,
+  bindAgentProvider,
+  connect,
+  disconnect,
+  loadHosts,
+  providerRequest,
+  request,
+  saveAgentEnvironment,
+  saveHosts,
+  ServerRequestError,
+} from "./api";
+import { getModelConfigVersion } from "./modelConfigVersion";
 import {
   HOST_DISCONNECTED_EVENT,
   HostConnectionError,
@@ -192,4 +205,147 @@ it("preserves structured Server error codes without marking the host disconnecte
   } finally {
     window.removeEventListener(HOST_DISCONNECTED_EVENT, listener);
   }
+});
+
+it("scopes model config version bumps to the affected host and Agent", async () => {
+  const localClaudeStart = getModelConfigVersion("local", "claude");
+  const localCodexStart = getModelConfigVersion("local", "codex");
+  const remoteClaudeStart = getModelConfigVersion("remote-a", "claude");
+  const untouchedHostStart = getModelConfigVersion("remote-b", "claude");
+
+  // Editing an unbound provider before loading providers still affects no host or Agent.
+  mocks.invoke.mockResolvedValueOnce({
+    kind: "providers",
+    providers: [],
+    bindings: [],
+  });
+  await providerRequest({
+    method: "save_provider",
+    provider: {
+      id: "unbound-existing",
+      name: "Unbound",
+      protocol: "anthropic_messages",
+      base_url: "https://api.example.com",
+      model: "claude",
+      models: ["claude"],
+      model_labels: {},
+      models_1m: [],
+      auth: "none",
+      credential: null,
+    },
+  });
+  expect(getModelConfigVersion("local", "claude")).toBe(localClaudeStart);
+  expect(getModelConfigVersion("remote-a", "claude")).toBe(remoteClaudeStart);
+
+  mocks.invoke.mockResolvedValue({
+    kind: "providers",
+    providers: [],
+    bindings: [],
+  });
+  await providerRequest({ method: "providers" });
+  await agentProviders("local");
+  mocks.invoke.mockResolvedValueOnce({});
+  await agentEnvironments("local");
+  mocks.invoke.mockResolvedValueOnce([
+    { id: "remote-a", name: "A", ssh: "a", server_path: null },
+    { id: "remote-b", name: "B", ssh: "b", server_path: null },
+  ]);
+  await loadHosts();
+  expect(getModelConfigVersion("local", "claude")).toBe(localClaudeStart);
+  expect(getModelConfigVersion("remote-a", "claude")).toBe(remoteClaudeStart);
+
+  // Creating an unbound provider affects no host or Agent.
+  mocks.invoke.mockResolvedValueOnce({
+    kind: "providers",
+    providers: [],
+    bindings: [],
+  });
+  await providerRequest({
+    method: "save_provider",
+    provider: {
+      id: null,
+      name: "Team",
+      protocol: "anthropic_messages",
+      base_url: "https://api.example.com",
+      model: "claude",
+      models: ["claude"],
+      model_labels: {},
+      models_1m: [],
+      auth: "none",
+      credential: null,
+    },
+  });
+  expect(getModelConfigVersion("local", "claude")).toBe(localClaudeStart);
+  expect(getModelConfigVersion("remote-a", "claude")).toBe(remoteClaudeStart);
+
+  // Binding a provider on local/claude bumps only local/claude.
+  mocks.invoke.mockResolvedValueOnce({
+    kind: "providers",
+    providers: [],
+    bindings: [
+      {
+        host_id: "local",
+        agent: "claude",
+        provider_id: "p1",
+        provider_revision: "r1",
+      },
+    ],
+  });
+  await bindAgentProvider("local", "claude", "p1");
+  expect(getModelConfigVersion("local", "claude")).toBe(localClaudeStart + 1);
+  expect(getModelConfigVersion("local", "codex")).toBe(localCodexStart);
+  expect(getModelConfigVersion("remote-a", "claude")).toBe(remoteClaudeStart);
+
+  // Updating bound provider p1 bumps only the (host, agent) bound to p1.
+  mocks.invoke.mockResolvedValueOnce({
+    kind: "providers",
+    providers: [],
+    bindings: [
+      {
+        host_id: "local",
+        agent: "claude",
+        provider_id: "p1",
+        provider_revision: "r2",
+      },
+    ],
+  });
+  await providerRequest({
+    method: "save_provider",
+    provider: {
+      id: "p1",
+      name: "Team",
+      protocol: "anthropic_messages",
+      base_url: "https://api.example.com",
+      model: "claude",
+      models: ["claude"],
+      model_labels: {},
+      models_1m: [],
+      auth: "none",
+      credential: null,
+    },
+  });
+  expect(getModelConfigVersion("local", "claude")).toBe(localClaudeStart + 2);
+  expect(getModelConfigVersion("local", "codex")).toBe(localCodexStart);
+  expect(getModelConfigVersion("remote-a", "claude")).toBe(remoteClaudeStart);
+
+  // Saving an Agent environment bumps only that host and Agent.
+  mocks.invoke.mockResolvedValueOnce({ ANTHROPIC_BASE_URL: "https://x" });
+  await saveAgentEnvironment("local", "claude", {
+    ANTHROPIC_BASE_URL: "https://x",
+  });
+  expect(getModelConfigVersion("local", "claude")).toBe(localClaudeStart + 3);
+  expect(getModelConfigVersion("local", "codex")).toBe(localCodexStart);
+  expect(getModelConfigVersion("remote-a", "claude")).toBe(remoteClaudeStart);
+
+  // Saving SSH hosts bumps only the modified remote host, leaving local and untouched hosts cached.
+  mocks.invoke.mockResolvedValueOnce(["remote-a"]);
+  await saveHosts([
+    { id: "remote-a", name: "A2", ssh: "a2", server_path: null },
+    { id: "remote-b", name: "B", ssh: "b", server_path: null },
+  ]);
+  expect(getModelConfigVersion("remote-a", "claude")).toBe(
+    remoteClaudeStart + 1,
+  );
+  expect(getModelConfigVersion("remote-b", "claude")).toBe(untouchedHostStart);
+  expect(getModelConfigVersion("local", "claude")).toBe(localClaudeStart + 3);
 });

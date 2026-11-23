@@ -380,6 +380,7 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
                             change_preview: true,
                             side_chat_controls: true,
                             claude_side_chat: true,
+                            side_chat_inherit_permission: true,
                         }
                     } else {
                         Response::Error {
@@ -1286,7 +1287,10 @@ async fn dispatch_admitted(
                     "此 Agent 不支持所选思考强度".into(),
                 ));
             }
-            if let Some(mode) = &permission_mode {
+            let is_side_chat = db(&s.database, |d| Ok(d.side_parent(&session_id)?.is_some()))?;
+            if let Some(mode) = &permission_mode
+                && !(is_side_chat && mode == "inherit")
+            {
                 let _permit = s
                     .command_probes
                     .try_acquire()

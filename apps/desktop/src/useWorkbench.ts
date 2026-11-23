@@ -6,11 +6,15 @@ import {
   clampWorkspaceWidth,
   CONVERSATION_MIN_WIDTH,
   copyWorkspace,
+  openSideChatTab,
   openSubagents,
   syncProjectInWorkspaces,
   useWorkspaceState,
   workspaceKey,
 } from "./workspaceState";
+import { resolveSideChatNavigation } from "./sideChatNavigation";
+import type { StandaloneSideChatTarget } from "./SideChatRecoveryDialog";
+import { requestSideWriteConfirmation } from "./sideWritePrompts";
 import { useEffect, useRef, useState } from "react";
 import {
   isSubagentPanelCommand,
@@ -185,6 +189,8 @@ export function useWorkbench() {
     return result;
   }
   const [hostId, setHostId] = useState("local");
+  const [standaloneSideChat, setStandaloneSideChat] =
+    useState<StandaloneSideChatTarget | null>(null);
   const [retry, setRetry] = useState(0);
   const lastConnectionRetry = useRef(retry);
   const hostHellos = useRef(
@@ -213,6 +219,8 @@ export function useWorkbench() {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [draftAgents, setDraftAgents] = useState<Record<string, string>>({});
   const [catalog, setCatalog] = useState(readCatalog);
+  const catalogRef = useRef(catalog);
+  catalogRef.current = catalog;
   const [projectOrder, setProjectOrder] = useState(readProjectOrder);
   useEffect(() => writeProjectOrder(projectOrder), [projectOrder]);
   const [hostErrors, setHostErrors] = useState<Record<string, string>>({});
@@ -1147,6 +1155,7 @@ export function useWorkbench() {
         selectedSessionId.current === action.session_id
       ) {
         draft.current = true;
+        setDraftWorkspaceId(crypto.randomUUID());
         resetConversationView();
         setSessionId("");
         setEvents([]);
@@ -1159,7 +1168,10 @@ export function useWorkbench() {
   }
   function openSession(target: HostedSession) {
     if (modal === "skills") setModal(null);
-    if (target.hostId === hostId && target.id === sessionId) {
+    setStandaloneSideChat(null);
+    const current = selection.current;
+    const currentSessionId = selectedSessionId.current;
+    if (target.hostId === current.hostId && target.id === currentSessionId) {
       if (target.unread && connected)
         void sessionAction(target.hostId, {
           method: "mark_session_unread",
@@ -1169,16 +1181,24 @@ export function useWorkbench() {
       return;
     }
     selectProject(target.hostId, target.project_id);
+    if (draft.current) setDraftWorkspaceId(crypto.randomUUID());
     draft.current = false;
-    if (target.id !== sessionId) resetConversationView();
+    if (target.id !== currentSessionId) resetConversationView();
     pendingSession.current = {
       hostId: target.hostId,
       projectId: target.project_id,
       id: target.id,
     };
-    if (target.hostId === hostId && target.project_id === projectId)
+    if (
+      target.hostId === current.hostId &&
+      target.project_id === current.projectId
+    ) {
       pendingSession.current = null;
-    else setSessions([target]);
+      setSessions((old) =>
+        old.some((s) => s.id === target.id) ? old : [target, ...old],
+      );
+    } else setSessions([target]);
+    selectedSessionId.current = target.id;
     const scope = JSON.stringify([target.hostId, target.id]);
     const cached = historyCache.get(scope);
     setHasEarlierHistory(historyCache.hasEarlier(scope));
@@ -1186,6 +1206,38 @@ export function useWorkbench() {
     setHistoryReadyScope(cached ? scope : null);
     setEvents(cached ?? []);
     setSessionId(target.id);
+  }
+  async function openSideChatSession(
+    targetHostId: string,
+    sideId: string,
+  ): Promise<void> {
+    const revision = navigationRevision.current;
+    const target = await resolveSideChatNavigation(targetHostId, sideId);
+    if (
+      !(catalogRef.current[targetHostId] ?? []).some(
+        (item) => item.id === target.side.project_id,
+      )
+    ) {
+      const projectsResponse = await request(targetHostId, {
+        method: "projects",
+      });
+      if (projectsResponse.kind === "projects")
+        updateProjects(targetHostId, projectsResponse.projects);
+    }
+    if (navigationRevision.current !== revision) return;
+    if (modal) setModal(null);
+    requestSideWriteConfirmation(targetHostId, sideId);
+    if (target.kind === "standalone") {
+      setStandaloneSideChat({
+        hostId: targetHostId,
+        sideId,
+        initialSession: target.side,
+      });
+      return;
+    }
+    setStandaloneSideChat(null);
+    openSideChatTab(workspaceKey(target.parent.id), sideId, false);
+    openSession({ ...target.parent, hostId: targetHostId });
   }
   async function loadEarlierHistory(): Promise<void> {
     const targetHost = hostId,
@@ -1265,6 +1317,7 @@ export function useWorkbench() {
     if (!hosts.some((h) => h.id === targetHostId))
       throw new Error("项目所在主机已移除");
     if (modal === "skills") setModal(null);
+    setStandaloneSideChat(null);
     pendingSession.current = null;
     draft.current = true;
     setDraftWorkspaceId(crypto.randomUUID());
@@ -1320,6 +1373,7 @@ export function useWorkbench() {
         ]);
         if (navigationRevision.current === revision) {
           copyWorkspace(workspaceId, workspaceKey(r.session.id));
+          setDraftWorkspaceId(crypto.randomUUID());
           draft.current = false;
           selectedSessionId.current = r.session.id;
           setSessionId(r.session.id);
@@ -1544,6 +1598,9 @@ export function useWorkbench() {
       return next;
     });
     if (projectHostId === id) setProjectHostId("local");
+    setStandaloneSideChat((current) =>
+      current?.hostId === id ? null : current,
+    );
     if (hostId === id) {
       activateHost("local");
       setProjectId("");
@@ -1561,12 +1618,16 @@ export function useWorkbench() {
   function selectProject(targetHostId: string, id: string) {
     if (modal === "skills") setModal(null);
     pendingSession.current = null;
-    if (id === projectId && targetHostId === hostId) return;
+    const current = selection.current;
+    if (id === current.projectId && targetHostId === current.hostId) return;
     draft.current = false;
+    setDraftWorkspaceId(crypto.randomUUID());
     resetConversationView();
-    if (targetHostId !== hostId) {
+    if (targetHostId !== current.hostId) {
       activateHost(targetHostId);
     }
+    selection.current = { hostId: targetHostId, projectId: id };
+    selectedSessionId.current = "";
     setError("");
     setProjectId(id);
     setSessions([]);
@@ -1850,6 +1911,8 @@ export function useWorkbench() {
     setHostId,
     connected,
     supportsSideChat: cachedHello(host)?.side_chat_controls === true,
+    supportsSideChatInheritPermission:
+      cachedHello(host)?.side_chat_inherit_permission === true,
     supportsClaudeSideChat: cachedHello(host)?.claude_side_chat === true,
     connectionLost: connectedHosts.current.has(hostId),
     agentSessionTransitions,
@@ -1896,6 +1959,9 @@ export function useWorkbench() {
     pinned,
     movePinnedSession,
     openSession,
+    openSideChatSession,
+    standaloneSideChat,
+    closeStandaloneSideChat: () => setStandaloneSideChat(null),
     sessionAction,
     sessionId,
     workspaceId,

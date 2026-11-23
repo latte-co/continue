@@ -153,7 +153,7 @@ it("shows unavailable live evidence instead of inventing a zero count", async ()
   expect(mocks.closeSession).not.toHaveBeenCalled();
 });
 
-it("confirms and closes a running side chat, preserving the pending-write notice", async () => {
+it("confirms and closes a running side chat along with main conversations", async () => {
   rows = [{ ...session("main"), native_id: "native-main" }];
   const side = { ...session("side", true), status: "running" as const };
   mocks.request.mockResolvedValue({
@@ -161,9 +161,7 @@ it("confirms and closes a running side chat, preserving the pending-write notice
     sessions: [...rows, side],
     next: null,
   });
-  mocks.closeSession.mockImplementation(async (_host, action) => ({
-    kind: action.session_id === "side" ? "side_chat_closed" : "ok",
-  }));
+  mocks.closeSession.mockResolvedValue({ kind: "ok" });
   const p = props();
   render(<ProjectActions {...p} />);
   fireEvent.click(
@@ -172,7 +170,7 @@ it("confirms and closes a running side chat, preserving the pending-write notice
   await screen.findByRole("dialog", { name: "关闭全部对话" });
   expect(mocks.closeSession).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole("button", { name: "关闭全部" }));
-  await screen.findByText(/side：本地会话已关闭，后台写入待确认/);
+  await waitFor(() => expect(p.close).toHaveBeenCalledOnce());
   expect(
     mocks.closeSession.mock.calls.map(([, action]) => [
       action.session_id,
@@ -182,9 +180,6 @@ it("confirms and closes a running side chat, preserving the pending-write notice
     ["main", false],
     ["side", false],
   ]);
-  expect(p.close).not.toHaveBeenCalled();
-  fireEvent.click(screen.getByRole("button", { name: "完成" }));
-  expect(p.close).toHaveBeenCalledOnce();
 });
 
 it("edits a local project's name and source folder, supports clearing/re-adding the folder, and routes bottom-left remove back to edit on cancel", async () => {

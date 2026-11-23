@@ -3,6 +3,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useId,
   useLayoutEffect,
   useMemo,
@@ -13,14 +14,45 @@ import {
   type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
-import { ChevronLeft, ChevronRight, X } from "lucide-react";
+import {
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  Download,
+  X,
+} from "lucide-react";
 import { Modal } from "./Modal";
+import { message } from "./api";
+import { copyImageBytes, saveImageBytes } from "./clipboard";
+
+export type ImagePayload = {
+  bytes: Uint8Array;
+  mime: string;
+};
+
+function sameImagePayload(a?: ImagePayload, b?: ImagePayload): boolean {
+  if (a === b) return true;
+  if (
+    !a ||
+    !b ||
+    a.mime !== b.mime ||
+    a.bytes.byteLength !== b.bytes.byteLength
+  )
+    return false;
+  if (a.bytes === b.bytes) return true;
+  for (let index = 0; index < a.bytes.byteLength; index++) {
+    if (a.bytes[index] !== b.bytes[index]) return false;
+  }
+  return true;
+}
 
 type Entry = {
   id: string;
   trigger: RefObject<HTMLElement | null>;
   name: string;
   title?: string;
+  payload?: ImagePayload;
   content: ReactNode;
 };
 type Gallery = {
@@ -60,6 +92,31 @@ function ImageDialog({
   const stage = useRef<HTMLDivElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
   const stageFocus = useRef<HTMLElement | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState("");
+  const previousResource = useRef<{ id: string; payload?: ImagePayload }>({
+    id: entry.id,
+    payload: entry.payload,
+  });
+  const actionToken = useRef(0);
+  useEffect(() => {
+    if (
+      previousResource.current.id === entry.id &&
+      sameImagePayload(previousResource.current.payload, entry.payload)
+    )
+      return;
+    previousResource.current = { id: entry.id, payload: entry.payload };
+    actionToken.current += 1;
+    setCopied(false);
+    setBusy(false);
+    setActionError("");
+  }, [entry.id, entry.payload]);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 1800);
+    return () => clearTimeout(timer);
+  }, [copied]);
   useLayoutEffect(() => {
     // Async reads can also replace a focused retry button without navigation.
     if (stageFocus.current && !stageFocus.current.isConnected) {
@@ -77,6 +134,7 @@ function ImageDialog({
   };
   const previous = index > 0;
   const next = index < count - 1;
+  const payload = entry.payload;
   return createPortal(
     <div
       className="modal-backdrop attachment-image-backdrop"
@@ -109,16 +167,73 @@ function ImageDialog({
       >
         <header>
           <span title={entry.title}>{entry.name}</span>
-          <button
-            type="button"
-            className="icon-button"
-            aria-label="关闭图片预览"
-            ref={closeButton}
-            onClick={close}
-          >
-            <X size={18} />
-          </button>
+          <div className="attachment-image-actions">
+            <button
+              type="button"
+              className="icon-button"
+              aria-label={copied ? "已复制" : "复制图片"}
+              title={copied ? "已复制到剪贴板" : "复制图片"}
+              disabled={!payload || busy}
+              onClick={() => {
+                if (!payload || busy) return;
+                const token = (actionToken.current += 1);
+                setBusy(true);
+                setActionError("");
+                void copyImageBytes(payload.bytes, payload.mime)
+                  .then(() => {
+                    if (actionToken.current === token) setCopied(true);
+                  })
+                  .catch((cause) => {
+                    if (actionToken.current === token)
+                      setActionError(`复制失败：${message(cause)}`);
+                  })
+                  .finally(() => {
+                    if (actionToken.current === token) setBusy(false);
+                  });
+              }}
+            >
+              {copied ? <Check size={16} /> : <Copy size={16} />}
+            </button>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="下载图片"
+              title="下载图片"
+              disabled={!payload || busy}
+              onClick={() => {
+                if (!payload || busy) return;
+                const token = (actionToken.current += 1);
+                setBusy(true);
+                setActionError("");
+                void saveImageBytes(entry.name, payload.bytes, payload.mime)
+                  .catch((cause) => {
+                    if (actionToken.current === token)
+                      setActionError(`下载失败：${message(cause)}`);
+                  })
+                  .finally(() => {
+                    if (actionToken.current === token) setBusy(false);
+                  });
+              }}
+            >
+              <Download size={16} />
+            </button>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="关闭图片预览"
+              title="关闭图片预览（Esc）"
+              ref={closeButton}
+              onClick={close}
+            >
+              <X size={18} />
+            </button>
+          </div>
         </header>
+        {actionError && (
+          <p className="attachment-image-action-error" role="alert">
+            {actionError}
+          </p>
+        )}
         <div
           className="attachment-image-stage"
           ref={stage}
@@ -300,16 +415,25 @@ export function ImagePreview({
   preview,
   name,
   title,
+  payload,
   children,
 }: {
   preview: ReturnType<typeof useImagePreview>;
   name: string;
   title?: string;
+  payload?: ImagePayload;
   children: ReactNode;
 }) {
   const { gallery, id, identity, active, open, trigger } = preview;
-  const entry = useRef<Entry>({ id, trigger, name, title, content: children });
-  entry.current = { id, trigger, name, title, content: children };
+  const entry = useRef<Entry>({
+    id,
+    trigger,
+    name,
+    title,
+    payload,
+    content: children,
+  });
+  entry.current = { id, trigger, name, title, payload, content: children };
   const register = gallery?.register;
   const update = gallery?.update;
   useLayoutEffect(() => {
@@ -317,7 +441,7 @@ export function ImagePreview({
   }, [register, id, identity, active]);
   useLayoutEffect(() => {
     if (active) update?.();
-  }, [update, active, name, title, children]);
+  }, [update, active, name, title, payload, children]);
   return !gallery && open ? (
     <ImageDialog entry={entry.current} close={preview.close} />
   ) : null;
