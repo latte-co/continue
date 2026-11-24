@@ -257,6 +257,7 @@ type SideChatComponentProps = {
   connected: boolean;
   supported: boolean;
   supportsInheritPermission?: boolean;
+  onStatusChange?: (status: Session["status"]) => void;
 };
 
 export function SideChat(props: SideChatComponentProps) {
@@ -277,8 +278,17 @@ function SideChatPane({
   connected,
   supported,
   supportsInheritPermission = true,
+  onStatusChange,
   draftKey: key,
 }: SideChatComponentProps & { draftKey: string }) {
+  const onStatusChangeRef = useRef(onStatusChange);
+  onStatusChangeRef.current = onStatusChange;
+  const lastPublishedStatus = useRef<Session["status"] | undefined>(undefined);
+  function publishLiveStatus(nextStatus: Session["status"]) {
+    if (lastPublishedStatus.current === nextStatus) return;
+    lastPublishedStatus.current = nextStatus;
+    onStatusChangeRef.current?.(nextStatus);
+  }
   const draft = useDraft(drafts, key);
   const knownServerId = serverId || undefined;
   const [initial] = useState(() =>
@@ -416,6 +426,7 @@ function SideChatPane({
       setAway(false);
       setTitleSettleExpired(false);
       setTurnSubmitted(false);
+      lastPublishedStatus.current = undefined;
       after.current = 0;
       eventsRef.current = [];
       setEvents([]);
@@ -573,6 +584,7 @@ function SideChatPane({
         }
         setSession(page.session);
         setReady(nextReady);
+        if (nextReady) publishLiveStatus(page.session.status);
         sideCache(drafts).set(key, {
           hostId,
           serverId: knownServerId,
@@ -730,6 +742,7 @@ function SideChatPane({
           throw new Error("操作结果待确认，请核对侧边聊天的记录");
         if (response.kind === "session") {
           setSession(response.session);
+          publishLiveStatus(response.session.status);
           sideCache(drafts).set(key, {
             hostId,
             serverId: knownServerId,
@@ -739,8 +752,9 @@ function SideChatPane({
             ready: effectiveReady,
           });
         }
-        if (action.method === "send" && !candidateTitle) {
-          setTurnSubmitted(true);
+        if (action.method === "send") {
+          publishLiveStatus("running");
+          if (!candidateTitle) setTurnSubmitted(true);
         }
         accepted?.();
         if (!effectiveSession) setReady(false);

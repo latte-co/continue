@@ -1116,6 +1116,58 @@ export function useWorkbench() {
     )
       setSessions((old) => old.map((s) => (s.id === value.id ? value : s)));
   }
+  function notifySideChatStatus(
+    targetHostId: string,
+    targetProjectId: string,
+    parentId: string,
+    sideStatus: Session["status"],
+  ) {
+    if (sideStatus === "running" || sideStatus === "waiting") {
+      const applyOptimistic = (s: Session): Session =>
+        s.id === parentId
+          ? {
+              ...s,
+              side_chat_status:
+                sideStatus === "running" || s.side_chat_status === "running"
+                  ? "running"
+                  : "waiting",
+            }
+          : s;
+      setPinCache((old) =>
+        old[targetHostId]
+          ? { ...old, [targetHostId]: old[targetHostId].map(applyOptimistic) }
+          : old,
+      );
+      if (
+        selection.current.hostId === targetHostId &&
+        selection.current.projectId === targetProjectId
+      ) {
+        setSessions((old) => old.map(applyOptimistic));
+      }
+      if (sideStatus === "running") return;
+    }
+    const connectionVersion = connectionVersions.current.get(targetHostId);
+    const server = hostHellos.current.get(targetHostId)?.server_id;
+    void request(targetHostId, {
+      method: "session",
+      session_id: parentId,
+    })
+      .then((result) => {
+        if (
+          result.kind !== "session" ||
+          !liveHosts.current.has(targetHostId) ||
+          connectionVersions.current.get(targetHostId) !== connectionVersion ||
+          currentHostConnectionVersions.current[targetHostId] !==
+            connectionVersion ||
+          hostHellos.current.get(targetHostId)?.server_id !== server
+        )
+          return;
+        updateSession(targetHostId, result.session);
+      })
+      .catch(() => {
+        /* Periodic session polling reconciles transient errors. */
+      });
+  }
   async function sessionAction(targetHostId: string, action: Request) {
     const result = await request(targetHostId, action);
     if (
@@ -1995,6 +2047,7 @@ export function useWorkbench() {
     movePinnedSession,
     openSession,
     openSideChatSession,
+    notifySideChatStatus,
     standaloneSideChat,
     closeStandaloneSideChat: () => setStandaloneSideChat(null),
     sessionAction,

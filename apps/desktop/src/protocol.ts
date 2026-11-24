@@ -56,6 +56,10 @@ export type Session = {
    */
   parent_session_id?: string;
   /**
+   * Highest-priority active side-chat status (`running` or `waiting`) for a parent session.
+   */
+  side_chat_status?: Status;
+  /**
    * Live server projection only; absent on older servers and in durable history.
    */
   agent_session_open?: boolean;

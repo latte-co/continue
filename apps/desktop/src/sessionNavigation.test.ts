@@ -198,10 +198,38 @@ it("does not restore live Agent session state from the persistent pinned cache",
   localStorage.setItem(
     "latte-work.pinned-sessions.v1",
     JSON.stringify({
-      local: [{ ...session("old"), agent_session_open: true }],
+      local: [
+        {
+          ...session("old"),
+          agent_session_open: true,
+          side_chat_status: "running",
+        },
+      ],
     }),
   );
   expect(readPinnedCache().local[0].agent_session_open).toBeUndefined();
+  expect(readPinnedCache().local[0].side_chat_status).toBeUndefined();
   expect(readPinnedCache().local[0].title).toBe("old");
   localStorage.clear();
+});
+
+it("clears stale recent side_chat_status when live session omits the field", () => {
+  const staleRecent: Session = {
+    ...session("s", null),
+    status: "completed",
+    side_chat_status: "running",
+  };
+  const liveSettled: Session = {
+    ...session("s", null),
+    status: "completed",
+  };
+  const rows = recentSessions(
+    { local: [{ session: staleRecent, updated_at: 10 }] },
+    [{ hostId: "local", id: "p", name: "Project", path: "/repo" }],
+    "local",
+    [liveSettled],
+    [],
+  );
+  expect(rows).toHaveLength(1);
+  expect(rows[0].side_chat_status).toBeUndefined();
 });

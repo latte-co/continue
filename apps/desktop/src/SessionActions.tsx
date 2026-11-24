@@ -17,7 +17,11 @@ import {
 import { message, request } from "./api";
 import type { Workbench } from "./useWorkbench";
 import type { HostedSession } from "./sessionNavigation";
-import { conversationMarkdown, loadConversation } from "./sessionNavigation";
+import {
+  conversationMarkdown,
+  hasActiveSideChat,
+  loadConversation,
+} from "./sessionNavigation";
 import {
   agentSessionLabels,
   type AgentSessionState,
@@ -73,6 +77,7 @@ export function SessionActions({
 
   const menuView = view === "menu" || view === "copy";
   const active = ["running", "waiting"].includes(session.status);
+  const sideActive = hasActiveSideChat(session);
   const canClose = agentState === "open";
   const previousView = useRef(view);
 
@@ -296,7 +301,7 @@ export function SessionActions({
             </MenuRow>
             <MenuRow
               role="menuitem"
-              disabled={busy || active}
+              disabled={busy || active || sideActive}
               leading={
                 session.archived ? (
                   <ArchiveRestore size={15} />
@@ -304,7 +309,13 @@ export function SessionActions({
                   <Archive size={15} />
                 )
               }
-              title={active ? "请先停止任务，再归档" : undefined}
+              title={
+                active
+                  ? "请先停止任务，再归档"
+                  : sideActive
+                    ? "侧边聊天仍在执行，请等待完成或停止后再归档"
+                    : undefined
+              }
               onClick={() =>
                 run({
                   method: "archive_session",

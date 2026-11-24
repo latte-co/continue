@@ -6,6 +6,23 @@ export type HostedSession = Session & { hostId: string };
 export function sessionKey(hostId: string, id: string) {
   return JSON.stringify([hostId, id]);
 }
+export function effectiveSessionActivityStatus(
+  session: Session,
+): Session["status"] {
+  if (session.status === "running" || session.side_chat_status === "running") {
+    return "running";
+  }
+  if (session.status === "waiting" || session.side_chat_status === "waiting") {
+    return "waiting";
+  }
+  return session.status;
+}
+export function hasActiveSideChat(session: Session): boolean {
+  return (
+    session.side_chat_status === "running" ||
+    session.side_chat_status === "waiting"
+  );
+}
 export function recentSessions(
   cache: Record<string, RecentSession[]>,
   projects: HostedProject[],
@@ -25,7 +42,16 @@ export function recentSessions(
   for (const [hostId, entries] of Object.entries(cache))
     for (const { session, updated_at } of entries) {
       const key = sessionKey(hostId, session.id);
-      const value = { ...session, ...live.get(key), hostId, updated_at };
+      const liveSession = live.get(key);
+      const value = liveSession
+        ? {
+            ...session,
+            ...liveSession,
+            side_chat_status: liveSession.side_chat_status,
+            hostId,
+            updated_at,
+          }
+        : { ...session, hostId, updated_at };
       if (
         !value.archived &&
         value.pinned_at === null &&
@@ -106,6 +132,7 @@ export function readPinnedCache(): Record<string, Session[]> {
           (rows as Session[]).map((session) => ({
             ...session,
             agent_session_open: undefined,
+            side_chat_status: undefined,
           })),
         ]),
     );

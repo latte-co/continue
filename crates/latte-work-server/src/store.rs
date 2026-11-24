@@ -760,6 +760,7 @@ impl Store {
             unread: false,
             archived: false,
             parent_session_id: None,
+            side_chat_status: None,
             agent_session_open: None,
             agent_session_busy: None,
             side_write_pending: None,
@@ -1844,10 +1845,36 @@ impl Store {
         tx.commit()?;
         self.session(session_id)
     }
+    pub fn active_side_chat_status(&self, parent_id: &str) -> Result<Option<Status>> {
+        let raw: Option<String> = self
+            .db
+            .query_row(
+                "SELECT json_extract(s.data, '$.status')
+                 FROM side_chats c
+                 JOIN sessions s ON s.id = c.session_id
+                 WHERE c.parent_id = ?1
+                   AND json_extract(s.data, '$.status') IN ('running', 'waiting')
+                 ORDER BY CASE json_extract(s.data, '$.status') WHEN 'running' THEN 0 ELSE 1 END
+                 LIMIT 1",
+                [parent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(match raw.as_deref() {
+            Some("running") => Some(Status::Running),
+            Some("waiting") => Some(Status::Waiting),
+            _ => None,
+        })
+    }
     pub fn project_session_recovery(&self, session: &mut Session) -> Result<()> {
         session.parent_session_id = self
             .side_parent(&session.id)?
             .map(|(parent_id, _)| parent_id);
+        session.side_chat_status = if session.parent_session_id.is_none() {
+            self.active_side_chat_status(&session.id)?
+        } else {
+            None
+        };
         session.side_write_pending = self.pending_side_write(&session.id)?;
         session.agent_close_pending = self
             .db
@@ -3424,6 +3451,67 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn parent_projection_summarizes_active_side_chats_with_running_priority_and_clears_after_restart()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let mut store = super::Store::open(&path).unwrap();
+        let project = store.add_project(directory.path()).unwrap();
+        let mut parent = store.create_session(project.id, "claude".into()).unwrap();
+        parent.native_id = Some("native-parent".into());
+        parent.status = super::Status::Completed;
+        store.save(&parent).unwrap();
+
+        let side_a_id = uuid::Uuid::new_v4().to_string();
+        let side_b_id = uuid::Uuid::new_v4().to_string();
+        let side_a = store.open_side_chat(&parent.id, Some(&side_a_id)).unwrap();
+        let side_b = store.open_side_chat(&parent.id, Some(&side_b_id)).unwrap();
+
+        let mut projected = store.session(&parent.id).unwrap();
+        store.project_session_recovery(&mut projected).unwrap();
+        assert_eq!(projected.side_chat_status, None);
+
+        store
+            .state(&side_a.id, super::Status::Waiting, None)
+            .unwrap();
+        let mut projected = store.session(&parent.id).unwrap();
+        store.project_session_recovery(&mut projected).unwrap();
+        assert_eq!(projected.side_chat_status, Some(super::Status::Waiting));
+
+        let mut projected_side = store.session(&side_a.id).unwrap();
+        store.project_session_recovery(&mut projected_side).unwrap();
+        assert_eq!(
+            projected_side.parent_session_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        assert_eq!(projected_side.side_chat_status, None);
+
+        store
+            .state(&side_b.id, super::Status::Running, None)
+            .unwrap();
+        let mut projected = store.session(&parent.id).unwrap();
+        store.project_session_recovery(&mut projected).unwrap();
+        assert_eq!(projected.side_chat_status, Some(super::Status::Running));
+
+        store
+            .state(&side_b.id, super::Status::Completed, None)
+            .unwrap();
+        let mut projected = store.session(&parent.id).unwrap();
+        store.project_session_recovery(&mut projected).unwrap();
+        assert_eq!(projected.side_chat_status, Some(super::Status::Waiting));
+
+        drop(store);
+        let reopened = super::Store::open(&path).unwrap();
+        assert_eq!(
+            reopened.session(&side_a.id).unwrap().status,
+            super::Status::Unknown
+        );
+        let mut projected = reopened.session(&parent.id).unwrap();
+        reopened.project_session_recovery(&mut projected).unwrap();
+        assert_eq!(projected.side_chat_status, None);
     }
 
     #[test]

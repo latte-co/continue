@@ -532,6 +532,14 @@ export default function App() {
                       supportsInheritPermission={
                         workbench.supportsSideChatInheritPermission
                       }
+                      onStatusChange={(sideStatus) =>
+                        workbench.notifySideChatStatus(
+                          hostId,
+                          session.project_id,
+                          session.id,
+                          sideStatus,
+                        )
+                      }
                     />
                   )
                 : undefined

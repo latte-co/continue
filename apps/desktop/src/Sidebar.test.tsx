@@ -1252,3 +1252,73 @@ it("places Skills directly below New task as a primary navigation entry", () => 
     screen.getByRole("button", { name: "Task" }).classList.contains("active"),
   ).toBe(false);
 });
+
+it("shows running and waiting indicators on conversations and collapsed folders when side chats execute", () => {
+  vi.useFakeTimers();
+  const sideRunning: Session = {
+    ...session("completed"),
+    side_chat_status: "running",
+  };
+  const base = state([sideRunning]);
+  base.sessionAction = vi.fn().mockResolvedValue(undefined);
+  const view = render(<Sidebar state={base} />);
+
+  const row = screen.getByRole("button", { name: "Task" });
+  const runningBadge = within(row).getByRole("img", { name: "执行中" });
+  expect(runningBadge.getAttribute("title")).toBe("侧边聊天执行中");
+
+  fireEvent.mouseEnter(row);
+  act(() => vi.advanceTimersByTime(350));
+  expect(
+    within(screen.getByRole("tooltip")).getByText(
+      "Local · 已完成 · 侧边聊天执行中",
+    ),
+  ).toBeTruthy();
+
+  const quickArchive = screen.getByRole("button", {
+    name: "归档 Task",
+  }) as HTMLButtonElement;
+  expect(quickArchive.disabled).toBe(true);
+  expect(quickArchive.title).toBe("侧边聊天仍在执行，请等待完成或停止后再归档");
+
+  fireEvent.click(screen.getByRole("button", { name: "Task 的更多操作" }));
+  expect(screen.queryByRole("menuitem", { name: "停止任务" })).toBeNull();
+  const menuArchive = screen.getByRole("menuitem", {
+    name: "归档",
+  }) as HTMLButtonElement;
+  expect(menuArchive.disabled).toBe(true);
+  expect(menuArchive.title).toBe("侧边聊天仍在执行，请等待完成或停止后再归档");
+  fireEvent.keyDown(document, { key: "Escape" });
+
+  const projectButton = screen.getByRole("button", { name: "Project" });
+  fireEvent.click(projectButton);
+  expect(
+    within(projectButton).getByRole("img", { name: "项目中有对话执行中" }),
+  ).toBeTruthy();
+
+  view.rerender(
+    <Sidebar
+      state={state([{ ...session("completed"), side_chat_status: "waiting" }])}
+    />,
+  );
+  expect(
+    within(projectButton).getByRole("img", { name: "项目中有对话等待确认" }),
+  ).toBeTruthy();
+  fireEvent.click(projectButton);
+  expect(
+    within(screen.getByRole("button", { name: "Task" })).getByRole("img", {
+      name: "等待确认",
+    }),
+  ).toBeTruthy();
+
+  view.rerender(<Sidebar state={state([session("completed")])} />);
+  expect(
+    within(screen.getByRole("button", { name: "Task" })).queryByRole("img", {
+      name: "执行中",
+    }),
+  ).toBeNull();
+  expect(
+    (screen.getByRole("button", { name: "归档 Task" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(false);
+});

@@ -76,6 +76,10 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub parent_session_id: Option<String>,
+    /// Highest-priority active side-chat status (`running` or `waiting`) for a parent session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub side_chat_status: Option<Status>,
     /// Live server projection only; absent on older servers and in durable history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -1700,13 +1704,16 @@ mod session_projection_compatibility {
     use super::*;
     #[test]
     fn old_sessions_have_no_live_state_and_do_not_persist_it() {
-        let session: Session = serde_json::from_str(r#"{"id":"s","project_id":"p","title":"old","agent":"claude","native_id":"old-native","status":"completed","created_at":1}"#).unwrap();
+        let mut session: Session = serde_json::from_str(r#"{"id":"s","project_id":"p","title":"old","agent":"claude","native_id":"old-native","status":"completed","created_at":1}"#).unwrap();
         assert_eq!(session.agent_session_open, None);
-        assert!(
-            serde_json::to_value(&session)
-                .unwrap()
-                .get("agent_session_open")
-                .is_none()
-        );
+        assert_eq!(session.side_chat_status, None);
+        let encoded = serde_json::to_value(&session).unwrap();
+        assert!(encoded.get("agent_session_open").is_none());
+        assert!(encoded.get("side_chat_status").is_none());
+
+        session.side_chat_status = Some(Status::Running);
+        let round_trip: Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        assert_eq!(round_trip.side_chat_status, Some(Status::Running));
     }
 }
