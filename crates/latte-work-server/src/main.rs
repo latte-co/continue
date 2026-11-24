@@ -2119,10 +2119,16 @@ async fn dispatch_admitted(
                         scope,
                         base,
                         head,
+                        repo_path,
                     } => {
                         let project = db(&s.database, |d| d.project(&project_id))?;
-                        git_review::image_chunk(
+                        let repo_root = git_review::resolve_repository(
                             Path::new(&project.path),
+                            repo_path.as_deref(),
+                        )
+                        .await?;
+                        git_review::image_chunk(
+                            &repo_root,
                             scope,
                             base.as_deref(),
                             head.as_deref(),
@@ -2234,20 +2240,36 @@ async fn dispatch_admitted(
             let (entries, truncated) = files::changes(Path::new(&p.path)).await?;
             Response::Changes { entries, truncated }
         }
-        Request::GitInfo { project_id } => {
+        Request::GitRepositories { project_id } => {
+            let p = db(&s.database, |d| d.project(&project_id))?;
+            let (repositories, truncated) =
+                git_review::discover_repositories(Path::new(&p.path)).await?;
+            Response::GitRepositories {
+                repositories,
+                truncated,
+            }
+        }
+        Request::GitInfo {
+            project_id,
+            repo_path,
+        } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
             Response::GitInfo {
-                info: git_review::info(Path::new(&p.path)).await?,
+                info: git_review::info_for_project(Path::new(&p.path), repo_path.as_deref())
+                    .await?,
             }
         }
         Request::GitCommits {
             project_id,
             head,
             offset,
+            repo_path,
         } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
+            let repo_root =
+                git_review::resolve_repository(Path::new(&p.path), repo_path.as_deref()).await?;
             let (head, commits, has_more) =
-                git_review::commits(Path::new(&p.path), head.as_deref(), offset).await?;
+                git_review::commits(&repo_root, head.as_deref(), offset).await?;
             Response::GitCommits {
                 head,
                 commits,
@@ -2258,10 +2280,13 @@ async fn dispatch_admitted(
             project_id,
             scope,
             base,
+            repo_path,
         } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
+            let repo_root =
+                git_review::resolve_repository(Path::new(&p.path), repo_path.as_deref()).await?;
             Response::GitReview {
-                review: git_review::review(Path::new(&p.path), scope, base.as_deref()).await?,
+                review: git_review::review(&repo_root, scope, base.as_deref()).await?,
             }
         }
         Request::GitReviewDiff {
@@ -2271,10 +2296,13 @@ async fn dispatch_admitted(
             head,
             path,
             full_context,
+            repo_path,
         } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
+            let repo_root =
+                git_review::resolve_repository(Path::new(&p.path), repo_path.as_deref()).await?;
             let (text, truncated) = git_review::diff(
-                Path::new(&p.path),
+                &repo_root,
                 scope,
                 base.as_deref(),
                 head.as_deref(),

@@ -854,18 +854,30 @@ pub enum Request {
     Changes {
         project_id: String,
     },
+    GitRepositories {
+        project_id: String,
+    },
     GitInfo {
         project_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        repo_path: Option<String>,
     },
     GitCommits {
         project_id: String,
         head: Option<String>,
         offset: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        repo_path: Option<String>,
     },
     GitReview {
         project_id: String,
         scope: GitReviewScope,
         base: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        repo_path: Option<String>,
     },
     GitReviewDiff {
         project_id: String,
@@ -874,6 +886,9 @@ pub enum Request {
         head: Option<String>,
         path: String,
         full_context: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        repo_path: Option<String>,
     },
     ChangeSummary {
         project_id: String,
@@ -987,6 +1002,9 @@ pub enum ChangePreviewTarget {
         scope: GitReviewScope,
         base: Option<String>,
         head: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        repo_path: Option<String>,
     },
     Task {
         session_id: String,
@@ -1067,6 +1085,20 @@ pub struct GitCommit {
     pub oid: String,
     pub subject: String,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum GitRepositoryKind {
+    Root,
+    Repository,
+    Submodule,
+    Worktree,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct GitRepository {
+    pub path: String,
+    pub name: String,
+    pub kind: GitRepositoryKind,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct GitInfo {
     pub branch: Option<String>,
@@ -1074,6 +1106,12 @@ pub struct GitInfo {
     pub default_base: Option<String>,
     pub refs: Vec<GitRef>,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub repositories: Option<Vec<GitRepository>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub repositories_truncated: Option<bool>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct GitReviewFile {
@@ -1233,6 +1271,10 @@ pub enum Response {
     },
     Changes {
         entries: Vec<GitChange>,
+        truncated: bool,
+    },
+    GitRepositories {
+        repositories: Vec<GitRepository>,
         truncated: bool,
     },
     GitInfo {
@@ -1571,6 +1613,62 @@ mod tests {
             serde_json::to_value(&minimal)
                 .unwrap()
                 .get("closed_terminal_ids")
+                .is_none()
+        );
+    }
+    #[test]
+    fn git_repository_selection_is_optional_for_legacy_peers_and_round_trips() {
+        let legacy_info_req: Request =
+            serde_json::from_value(serde_json::json!({"method":"git_info","project_id":"p"}))
+                .unwrap();
+        assert!(matches!(
+            &legacy_info_req,
+            Request::GitInfo {
+                project_id,
+                repo_path: None
+            } if project_id == "p"
+        ));
+        assert!(
+            serde_json::to_value(&legacy_info_req)
+                .unwrap()
+                .get("repo_path")
+                .is_none()
+        );
+
+        let scoped_review_req = Request::GitReview {
+            project_id: "p".into(),
+            scope: GitReviewScope::Branch,
+            base: None,
+            repo_path: Some("continue".into()),
+        };
+        let encoded = serde_json::to_value(&scoped_review_req).unwrap();
+        assert_eq!(encoded["repo_path"], "continue");
+        assert!(matches!(
+            serde_json::from_value::<Request>(encoded).unwrap(),
+            Request::GitReview {
+                repo_path: Some(path),
+                ..
+            } if path == "continue"
+        ));
+
+        let legacy_info_resp: Response = serde_json::from_value(serde_json::json!({
+            "kind":"git_info",
+            "info":{"branch":"main","head":null,"default_base":null,"refs":[],"truncated":false}
+        }))
+        .unwrap();
+        assert!(matches!(
+            &legacy_info_resp,
+            Response::GitInfo {
+                info: GitInfo {
+                    repositories: None,
+                    repositories_truncated: None,
+                    ..
+                }
+            }
+        ));
+        assert!(
+            serde_json::to_value(&legacy_info_resp).unwrap()["info"]
+                .get("repositories")
                 .is_none()
         );
     }

@@ -46,6 +46,7 @@ pub fn lane(request: &Request) -> Lane {
         | Request::Changes { .. }
         | Request::ChangeDiff { .. }
         | Request::LastTurnChanges { .. }
+        | Request::GitRepositories { .. }
         | Request::GitInfo { .. }
         | Request::GitCommits { .. }
         | Request::GitReview { .. }

@@ -8,6 +8,13 @@ import { subagentCounts } from "./SubagentsPanel";
 import { useStatusIssues } from "./statusNotices";
 import { DiffStat, IconButton } from "./ui";
 import { SideChatHistory, type SideChatHistoryProps } from "./SideChatHistory";
+import {
+  isEmptyRepositoryReviewError,
+  isNotGitRepositoryError,
+  normalizeGitRepoPath,
+  readGitRepositories,
+  useSelectedGitRepository,
+} from "./gitRepositories";
 
 export function TaskOverview({
   hostId,
@@ -31,12 +38,16 @@ export function TaskOverview({
   const [open, setOpen] = useState(false);
   const trigger = useRef<HTMLButtonElement>(null);
   const popup = useRef<HTMLDivElement>(null);
+  const [selectedRepo] = useSelectedGitRepository(hostId, project);
   const [changes, setChanges] = useState<{
     count?: number;
     added?: number;
     removed?: number;
     binary?: number;
     truncated?: boolean;
+    nonGit?: boolean;
+    repoLabel?: string;
+    repoCount?: number;
     error?: string;
   }>({});
   useStatusIssues([
@@ -49,6 +60,8 @@ export function TaskOverview({
         connected &&
         !!project &&
         changes.count === undefined &&
+        !changes.nonGit &&
+        !changes.repoCount &&
         !changes.error,
       action: {
         label: "查看变更",
@@ -64,16 +77,19 @@ export function TaskOverview({
     if (!open) return;
     let disposed = false;
     setChanges({});
-    if (connected && project)
-      void request(hostId, {
-        method: "git_review",
-        project_id: project.id,
-        scope: "branch",
-        base: null,
-      })
-        .then((response) => {
+    if (connected && project) {
+      const repoArg = normalizeGitRepoPath(selectedRepo);
+      void (async () => {
+        try {
+          const response = await request(hostId, {
+            method: "git_review",
+            project_id: project.id,
+            scope: "branch",
+            base: null,
+            ...(repoArg ? { repo_path: repoArg } : {}),
+          });
           if (response.kind !== "git_review") throw new Error("无法读取变更");
-          if (!disposed)
+          if (!disposed) {
             setChanges({
               count: response.review.entries.length,
               added: response.review.added,
@@ -81,11 +97,66 @@ export function TaskOverview({
               binary: response.review.entries.filter((entry) => entry.binary)
                 .length,
               truncated: response.review.truncated,
+              repoLabel: repoArg,
             });
-        })
-        .catch((cause) => {
-          if (!disposed) setChanges({ error: message(cause) });
-        });
+          }
+        } catch (cause) {
+          if (!isNotGitRepositoryError(cause)) {
+            if (!disposed) setChanges({ error: message(cause) });
+            return;
+          }
+          const { repositories } = await readGitRepositories(
+            hostId,
+            project.id,
+          );
+          if (disposed) return;
+          if (!repositories.length) {
+            setChanges({ nonGit: true });
+            return;
+          }
+          const chosen =
+            repositories.find((repo) => repo.path === selectedRepo) ??
+            repositories[0];
+          const fallbackArg = normalizeGitRepoPath(chosen.path);
+          try {
+            const response = await request(hostId, {
+              method: "git_review",
+              project_id: project.id,
+              scope: "branch",
+              base: null,
+              ...(fallbackArg ? { repo_path: fallbackArg } : {}),
+            });
+            if (response.kind !== "git_review") throw new Error("无法读取变更");
+            if (!disposed) {
+              setChanges({
+                count: response.review.entries.length,
+                added: response.review.added,
+                removed: response.review.removed,
+                binary: response.review.entries.filter((entry) => entry.binary)
+                  .length,
+                truncated: response.review.truncated,
+                repoLabel: chosen.path !== "." ? chosen.name : undefined,
+                repoCount: repositories.length,
+              });
+            }
+          } catch (childCause) {
+            if (!disposed) {
+              if (
+                isNotGitRepositoryError(childCause) ||
+                isEmptyRepositoryReviewError(childCause)
+              ) {
+                setChanges({
+                  repoLabel: chosen.path !== "." ? chosen.name : undefined,
+                  repoCount: repositories.length,
+                });
+              } else {
+                setChanges({ error: message(childCause) });
+              }
+            }
+          }
+        }
+      })();
+    }
     popup.current
       ?.querySelector<HTMLButtonElement>("button:not(:disabled)")
       ?.focus();
@@ -135,7 +206,7 @@ export function TaskOverview({
       window.removeEventListener("keydown", keyboard, true);
       window.removeEventListener("resize", close);
     };
-  }, [open, hostId, project?.id, connected]);
+  }, [open, hostId, project?.id, project?.path, selectedRepo, connected]);
   const counts = subagentCounts(subagents.tasks);
   const choose = (action: () => void) => {
     close();
@@ -207,9 +278,13 @@ export function TaskOverview({
               <span>
                 {!connected || changes.error
                   ? "—"
-                  : changes.count === undefined
-                    ? "读取中…"
-                    : `${changes.count} 个文件${changes.truncated ? " · 部分记录" : ""}`}
+                  : changes.nonGit
+                    ? "此项目无 Git 分支信息"
+                    : changes.count === undefined
+                      ? changes.repoCount
+                        ? `${changes.repoCount} 个 Git 仓库`
+                        : "读取中…"
+                      : `${changes.count} 个文件${changes.truncated ? " · 部分记录" : ""}`}
               </span>
             </button>
             {changes.count !== undefined && !changes.error && (
@@ -219,7 +294,10 @@ export function TaskOverview({
                   removed={changes.removed ?? 0}
                 />
                 <small>
-                  分支
+                  {changes.repoLabel ? `${changes.repoLabel} · 分支` : "分支"}
+                  {changes.repoCount && changes.repoCount > 1
+                    ? ` · 共 ${changes.repoCount} 个仓库`
+                    : ""}
                   {changes.binary ? " · 含二进制变更" : ""}
                 </small>
               </div>

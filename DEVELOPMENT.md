@@ -901,8 +901,10 @@ on each token, and Markdown fences are stripped in a linear line scan. TodoWrite
 replaces its own snapshot while retaining TaskCreate records. Branch reviews are
 read on opening, settlement and explicit refresh, independent of streamed tool
 activity. Confirmed non-Git directories return `not_git_repository` through the
-existing error envelope; Task Summary shows a disabled branch row without a status
-alert or invented zero totals. Resources, tools and non-Git turn snapshots remain
+existing error envelope; Task Overview, Task Summary and Changes stay silent without a status
+alert or invented zero totals, and bounded `git_repositories` discovery lets umbrella workspaces
+inspect contained child repositories, initialized submodules and `.worktree` / `.oh-my-code/worktree`
+linked worktrees via optional `repo_path`. Resources, tools and non-Git turn snapshots remain
 available. Other Git failures stay actionable, including incomplete `.git` markers.
 The desktop retains Server error codes; older remote Servers must update to provide
 this distinction. The lightweight source inventory refreshes at most once every

@@ -34,6 +34,8 @@ fn main() {
         ToolOutputBlock::decl(),
         GitChange::decl(),
         GitReviewScope::decl(),
+        GitRepositoryKind::decl(),
+        GitRepository::decl(),
         GitRef::decl(),
         GitCommit::decl(),
         GitInfo::decl(),

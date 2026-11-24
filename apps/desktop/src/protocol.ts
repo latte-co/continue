@@ -196,6 +196,7 @@ export type ChangePreviewTarget =
       scope: GitReviewScope;
       base: string | null;
       head: string | null;
+      repo_path?: string;
     }
   | { kind: "task"; session_id: string }
   | { kind: "turn"; session_id: string; request_id: string };
@@ -222,6 +223,13 @@ export type GitChange = {
 };
 export type GitReviewScope =
   "branch" | "commit" | "worktree" | "unstaged" | "staged";
+export type GitRepositoryKind =
+  "root" | "repository" | "submodule" | "worktree";
+export type GitRepository = {
+  path: string;
+  name: string;
+  kind: GitRepositoryKind;
+};
 export type GitRef = { name: string; full_name: string };
 export type GitCommit = { oid: string; subject: string };
 export type GitInfo = {
@@ -230,6 +238,8 @@ export type GitInfo = {
   default_base: string | null;
   refs: Array<GitRef>;
   truncated: boolean;
+  repositories?: Array<GitRepository>;
+  repositories_truncated?: boolean;
 };
 export type GitReviewFile = {
   path: string;
@@ -611,18 +621,21 @@ export type Request =
   | { method: "read_file"; project_id: string; path: string }
   | { method: "diff"; project_id: string }
   | { method: "changes"; project_id: string }
-  | { method: "git_info"; project_id: string }
+  | { method: "git_repositories"; project_id: string }
+  | { method: "git_info"; project_id: string; repo_path?: string }
   | {
       method: "git_commits";
       project_id: string;
       head: string | null;
       offset: number;
+      repo_path?: string;
     }
   | {
       method: "git_review";
       project_id: string;
       scope: GitReviewScope;
       base: string | null;
+      repo_path?: string;
     }
   | {
       method: "git_review_diff";
@@ -632,6 +645,7 @@ export type Request =
       head: string | null;
       path: string;
       full_context: boolean;
+      repo_path?: string;
     }
   | {
       method: "change_summary";
@@ -762,6 +776,11 @@ export type Response =
       source: string;
     }
   | { kind: "changes"; entries: Array<GitChange>; truncated: boolean }
+  | {
+      kind: "git_repositories";
+      repositories: Array<GitRepository>;
+      truncated: boolean;
+    }
   | { kind: "git_info"; info: GitInfo }
   | {
       kind: "git_commits";

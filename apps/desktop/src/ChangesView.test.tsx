@@ -10,6 +10,7 @@ import {
 import { renderWithStatus as render } from "./test/renderWithStatus";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ChangesView } from "./ChangesView";
+import { clearSelectedGitRepositoriesForTests } from "./gitRepositories";
 import type { Request, TurnChanges } from "./protocol";
 const mocks = vi.hoisted(() => ({ request: vi.fn() }));
 vi.mock("./api", () => ({ request: mocks.request, message: String }));
@@ -55,6 +56,7 @@ const review = {
 };
 beforeEach(() => {
   vi.clearAllMocks();
+  clearSelectedGitRepositoriesForTests();
   HTMLElement.prototype.scrollIntoView = vi.fn();
   mocks.request.mockImplementation(async (_host: string, req: Request) =>
     req.method === "git_info"
@@ -819,5 +821,188 @@ it("resets commit scope to branch review instead of dereferencing an empty commi
     project_id: "p",
     scope: "branch",
     base: info.default_base,
+  });
+});
+
+it("stays silent on pure non-Git folders and falls back to task snapshot when a session is active", async () => {
+  const nonGitError = Object.assign(new Error("此项目无 Git 分支信息"), {
+    code: "not_git_repository",
+  });
+  mocks.request.mockImplementation(async (_host: string, req: Request) => {
+    if (req.method === "git_info") throw nonGitError;
+    if (req.method === "git_repositories")
+      return { kind: "git_repositories", repositories: [], truncated: false };
+    if (req.method === "change_summary")
+      return {
+        kind: "change_summary",
+        summary: {
+          entries: [{ path: "notes.md", status: "M", added: 4, removed: 0 }],
+          added: 4,
+          removed: 0,
+          binary_files: 0,
+          truncated: false,
+          baseline_at: 1,
+          unavailable: null,
+        },
+      };
+    if (req.method === "task_change_diff")
+      return {
+        kind: "content",
+        text: "@@ -0,0 +1,4 @@\n+line\n",
+        truncated: false,
+      };
+    throw new Error(`unexpected ${req.method}`);
+  });
+
+  const draftView = render(
+    <ChangesView
+      hostId="local"
+      project={{ id: "plain", name: "Plain", path: "/plain" }}
+      active
+    />,
+  );
+  await screen.findByText("此项目及子目录未发现 Git 仓库");
+  expect(screen.getByRole("button", { name: "状态提示" })).toBeTruthy();
+  draftView.unmount();
+
+  render(
+    <ChangesView
+      hostId="local"
+      project={{ id: "plain", name: "Plain", path: "/plain" }}
+      sessionId="s-plain"
+      active
+    />,
+  );
+  await screen.findByText("+line");
+  expect(screen.getByRole("combobox", { name: "变更范围" }).textContent).toBe(
+    "任务净变更",
+  );
+  expect(screen.getByRole("button", { name: "状态提示" })).toBeTruthy();
+});
+
+it("discovers child repositories, submodules and worktrees and switches repo_path across Git scopes", async () => {
+  const nonGitError = Object.assign(new Error("此项目无 Git 分支信息"), {
+    code: "not_git_repository",
+  });
+  const commit = { oid: "d".repeat(40), subject: "Worktree commit" };
+  mocks.request.mockImplementation(async (_host: string, req: Request) => {
+    if (req.method === "git_info" && !req.repo_path) throw nonGitError;
+    if (req.method === "git_repositories")
+      return {
+        kind: "git_repositories",
+        repositories: [
+          { path: "continue", name: "continue", kind: "repository" },
+          {
+            path: "continue/vendor/sub",
+            name: "continue/vendor/sub",
+            kind: "submodule",
+          },
+          {
+            path: ".oh-my-code/worktree/continue/fix-ux",
+            name: "continue/fix-ux",
+            kind: "worktree",
+          },
+        ],
+        truncated: false,
+      };
+    if (req.method === "git_info")
+      return {
+        kind: "git_info",
+        info: {
+          ...info,
+          branch:
+            req.repo_path === ".oh-my-code/worktree/continue/fix-ux"
+              ? "fix/ux"
+              : "main",
+        },
+      };
+    if (req.method === "git_commits")
+      return {
+        kind: "git_commits",
+        head: commit.oid,
+        commits: [commit],
+        has_more: false,
+      };
+    if (req.method === "git_review")
+      return {
+        kind: "git_review",
+        review: {
+          ...review,
+          entries: [
+            {
+              path:
+                req.repo_path === ".oh-my-code/worktree/continue/fix-ux"
+                  ? "SideChat.tsx"
+                  : "App.tsx",
+              previous_path: null,
+              status: "M",
+              added: 5,
+              removed: 1,
+              binary: false,
+              untracked: false,
+            },
+          ],
+        },
+      };
+    if (req.method === "git_review_diff")
+      return {
+        kind: "content",
+        text: `@@ -1 +1 @@\n-old\n+${req.repo_path}:${req.path}\n`,
+        truncated: false,
+      };
+    throw new Error(`unexpected ${req.method}`);
+  });
+
+  render(
+    <ChangesView
+      hostId="local"
+      project={{ id: "umbrella", name: "latte-co", path: "/latte-co" }}
+      active
+    />,
+  );
+  await screen.findByText(
+    (_, element) =>
+      element?.tagName === "CODE" &&
+      element.textContent === "+continue:App.tsx",
+  );
+  expect(screen.getByRole("button", { name: "状态提示" })).toBeTruthy();
+
+  const repoTrigger = screen.getByRole("combobox", { name: "Git 仓库" });
+  expect(repoTrigger.textContent).toContain("continue");
+  fireEvent.click(repoTrigger);
+  expect(screen.getByText("子模块")).toBeTruthy();
+  expect(
+    screen.getByText("工作树 · .oh-my-code/worktree/continue/fix-ux"),
+  ).toBeTruthy();
+  fireEvent.click(screen.getByRole("option", { name: /continue\/fix-ux/ }));
+
+  await screen.findByText(
+    (_, element) =>
+      element?.tagName === "CODE" &&
+      element.textContent ===
+        "+.oh-my-code/worktree/continue/fix-ux:SideChat.tsx",
+  );
+  expect(screen.getByText("fix/ux")).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("combobox", { name: "变更范围" }));
+  fireEvent.click(screen.getByRole("option", { name: "已提交" }));
+  fireEvent.click(
+    await screen.findByRole("option", { name: /Worktree commit/ }),
+  );
+  await waitFor(() =>
+    expect(mocks.request).toHaveBeenCalledWith("local", {
+      method: "git_commits",
+      project_id: "umbrella",
+      repo_path: ".oh-my-code/worktree/continue/fix-ux",
+      head: null,
+      offset: 0,
+    }),
+  );
+  expect(mocks.request).toHaveBeenCalledWith("local", {
+    method: "git_review",
+    project_id: "umbrella",
+    scope: "commit",
+    base: commit.oid,
+    repo_path: ".oh-my-code/worktree/continue/fix-ux",
   });
 });

@@ -1,16 +1,15 @@
 // @vitest-environment jsdom
-import {
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { renderWithStatus as render } from "./test/renderWithStatus";
 import { afterEach, expect, it, vi } from "vitest";
 import { TaskOverview } from "./TaskOverview";
+import { clearSelectedGitRepositoriesForTests } from "./gitRepositories";
 const mocks = vi.hoisted(() => ({ request: vi.fn() }));
 vi.mock("./api", () => ({ request: mocks.request, message: String }));
-afterEach(cleanup);
+afterEach(() => {
+  clearSelectedGitRepositoriesForTests();
+  cleanup();
+});
 const project = { id: "p", name: "Project", path: "/project" };
 const state = {
   tasks: [
@@ -201,4 +200,76 @@ it("opens a historical side chat from the main conversation overview", async () 
   fireEvent.click(entry);
   expect(openSideChat).toHaveBeenCalledWith("old");
   expect(screen.queryByRole("dialog")).toBeNull();
+});
+
+it("stays silent on non-Git projects and summarizes child repositories when present", async () => {
+  const nonGitError = Object.assign(new Error("此项目无 Git 分支信息"), {
+    code: "not_git_repository",
+  });
+  mocks.request.mockImplementation(async (_host, req) => {
+    if (req.method === "git_review") throw nonGitError;
+    if (req.method === "git_repositories")
+      return { kind: "git_repositories", repositories: [], truncated: false };
+    throw new Error(`unexpected ${req.method}`);
+  });
+  const view = render(
+    <TaskOverview
+      hostId="local"
+      project={project}
+      connected
+      subagents={state}
+      openChanges={vi.fn()}
+      openSubagents={vi.fn()}
+      openInfo={vi.fn()}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "任务概览" }));
+  await screen.findByText("此项目无 Git 分支信息");
+  // StatusCenter stays quiet (no badge count in aria-label).
+  expect(screen.getByRole("button", { name: "状态提示" })).toBeTruthy();
+
+  // Umbrella workspace with child repositories shows child branch stats without alerts.
+  mocks.request.mockImplementation(async (_host, req) => {
+    if (req.method === "git_review" && !req.repo_path) throw nonGitError;
+    if (req.method === "git_repositories")
+      return {
+        kind: "git_repositories",
+        repositories: [
+          { path: "continue", name: "continue", kind: "repository" },
+          {
+            path: ".oh-my-code/worktree/continue/fix",
+            name: "continue/fix",
+            kind: "worktree",
+          },
+        ],
+        truncated: false,
+      };
+    if (req.method === "git_review" && req.repo_path === "continue")
+      return {
+        kind: "git_review",
+        review: {
+          entries: [{ path: "src/App.tsx", binary: false }],
+          added: 9,
+          removed: 2,
+          truncated: false,
+        },
+      };
+    throw new Error(`unexpected ${JSON.stringify(req)}`);
+  });
+  view.rerender(
+    <TaskOverview
+      hostId="local"
+      project={{ id: "umbrella", name: "latte-co", path: "/latte-co" }}
+      connected
+      subagents={state}
+      openChanges={vi.fn()}
+      openSubagents={vi.fn()}
+      openInfo={vi.fn()}
+    />,
+  );
+  await screen.findByText("1 个文件");
+  expect(screen.getByText("+9")).toBeTruthy();
+  expect(screen.getByText("-2")).toBeTruthy();
+  expect(screen.getByText("continue · 分支 · 共 2 个仓库")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "状态提示" })).toBeTruthy();
 });

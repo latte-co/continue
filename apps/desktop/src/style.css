@@ -6048,6 +6048,18 @@ button.task-info-row:not(:disabled):hover,
   box-shadow: none;
   background: transparent;
 }
+.git-review-repo-select .select-trigger {
+  max-width: 220px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-hover);
+  font-size: var(--text-sm);
+}
+.git-review-repo-select .select-trigger > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .git-review-comparison .select-trigger > span {
   overflow: hidden;
   text-overflow: ellipsis;

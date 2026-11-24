@@ -6135,6 +6135,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
         &mut client,
         Request::GitInfo {
             project_id: project.id.clone(),
+            repo_path: None,
         },
     )
     .await
@@ -6152,6 +6153,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
             project_id: project.id.clone(),
             scope: GitReviewScope::Branch,
             base: None,
+            repo_path: None,
         },
     )
     .await
@@ -6169,6 +6171,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
             project_id: project.id.clone(),
             head: None,
             offset: 0,
+            repo_path: None,
         },
     )
     .await
@@ -6184,6 +6187,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
             project_id: project.id.clone(),
             scope: GitReviewScope::Commit,
             base: Some(commits[0].oid.clone()),
+            repo_path: None,
         },
     )
     .await
@@ -6199,6 +6203,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
             project_id: project.id.clone(),
             scope: GitReviewScope::Commit,
             base: Some(commits[1].oid.clone()),
+            repo_path: None,
         },
     )
     .await
@@ -6207,7 +6212,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
     };
     assert!(root_commit.base.is_none());
     assert!(
-        matches!(ask(&mut client, Request::GitReviewDiff { project_id: project.id.clone(), scope: GitReviewScope::Commit, base: None, head: root_commit.head, path: "file.txt".into(), full_context: false }).await, Response::Content { text, .. } if text.contains("+original"))
+        matches!(ask(&mut client, Request::GitReviewDiff { project_id: project.id.clone(), scope: GitReviewScope::Commit, base: None, head: root_commit.head, path: "file.txt".into(), full_context: false, repo_path: None }).await, Response::Content { text, .. } if text.contains("+original"))
     );
     let mut reconnect = host.client().await;
     run(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
@@ -6218,6 +6223,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
         head: review.head.clone(),
         path: path.into(),
         full_context: false,
+        repo_path: None,
     };
     assert!(
         matches!(ask(&mut reconnect,request("file.txt")).await,Response::Content{text,truncated:false} if text.contains("+committed")&&!text.contains("+working"))
@@ -6232,6 +6238,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
             project_id: project.id.clone(),
             scope: GitReviewScope::Worktree,
             base: None,
+            repo_path: None,
         },
     )
     .await
@@ -6245,7 +6252,8 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
             Request::GitReview {
                 project_id: project.id,
                 scope: GitReviewScope::Branch,
-                base: Some("--output=/tmp/escape".into())
+                base: Some("--output=/tmp/escape".into()),
+                repo_path: None,
             }
         )
         .await,
@@ -8670,6 +8678,7 @@ async fn non_git_summary_error_is_typed_without_disabling_project_reads() {
                 project_id: project.id.clone(),
                 scope: GitReviewScope::Branch,
                 base: None,
+                repo_path: None,
             },
         )
         .await
@@ -8695,9 +8704,10 @@ async fn non_git_summary_error_is_typed_without_disabling_project_reads() {
     match ask(
         &mut client,
         Request::GitReview {
-            project_id: project.id,
+            project_id: project.id.clone(),
             scope: GitReviewScope::Branch,
             base: None,
+            repo_path: None,
         },
     )
     .await
@@ -8705,6 +8715,127 @@ async fn non_git_summary_error_is_typed_without_disabling_project_reads() {
         Response::Error { code, .. } => assert_eq!(code, "request_failed"),
         response => panic!("unexpected: {response:?}"),
     }
+
+    // Multi-repo non-Git umbrella directory exposes child repos and worktrees cleanly.
+    let umbrella = tempfile::tempdir().unwrap();
+    let child_repo = umbrella.path().join("continue");
+    std::fs::create_dir_all(&child_repo).unwrap();
+    let git = |cwd: &std::path::Path, args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    git(&child_repo, &["init", "-q", "-b", "main"]);
+    git(&child_repo, &["config", "user.name", "Fixture"]);
+    git(
+        &child_repo,
+        &["config", "user.email", "fixture@example.test"],
+    );
+    std::fs::write(child_repo.join("README.md"), "v1\n").unwrap();
+    git(&child_repo, &["add", "."]);
+    git(&child_repo, &["commit", "-qm", "init"]);
+    let wt_dir = umbrella
+        .path()
+        .join(".oh-my-code/worktree/continue/feat-branch");
+    std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
+    git(
+        &child_repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/branch",
+            wt_dir.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    std::fs::write(wt_dir.join("README.md"), "v2\n").unwrap();
+    git(&wt_dir, &["add", "."]);
+    git(&wt_dir, &["commit", "-qm", "feat change"]);
+
+    let Response::Project {
+        project: umbrella_project,
+    } = ask(
+        &mut client,
+        Request::AddProject {
+            path: umbrella.path().to_string_lossy().into(),
+            name: None,
+        },
+    )
+    .await
+    else {
+        panic!("umbrella project")
+    };
+    let Response::GitRepositories {
+        repositories,
+        truncated: false,
+    } = ask(
+        &mut client,
+        Request::GitRepositories {
+            project_id: umbrella_project.id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("expected git_repositories")
+    };
+    assert_eq!(repositories.len(), 2);
+    assert_eq!(repositories[0].path, "continue");
+    assert_eq!(
+        repositories[1].path,
+        ".oh-my-code/worktree/continue/feat-branch"
+    );
+
+    let wt_path = Some(".oh-my-code/worktree/continue/feat-branch".to_owned());
+    let Response::GitInfo { info: wt_info } = ask(
+        &mut client,
+        Request::GitInfo {
+            project_id: umbrella_project.id.clone(),
+            repo_path: wt_path.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("expected child git_info")
+    };
+    assert_eq!(wt_info.branch.as_deref(), Some("feat/branch"));
+
+    let Response::GitReview { review: wt_review } = ask(
+        &mut client,
+        Request::GitReview {
+            project_id: umbrella_project.id.clone(),
+            scope: GitReviewScope::Branch,
+            base: Some("refs/heads/main".into()),
+            repo_path: wt_path.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("expected child git_review")
+    };
+    assert_eq!((wt_review.added, wt_review.removed), (1, 1));
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::GitReviewDiff {
+                project_id: umbrella_project.id,
+                scope: GitReviewScope::Branch,
+                base: wt_review.base,
+                head: wt_review.head,
+                path: "README.md".into(),
+                full_context: false,
+                repo_path: wt_path,
+            },
+        )
+        .await,
+        Response::Content { text, .. } if text.contains("+v2")
+    ));
 }
 
 #[tokio::test]

@@ -4,12 +4,22 @@ import type {
   ChangeSummary,
   GitCommit,
   GitInfo,
+  GitRepository,
   GitReview,
   Project,
   TurnChanges,
 } from "./protocol";
 import { request, message } from "./api";
 import { ChangeScopePicker, type ReviewScope } from "./ChangeScopePicker";
+import {
+  formatGitRepositoryOption,
+  isNotGitRepositoryError,
+  matchRepositoryForPath,
+  normalizeGitRepoPath,
+  readGitRepositories,
+  stripRepositoryPrefix,
+  useSelectedGitRepository,
+} from "./gitRepositories";
 import { ReviewOptions } from "./ReviewOptions";
 import { ReviewWorkspace } from "./ReviewWorkspace";
 import { loadChangeImage } from "./changeImageLoader";
@@ -48,8 +58,35 @@ export function ChangesView({
 }) {
   const [info, setInfo] = useState<GitInfo>();
   const [scope, setScope] = useState<ReviewScope>(initialScope);
+  const userChoseScope = useRef(Boolean(requestId));
   const [base, setBase] = useState("");
   const [commit, setCommit] = useState<GitCommit>();
+  const [selectedRepo, setSelectedRepo] = useSelectedGitRepository(
+    hostId,
+    project,
+  );
+  const projectKey = JSON.stringify([hostId, project.id, project.path]);
+  const [discoveredRepos, setDiscoveredRepos] = useState<{
+    scopeKey: string;
+    list: GitRepository[];
+    truncated: boolean;
+    noGit: boolean;
+  }>();
+  const repositories =
+    discoveredRepos?.scopeKey === projectKey ? discoveredRepos.list : [];
+  const repositoriesTruncated =
+    discoveredRepos?.scopeKey === projectKey
+      ? discoveredRepos.truncated
+      : false;
+  const noGit =
+    discoveredRepos?.scopeKey === projectKey ? discoveredRepos.noGit : false;
+  const effectiveRepo =
+    selectedRepo &&
+    (!repositories.length ||
+      repositories.some((repo) => repo.path === selectedRepo))
+      ? selectedRepo
+      : repositories[0]?.path;
+  const repoArg = normalizeGitRepoPath(effectiveRepo);
   const gitMode = [
     "branch",
     "commit",
@@ -57,10 +94,14 @@ export function ChangesView({
     "unstaged",
     "staged",
   ].includes(scope);
+  const scopedInitialPath = gitMode
+    ? stripRepositoryPrefix(initialPath, effectiveRepo)
+    : initialPath;
   const context = JSON.stringify([
     hostId,
     project.id,
     project.path,
+    gitMode ? (repoArg ?? ".") : null,
     scope,
     gitMode ? null : sessionId,
     scope === "turn" ? requestId : null,
@@ -123,56 +164,144 @@ export function ChangesView({
   const selection = useRef(selected);
   selection.current = selected;
   useEffect(() => {
-    select(initialPath ?? "");
-  }, [initialPath]);
+    select(scopedInitialPath ?? "");
+  }, [scopedInitialPath]);
   useEffect(() => {
     infoContext.current = "";
+    userChoseScope.current = Boolean(requestId);
     setInfo(undefined);
     setBase("");
     setCommit(undefined);
     setScope((previous) => (previous === "commit" ? "branch" : previous));
     setSnapshot(undefined);
-    select(initialPath ?? "");
+    select(scopedInitialPath ?? "");
     setError("");
   }, [hostId, project.id, project.path]);
   useEffect(() => {
-    if (!active || !gitMode) return;
+    if (!active || !gitMode || noGit) return;
     setLoading(true);
     setError("");
     let disposed = false;
-    void request(hostId, { method: "git_info", project_id: project.id })
-      .then((response) => {
+    void (async () => {
+      try {
+        const response = await request(hostId, {
+          method: "git_info",
+          project_id: project.id,
+          ...(repoArg ? { repo_path: repoArg } : {}),
+        });
         if (response.kind !== "git_info")
           throw new Error("Server 不支持分支审阅，请更新后重试");
-        if (!disposed) {
-          infoContext.current = JSON.stringify([
-            hostId,
-            project.id,
-            project.path,
-          ]);
-          setInfo({ ...response.info });
-          setBase(
-            (previous) => previous || response.info.default_base || "HEAD",
-          );
+        if (disposed) return;
+        if (response.info.repositories?.length) {
+          const matched = !selectedRepo
+            ? matchRepositoryForPath(response.info.repositories, initialPath)
+            : undefined;
+          setDiscoveredRepos({
+            scopeKey: projectKey,
+            list: response.info.repositories,
+            truncated: Boolean(response.info.repositories_truncated),
+            noGit: false,
+          });
+          if (matched && matched.path !== ".") {
+            setSelectedRepo(matched.path);
+            return;
+          }
+        } else if (revision > 0 && repositories.length > 0 && repoArg) {
+          const latest = await readGitRepositories(hostId, project.id);
+          if (disposed) return;
+          if (latest.repositories.length) {
+            setDiscoveredRepos({
+              scopeKey: projectKey,
+              list: latest.repositories,
+              truncated: latest.truncated,
+              noGit: false,
+            });
+          }
         }
-      })
-      .catch((cause) => {
-        if (!disposed) {
+        infoContext.current = JSON.stringify([
+          hostId,
+          project.id,
+          project.path,
+          repoArg ?? ".",
+        ]);
+        setInfo({ ...response.info });
+        setBase((previous) => previous || response.info.default_base || "HEAD");
+      } catch (cause) {
+        if (disposed) return;
+        if (!isNotGitRepositoryError(cause)) {
           setError(message(cause));
           setLoading(false);
+          return;
         }
-      });
+        const discovered = await readGitRepositories(hostId, project.id);
+        if (disposed) return;
+        if (discovered.repositories.length > 0) {
+          const matched = matchRepositoryForPath(
+            discovered.repositories,
+            initialPath,
+          );
+          const chosen =
+            (selectedRepo &&
+            selectedRepo !== effectiveRepo &&
+            discovered.repositories.some((repo) => repo.path === selectedRepo)
+              ? discovered.repositories.find(
+                  (repo) => repo.path === selectedRepo,
+                )
+              : undefined) ??
+            matched ??
+            discovered.repositories[0];
+          setDiscoveredRepos({
+            scopeKey: projectKey,
+            list: discovered.repositories,
+            truncated: discovered.truncated,
+            noGit: false,
+          });
+          setInfo(undefined);
+          setBase("");
+          setCommit(undefined);
+          setSelectedRepo(chosen.path);
+          return;
+        }
+        setDiscoveredRepos({
+          scopeKey: projectKey,
+          list: [],
+          truncated: false,
+          noGit: true,
+        });
+        setInfo(undefined);
+        setLoading(false);
+        if (sessionId && !userChoseScope.current) {
+          setScope("task");
+        }
+      }
+    })();
     return () => {
       disposed = true;
     };
-  }, [active, hostId, project.id, project.path, revision, gitMode]);
+  }, [
+    active,
+    hostId,
+    project.id,
+    project.path,
+    projectKey,
+    repoArg,
+    noGit,
+    revision,
+    gitMode,
+  ]);
   useEffect(() => {
     if (
       !active ||
       (gitMode &&
-        (!info ||
+        (noGit ||
+          !info ||
           infoContext.current !==
-            JSON.stringify([hostId, project.id, project.path]) ||
+            JSON.stringify([
+              hostId,
+              project.id,
+              project.path,
+              repoArg ?? ".",
+            ]) ||
           (scope === "branch" && !base)))
     )
       return;
@@ -227,6 +356,7 @@ export function ChangesView({
                     : scope === "commit" && commit
                       ? commit.oid
                       : null,
+                ...(repoArg ? { repo_path: repoArg } : {}),
               },
     )
       .then((response) => {
@@ -289,7 +419,8 @@ export function ChangesView({
         }
       })
       .catch((cause) => {
-        if (!disposed) setError(message(cause));
+        if (!disposed && !isNotGitRepositoryError(cause))
+          setError(message(cause));
       })
       .finally(() => {
         if (!disposed) setLoading(false);
@@ -302,6 +433,8 @@ export function ChangesView({
     hostId,
     project.id,
     project.path,
+    repoArg,
+    noGit,
     scope,
     base,
     info,
@@ -343,6 +476,7 @@ export function ChangesView({
                 head: review!.head,
                 path,
                 full_context: fullContext,
+                ...(repoArg ? { repo_path: repoArg } : {}),
               },
       );
       if (response.kind !== "content") throw new Error("无法读取文件差异");
@@ -352,6 +486,7 @@ export function ChangesView({
       hostId,
       project.id,
       project.path,
+      repoArg,
       scope,
       snapshot,
       turn,
@@ -380,12 +515,13 @@ export function ChangesView({
                 >,
                 base: review!.base,
                 head: review!.head,
+                ...(repoArg ? { repo_path: repoArg } : {}),
               },
         path,
         before,
         valid,
       ),
-    [hostId, project.id, project.path, scope, snapshot, turn, review],
+    [hostId, project.id, project.path, repoArg, scope, snapshot, turn, review],
   );
   const options = info
     ? [
@@ -393,17 +529,48 @@ export function ChangesView({
         { value: "HEAD", label: "当前提交" },
       ]
     : [];
+  const showRepositoryPicker =
+    gitMode &&
+    (repositories.length > 1 ||
+      (repositories.length === 1 && repositories[0].path !== "."));
+  const repositoryOptions = repositories.map(formatGitRepositoryOption);
+  const repositoryControl = showRepositoryPicker ? (
+    <div className="git-review-repo-select">
+      <Select
+        label="Git 仓库"
+        compact
+        value={effectiveRepo ?? repositories[0].path}
+        options={repositoryOptions}
+        onChange={(nextRepo) => {
+          infoContext.current = "";
+          setInfo(undefined);
+          setBase("");
+          setCommit(undefined);
+          setScope((previous) => (previous === "commit" ? "branch" : previous));
+          setSnapshot(undefined);
+          setSelectedRepo(nextRepo);
+          select("");
+        }}
+        disabled={!active}
+        minMenuWidth={240}
+        searchable={repositories.length > 4}
+        searchPlaceholder="搜索仓库、子模块或工作树"
+      />
+    </div>
+  ) : null;
   const scopeControl = (
     <>
       <ChangeScopePicker
         hostId={hostId}
         projectId={project.id}
+        repoPath={repoArg}
         sessionId={sessionId}
         requestId={requestId}
         scope={scope}
         commit={commit}
         disabled={!active}
         choose={(value, commit) => {
+          userChoseScope.current = true;
           setScope(value);
           if (commit) setCommit(commit);
           select(value === "turn" ? (initialPath ?? "") : "");
@@ -420,9 +587,10 @@ export function ChangesView({
         sessionId,
         requestId,
       ])}
+      repositoryControl={repositoryControl}
       scopeControl={scopeControl}
       comparisonControl={
-        scope === "branch" ? (
+        scope === "branch" && !noGit ? (
           <div className="git-review-comparison">
             <span title={info?.head ?? ""}>
               {info?.branch ?? (info?.head ? "分离 HEAD" : "分支")}
@@ -447,21 +615,24 @@ export function ChangesView({
       removed={review?.removed ?? 0}
       active={active}
       initialPath={selected}
-      loading={loading || (gitMode && !info && !error)}
+      loading={loading || (gitMode && !noGit && !info && !error)}
       unavailable={error || undefined}
       emptyLabel={
-        scope === "lastTurn" && !turn
-          ? "当前对话尚无已保存的回合快照"
-          : !gitMode
-            ? summary?.truncated
-              ? "采集范围内没有已记录的文件变更"
-              : `${scope === "task" ? "本任务" : "本轮"}没有文件变更`
-            : "此范围没有变更"
+        gitMode && noGit
+          ? "此项目及子目录未发现 Git 仓库"
+          : scope === "lastTurn" && !turn
+            ? "当前对话尚无已保存的回合快照"
+            : !gitMode
+              ? summary?.truncated
+                ? "采集范围内没有已记录的文件变更"
+                : `${scope === "task" ? "本任务" : "本轮"}没有文件变更`
+              : "此范围没有变更"
       }
       loadDiff={loadDiff}
       loadImage={loadImage}
       refresh={() => {
         setFilePage(undefined);
+        if (noGit) setDiscoveredRepos(undefined);
         refresh((v) => v + 1);
       }}
       additionalActions={
@@ -569,6 +740,9 @@ export function ChangesView({
             <NoticeBanner tone="warning" className="panel-notice">
               分支列表仅显示部分结果。
             </NoticeBanner>
+          )}
+          {gitMode && repositoriesTruncated && (
+            <p className="panel-notice">子目录仓库列表仅显示部分结果。</p>
           )}
         </>
       }
