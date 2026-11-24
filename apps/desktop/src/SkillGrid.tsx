@@ -1,5 +1,7 @@
 import { Box, Check } from "lucide-react";
 import type { ManagedSkill, SkillScope, SkillState } from "./protocol";
+import { Badge, Button, EmptyState } from "./ui";
+
 export type GlobalSkillScope = Exclude<SkillScope, "project">;
 export const skillScopes: { value: GlobalSkillScope; label: string }[] = [
   { value: "platform", label: "平台内置" },
@@ -37,13 +39,14 @@ export function SkillGrid({
       <div className="skills-grid" aria-label={label}>
         {(expanded || query ? skills : skills.slice(0, 6)).map((skill) => (
           <button
+            type="button"
             key={skill.id}
             className="skills-row"
             disabled={disabled}
             onClick={(event) => onSelect(skill, event.currentTarget)}
           >
             <span className="skills-icon">
-              <Box size={22} />
+              <Box size={19} />
             </span>
             <span className="skills-row-copy">
               <span>{skill.name}</span>
@@ -57,27 +60,31 @@ export function SkillGrid({
               aria-label={skillStates[skill.state]}
             >
               {skill.state === "enabled" ? (
-                <Check size={17} />
+                <Check size={15} />
               ) : (
-                skillStates[skill.state]
+                <Badge>{skillStates[skill.state]}</Badge>
               )}
             </span>
           </button>
         ))}
       </div>
       {!skills.length && !loading && (
-        <p className="skills-empty">
-          {query ? "没有匹配的技能" : emptyMessage}
-        </p>
+        <EmptyState
+          icon={<Box size={18} />}
+          title={query ? "没有匹配的技能" : emptyMessage}
+        />
       )}
       {skills.length > 6 && !query && (
-        <button
-          className="skills-expand"
-          aria-expanded={expanded}
-          onClick={() => onExpand(!expanded)}
-        >
-          {expanded ? "收起" : `查看全部，另有 ${skills.length - 6} 项`}
-        </button>
+        <div style={{ marginTop: "var(--space-2)" }}>
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-expanded={expanded}
+            onClick={() => onExpand(!expanded)}
+          >
+            {expanded ? "收起" : `查看全部，另有 ${skills.length - 6} 项`}
+          </Button>
+        </div>
       )}
     </>
   );

@@ -4,7 +4,7 @@
   "light": {
     "accent": "#2563EB",
     "background": "#FFFFFF",
-    "foreground": "#222222",
+    "foreground": "#181818",
     "contrast": 50,
     "translucentSidebar": false,
     "uiFont": "system",
@@ -15,9 +15,9 @@
     "codeWeight": "400"
   },
   "dark": {
-    "accent": "#F1F1F1",
-    "background": "#111111",
-    "foreground": "#EEEEEE",
+    "accent": "#F2F2F2",
+    "background": "#181818",
+    "foreground": "#F2F2F2",
     "contrast": 50,
     "translucentSidebar": false,
     "uiFont": "system",

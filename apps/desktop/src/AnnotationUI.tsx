@@ -7,7 +7,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { ArrowUp, MessageSquareText, Pencil, Trash2, X } from "lucide-react";
-import { Modal } from "./Modal";
+import { isHiddenOrInert, Modal } from "./Modal";
 import { MessageContent } from "./MessageContent";
 import {
   annotationRange,
@@ -360,7 +360,7 @@ export function AnnotationSummary({
     setAnchor(null);
     setEditingId(null);
     queueMicrotask(() => {
-      if (trigger.current?.isConnected && !trigger.current.closest("[inert]"))
+      if (trigger.current?.isConnected && !isHiddenOrInert(trigger.current))
         trigger.current.focus();
     });
   };
@@ -721,7 +721,7 @@ export function AnnotatedMessage({
       if (
         document.activeElement === document.body &&
         body.current?.isConnected &&
-        !body.current.closest("[inert]")
+        !isHiddenOrInert(body.current)
       )
         body.current.focus({ preventScroll: true });
     });

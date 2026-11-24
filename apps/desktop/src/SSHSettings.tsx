@@ -1,9 +1,25 @@
-import { Modal } from "./Modal";
-import { useEffect, useState } from "react";
-import { FolderOpen, Globe2, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { useState } from "react";
+import { FolderOpen, Globe2, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { CopyButton } from "./MessageContent";
 import { chooseIdentityFile, message, type Host } from "./api";
 import type { Workbench } from "./useWorkbench";
+import {
+  Badge,
+  Button,
+  CardList,
+  ChoiceGroup,
+  Dialog,
+  Disclosure,
+  EmptyState,
+  Field,
+  IconButton,
+  InputGroup,
+  ItemRow,
+  NoticeBanner,
+  PageContainer,
+  PageHeader,
+  TextInput,
+} from "./ui";
 
 const setupCommands =
   'cargo build --release -p latte-work-server --locked\nmkdir -p "$HOME/.local/bin"\ninstall -m 755 target/release/latte-work-server "$HOME/.local/bin/latte-work-server"';
@@ -33,10 +49,10 @@ function draftFor(host?: Host): Draft {
   };
 }
 
-const authOptions: { id: Auth; label: string }[] = [
-  { id: "none", label: "默认身份验证" },
-  { id: "identity_file", label: "身份文件" },
-  { id: "password", label: "密码" },
+const authOptions: { value: Auth; label: string }[] = [
+  { value: "none", label: "默认身份验证" },
+  { value: "identity_file", label: "身份文件" },
+  { value: "password", label: "密码" },
 ];
 
 export function SSHSettings({
@@ -51,24 +67,11 @@ export function SSHSettings({
   const [workingHost, setWorkingHost] = useState("");
   const [error, setError] = useState("");
   const hosts = state.hosts.filter((host) => host.ssh);
-  useEffect(() => {
-    if (!draft) return;
-    const key = (event: KeyboardEvent) => {
-      if (
-        event.key === "Escape" &&
-        !busy &&
-        !document.querySelector(".ssh-password-modal")
-      ) {
-        event.stopImmediatePropagation();
-        setDraft(null);
-      }
-    };
-    window.addEventListener("keydown", key);
-    return () => window.removeEventListener("keydown", key);
-  }, [draft, busy]);
+
   function update(patch: Partial<Draft>) {
     setDraft((value) => value && { ...value, ...patch });
   }
+
   async function save(event: React.FormEvent) {
     event.preventDefault();
     if (!draft || busy) return;
@@ -117,6 +120,7 @@ export function SSHSettings({
       onBusy(false);
     }
   }
+
   async function remove(host: Host) {
     if (
       !window.confirm(
@@ -136,6 +140,7 @@ export function SSHSettings({
       onBusy(false);
     }
   }
+
   async function pickIdentityFile() {
     try {
       const path = await chooseIdentityFile();
@@ -144,28 +149,31 @@ export function SSHSettings({
       setError(message(cause));
     }
   }
+
+  const editingExisting = !!draft && hosts.some((host) => host.id === draft.id);
+
   return (
-    <div className="settings-panel-content ssh-settings">
-      <div className="ssh-settings-heading">
-        <div>
-          <h2>SSH 连接</h2>
-          <p>
-            管理远程项目使用的 SSH 主机。远程设备需先安装 Latte Work Server。
-          </p>
-        </div>
-        <button
-          className="primary ssh-add"
-          onClick={(event) => {
-            event.currentTarget.focus();
-            setError("");
-            setDraft(draftFor());
-          }}
-        >
-          <Plus size={16} /> 添加
-        </button>
-      </div>
-      <details className="settings-details ssh-setup">
-        <summary>准备远程设备</summary>
+    <PageContainer className="settings-panel-content ssh-settings">
+      <PageHeader
+        title="SSH 连接"
+        description="管理远程项目使用的 SSH 主机。远程设备需先安装 Latte Work Server。"
+        actions={
+          <Button
+            variant="primary"
+            size="md"
+            leading={<Plus size={15} />}
+            onClick={(event) => {
+              event.currentTarget.focus();
+              setError("");
+              setDraft(draftFor());
+            }}
+          >
+            添加
+          </Button>
+        }
+      />
+
+      <Disclosure title="准备远程设备" className="ssh-setup">
         <ol>
           <li>
             在终端运行 <code>ssh 你的主机</code>，核对并确认主机指纹。
@@ -191,255 +199,243 @@ export function SSHSettings({
           不可用时检查远端 CLI 登录和非交互 Shell 的
           PATH。升级前先结束任务并关闭终端。
         </p>
-      </details>
+      </Disclosure>
+
       {hosts.length ? (
-        <div className="ssh-host-list">
+        <CardList label="SSH 主机列表">
           {hosts.map((host) => {
             const status = state.hostErrors[host.id];
             const checked = Object.hasOwn(state.hostErrors, host.id);
+            const authLabel = authOptions.find(
+              (option) => option.value === (host.auth ?? "none"),
+            )?.label;
             return (
-              <div className="ssh-host-row" key={host.id}>
-                <Globe2 size={18} aria-hidden="true" />
-                <div className="ssh-host-main">
-                  <strong>{host.name}</strong>
-                  <small title={host.ssh ?? ""}>
-                    {host.ssh}
-                    {host.port ? `:${host.port}` : ""} ·{" "}
-                    {
-                      authOptions.find(
-                        (option) => option.id === (host.auth ?? "none"),
-                      )?.label
-                    }
-                  </small>
-                  <span
-                    className={
-                      status ? "ssh-status ssh-status-error" : "ssh-status"
+              <ItemRow
+                key={host.id}
+                icon={<Globe2 size={16} />}
+                title={host.name}
+                badge={
+                  <Badge
+                    tone={
+                      workingHost === host.id
+                        ? "neutral"
+                        : status
+                          ? "danger"
+                          : checked
+                            ? "success"
+                            : "neutral"
                     }
                   >
                     {workingHost === host.id
                       ? "正在处理…"
                       : status
-                        ? `连接失败：${status}`
+                        ? "连接失败"
                         : checked
                           ? "已连接"
                           : "等待连接"}
-                  </span>
-                </div>
-                <div className="ssh-host-actions">
-                  <button
-                    className="secondary"
-                    disabled={!!workingHost || busy}
-                    onClick={() => {
-                      void state.refreshHost(host);
-                    }}
-                    title="重新连接"
-                  >
-                    <RefreshCw size={15} />
-                  </button>
-                  <button
-                    className="secondary"
-                    disabled={!!workingHost || busy}
-                    onClick={(event) => {
-                      event.currentTarget.focus();
-                      setError("");
-                      setDraft(draftFor(host));
-                    }}
-                  >
-                    编辑
-                  </button>
-                  <button
-                    className="secondary"
-                    disabled={!!workingHost || busy}
-                    aria-label={`移除 ${host.name}`}
-                    onClick={() => void remove(host)}
-                  >
-                    <Trash2 size={15} />
-                  </button>
-                </div>
-              </div>
+                  </Badge>
+                }
+                subtitle={
+                  status
+                    ? `${host.ssh}${host.port ? `:${host.port}` : ""} · ${status}`
+                    : `${host.ssh}${host.port ? `:${host.port}` : ""} · ${authLabel}`
+                }
+                actions={
+                  <>
+                    <IconButton
+                      label="重新连接"
+                      variant="subtle"
+                      size="sm"
+                      disabled={!!workingHost || busy}
+                      onClick={() => void state.refreshHost(host)}
+                    >
+                      <RefreshCw size={14} />
+                    </IconButton>
+                    <Button
+                      variant="subtle"
+                      size="sm"
+                      disabled={!!workingHost || busy}
+                      onClick={(event) => {
+                        event.currentTarget.focus();
+                        setError("");
+                        setDraft(draftFor(host));
+                      }}
+                    >
+                      编辑
+                    </Button>
+                    <IconButton
+                      label={`移除 ${host.name}`}
+                      variant="ghost"
+                      size="sm"
+                      disabled={!!workingHost || busy}
+                      onClick={() => void remove(host)}
+                    >
+                      <Trash2 size={14} />
+                    </IconButton>
+                  </>
+                }
+              />
             );
           })}
-        </div>
+        </CardList>
       ) : (
-        <p className="ssh-empty">尚未添加 SSH 连接。</p>
+        <EmptyState
+          icon={<Globe2 size={22} />}
+          title="尚未添加 SSH 连接"
+          description="添加远程开发机后，即可与本机项目共享一致的会话、文件与终端体验。"
+        />
       )}
-      <p className="form-note">
+
+      <p className="ui-field-hint" style={{ margin: 0 }}>
         默认身份验证使用现有 OpenSSH 配置或 SSH
         Agent。首次连接请先在终端确认主机指纹。密码仅在本次应用运行期间保留；重启后连接时会提示重新输入。
       </p>
-      {!draft && error && (
-        <div className="form-error" role="alert">
-          {error}
-        </div>
-      )}
-      {draft && (
-        <div
-          className="modal-backdrop"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget && !busy) setDraft(null);
-          }}
-        >
-          <Modal
-            className="modal ssh-modal"
-            role="dialog"
-            aria-modal="true"
-            aria-label={
-              hosts.some((host) => host.id === draft.id)
-                ? "编辑 SSH 连接"
-                : "添加 SSH 连接"
-            }
-          >
-            <button
-              className="modal-close icon-button"
+
+      {!draft && error && <NoticeBanner tone="danger">{error}</NoticeBanner>}
+
+      <Dialog
+        open={!!draft}
+        title={editingExisting ? "编辑 SSH 连接" : "添加 SSH 连接"}
+        busy={busy}
+        className="ssh-modal"
+        onClose={() => {
+          if (!document.querySelector(".ssh-password-modal")) setDraft(null);
+        }}
+        footer={
+          <>
+            <Button
+              variant="subtle"
+              size="md"
               disabled={busy}
-              aria-label="关闭"
               onClick={() => setDraft(null)}
             >
-              <X size={18} />
-            </button>
-            <h2>
-              {hosts.some((host) => host.id === draft.id)
-                ? "编辑 SSH 连接"
-                : "添加 SSH 连接"}
-            </h2>
-            <form onSubmit={(event) => void save(event)}>
-              <label>
-                显示名称
-                <input
-                  autoFocus
-                  required
-                  maxLength={100}
-                  value={draft.name}
-                  onChange={(event) => update({ name: event.target.value })}
-                />
-              </label>
-              <label>
-                主机名
-                <input
-                  required
-                  placeholder="host.com 或 user@host.com"
-                  value={draft.ssh}
-                  onChange={(event) => update({ ssh: event.target.value })}
-                />
-              </label>
-              <label>
-                SSH 端口（可选）
-                <input
-                  type="number"
-                  min={1}
-                  max={65535}
-                  placeholder="22"
-                  value={draft.port}
-                  onChange={(event) => update({ port: event.target.value })}
-                />
-              </label>
-              <details className="settings-details">
-                <summary>高级设置</summary>
-                <label>
-                  远程 Server 路径（可选）
-                  <input
-                    placeholder="自动查找远程 Server"
-                    value={draft.serverPath}
-                    onChange={(event) =>
-                      update({ serverPath: event.target.value })
-                    }
-                  />
-                  <small>
-                    留空时自动查找远端 ~/.local/bin/latte-work-server 及 PATH。
-                    其他安装位置可填写绝对路径。
-                  </small>
-                </label>
-              </details>
-              <div className="ssh-auth-label">身份验证</div>
-              <div
-                className="ssh-auth-options"
-                role="radiogroup"
-                aria-label="身份验证方式"
+              取消
+            </Button>
+            <Button
+              type="submit"
+              form="ssh-host-form"
+              variant="primary"
+              size="md"
+              busy={busy}
+            >
+              {busy ? "正在连接…" : "保存并连接"}
+            </Button>
+          </>
+        }
+      >
+        {draft && (
+          <form
+            id="ssh-host-form"
+            style={{ display: "flex", flexDirection: "column", gap: 12 }}
+            onSubmit={(event) => void save(event)}
+          >
+            <Field label="显示名称" htmlFor="ssh-name">
+              <TextInput
+                id="ssh-name"
+                autoFocus
+                required
+                maxLength={100}
+                value={draft.name}
+                onChange={(event) => update({ name: event.target.value })}
+              />
+            </Field>
+            <Field label="主机名" htmlFor="ssh-host">
+              <TextInput
+                id="ssh-host"
+                required
+                monospace
+                placeholder="host.com 或 user@host.com"
+                value={draft.ssh}
+                onChange={(event) => update({ ssh: event.target.value })}
+              />
+            </Field>
+            <Field label="SSH 端口（可选）" htmlFor="ssh-port">
+              <TextInput
+                id="ssh-port"
+                type="number"
+                min={1}
+                max={65535}
+                placeholder="22"
+                value={draft.port}
+                onChange={(event) => update({ port: event.target.value })}
+              />
+            </Field>
+            <Disclosure title="高级设置">
+              <Field
+                label="远程 Server 路径（可选）"
+                htmlFor="ssh-server-path"
+                hint="留空时自动查找远端 ~/.local/bin/latte-work-server 及 PATH。其他安装位置可填写绝对路径。"
               >
-                {authOptions.map((option) => (
-                  <label
-                    key={option.id}
-                    className={draft.auth === option.id ? "selected" : ""}
-                  >
-                    <input
-                      type="radio"
-                      name="ssh-auth"
-                      checked={draft.auth === option.id}
-                      onChange={() => update({ auth: option.id })}
-                    />
-                    {option.label}
-                  </label>
-                ))}
-              </div>
-              {draft.auth === "identity_file" && (
-                <label>
-                  身份文件
-                  <div className="ssh-file-field">
-                    <input
-                      required
-                      placeholder="/Users/name/.ssh/id_ed25519"
-                      value={draft.identityFile}
-                      onChange={(event) =>
-                        update({ identityFile: event.target.value })
-                      }
-                    />
-                    <button
-                      type="button"
-                      className="secondary"
-                      onClick={() => void pickIdentityFile()}
-                      aria-label="选择身份文件"
-                    >
-                      <FolderOpen size={17} />
-                    </button>
-                  </div>
-                </label>
-              )}
-              {draft.auth === "password" && (
-                <label>
-                  SSH 密码
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    placeholder={
-                      hosts.some(
-                        (host) =>
-                          host.id === draft.id && host.auth === "password",
-                      )
-                        ? "留空则使用本次运行已输入的密码"
-                        : undefined
-                    }
-                    value={draft.password}
+                <TextInput
+                  id="ssh-server-path"
+                  monospace
+                  placeholder="自动查找远程 Server"
+                  value={draft.serverPath}
+                  onChange={(event) =>
+                    update({ serverPath: event.target.value })
+                  }
+                />
+              </Field>
+            </Disclosure>
+            <Field label="身份验证">
+              <ChoiceGroup
+                label="身份验证方式"
+                value={draft.auth}
+                options={authOptions}
+                onChange={(auth) => update({ auth })}
+              />
+            </Field>
+            {draft.auth === "identity_file" && (
+              <Field label="身份文件" htmlFor="ssh-identity-file">
+                <InputGroup>
+                  <TextInput
+                    id="ssh-identity-file"
+                    required
+                    monospace
+                    placeholder="/Users/name/.ssh/id_ed25519"
+                    value={draft.identityFile}
                     onChange={(event) =>
-                      update({ password: event.target.value })
+                      update({ identityFile: event.target.value })
                     }
                   />
-                  <small>
-                    密码不会写入连接配置。应用重启后连接时会提示重新输入。
-                  </small>
-                </label>
-              )}
-              {error && (
-                <div className="form-error" role="alert">
-                  {error}
-                </div>
-              )}
-              <div className="modal-actions">
-                <button
-                  type="button"
-                  className="secondary"
-                  disabled={busy}
-                  onClick={() => setDraft(null)}
-                >
-                  取消
-                </button>
-                <button className="primary" disabled={busy}>
-                  {busy ? "正在连接…" : "保存并连接"}
-                </button>
-              </div>
-            </form>
-          </Modal>
-        </div>
-      )}
-    </div>
+                  <IconButton
+                    label="选择身份文件"
+                    variant="subtle"
+                    size="lg"
+                    onClick={() => void pickIdentityFile()}
+                  >
+                    <FolderOpen size={16} />
+                  </IconButton>
+                </InputGroup>
+              </Field>
+            )}
+            {draft.auth === "password" && (
+              <Field
+                label="SSH 密码"
+                htmlFor="ssh-password"
+                hint="密码不会写入连接配置。应用重启后连接时会提示重新输入。"
+              >
+                <TextInput
+                  id="ssh-password"
+                  type="password"
+                  autoComplete="off"
+                  placeholder={
+                    hosts.some(
+                      (host) =>
+                        host.id === draft.id && host.auth === "password",
+                    )
+                      ? "留空则使用本次运行已输入的密码"
+                      : undefined
+                  }
+                  value={draft.password}
+                  onChange={(event) => update({ password: event.target.value })}
+                />
+              </Field>
+            )}
+            {error && <NoticeBanner tone="danger">{error}</NoticeBanner>}
+          </form>
+        )}
+      </Dialog>
+    </PageContainer>
   );
 }

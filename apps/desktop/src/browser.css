@@ -123,7 +123,8 @@
   align-items: center;
   flex-wrap: wrap;
   gap: var(--space-1);
-  padding: var(--space-2);
+  min-height: var(--subbar-height);
+  padding: 4px var(--space-2);
   border-bottom: 1px solid var(--color-border-subtle);
 }
 .browser-toolbar .icon-button {
@@ -133,7 +134,7 @@
   flex: 1;
   min-width: 100px;
   width: 0;
-  height: 32px;
+  height: var(--control-height-sm);
   margin: 0;
   font-size: 12px;
 }
@@ -142,14 +143,16 @@
   align-items: center;
   flex: 1;
   min-width: 120px;
-  height: 32px;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-pill);
-  background: var(--color-input);
-  padding: 0 var(--space-1);
+  height: var(--control-height-sm);
+  border: 0;
+  border-radius: var(--radius-control);
+  background: var(--color-well);
+  box-shadow: var(--shadow-well);
+  padding: 0 3px;
 }
 .browser-address:focus-within {
-  background: var(--color-focus-background);
+  background: var(--color-well);
+  box-shadow: var(--focus-ring);
 }
 .browser-toolbar .browser-address input {
   background: transparent;
@@ -157,23 +160,25 @@
   border-radius: 0;
   box-shadow: none;
   padding: 0 var(--space-2);
-  height: 30px;
+  height: 26px;
   min-width: 0;
 }
 .browser-address .browser-site-trigger {
-  width: 28px;
-  height: 28px;
-  border-radius: var(--radius-pill);
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
 }
 .browser-site-info {
   position: fixed;
-  z-index: 1000;
+  z-index: 200;
   width: min(344px, calc(100vw - 16px));
   padding: var(--space-4);
-  background: var(--color-elevated);
+  background: color-mix(in srgb, var(--color-elevated) 92%, transparent);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
   color: var(--color-text);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-panel);
+  border: 0;
+  border-radius: var(--radius-card);
   box-shadow: var(--shadow-popover);
 }
 .browser-site-info header {
@@ -325,7 +330,7 @@
   justify-content: flex-start;
 }
 .browser-site-confirm-backdrop {
-  z-index: 1001;
+  z-index: 210;
 }
 .browser-site-confirm footer {
   display: flex;

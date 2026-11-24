@@ -1765,7 +1765,7 @@ export function Composer(props: Props) {
             setAddMenu(open);
           }}
         >
-          <Plus size={19} />
+          <Plus size={16} />
         </button>
         {toolbar(
           () => void submit(),

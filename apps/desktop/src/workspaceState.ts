@@ -49,21 +49,41 @@ export interface WorkspaceState {
 }
 export const CONVERSATION_MIN_WIDTH = 240;
 export const WORKSPACE_MIN_WIDTH = 280;
-const RESIZE_HANDLE_WIDTH = 1;
+export const STAGE_ISLAND_INSET = 7;
+export const SIDEBAR_HANDLE_WIDTH = 4;
+export const WORKSPACE_HANDLE_WIDTH = 1;
+
+export function stageAvailableWidth(
+  windowWidth: number,
+  sidebarWidth: number,
+): number {
+  const outerChrome =
+    sidebarWidth > 0
+      ? sidebarWidth + SIDEBAR_HANDLE_WIDTH + STAGE_ISLAND_INSET
+      : STAGE_ISLAND_INSET * 2;
+  return Math.max(0, windowWidth - outerChrome);
+}
+
+export function clampWorkspaceWidthInStage(
+  width: number,
+  stageWidth: number,
+): number {
+  const maximum = Math.max(
+    WORKSPACE_MIN_WIDTH,
+    stageWidth - CONVERSATION_MIN_WIDTH - WORKSPACE_HANDLE_WIDTH,
+  );
+  return Math.max(WORKSPACE_MIN_WIDTH, Math.min(width, maximum));
+}
+
 export function clampWorkspaceWidth(
   width: number,
   windowWidth: number,
   sidebarWidth: number,
 ) {
-  const handles = sidebarWidth > 0 ? 2 : 1;
-  const maximum = Math.max(
-    WORKSPACE_MIN_WIDTH,
-    windowWidth -
-      sidebarWidth -
-      CONVERSATION_MIN_WIDTH -
-      handles * RESIZE_HANDLE_WIDTH,
+  return clampWorkspaceWidthInStage(
+    width,
+    stageAvailableWidth(windowWidth, sidebarWidth),
   );
-  return Math.max(WORKSPACE_MIN_WIDTH, Math.min(width, maximum));
 }
 const prefix = "latte-work.conversation-workspace.v1:";
 const cache = new Map<string, WorkspaceState>();

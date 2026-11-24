@@ -1,9 +1,22 @@
 import { useEffect, useState } from "react";
-import { Archive, Folder, Search } from "lucide-react";
+import { Archive, Folder } from "lucide-react";
 import { message, request } from "./api";
 import type { Session } from "./protocol";
 import type { Workbench } from "./useWorkbench";
-import { Select } from "./Select";
+import {
+  Button,
+  CardList,
+  EmptyState,
+  FilterBar,
+  ItemRow,
+  NoticeBanner,
+  PageContainer,
+  PageHeader,
+  SearchInput,
+  Section,
+  SectionHeader,
+  Select,
+} from "./ui";
 
 export function ArchivedChats({
   state,
@@ -56,6 +69,7 @@ export function ArchivedChats({
       disposed = true;
     };
   }, [active, targets, revision]);
+
   async function restore(hostId: string, session: Session) {
     setBusy(true);
     onBusy(true);
@@ -78,6 +92,7 @@ export function ArchivedChats({
       onBusy(false);
     }
   }
+
   const groups = state.projects
     .filter((p) => !filter || `${p.hostId}:${p.id}` === filter)
     .map((p) => ({
@@ -87,21 +102,26 @@ export function ArchivedChats({
         s.title.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()),
       ),
     }));
+
   return (
-    <div className="settings-panel-content archived-chats">
-      <h2>已归档的聊天</h2>
-      <div className="archive-filters">
-        <div className="archive-search">
-          <Search size={17} />
-          <input
-            aria-label="搜索已归档的聊天"
-            placeholder="搜索已归档的聊天"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-        </div>
+    <PageContainer className="settings-panel-content archived-chats">
+      <PageHeader
+        title="已归档的聊天"
+        description="按项目检索并恢复已归档的历史对话记录。"
+      />
+      <FilterBar className="archive-filters">
+        <SearchInput
+          aria-label="搜索已归档的聊天"
+          placeholder="搜索已归档的聊天"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onClear={() => setQuery("")}
+        />
         <Select
           label="筛选项目"
+          size="md"
+          minMenuWidth={220}
+          align="end"
           value={filter}
           onChange={setFilter}
           options={[
@@ -112,54 +132,72 @@ export function ArchivedChats({
             })),
           ]}
         />
-      </div>
-      {error && <p role="alert">{error}</p>}
-      {loading && <p role="status">正在加载…</p>}
-      {groups.map((p) => (
-        <section key={p.key} className="archive-group">
-          {(p.chats.length > 0 || errors[p.key]) && (
-            <h3>
-              <Folder size={17} />
-              <span>{p.name}</span>
-              <small>{state.hosts.find((h) => h.id === p.hostId)?.name}</small>
-              <span className="archive-count">
-                {errors[p.key] ? "" : `${p.chats.length} 个聊天`}
-              </span>
-            </h3>
-          )}
-          {errors[p.key] && (
-            <div role="alert" className="archive-load-error">
-              <span>{errors[p.key]}</span>
-              <button
-                disabled={busy || loading}
-                onClick={() => setRevision((v) => v + 1)}
+      </FilterBar>
+      {error && <NoticeBanner tone="danger">{error}</NoticeBanner>}
+      {loading && <NoticeBanner tone="neutral">正在加载…</NoticeBanner>}
+      {groups.map((p) =>
+        p.chats.length > 0 || errors[p.key] ? (
+          <Section key={p.key} className="archive-group">
+            <SectionHeader
+              icon={<Folder size={15} />}
+              title={p.name}
+              meta={state.hosts.find((h) => h.id === p.hostId)?.name}
+              count={errors[p.key] ? undefined : `${p.chats.length} 个聊天`}
+            />
+            {errors[p.key] && (
+              <NoticeBanner
+                tone="danger"
+                action={
+                  <Button
+                    size="xs"
+                    variant="subtle"
+                    disabled={busy || loading}
+                    onClick={() => setRevision((v) => v + 1)}
+                  >
+                    重试
+                  </Button>
+                }
               >
-                重试
-              </button>
-            </div>
-          )}
-          {p.chats.map((s) => (
-            <div className="archive-chat" key={s.id}>
-              <span className="archive-chat-info">{s.title}</span>
-              <button
-                disabled={busy || loading}
-                aria-label={`取消归档 ${s.title}`}
-                onClick={() => void restore(p.hostId, s)}
-              >
-                取消归档
-              </button>
-            </div>
-          ))}
-        </section>
-      ))}
-      {!loading && !groups.some((p) => p.chats.length || errors[p.key]) && (
-        <div className="archive-empty">
-          <Archive size={24} />
-          <p>
-            {query || filter ? "没有匹配的已归档聊天" : "还没有已归档的聊天"}
-          </p>
-        </div>
+                {errors[p.key]}
+              </NoticeBanner>
+            )}
+            {p.chats.length > 0 && (
+              <CardList>
+                {p.chats.map((s) => (
+                  <ItemRow
+                    key={s.id}
+                    title={s.title}
+                    actions={
+                      <Button
+                        size="sm"
+                        variant="subtle"
+                        disabled={busy || loading}
+                        aria-label={`取消归档 ${s.title}`}
+                        onClick={() => void restore(p.hostId, s)}
+                      >
+                        取消归档
+                      </Button>
+                    }
+                  />
+                ))}
+              </CardList>
+            )}
+          </Section>
+        ) : null,
       )}
-    </div>
+      {!loading && !groups.some((p) => p.chats.length || errors[p.key]) && (
+        <EmptyState
+          icon={<Archive size={22} />}
+          title={
+            query || filter ? "没有匹配的已归档聊天" : "还没有已归档的聊天"
+          }
+          description={
+            query || filter
+              ? "尝试更换搜索关键词或切换到所有项目。"
+              : "在左侧边栏对会话执行归档后，可随时在此找回并恢复。"
+          }
+        />
+      )}
+    </PageContainer>
   );
 }

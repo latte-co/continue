@@ -1,8 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { X } from "lucide-react";
 import { ApprovalCard } from "./ApprovalCard";
+import { ImageGallery } from "./ImageGallery";
 import { MessageContent } from "./MessageContent";
-import { Modal } from "./Modal";
 import { QuestionCard } from "./QuestionCard";
 import { ToolGroup, ToolRow } from "./ToolActivity";
 import { ToolImages } from "./ToolImages";
@@ -15,6 +14,7 @@ import type { Event, Request, Session } from "./protocol";
 import { clearSideWriteConfirmation } from "./sideWritePrompts";
 import { LIVE_POLL_MS } from "./usePollingSnapshot";
 import type { Workbench } from "./useWorkbench";
+import { Button, Dialog, NoticeBanner } from "./ui";
 
 export interface StandaloneSideChatTarget {
   hostId: string;
@@ -92,15 +92,21 @@ export function SideChatRecoveryDialog({
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
       if (
-        event.key === "Escape" &&
-        !busy &&
-        !event.defaultPrevented &&
-        !document.querySelector(".ssh-password-modal")
-      ) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        closeStandaloneSideChat();
+        event.key !== "Escape" ||
+        busy ||
+        event.defaultPrevented ||
+        document.querySelector(".ssh-password-modal")
+      )
+        return;
+      const self = document.querySelector<HTMLElement>(
+        ".side-chat-recovery-modal",
+      );
+      for (let cur = self; cur; cur = cur.parentElement) {
+        if (cur.inert || cur.hasAttribute("inert")) return;
       }
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      closeStandaloneSideChat();
     };
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
@@ -225,48 +231,53 @@ export function SideChatRecoveryDialog({
   const title = session.title.trim() || sideId;
 
   return (
-    <div className="modal-backdrop">
-      <Modal
-        className="modal side-chat-recovery-modal"
-        aria-label={`核对侧边聊天：${title}`}
-      >
-        <button
-          type="button"
-          className="modal-close icon-button"
-          aria-label="关闭侧边聊天核对窗口"
+    <Dialog
+      open
+      width={680}
+      className="side-chat-recovery-modal"
+      ariaLabel={`核对侧边聊天：${title}`}
+      title="核对侧边聊天"
+      description={`${hostName}${projectName ? ` · ${projectName}` : ""} · ${title}（${sideId}）`}
+      closeLabel="关闭侧边聊天核对窗口"
+      busy={busy}
+      onClose={closeStandaloneSideChat}
+      footer={
+        <Button
+          variant={reconciled ? "primary" : "subtle"}
+          size="md"
           disabled={busy}
           onClick={closeStandaloneSideChat}
         >
-          <X size={18} />
-        </button>
-        <h2>核对侧边聊天</h2>
-        <p className="side-chat-recovery-meta">
-          {hostName}
-          {projectName ? ` · ${projectName}` : ""} · {title}（{sideId}）
-        </p>
-        <p className="form-note">
-          当前主机的旧版 Server
-          未返回该侧边聊天所属的主会话（可能已归档、已关闭且超出最近 500
-          条记录）。你可直接在此核对侧边聊天记录并确认写入结束，或更新主机
-          Server 以恢复跳转至原主会话。
-        </p>
-        <div
-          className="side-chat-transcript side-chat-recovery-transcript"
-          ref={scroll}
-          onScroll={(event) => {
-            const element = event.currentTarget;
-            follow.current =
-              element.scrollHeight - element.clientHeight - element.scrollTop <
-              90;
-          }}
-        >
-          <div className="side-chat-messages">
-            {!ready && !events.length && connected && !readError && (
-              <WorkingStatus label="正在读取记录…" animated />
-            )}
-            {ready && !events.length && !readError && (
-              <p className="form-note">暂无侧边聊天记录。</p>
-            )}
+          {reconciled ? "完成" : "关闭"}
+        </Button>
+      }
+    >
+      <p className="ui-field-hint" style={{ margin: 0 }}>
+        当前主机的旧版 Server
+        未返回该侧边聊天所属的主会话（可能已归档、已关闭且超出最近 500
+        条记录）。你可直接在此核对侧边聊天记录并确认写入结束，或更新主机 Server
+        以恢复跳转至原主会话。
+      </p>
+      <div
+        className="side-chat-transcript side-chat-recovery-transcript"
+        ref={scroll}
+        onScroll={(event) => {
+          const element = event.currentTarget;
+          follow.current =
+            element.scrollHeight - element.clientHeight - element.scrollTop <
+            90;
+        }}
+      >
+        <div className="side-chat-messages">
+          {!ready && !events.length && connected && !readError && (
+            <WorkingStatus label="正在读取记录…" animated />
+          )}
+          {ready && !events.length && !readError && (
+            <p className="ui-field-hint" style={{ margin: 0 }}>
+              暂无侧边聊天记录。
+            </p>
+          )}
+          <ImageGallery scope={`${hostId}:${sideId}`} active={connected}>
             <TurnTranscript events={events}>
               {(item) => {
                 if (item.type === "user")
@@ -359,33 +370,47 @@ export function SideChatRecoveryDialog({
                 return null;
               }}
             </TurnTranscript>
-            {status && (
-              <WorkingStatus label={status} animated={connected && running} />
-            )}
-          </div>
+          </ImageGallery>
+          {status && (
+            <WorkingStatus label={status} animated={connected && running} />
+          )}
         </div>
-        <div className="side-chat-recovery-footer">
-          {running && (
-            <div className="notice" role="status">
-              侧边聊天仍在运行，请等待完成或停止运行后再确认写入结束。
-              <button
-                type="button"
-                className="secondary small"
+      </div>
+
+      <div
+        className="side-chat-recovery-footer"
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: "var(--space-2)",
+        }}
+      >
+        {running && (
+          <NoticeBanner
+            tone="warning"
+            action={
+              <Button
+                size="xs"
+                variant="subtle"
                 disabled={!connected || busy}
                 onClick={() =>
                   void perform({ method: "cancel", session_id: sideId })
                 }
               >
                 停止运行
-              </button>
-            </div>
-          )}
-          {needsRuntimeClose && (
-            <div className="notice" role="status">
-              原生会话仍由 Server 管理，请先关闭后再核对关闭状态。
-              <button
-                type="button"
-                className="secondary small"
+              </Button>
+            }
+          >
+            侧边聊天仍在运行，请等待完成或停止运行后再确认写入结束。
+          </NoticeBanner>
+        )}
+        {needsRuntimeClose && (
+          <NoticeBanner
+            tone="warning"
+            action={
+              <Button
+                size="xs"
+                variant="subtle"
                 disabled={!connected || busy || !!session.agent_session_busy}
                 onClick={() =>
                   void perform({
@@ -396,90 +421,90 @@ export function SideChatRecoveryDialog({
                 }
               >
                 关闭原生会话
-              </button>
-            </div>
-          )}
-          {pendingToken && (
-            <div className="notice" role="status">
-              {closePending
-                ? showingConfirmation
-                  ? "请核对主机上的原生进程、后台任务和外部工具均已停止。"
-                  : "原生会话关闭待确认。"
-                : showingConfirmation
-                  ? "请核对侧边聊天启动的后台进程和外部工具均已停止写入工作区。"
-                  : "侧边聊天后台写入待确认。"}
-              {showingConfirmation && (
-                <button
-                  type="button"
-                  className="secondary small"
-                  onClick={() => setConfirming(undefined)}
+              </Button>
+            }
+          >
+            原生会话仍由 Server 管理，请先关闭后再核对关闭状态。
+          </NoticeBanner>
+        )}
+        {pendingToken && (
+          <NoticeBanner
+            tone="warning"
+            action={
+              <div style={{ display: "inline-flex", gap: "var(--space-2)" }}>
+                {showingConfirmation && (
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    onClick={() => setConfirming(undefined)}
+                  >
+                    取消
+                  </Button>
+                )}
+                <Button
+                  size="xs"
+                  variant="subtle"
+                  disabled={
+                    !connected ||
+                    !ready ||
+                    busy ||
+                    (!!closePending && !!session.agent_session_busy)
+                  }
+                  onClick={() =>
+                    showingConfirmation
+                      ? confirmEnd()
+                      : setConfirming(pendingToken)
+                  }
                 >
-                  取消
-                </button>
-              )}
-              <button
-                type="button"
-                className="secondary small"
-                disabled={
-                  !connected ||
-                  !ready ||
-                  busy ||
-                  (!!closePending && !!session.agent_session_busy)
-                }
-                onClick={() =>
-                  showingConfirmation
-                    ? confirmEnd()
-                    : setConfirming(pendingToken)
-                }
-              >
-                {showingConfirmation
-                  ? "我已核对，确认结束"
-                  : closePending
-                    ? "核对原生会话关闭"
-                    : "核对后台写入已结束"}
-              </button>
-            </div>
-          )}
-          {reconciled && (
-            <div className="notice" role="status">
-              后台写入已确认结束，关闭此窗口后可继续原操作。
-            </div>
-          )}
-          {noPendingProjected && (
-            <div className="notice" role="status">
-              当前侧边聊天未返回待确认的写入状态；若原操作仍受阻，请更新主机
-              Server 后重试。
-            </div>
-          )}
-          {(!connected || readError || error) && (
-            <div role="alert" className="notice">
-              {!connected
-                ? "主机已断开，请在重连后核对记录"
-                : readError || error}
-              {connected && readError && (
-                <button
-                  type="button"
-                  className="secondary small"
+                  {showingConfirmation
+                    ? "我已核对，确认结束"
+                    : closePending
+                      ? "核对原生会话关闭"
+                      : "核对后台写入已结束"}
+                </Button>
+              </div>
+            }
+          >
+            {closePending
+              ? showingConfirmation
+                ? "请核对主机上的原生进程、后台任务和外部工具均已停止。"
+                : "原生会话关闭待确认。"
+              : showingConfirmation
+                ? "请核对侧边聊天启动的后台进程和外部工具均已停止写入工作区。"
+                : "侧边聊天后台写入待确认。"}
+          </NoticeBanner>
+        )}
+        {reconciled && (
+          <NoticeBanner tone="success">
+            后台写入已确认结束，关闭此窗口后可继续原操作。
+          </NoticeBanner>
+        )}
+        {noPendingProjected && (
+          <NoticeBanner tone="neutral">
+            当前侧边聊天未返回待确认的写入状态；若原操作仍受阻，请更新主机
+            Server 后重试。
+          </NoticeBanner>
+        )}
+        {(!connected || readError || error) && (
+          <NoticeBanner
+            tone="danger"
+            action={
+              connected && readError ? (
+                <Button
+                  size="xs"
+                  variant="subtle"
                   disabled={busy}
                   onClick={() => refresh((value) => value + 1)}
                 >
                   重新读取
-                </button>
-              )}
-            </div>
-          )}
-          <div className="modal-actions">
-            <button
-              type="button"
-              className={reconciled ? "primary" : "secondary"}
-              disabled={busy}
-              onClick={closeStandaloneSideChat}
-            >
-              {reconciled ? "完成" : "关闭"}
-            </button>
-          </div>
-        </div>
-      </Modal>
-    </div>
+                </Button>
+              ) : undefined
+            }
+          >
+            {!connected ? "主机已断开，请在重连后核对记录" : readError || error}
+          </NoticeBanner>
+        )}
+      </div>
+    </Dialog>
   );
 }

@@ -1,6 +1,56 @@
-import { useLayoutEffect, useRef, type ComponentProps } from "react";
+import {
+  useLayoutEffect,
+  useRef,
+  type ComponentProps,
+  type RefObject,
+} from "react";
 
 const stack: HTMLElement[] = [];
+const overlayLayers: HTMLElement[] = [];
+const MODAL_BASE_Z_INDEX = 200;
+
+function syncOverlayLayers() {
+  overlayLayers.forEach((layer, index) => {
+    layer.style.zIndex = String(MODAL_BASE_Z_INDEX + index * 10);
+  });
+}
+
+function registerOverlayLayer(layer: HTMLElement): () => void {
+  const existing = overlayLayers.indexOf(layer);
+  if (existing >= 0) overlayLayers.splice(existing, 1);
+  overlayLayers.push(layer);
+  syncOverlayLayers();
+  return () => {
+    const idx = overlayLayers.indexOf(layer);
+    if (idx >= 0) {
+      overlayLayers.splice(idx, 1);
+      layer.style.removeProperty("z-index");
+      syncOverlayLayers();
+    }
+  };
+}
+
+/**
+ * Participates in the shared chronological overlay z-index stack for non-Modal
+ * dialog surfaces (such as BrowserSiteInfo) that can spawn child Modal confirmations.
+ */
+export function useOverlayLayer(
+  ref: RefObject<HTMLElement | null>,
+  active: boolean,
+) {
+  useLayoutEffect(() => {
+    if (!active || !ref.current) return;
+    return registerOverlayLayer(ref.current);
+  }, [ref, active]);
+}
+
+export function isHiddenOrInert(item: HTMLElement | null): boolean {
+  for (let cur = item; cur; cur = cur.parentElement) {
+    if (cur.hidden || cur.inert || cur.hasAttribute("inert")) return true;
+  }
+  return false;
+}
+
 // Different dialogs may suspend the same background node. A previous-value
 // snapshot per dialog would restore stale inert=true when both close together.
 const inertOwners = new Map<
@@ -9,7 +59,7 @@ const inertOwners = new Map<
 >();
 const canFocus = (item: HTMLElement) =>
   !item.matches(":disabled") &&
-  !item.closest("[hidden], [inert]") &&
+  !isHiddenOrInert(item) &&
   getComputedStyle(item).display !== "none" &&
   getComputedStyle(item).visibility !== "hidden" &&
   (!item.closest("details:not([open])") || item.tagName === "SUMMARY");
@@ -23,6 +73,11 @@ export function Modal(props: ComponentProps<"section">) {
   useLayoutEffect(() => {
     const element = root.current!;
     stack.push(element);
+    const layerHost =
+      element.closest<HTMLElement>(
+        ".ui-dialog-backdrop, .modal-backdrop, .annotation-backdrop",
+      ) ?? element;
+    const releaseLayer = registerOverlayLayer(layerHost);
     const ancestors: HTMLElement[] = [];
     for (
       let node = trigger.current?.parentElement;
@@ -78,6 +133,7 @@ export function Modal(props: ComponentProps<"section">) {
     document.addEventListener("focusin", focus);
     return () => {
       stack.splice(stack.indexOf(element), 1);
+      releaseLayer();
       document.removeEventListener("keydown", key);
       document.removeEventListener("focusin", focus);
       for (const item of inert) {
@@ -108,8 +164,7 @@ export function Modal(props: ComponentProps<"section">) {
           const parent = stack.at(-1);
           const regions = parent ? [parent] : ancestors;
           for (const region of regions) {
-            if (!region.isConnected || region.closest("[hidden], [inert]"))
-              continue;
+            if (!region.isConnected || isHiddenOrInert(region)) continue;
             const candidate = Array.from(
               region.querySelectorAll<HTMLElement>(focusable),
             ).find(tabbable);

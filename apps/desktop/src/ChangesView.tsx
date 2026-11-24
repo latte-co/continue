@@ -16,6 +16,7 @@ import { loadChangeImage } from "./changeImageLoader";
 import { formatMessageTimestamp } from "./MessageTimestamp";
 import { Select } from "./Select";
 import { useStatusIssues } from "./statusNotices";
+import { Button, IconButton, NoticeBanner } from "./ui";
 type Snapshot = {
   scope: ReviewScope;
   context: string;
@@ -464,18 +465,18 @@ export function ChangesView({
         refresh((v) => v + 1);
       }}
       additionalActions={
-        <button
+        <IconButton
           ref={moreTrigger}
-          className="icon-button"
-          title="更多差异选项"
-          aria-label="更多差异选项"
+          size="sm"
+          active={more}
+          label="更多差异选项"
           aria-haspopup="menu"
           aria-expanded={more}
           disabled={!review?.entries.length || !active}
           onClick={() => setMore((v) => !v)}
         >
-          <MoreHorizontal size={16} />
-        </button>
+          <MoreHorizontal size={15.5} />
+        </IconButton>
       }
       overlay={
         more && active && moreTrigger.current ? (
@@ -496,7 +497,9 @@ export function ChangesView({
                 className="turn-changes-pagination"
                 aria-label="变更文件分页"
               >
-                <button
+                <Button
+                  variant="subtle"
+                  size="xs"
                   disabled={
                     loading ||
                     !active ||
@@ -512,13 +515,15 @@ export function ChangesView({
                   }}
                 >
                   {pageHistory.length ? "上一页" : "返回第一页"}
-                </button>
+                </Button>
                 <span>
                   文件 {(summary.offset ?? 0) + 1}–
                   {(summary.offset ?? 0) + summary.entries.length} /{" "}
                   {summary.total_files ?? summary.entries.length}
                 </span>
-                <button
+                <Button
+                  variant="subtle"
+                  size="xs"
                   disabled={loading || !active || summary.next_offset == null}
                   onClick={(event) => {
                     pagingFocus.current = event.currentTarget;
@@ -530,7 +535,7 @@ export function ChangesView({
                   }}
                 >
                   下一页
-                </button>
+                </Button>
               </div>
             )}
 
@@ -539,7 +544,7 @@ export function ChangesView({
               turn.undo === "unknown" ||
               turn.interrupted ||
               turn.background_pending) && (
-              <p className="panel-notice">
+              <NoticeBanner tone="neutral" className="panel-notice">
                 {[
                   turn.undo === "reverted"
                     ? "本轮修改已撤销，仍显示原始快照。"
@@ -553,13 +558,17 @@ export function ChangesView({
                 ]
                   .filter(Boolean)
                   .join(" ")}
-              </p>
+              </NoticeBanner>
             )}
           {review?.truncated && (
-            <p className="panel-notice">部分文件或统计超出采集范围。</p>
+            <NoticeBanner tone="warning" className="panel-notice">
+              部分文件或统计超出采集范围。
+            </NoticeBanner>
           )}
           {gitMode && info?.truncated && (
-            <p className="panel-notice">分支列表仅显示部分结果。</p>
+            <NoticeBanner tone="warning" className="panel-notice">
+              分支列表仅显示部分结果。
+            </NoticeBanner>
           )}
         </>
       }

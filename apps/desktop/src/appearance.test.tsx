@@ -15,7 +15,9 @@ import {
   applyAppearance,
   contrastRatio,
   defaultAppearance,
+  minimumThemeContrast,
   parseAppearance,
+  presets,
   readAppearance,
   resolveTheme,
   saveAppearance,
@@ -383,4 +385,65 @@ it("uses the modern clipboard fallback and reports failure without claiming a su
   expect(screen.getByRole("alert").textContent).toContain("无法写入剪贴板");
   expect(screen.queryByText(/已复制完整主题 JSON/)).toBeNull();
   expect(document.querySelector("textarea:not([readonly])")).toBeNull();
+});
+
+it("checks contrast across elevated/card surfaces and boosts derived text when foreground barely clears canvas", () => {
+  for (const kind of ["light", "dark"] as const) {
+    for (const preset of Object.values(presets[kind])) {
+      expect(
+        minimumThemeContrast({
+          ...defaultAppearance()[kind],
+          ...preset,
+        }),
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+  }
+
+  const settings = defaultAppearance();
+  settings.dark.background = "#181818";
+  settings.dark.foreground = "#828282";
+  const tokens = themeTokens(settings.dark);
+  expect(
+    contrastRatio(tokens["--color-canvas"], tokens["--color-text"]),
+  ).toBeGreaterThanOrEqual(4.5);
+  expect(
+    contrastRatio(tokens["--color-text-secondary"], tokens["--color-elevated"]),
+  ).toBeGreaterThanOrEqual(4.5);
+  expect(
+    contrastRatio(tokens["--color-text-muted"], tokens["--color-elevated"]),
+  ).toBeGreaterThanOrEqual(4.5);
+  expect(minimumThemeContrast(settings.dark)).toBeLessThan(4.5);
+
+  saveAppearance(settings);
+  render(
+    <AppearanceProvider>
+      <AppearanceSettings />
+    </AppearanceProvider>,
+  );
+  expect(screen.getByText(/当前文字与界面层对比度较低/)).toBeTruthy();
+
+  const customTeal = {
+    ...defaultAppearance().dark,
+    background: "#00C090",
+    foreground: "#050505",
+    contrast: 50,
+  };
+  const tealTokens = themeTokens(customTeal);
+  expect(minimumThemeContrast(customTeal)).toBeGreaterThanOrEqual(4.5);
+  for (const surface of [
+    tealTokens["--color-canvas"],
+    tealTokens["--color-sidebar"].slice(0, 7),
+    tealTokens["--color-surface"],
+    tealTokens["--color-card"],
+    tealTokens["--color-elevated"],
+    tealTokens["--color-input"],
+    tealTokens["--color-composer"],
+  ]) {
+    expect(
+      contrastRatio(tealTokens["--color-text-secondary"], surface),
+    ).toBeGreaterThanOrEqual(4.5);
+    expect(
+      contrastRatio(tealTokens["--color-text-muted"], surface),
+    ).toBeGreaterThanOrEqual(4.5);
+  }
 });

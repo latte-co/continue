@@ -1,12 +1,11 @@
 import { copyText } from "./clipboard";
-import { Modal } from "./Modal";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import {
   Archive,
   ArchiveRestore,
   Check,
   ArrowLeft,
+  ChevronRight,
   Copy,
   Eye,
   Pencil,
@@ -23,6 +22,17 @@ import {
   agentSessionLabels,
   type AgentSessionState,
 } from "./agentSessionState";
+import {
+  Button,
+  Dialog,
+  Field,
+  MenuRow,
+  MenuSeparator,
+  NoticeBanner,
+  Popover,
+  TextArea,
+  TextInput,
+} from "./ui";
 
 export function SessionActions({
   session,
@@ -49,109 +59,38 @@ export function SessionActions({
   const [error, setError] = useState("");
   const [markdown, setMarkdown] = useState("");
   const [copied, setCopied] = useState(false);
-  const [position, setPosition] = useState(point);
   const [closeId, setCloseId] = useState<string>();
-  const menu = useRef<HTMLDivElement>(null);
   const opener = useRef(document.activeElement as HTMLElement | null);
+  const triggerRef = useRef<HTMLElement | null>(trigger ?? null);
+  triggerRef.current = trigger ?? null;
+
   useEffect(
     () => () => {
       if (opener.current?.isConnected) opener.current.focus();
     },
     [],
   );
+
   const menuView = view === "menu" || view === "copy";
   const active = ["running", "waiting"].includes(session.status);
   const canClose = agentState === "open";
   const previousView = useRef(view);
+
   useLayoutEffect(() => {
-    if (!menu.current) return;
-    const rect = menu.current.getBoundingClientRect();
-    setPosition({
-      x: Math.max(
-        8,
-        Math.min(
-          point.x - (align === "end" ? rect.width : 0),
-          innerWidth - rect.width - 8,
-        ),
-      ),
-      y: Math.max(8, Math.min(point.y, innerHeight - rect.height - 8)),
-    });
-    menu.current
-      .querySelector<HTMLButtonElement>(
-        view === "menu" && previousView.current === "copy"
-          ? "[data-copy]"
-          : "button:not(:disabled)",
-      )
-      ?.focus();
+    if (view === "menu" && previousView.current === "copy") {
+      document
+        .querySelector<HTMLButtonElement>(".session-context-menu [data-copy]")
+        ?.focus();
+    } else if (view === "copy" && previousView.current === "menu") {
+      document
+        .querySelector<HTMLButtonElement>(
+          ".session-context-menu button:not(:disabled)",
+        )
+        ?.focus();
+    }
     previousView.current = view;
-  }, [point, align, view]);
-  useEffect(() => {
-    const key = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        if (!busy) {
-          if (view === "copy") setView("menu");
-          else close();
-        }
-        return;
-      }
-      if (!menuView) return;
-      if (e.key === "ArrowLeft" && view === "copy") {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        setView("menu");
-        return;
-      }
-      if (
-        e.key === "ArrowRight" &&
-        (document.activeElement as HTMLElement)?.dataset.copy === "true"
-      ) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        setView("copy");
-        return;
-      }
-      if (e.key === "Tab") {
-        close();
-        return;
-      }
-      if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      const buttons = Array.from(
-        menu.current?.querySelectorAll<HTMLButtonElement>(
-          "button:not(:disabled)",
-        ) ?? [],
-      );
-      const index = buttons.indexOf(
-        document.activeElement as HTMLButtonElement,
-      );
-      buttons[
-        e.key === "Home"
-          ? 0
-          : e.key === "End"
-            ? buttons.length - 1
-            : (index + (e.key === "ArrowDown" ? 1 : -1) + buttons.length) %
-              buttons.length
-      ]?.focus();
-    };
-    const outside = (e: PointerEvent) => {
-      if (
-        menuView &&
-        !busy &&
-        !menu.current?.contains(e.target as Node) &&
-        !trigger?.contains(e.target as Node)
-      )
-        close();
-    };
-    window.addEventListener("keydown", key, true);
-    document.addEventListener("pointerdown", outside);
-    return () => {
-      window.removeEventListener("keydown", key, true);
-      document.removeEventListener("pointerdown", outside);
-    };
-  }, [close, busy, menuView, view, trigger]);
+  }, [view]);
+
   async function perform(action: () => Promise<unknown>, dismiss = true) {
     setBusy(true);
     setError("");
@@ -164,52 +103,83 @@ export function SessionActions({
       setBusy(false);
     }
   }
+
   const run = (action: Parameters<Workbench["sessionAction"]>[1]) =>
     void perform(() => state.sessionAction(session.hostId, action));
   const id = session.id;
+
   async function copy(text: string) {
     await copyText(text);
     setCopied(true);
   }
-  if (menuView)
-    return createPortal(
-      <div
-        ref={menu}
+
+  if (menuView) {
+    return (
+      <Popover
+        open
+        anchorPoint={point}
+        anchorRef={triggerRef}
+        align={align}
+        minWidth={204}
         role="menu"
-        aria-label={`${session.title} 会话操作`}
-        className="project-context-menu session-context-menu"
-        style={{ left: position.x, top: position.y }}
+        label={`${session.title} 会话操作`}
+        className="session-context-menu"
+        restoreFocusOnEscape={false}
         onContextMenu={(e) => e.preventDefault()}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowLeft" && view === "copy") {
+            e.preventDefault();
+            e.stopPropagation();
+            setView("menu");
+          } else if (
+            e.key === "ArrowRight" &&
+            (document.activeElement as HTMLElement)?.dataset.copy === "true"
+          ) {
+            e.preventDefault();
+            e.stopPropagation();
+            setView("copy");
+          }
+        }}
+        onClose={(fromEscape) => {
+          if (busy) return;
+          if (fromEscape && view === "copy") {
+            setView("menu");
+            return;
+          }
+          close();
+        }}
       >
         {view === "copy" ? (
           <>
-            <button
+            <MenuRow
               role="menuitem"
               disabled={busy}
+              leading={<ArrowLeft size={15} />}
               onClick={() => setView("menu")}
             >
-              <ArrowLeft size={17} />
               返回
-            </button>
-            <button
+            </MenuRow>
+            <MenuSeparator />
+            <MenuRow
               role="menuitem"
               disabled={busy}
+              leading={<Copy size={15} />}
               onClick={() => void perform(() => copy(session.title))}
             >
-              <Copy size={17} />
               复制标题
-            </button>
-            <button
+            </MenuRow>
+            <MenuRow
               role="menuitem"
               disabled={busy}
+              leading={<Copy size={15} />}
               onClick={() => void perform(() => copy(id))}
             >
-              <Copy size={17} />
               复制会话 ID
-            </button>
-            <button
+            </MenuRow>
+            <MenuRow
               role="menuitem"
               disabled={busy}
+              leading={<Copy size={15} />}
               onClick={() =>
                 void perform(async () => {
                   const events = await loadConversation((after) =>
@@ -224,23 +194,29 @@ export function SessionActions({
                 }, false)
               }
             >
-              <Copy size={17} />
               {busy ? "读取完整对话…" : "对话 Markdown…"}
-            </button>
+            </MenuRow>
           </>
         ) : (
           <>
-            <button
+            <MenuRow
               role="menuitem"
               disabled={busy}
+              leading={<Pencil size={15} />}
               onClick={() => setView("rename")}
             >
-              <Pencil size={17} />
               重命名
-            </button>
-            <button
+            </MenuRow>
+            <MenuRow
               role="menuitem"
               disabled={busy || session.archived}
+              leading={
+                session.pinned_at === null ? (
+                  <Pin size={15} />
+                ) : (
+                  <PinOff size={15} />
+                )
+              }
               onClick={() =>
                 run({
                   method: "pin_session",
@@ -249,16 +225,12 @@ export function SessionActions({
                 })
               }
             >
-              {session.pinned_at === null ? (
-                <Pin size={17} />
-              ) : (
-                <PinOff size={17} />
-              )}
               {session.pinned_at === null ? "置顶" : "取消置顶"}
-            </button>
-            <button
+            </MenuRow>
+            <MenuRow
               role="menuitem"
               disabled={busy}
+              leading={<Eye size={15} />}
               onClick={() =>
                 run({
                   method: "mark_session_unread",
@@ -267,46 +239,47 @@ export function SessionActions({
                 })
               }
             >
-              <Eye size={17} />
               {session.unread ? "标记为已读" : "标记为未读"}
-            </button>
-            <div role="separator" />
-            <button
+            </MenuRow>
+            <MenuSeparator />
+            <MenuRow
               role="menuitem"
               disabled={busy}
               data-copy="true"
+              leading={<Copy size={15} />}
+              trailing={<ChevronRight size={13.5} />}
               onClick={() => setView("copy")}
             >
-              <Copy size={17} />
               复制…
-            </button>
-            <div role="separator" />
+            </MenuRow>
+            <MenuSeparator />
             {session.agent_close_pending && (
-              <button
+              <MenuRow
                 role="menuitem"
                 disabled={busy || active}
+                leading={<Check size={15} />}
                 onClick={() => {
                   setCloseId(session.agent_close_pending);
                   setView("confirm-close");
                 }}
               >
-                <Check size={17} />
                 核对原生会话关闭
-              </button>
+              </MenuRow>
             )}
             {active && (
-              <button
+              <MenuRow
                 role="menuitem"
                 disabled={busy}
+                leading={<Square size={15} />}
                 onClick={() => run({ method: "cancel", session_id: id })}
               >
-                <Square size={17} />
                 停止任务
-              </button>
+              </MenuRow>
             )}
-            <button
+            <MenuRow
               role="menuitem"
               disabled={busy || !canClose}
+              leading={<X size={15} />}
               title={
                 canClose
                   ? "关闭对话，保留历史"
@@ -319,12 +292,18 @@ export function SessionActions({
                 run({ method: "close_agent_session", session_id: id })
               }
             >
-              <X size={17} />
               关闭
-            </button>
-            <button
+            </MenuRow>
+            <MenuRow
               role="menuitem"
               disabled={busy || active}
+              leading={
+                session.archived ? (
+                  <ArchiveRestore size={15} />
+                ) : (
+                  <Archive size={15} />
+                )
+              }
               title={active ? "请先停止任务，再归档" : undefined}
               onClick={() =>
                 run({
@@ -334,151 +313,134 @@ export function SessionActions({
                 })
               }
             >
-              {session.archived ? (
-                <ArchiveRestore size={17} />
-              ) : (
-                <Archive size={17} />
-              )}
               {session.archived ? "取消归档" : "归档"}
-            </button>
+            </MenuRow>
           </>
         )}
-        {error && (
-          <div className="form-error" role="alert">
-            {error}
-          </div>
-        )}
-      </div>,
-      document.body,
+        {error && <NoticeBanner tone="danger">{error}</NoticeBanner>}
+      </Popover>
     );
+  }
+
   const dialogTitle =
     view === "rename"
       ? "重命名会话"
       : view === "confirm-close"
         ? "核对原生会话关闭"
         : "复制对话";
-  return createPortal(
-    <div
-      className="modal-backdrop"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !busy) close();
-      }}
-    >
-      <Modal
-        className="modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label={dialogTitle}
-      >
-        <button
-          className="modal-close icon-button"
-          aria-label="关闭"
-          disabled={busy}
-          onClick={close}
-        >
-          <X size={18} />
-        </button>
-        <h2>{dialogTitle}</h2>
-        {view === "rename" ? (
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              run({ method: "rename_session", session_id: id, title });
-            }}
-          >
-            <label>
-              会话名称
-              <input
-                autoFocus
-                required
-                maxLength={100}
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                disabled={busy}
-              />
-            </label>
-            {error && (
-              <div className="form-error" role="alert">
-                {error}
-              </div>
-            )}
-            <div className="modal-actions">
-              <button
-                type="button"
-                className="secondary"
-                disabled={busy}
-                onClick={close}
-              >
-                取消
-              </button>
-              <button className="primary" disabled={busy}>
-                {busy ? "保存中…" : "保存"}
-              </button>
-            </div>
-          </form>
+
+  return (
+    <Dialog
+      open
+      size={view === "transcript" ? "lg" : "sm"}
+      ariaLabel={dialogTitle}
+      title={dialogTitle}
+      busy={busy}
+      onClose={close}
+      footer={
+        view === "rename" ? (
+          <>
+            <Button variant="subtle" size="md" disabled={busy} onClick={close}>
+              取消
+            </Button>
+            <Button
+              type="submit"
+              form="rename-session-form"
+              variant="primary"
+              size="md"
+              busy={busy}
+              disabled={busy}
+            >
+              {busy ? "保存中…" : "保存"}
+            </Button>
+          </>
         ) : view === "confirm-close" ? (
           <>
-            <p className="form-note">
-              请先在执行主机上确认原生进程和后台任务已停止，再继续会话。
-            </p>
-            {error && (
-              <div className="form-error" role="alert">
-                {error}
-              </div>
-            )}
-            <div className="modal-actions">
-              <button className="secondary" disabled={busy} onClick={close}>
-                取消
-              </button>
-              <button
-                className="primary"
-                disabled={
-                  busy || !closeId || closeId !== session.agent_close_pending
-                }
-                onClick={() =>
-                  closeId &&
-                  run({
-                    method: "confirm_agent_closed",
-                    session_id: id,
-                    close_id: closeId,
-                  })
-                }
-              >
-                我已核对，确认关闭
-              </button>
-            </div>
+            <Button variant="subtle" size="md" disabled={busy} onClick={close}>
+              取消
+            </Button>
+            <Button
+              variant="primary"
+              size="md"
+              busy={busy}
+              disabled={
+                busy || !closeId || closeId !== session.agent_close_pending
+              }
+              onClick={() =>
+                closeId &&
+                run({
+                  method: "confirm_agent_closed",
+                  session_id: id,
+                  close_id: closeId,
+                })
+              }
+            >
+              我已核对，确认关闭
+            </Button>
           </>
         ) : (
-          <>
-            <p className="form-note">
-              复制截至读取时的用户和助手消息，保留 Markdown
-              格式，不包含工具原始输出。
-            </p>
-            <textarea
-              className="copy-transcript"
-              aria-label="对话 Markdown"
-              readOnly
-              value={markdown}
+          <Button
+            variant="primary"
+            size="md"
+            disabled={busy}
+            leading={copied ? <Check size={15} /> : <Copy size={15} />}
+            onClick={() => void perform(() => copy(markdown), false)}
+          >
+            {copied ? "已复制" : "复制"}
+          </Button>
+        )
+      }
+    >
+      {view === "rename" ? (
+        <form
+          id="rename-session-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            run({ method: "rename_session", session_id: id, title });
+          }}
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "var(--space-3)",
+          }}
+        >
+          <Field label="会话名称" htmlFor="rename-session-input">
+            <TextInput
+              id="rename-session-input"
+              autoFocus
+              required
+              maxLength={100}
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              disabled={busy}
             />
-            {error && (
-              <div className="form-error" role="alert">
-                {error}
-              </div>
-            )}
-            <div className="modal-actions">
-              <button
-                className="primary"
-                disabled={busy}
-                onClick={() => void perform(() => copy(markdown), false)}
-              >
-                {copied ? <Check size={16} /> : <Copy size={16} />}
-                {copied ? "已复制" : "复制"}
-              </button>
-            </div>
-          </>
-        )}
-      </Modal>
-    </div>,
-    document.body,
+          </Field>
+          {error && <NoticeBanner tone="danger">{error}</NoticeBanner>}
+        </form>
+      ) : view === "confirm-close" ? (
+        <>
+          <p className="ui-field-hint" style={{ margin: 0 }}>
+            请先在执行主机上确认原生进程和后台任务已停止，再继续会话。
+          </p>
+          {error && <NoticeBanner tone="danger">{error}</NoticeBanner>}
+        </>
+      ) : (
+        <>
+          <p className="ui-field-hint" style={{ margin: 0 }}>
+            复制截至读取时的用户和助手消息，保留 Markdown
+            格式，不包含工具原始输出。
+          </p>
+          <TextArea
+            className="copy-transcript"
+            aria-label="对话 Markdown"
+            monospace
+            rows={10}
+            readOnly
+            value={markdown}
+          />
+          {error && <NoticeBanner tone="danger">{error}</NoticeBanner>}
+        </>
+      )}
+    </Dialog>
   );
 }

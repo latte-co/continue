@@ -123,13 +123,18 @@ export function ApprovalCard({
   if (resolved || presentation === "record")
     return (
       <details
-        className={`approval-result activity-row ${tool?.status === "failed" ? "failure" : ""}`}
+        className="approval-result activity-row"
+        data-status={tool?.status}
       >
         <summary>
-          <ShieldCheck size={16} />
+          <ShieldCheck size={14} className="activity-icon" />
           <span className="activity-label">{label}</span>
-          <span className="activity-status">{status}</span>
-          <ChevronRight size={14} className="activity-chevron" />
+          <span
+            className={`activity-status${tool?.status === "failed" ? " failure" : ""}`}
+          >
+            {status}
+          </span>
+          <ChevronRight size={13} className="activity-chevron" />
         </summary>
         <div className="approval-result-body">
           <ApprovalOperation input={request.input} />

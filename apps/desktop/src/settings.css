@@ -45,9 +45,10 @@
     .provider-form,
     .settings-connection
   ) {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-panel);
+  background: var(--color-card);
+  border: 0;
+  box-shadow: var(--shadow-card);
+  border-radius: var(--radius-card);
   padding: var(--space-5);
 }
 .settings-panel-content .appearance-controls {
@@ -93,16 +94,17 @@
     .appearance-actions > button,
     .appearance-footer button
   ) {
-  min-height: 36px;
-  padding: var(--space-2) var(--space-3);
+  min-height: var(--control-height-md);
+  padding: 0 var(--space-3);
   font-size: var(--text-md);
   font-weight: 500;
   border-radius: var(--radius-control);
 }
 .settings-panel-content
   :is(.appearance-actions > button, .appearance-footer button) {
-  border: 1px solid var(--color-border);
-  background: var(--color-input);
+  border: 0;
+  background: var(--color-well);
+  box-shadow: var(--shadow-well);
 }
 .settings-panel-content .appearance-actions > .select-trigger {
   min-height: var(--control-height);

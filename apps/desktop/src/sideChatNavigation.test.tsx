@@ -5,9 +5,11 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import App from "./App";
+import { annotationPrompt } from "./annotations";
 import { ServerRequestError } from "./api";
 import type { Event, Request, Response, Session } from "./protocol";
 import {
@@ -1202,4 +1204,172 @@ it("renders post-approval tool execution failure details and full-output loader 
       name: "加载完整内容（已省略至预览，共 4 KB）",
     }),
   ).toBeTruthy();
+});
+
+it("stacks image preview above SideChatRecoveryDialog in opening order and restores focus on close", async () => {
+  const prevCreate = URL.createObjectURL;
+  const prevRevoke = URL.revokeObjectURL;
+  URL.createObjectURL = vi.fn(() => "blob:test-image");
+  URL.revokeObjectURL = vi.fn();
+  try {
+    const { SideChatRecoveryDialog } = await import("./SideChatRecoveryDialog");
+    const sideSession = makeSession({
+      id: "side-with-image",
+      parent_session_id: "archived-parent",
+      project_id: "proj-a",
+      agent: "claude",
+      title: "界面截图核对",
+    });
+    const sideEvents: Event[] = [
+      {
+        seq: 1,
+        session_id: "side-with-image",
+        at: 1,
+        event: {
+          kind: "user",
+          text: annotationPrompt("截图查看", [
+            {
+              id: "ann-1",
+              quote: "目标行",
+              comment: "核对此处逻辑",
+              source: { message: 0, start: 0, end: 3 },
+            },
+          ]),
+          request_id: "req-img",
+        },
+      },
+      {
+        seq: 2,
+        session_id: "side-with-image",
+        at: 2,
+        event: {
+          kind: "tool",
+          id: "tool-shot",
+          name: "Bash",
+          input: { command: "capture" },
+        },
+      },
+      {
+        seq: 3,
+        session_id: "side-with-image",
+        at: 3,
+        event: {
+          kind: "tool_result",
+          id: "tool-shot",
+          content: [
+            {
+              type: "image",
+              mime_type: "image/png",
+              data_base64: "iVBORw0KGgo=",
+            },
+          ],
+          is_error: false,
+        },
+      },
+    ];
+    mocks.request.mockImplementation(
+      async (_hostId: string, req: Request): Promise<Response> => {
+        if (req.method === "poll" && req.session_id === "side-with-image") {
+          return {
+            kind: "events",
+            session: sideSession,
+            events: sideEvents.filter((entry) => entry.seq > req.after),
+            has_more: false,
+          };
+        }
+        throw new Error(`unexpected request: ${JSON.stringify(req)}`);
+      },
+    );
+
+    const closeStandaloneSideChat = vi.fn();
+    render(
+      <SideChatRecoveryDialog
+        state={
+          {
+            hosts: [{ id: "remote", name: "Remote Box" }],
+            projects: [
+              {
+                id: "proj-a",
+                hostId: "remote",
+                name: "Project A",
+                path: "/repo/a",
+              },
+            ],
+            isHostConnected: () => true,
+            closeStandaloneSideChat,
+          } as unknown as Parameters<typeof SideChatRecoveryDialog>[0]["state"]
+        }
+        target={{
+          hostId: "remote",
+          sideId: "side-with-image",
+          initialSession: sideSession,
+        }}
+      />,
+    );
+
+    const recoveryDialog = await screen.findByRole(
+      "dialog",
+      { name: /核对侧边聊天/ },
+      UI_TIMEOUT,
+    );
+    const imageTrigger = await within(recoveryDialog).findByRole(
+      "button",
+      { name: /工具输出图片 1/ },
+      UI_TIMEOUT,
+    );
+    fireEvent.click(imageTrigger);
+
+    const imageDialog = await screen.findByRole("dialog", {
+      name: "图片预览 工具输出图片 1",
+    });
+    const recoveryBackdrop = recoveryDialog.closest<HTMLElement>(
+      ".ui-dialog-backdrop",
+    )!;
+    const imageBackdrop = imageDialog.closest<HTMLElement>(".modal-backdrop")!;
+
+    expect(Number(imageBackdrop.style.zIndex)).toBeGreaterThan(
+      Number(recoveryBackdrop.style.zIndex),
+    );
+    expect(recoveryBackdrop.inert).toBe(true);
+    expect(imageDialog.contains(document.activeElement)).toBe(true);
+
+    fireEvent.keyDown(imageDialog, { key: "Escape" });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "图片预览 工具输出图片 1" }),
+      ).toBeNull(),
+    );
+    expect(closeStandaloneSideChat).not.toHaveBeenCalled();
+    expect(recoveryBackdrop.inert).toBe(false);
+    await waitFor(() => expect(document.activeElement).toBe(imageTrigger));
+
+    const annotationTrigger = within(recoveryDialog).getByRole("button", {
+      name: /1 条注释/,
+    });
+    fireEvent.click(annotationTrigger);
+
+    const annotationDialog = await screen.findByRole("dialog", {
+      name: "消息注释",
+    });
+    const annotationBackdrop = annotationDialog.closest<HTMLElement>(
+      ".annotation-backdrop",
+    )!;
+    expect(Number(annotationBackdrop.style.zIndex)).toBeGreaterThan(
+      Number(recoveryBackdrop.style.zIndex),
+    );
+    expect(recoveryBackdrop.inert).toBe(true);
+    expect(annotationDialog.contains(document.activeElement)).toBe(true);
+
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "消息注释" })).toBeNull(),
+    );
+    expect(closeStandaloneSideChat).not.toHaveBeenCalled();
+    expect(recoveryBackdrop.inert).toBe(false);
+    await waitFor(() => expect(document.activeElement).toBe(annotationTrigger));
+  } finally {
+    cleanup();
+    URL.createObjectURL = prevCreate;
+    URL.revokeObjectURL = prevRevoke;
+  }
 });

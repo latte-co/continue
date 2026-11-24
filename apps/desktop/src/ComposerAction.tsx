@@ -25,11 +25,11 @@ export function ComposerAction({
       onClick={onClick}
     >
       {sending ? (
-        <LoaderCircle size={17} className="spin" />
+        <LoaderCircle size={15} className="spin" />
       ) : active ? (
-        <Square size={14} fill="currentColor" />
+        <Square size={11} rx={1.5} fill="currentColor" />
       ) : (
-        <ArrowUp size={19} />
+        <ArrowUp size={16} strokeWidth={2} />
       )}
     </button>
   );

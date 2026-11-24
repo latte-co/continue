@@ -15,6 +15,8 @@ import type { Workbench } from "./useWorkbench";
 
 import { BrowserSettings } from "./BrowserSettings";
 import { AppearanceSettings } from "./AppearanceSettings";
+import { isHiddenOrInert } from "./Modal";
+import { Button, NavRow, StageIsland } from "./ui";
 
 const tabs = [
   { id: "browser", label: "浏览器", icon: Globe2 },
@@ -53,6 +55,7 @@ export function SettingsPage({
         !event.defaultPrevented &&
         event.key === "Escape" &&
         !busy &&
+        !isHiddenOrInert(navigation.current) &&
         !document.querySelector(".ssh-password-modal") &&
         !document.querySelector(".ssh-modal")
       )
@@ -73,10 +76,16 @@ export function SettingsPage({
       <div className="settings-layout">
         <aside className="settings-navigation">
           <h1>设置</h1>
-          <button className="settings-back" onClick={close} disabled={busy}>
-            <ArrowLeft size={16} />
+          <Button
+            variant="ghost"
+            size="md"
+            className="settings-back"
+            leading={<ArrowLeft size={15.5} />}
+            onClick={close}
+            disabled={busy}
+          >
             返回工作台
-          </button>
+          </Button>
           <div
             ref={navigation}
             role="tablist"
@@ -107,83 +116,86 @@ export function SettingsPage({
             }}
           >
             {tabs.map(({ id, label, icon: Icon }) => (
-              <button
+              <NavRow
                 key={id}
                 id={`settings-tab-${id}`}
                 role="tab"
+                selected={tab === id}
                 aria-selected={tab === id}
                 aria-controls={`settings-panel-${id}`}
                 tabIndex={tab === id ? 0 : -1}
                 disabled={busy}
+                icon={<Icon size={15.5} />}
                 onClick={() => setTab(id)}
               >
-                <Icon size={17} />
                 {label}
-              </button>
+              </NavRow>
             ))}
           </div>
         </aside>
-        <main className="settings-body" aria-label="设置">
-          <section
-            id="settings-panel-browser"
-            role="tabpanel"
-            aria-labelledby="settings-tab-browser"
-            hidden={tab !== "browser"}
-          >
-            <BrowserSettings />
-          </section>
-          <section
-            id="settings-panel-archived"
-            role="tabpanel"
-            aria-labelledby="settings-tab-archived"
-            hidden={tab !== "archived"}
-          >
-            <ArchivedChats
-              state={state}
-              active={active && tab === "archived"}
-              onBusy={setArchiveBusy}
-            />
-          </section>
-          <section
-            id="settings-panel-appearance"
-            role="tabpanel"
-            aria-labelledby="settings-tab-appearance"
-            hidden={tab !== "appearance"}
-          >
-            {tab === "appearance" && <AppearanceSettings />}
-          </section>
-          <section
-            id="settings-panel-agents"
-            role="tabpanel"
-            aria-labelledby="settings-tab-agents"
-            hidden={tab !== "agents"}
-          >
-            <AgentSettings
-              state={state}
-              active={active && tab === "agents"}
-              onBusy={setAgentBusy}
-            />
-          </section>
-          <section
-            id="settings-panel-providers"
-            role="tabpanel"
-            aria-labelledby="settings-tab-providers"
-            hidden={tab !== "providers"}
-          >
-            <ProviderSettings
-              active={active && tab === "providers"}
-              onBusy={setProviderBusy}
-            />
-          </section>
-          <section
-            id="settings-panel-ssh"
-            role="tabpanel"
-            aria-labelledby="settings-tab-ssh"
-            hidden={tab !== "ssh"}
-          >
-            <SSHSettings state={state} onBusy={setSshBusy} />
-          </section>
-        </main>
+        <StageIsland>
+          <main className="settings-body" aria-label="设置">
+            <section
+              id="settings-panel-browser"
+              role="tabpanel"
+              aria-labelledby="settings-tab-browser"
+              hidden={tab !== "browser"}
+            >
+              <BrowserSettings />
+            </section>
+            <section
+              id="settings-panel-archived"
+              role="tabpanel"
+              aria-labelledby="settings-tab-archived"
+              hidden={tab !== "archived"}
+            >
+              <ArchivedChats
+                state={state}
+                active={active && tab === "archived"}
+                onBusy={setArchiveBusy}
+              />
+            </section>
+            <section
+              id="settings-panel-appearance"
+              role="tabpanel"
+              aria-labelledby="settings-tab-appearance"
+              hidden={tab !== "appearance"}
+            >
+              {tab === "appearance" && <AppearanceSettings />}
+            </section>
+            <section
+              id="settings-panel-agents"
+              role="tabpanel"
+              aria-labelledby="settings-tab-agents"
+              hidden={tab !== "agents"}
+            >
+              <AgentSettings
+                state={state}
+                active={active && tab === "agents"}
+                onBusy={setAgentBusy}
+              />
+            </section>
+            <section
+              id="settings-panel-providers"
+              role="tabpanel"
+              aria-labelledby="settings-tab-providers"
+              hidden={tab !== "providers"}
+            >
+              <ProviderSettings
+                active={active && tab === "providers"}
+                onBusy={setProviderBusy}
+              />
+            </section>
+            <section
+              id="settings-panel-ssh"
+              role="tabpanel"
+              aria-labelledby="settings-tab-ssh"
+              hidden={tab !== "ssh"}
+            >
+              <SSHSettings state={state} onBusy={setSshBusy} />
+            </section>
+          </main>
+        </StageIsland>
       </div>
     </div>
   );

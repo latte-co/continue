@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
-import { Globe2, Monitor, RefreshCw, Search } from "lucide-react";
-import { Select } from "./Select";
+import { Globe2, Monitor, RefreshCw } from "lucide-react";
 import { SkillAddMenu } from "./SkillAddMenu";
 import { SkillDetailDialog } from "./SkillDetailDialog";
 import { SkillChangeDialog, SkillImportDialog } from "./SkillOperationDialogs";
@@ -11,7 +10,22 @@ import {
 } from "./SkillGrid";
 import { useSkills } from "./useSkills";
 import type { Workbench } from "./useWorkbench";
+import {
+  Button,
+  Disclosure,
+  FilterBar,
+  IconButton,
+  NoticeBanner,
+  PageContainer,
+  PageHeader,
+  SearchInput,
+  Section,
+  SectionHeader,
+  Select,
+  Tabs,
+} from "./ui";
 import "./skills.css";
+
 export function SkillsSettings({
   state,
   active,
@@ -57,10 +71,12 @@ export function SkillsSettings({
     change,
     selectSkill,
   } = useSkills(state, active, onBusy);
+
   useEffect(() => {
     setInstalledExpanded(false);
     setCategoryExpanded(false);
   }, [context]);
+
   const filtered = (catalog?.skills ?? []).filter(
     (s) =>
       s.scope !== "project" &&
@@ -72,8 +88,10 @@ export function SkillsSettings({
   const category = filtered.filter((s) => s.scope === scope);
   const locked = busy || loading || !connected;
   const skill = detail?.skill;
+
   return (
-    <div
+    <PageContainer
+      size="wide"
       className="settings-panel-content skills-settings"
       onKeyDown={(event) => {
         if (
@@ -93,94 +111,110 @@ export function SkillsSettings({
         }
       }}
     >
-      <header className="skills-header">
-        <div>
-          <h2>技能</h2>
-          <p>管理当前主机的全局技能</p>
-        </div>
-        <div className="skills-toolbar">
-          <div className="skills-search">
-            <Search size={16} />
-            <input
+      <PageHeader
+        title="技能"
+        description="管理当前主机的全局技能"
+        actions={
+          <FilterBar className="skills-toolbar">
+            <SearchInput
               aria-label="搜索技能"
               placeholder="搜索技能"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
+              onClear={() => setQuery("")}
             />
-          </div>
-          <span className="skills-host">
-            {hostId === "local" ? <Monitor size={16} /> : <Globe2 size={16} />}
             <Select
               label="技能所在主机"
               menuTitle="主机"
               minMenuWidth={240}
               align="end"
-              compact
+              size="md"
+              leading={
+                hostId === "local" ? (
+                  <Monitor size={14.5} />
+                ) : (
+                  <Globe2 size={14.5} />
+                )
+              }
               value={hostId}
               disabled={busy}
               options={state.hosts.map((h) => ({ value: h.id, label: h.name }))}
               onChange={setHostId}
             />
-          </span>
-          <button
-            className="icon-button"
-            ref={refresh}
-            aria-label="刷新技能"
-            title="刷新技能"
-            disabled={locked}
-            onClick={() => reload()}
-          >
-            <RefreshCw size={17} className={loading ? "skills-spinning" : ""} />
-          </button>
-          <SkillAddMenu
-            key={context}
-            disabled={busy || !active}
-            importDisabled={locked || !catalog}
-            onCreate={onCreate ? () => onCreate(hostId) : undefined}
-            onImport={() => {
-              clearErrors();
-              setAdd(true);
-            }}
-          />
-        </div>
-      </header>
+            <IconButton
+              ref={refresh}
+              label="刷新技能"
+              variant="subtle"
+              size="md"
+              disabled={locked}
+              onClick={() => reload()}
+            >
+              <RefreshCw
+                size={15.5}
+                className={loading ? "skills-spinning" : ""}
+              />
+            </IconButton>
+            <SkillAddMenu
+              key={context}
+              disabled={busy || !active}
+              importDisabled={locked || !catalog}
+              onCreate={onCreate ? () => onCreate(hostId) : undefined}
+              onImport={() => {
+                clearErrors();
+                setAdd(true);
+              }}
+            />
+          </FilterBar>
+        }
+      />
+
       {!connected && (
-        <p role="status">
+        <NoticeBanner tone="warning">
           {host?.name ?? "主机"} 未连接。请在「连接与 Agent」中连接后查看技能。
-        </p>
+        </NoticeBanner>
       )}
       {pageError && !selected && !add && (
-        <p role="alert">
+        <NoticeBanner
+          tone="danger"
+          action={
+            <Button
+              size="xs"
+              variant="subtle"
+              disabled={busy || loading || !connected}
+              onClick={() => reload()}
+            >
+              刷新核对
+            </Button>
+          }
+        >
           {pageError}
-          <button
-            disabled={busy || loading || !connected}
-            onClick={() => reload()}
-          >
-            刷新核对
-          </button>
-        </p>
+        </NoticeBanner>
       )}
-      {notice && <p role="status">{notice}</p>}
-      {loading && <p role="status">正在读取技能…</p>}
+      {notice && <NoticeBanner tone="success">{notice}</NoticeBanner>}
+      {loading && <NoticeBanner tone="neutral">正在读取技能…</NoticeBanner>}
+
       {catalog && (
         <>
           {(catalog.warnings.length > 0 || catalog.truncated) && (
-            <details className="skills-warnings">
-              <summary>部分目录未能完整读取</summary>
+            <Disclosure
+              title="部分目录未能完整读取"
+              className="skills-warnings"
+            >
               {catalog.warnings.map((w, i) => (
-                <p key={i}>{w}</p>
+                <p key={i} style={{ margin: 0 }}>
+                  {w}
+                </p>
               ))}
               {catalog.truncated && (
-                <p>
+                <p style={{ margin: 0 }}>
                   扫描达到数量、大小或时间上限，部分技能可能未显示；请整理目录后刷新。
                 </p>
               )}
-            </details>
+            </Disclosure>
           )}
-          <section className="skills-installed">
-            <h3>
-              已安装 <small>{installed.length}</small>
-            </h3>
+
+          <Section className="skills-installed">
+            <SectionHeader title="已安装" count={installed.length} />
             <SkillGrid
               skills={installed}
               expanded={installedExpanded}
@@ -192,52 +226,24 @@ export function SkillsSettings({
               emptyMessage="暂无技能"
               onSelect={selectSkill}
             />
-          </section>
-          <section className="skills-categories">
-            <div className="skills-category-toolbar">
-              <div className="skills-tabs" role="tablist" aria-label="技能分类">
-                {scopes.map((s, i) => (
-                  <button
-                    role="tab"
-                    id={`skill-tab-${s.value}`}
-                    aria-controls="skill-category-panel"
-                    aria-selected={scope === s.value}
-                    tabIndex={scope === s.value ? 0 : -1}
-                    key={s.value}
-                    onClick={() => {
-                      setScope(s.value);
-                      setCategoryExpanded(false);
-                    }}
-                    onKeyDown={(e) => {
-                      if (
-                        !["ArrowRight", "ArrowLeft", "Home", "End"].includes(
-                          e.key,
-                        )
-                      )
-                        return;
-                      e.preventDefault();
-                      const next =
-                        e.key === "Home"
-                          ? 0
-                          : e.key === "End"
-                            ? scopes.length - 1
-                            : (i +
-                                (e.key === "ArrowRight" ? 1 : -1) +
-                                scopes.length) %
-                              scopes.length;
-                      setScope(scopes[next].value);
-                      setCategoryExpanded(false);
-                      document
-                        .getElementById(`skill-tab-${scopes[next].value}`)
-                        ?.focus();
-                    }}
-                  >
-                    {s.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <p className="skills-scope-note">
+          </Section>
+
+          <Section className="skills-categories">
+            <Tabs
+              label="技能分类"
+              idPrefix="skill-tab-"
+              panelId="skill-category-panel"
+              value={scope}
+              onChange={(nextScope) => {
+                setScope(nextScope);
+                setCategoryExpanded(false);
+              }}
+              options={scopes.map((s) => ({
+                value: s.value,
+                label: s.label,
+              }))}
+            />
+            <p className="skills-scope-note" style={{ margin: "2px 0 6px" }}>
               {scope === "platform"
                 ? "随 Latte Work 提供，仅注入 Work 启动的 Agent。"
                 : "当前主机的全局技能；文件操作会影响该主机上的其他 Agent。"}
@@ -259,9 +265,10 @@ export function SkillsSettings({
                 onSelect={selectSkill}
               />
             </div>
-          </section>
+          </Section>
         </>
       )}
+
       {active && selected && (
         <SkillDetailDialog
           key={selected}
@@ -307,6 +314,6 @@ export function SkillsSettings({
           onImport={(upload) => void mutate(upload)}
         />
       )}
-    </div>
+    </PageContainer>
   );
 }

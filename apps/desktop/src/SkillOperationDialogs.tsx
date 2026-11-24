@@ -1,5 +1,6 @@
-import { Modal } from "./Modal";
 import type { SkillChange } from "./useSkills";
+import { Button, Dialog, NoticeBanner, Well } from "./ui";
+
 type Shared = {
   hostName?: string;
   busy: boolean;
@@ -7,6 +8,7 @@ type Shared = {
   error: string;
   onClose: () => void;
 };
+
 export function SkillChangeDialog({
   confirm,
   hostName,
@@ -16,55 +18,79 @@ export function SkillChangeDialog({
   onClose,
   onConfirm,
 }: Shared & { confirm: SkillChange; onConfirm: () => void }) {
+  const actionVerb =
+    confirm.next === "uninstalled"
+      ? "卸载"
+      : confirm.next === "disabled"
+        ? "禁用"
+        : confirm.skill.state === "uninstalled"
+          ? "安装"
+          : "启用";
   return (
-    <div className="modal-backdrop skill-confirm-backdrop">
-      <Modal
-        className="modal"
-        aria-labelledby="skill-confirm-title"
-        aria-describedby="skill-confirm-description"
-      >
-        <h2 id="skill-confirm-title">
-          {confirm.next === "uninstalled"
-            ? "卸载"
-            : confirm.next === "disabled"
-              ? "禁用"
-              : confirm.skill.state === "uninstalled"
-                ? "安装"
-                : "启用"}{" "}
-          {confirm.skill.name}？
-        </h2>
-        <div id="skill-confirm-description">
-          <p>主机：{hostName}</p>
-          <p className="skill-detail-path">
-            {confirm.skill.directory ?? "Latte Work 平台内置技能"}
-          </p>
-          <p>
-            {confirm.skill.scope === "platform"
-              ? "仅影响此主机上由 Latte Work 启动的 Agent。"
-              : confirm.skill.state === "uninstalled"
-                ? "会恢复到此主机的全局技能目录，影响使用该目录的其他 Agent。"
-                : "会移动当前安装目录，影响这台主机上使用此目录的其他 Agent。"}
-            {confirm.next === "uninstalled"
-              ? "卸载后保留恢复副本，可在分类中重新安装。"
-              : "可以随时在此恢复。"}{" "}
-            已运行的会话及历史上下文保持原样，对后续新建的 Agent 会话生效。
-          </p>
-        </div>
-        {error && <p role="alert">{error}</p>}
-        <div className="modal-actions">
-          <button disabled={busy} onClick={() => onClose()}>
+    <Dialog
+      open
+      size="sm"
+      hideCloseButton
+      backdropClassName="skill-confirm-backdrop"
+      title={`${actionVerb} ${confirm.skill.name}？`}
+      ariaDescribedBy="skill-confirm-description"
+      busy={busy}
+      onClose={onClose}
+      footer={
+        <>
+          <Button
+            variant="subtle"
+            size="md"
+            disabled={busy}
+            onClick={() => onClose()}
+          >
             取消
-          </button>
-          <button
-            className={confirm.next === "uninstalled" ? "danger" : "primary"}
+          </Button>
+          <Button
+            variant={confirm.next === "uninstalled" ? "danger" : "primary"}
+            size="md"
+            busy={busy}
             disabled={busy || !connected}
             onClick={() => onConfirm()}
           >
             {busy ? "正在保存…" : "确认"}
-          </button>
-        </div>
-      </Modal>
-    </div>
+          </Button>
+        </>
+      }
+    >
+      <div
+        id="skill-confirm-description"
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: "var(--space-2)",
+          fontSize: "var(--text-sm)",
+          color: "var(--color-text-secondary)",
+          lineHeight: 1.55,
+        }}
+      >
+        <div>主机：{hostName}</div>
+        <Well
+          className="skill-detail-path"
+          style={{ padding: "6px 10px", margin: 0 }}
+        >
+          {confirm.skill.directory ?? "Latte Work 平台内置技能"}
+        </Well>
+        <p style={{ margin: 0 }}>
+          {confirm.skill.scope === "platform"
+            ? "仅影响此主机上由 Latte Work 启动的 Agent。"
+            : confirm.skill.state === "uninstalled"
+              ? "会恢复到此主机的全局技能目录，影响使用该目录的其他 Agent。"
+              : "会移动当前安装目录，影响这台主机上使用此目录的其他 Agent。"}
+          {confirm.next === "uninstalled"
+            ? "卸载后保留恢复副本，可在分类中重新安装。"
+            : "可以随时在此恢复。"}{" "}
+          已运行的会话及历史上下文保持原样，对后续新建的 Agent 会话生效。
+        </p>
+      </div>
+      {error && <NoticeBanner tone="danger">{error}</NoticeBanner>}
+    </Dialog>
   );
 }
+
 export { SkillImportDialog } from "./SkillImportDialog";

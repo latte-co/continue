@@ -55,6 +55,7 @@ import { TurnTranscript, turnTranscript } from "./TurnTranscript";
 import { TurnNavigator, turnNavigationEntries } from "./TurnNavigator";
 import { ToolGroup, ToolRow } from "./ToolActivity";
 import { ToolImages } from "./ToolImages";
+import { Button, FloatingPill } from "./ui";
 export const statusNames = {
   ready: "就绪",
   running: "执行中",
@@ -819,6 +820,7 @@ export function Conversation({
                         <ToolRow
                           key={item.key}
                           tool={item}
+                          onOpenSubagents={openSubagents}
                           loadContext={
                             session
                               ? { hostId, sessionId: session.id }
@@ -829,6 +831,7 @@ export function Conversation({
                         <ToolGroup
                           key={item.key}
                           tools={item.tools}
+                          onOpenSubagents={openSubagents}
                           loadContext={
                             session
                               ? { hostId, sessionId: session.id }
@@ -971,7 +974,7 @@ export function Conversation({
             </div>
           )}
           {away && !openingSession && (
-            <button
+            <FloatingPill
               className="return-latest"
               aria-label="回到最新"
               title="回到最新"
@@ -983,9 +986,9 @@ export function Conversation({
                 });
               }}
             >
-              <ArrowDown size={15} />
+              <ArrowDown size={14} />
               <span>回到最新</span>
-            </button>
+            </FloatingPill>
           )}
 
           {!session && (
@@ -1001,9 +1004,14 @@ export function Conversation({
           {!session && draft.skillCreator && !projectName && (
             <div className="skill-creator-context">
               <span>先选择工作目录，再描述要创建的技能。</span>
-              <button disabled={sending} onClick={openProject}>
+              <Button
+                variant="subtle"
+                size="xs"
+                disabled={sending}
+                onClick={openProject}
+              >
                 选择工作目录
-              </button>
+              </Button>
             </div>
           )}
           {!session && selectAgent && agents.length > 1 ? (

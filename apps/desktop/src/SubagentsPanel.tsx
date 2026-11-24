@@ -17,6 +17,7 @@ import { SubagentTranscript } from "./SubagentTranscript";
 import { subagentExecutionStatus } from "./executionStatus";
 import { useStatusIssues } from "./statusNotices";
 import { useTaskDisclosure } from "./useTaskDisclosure";
+import { EmptyState, FloatingPill, NoticeBanner } from "./ui";
 
 function SubagentGroup({
   label,
@@ -200,11 +201,11 @@ export function SubagentsPanel({
               </ImageGallery>
               {!selected.summary &&
                 ["failed", "stopped"].includes(selected.status) && (
-                  <div
-                    className={`notice ${selected.status === "failed" ? "failure" : ""}`}
+                  <NoticeBanner
+                    tone={selected.status === "failed" ? "danger" : "neutral"}
                   >
                     {subagentLabels[selected.status]}
-                  </div>
+                  </NoticeBanner>
                 )}
               {working && (
                 <WorkingStatus
@@ -216,7 +217,7 @@ export function SubagentsPanel({
           </div>
         </div>
         {away && (
-          <button
+          <FloatingPill
             className="return-latest"
             aria-label="回到最新"
             title="回到最新"
@@ -226,9 +227,9 @@ export function SubagentsPanel({
               root.current?.scrollTo({ top: root.current.scrollHeight });
             }}
           >
-            <ArrowDown size={15} />
+            <ArrowDown size={14} />
             <span>回到最新</span>
-          </button>
+          </FloatingPill>
         )}
       </div>
     );
@@ -251,7 +252,7 @@ export function SubagentsPanel({
         <WorkingStatus label="正在读取子智能体…" animated />
       )}
       {!state.loading && !state.error && !state.tasks.length && (
-        <p className="subagent-empty">当前对话尚未启动子智能体</p>
+        <EmptyState icon={<Bot size={20} />} title="当前对话尚未启动子智能体" />
       )}
       {(
         [

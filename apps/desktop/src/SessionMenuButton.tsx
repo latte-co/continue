@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { MoreHorizontal } from "lucide-react";
 import { SessionActions } from "./SessionActions";
 import type { Workbench } from "./useWorkbench";
+import { IconButton } from "./ui";
 
 export function SessionMenuButton({ state }: { state: Workbench }) {
   const trigger = useRef<HTMLButtonElement>(null);
@@ -17,10 +18,12 @@ export function SessionMenuButton({ state }: { state: Workbench }) {
     : undefined;
   return (
     <>
-      <button
+      <IconButton
         ref={trigger}
-        className={`panel-toggle icon-button${open ? " is-active" : ""}`}
-        aria-label="当前对话操作"
+        size="sm"
+        active={open}
+        className={`panel-toggle${open ? " is-active" : ""}`}
+        label="当前对话操作"
         title={session ? "当前对话操作" : "发送消息后可操作当前对话"}
         aria-haspopup="menu"
         aria-expanded={open}
@@ -36,8 +39,8 @@ export function SessionMenuButton({ state }: { state: Workbench }) {
           setAnchor({ scope, point: { x: rect.right, y: rect.bottom + 4 } });
         }}
       >
-        <MoreHorizontal size={16} />
-      </button>
+        <MoreHorizontal size={15.5} />
+      </IconButton>
       {open && session && anchor && (
         <SessionActions
           key={scope}

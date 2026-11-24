@@ -312,8 +312,15 @@ export function ImageGallery({
     // Modal restores the original DOM node normally. A prepended page may
     // replace that node; restore its current event/image counterpart instead.
     queueMicrotask(() => {
-      if (trigger?.isConnected && !trigger.closest("[hidden], [inert]"))
-        trigger.focus();
+      if (!trigger?.isConnected) return;
+      for (
+        let cur: HTMLElement | null = trigger;
+        cur;
+        cur = cur.parentElement
+      ) {
+        if (cur.hidden || cur.inert || cur.hasAttribute("inert")) return;
+      }
+      trigger.focus();
     });
   }, []);
   useLayoutEffect(() => select(null), [scope, active]);

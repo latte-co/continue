@@ -120,6 +120,13 @@ it("routes image previews to the saved turn on the selected remote host without 
   expect(
     await screen.findByRole("img", { name: "qr.png · 修改后" }),
   ).toBeTruthy();
+  const diffGrid = document.querySelector(".review-image-diff")!;
+  expect(diffGrid.classList.contains("review-image-diff--single")).toBe(false);
+  fireEvent.click(screen.getByRole("radio", { name: "修改后" }));
+  expect(diffGrid.classList.contains("review-image-diff--single")).toBe(true);
+  expect(screen.queryByRole("img", { name: "qr.png · 修改前" })).toBeNull();
+  fireEvent.click(screen.getByRole("radio", { name: "并排" }));
+  expect(diffGrid.classList.contains("review-image-diff--single")).toBe(false);
   expect(mocks.request).toHaveBeenCalledWith("devbox", {
     method: "preview_change",
     target: {

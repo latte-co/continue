@@ -4,12 +4,17 @@ import {
 } from "./connectionErrors";
 import {
   clampWorkspaceWidth,
+  clampWorkspaceWidthInStage,
   CONVERSATION_MIN_WIDTH,
   copyWorkspace,
   openSideChatTab,
   openSubagents,
+  SIDEBAR_HANDLE_WIDTH,
+  STAGE_ISLAND_INSET,
+  stageAvailableWidth,
   syncProjectInWorkspaces,
   useWorkspaceState,
+  WORKSPACE_HANDLE_WIDTH,
   workspaceKey,
 } from "./workspaceState";
 import { resolveSideChatNavigation } from "./sideChatNavigation";
@@ -449,13 +454,13 @@ export function useWorkbench() {
   );
   function restoreWorkspace() {
     const sidebarWidth = sidebarOpen ? leftWidth : 0;
+    const stageWidth = stageAvailableWidth(window.innerWidth, sidebarWidth);
     setWorkspace({
       visible: true,
       expanded: false,
-      width: clampWorkspaceWidth(
-        window.innerWidth - sidebarWidth - 320 - (sidebarOpen ? 2 : 1),
-        window.innerWidth,
-        sidebarWidth,
+      width: clampWorkspaceWidthInStage(
+        stageWidth - 320 - WORKSPACE_HANDLE_WIDTH,
+        stageWidth,
       ),
     });
   }
@@ -1804,20 +1809,21 @@ export function useWorkbench() {
             Math.min(
               320,
               window.innerWidth -
-                (panel && !merged ? rightWidth : 0) -
+                SIDEBAR_HANDLE_WIDTH -
+                STAGE_ISLAND_INSET -
                 CONVERSATION_MIN_WIDTH -
-                (panel ? 2 : 1),
+                (panel && !merged ? rightWidth + WORKSPACE_HANDLE_WIDTH : 0),
               value,
             ),
           ),
         );
       else {
         if (mergedDuringDrag) return;
-        const splitWidth = clampWorkspaceWidth(
-          value,
-          window.innerWidth,
-          sidebarWidth,
-        );
+        const measuredStage = handle.parentElement?.clientWidth || 0;
+        const splitWidth =
+          measuredStage > 0
+            ? clampWorkspaceWidthInStage(value, measuredStage)
+            : clampWorkspaceWidth(value, window.innerWidth, sidebarWidth);
         if (event.clientX <= sidebarWidth + 24) {
           mergedDuringDrag = true;
           setWorkspace({ expanded: true, conversationActive: true });

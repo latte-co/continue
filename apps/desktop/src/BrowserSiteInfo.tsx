@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { SiteIcon } from "./SiteIcon";
 import { webLink } from "./browserLinks";
-import { Modal } from "./Modal";
+import { isHiddenOrInert, Modal, useOverlayLayer } from "./Modal";
 import { message } from "./api";
 
 export type SiteInfo = {
@@ -91,13 +91,14 @@ export function BrowserSiteInfo({
       if (
         !confirming.current &&
         !busyRef.current &&
+        !isHiddenOrInert(panel.current) &&
         !panel.current?.contains(event.target as Node) &&
         !trigger.current?.contains(event.target as Node)
       )
         setOpen(false);
     };
     const key = (event: KeyboardEvent) => {
-      if (confirming.current) return;
+      if (confirming.current || isHiddenOrInert(panel.current)) return;
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
@@ -129,7 +130,7 @@ export function BrowserSiteInfo({
       document.removeEventListener("pointerdown", outside);
       window.removeEventListener("keydown", key, true);
       window.removeEventListener("resize", close);
-      if (trigger.current?.isConnected && !trigger.current.closest("[hidden]"))
+      if (trigger.current?.isConnected && !isHiddenOrInert(trigger.current))
         trigger.current.focus();
     };
   }, [open, active, id, address]);
@@ -182,6 +183,7 @@ export function BrowserSiteInfo({
     }
   }
   const rect = trigger.current?.getBoundingClientRect();
+  useOverlayLayer(panel, Boolean(open && active && address && rect));
   const connection = info?.connection;
   const ConnectionIcon =
     connection === "secure"

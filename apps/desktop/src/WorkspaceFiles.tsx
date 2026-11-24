@@ -9,6 +9,14 @@ import { ChangesView } from "./ChangesView";
 import { WorkspaceFileTree } from "./WorkspaceFileTree";
 import { useStatusIssues } from "./statusNotices";
 import { useFileTreeWidth } from "./useFileTreeWidth";
+import {
+  Badge,
+  EmptyState,
+  IconButton,
+  SplitHandle,
+  StateBlock,
+  Subbar,
+} from "./ui";
 
 const WRAP_STORAGE_KEY = "latte-work.file-wrap.v1";
 
@@ -68,6 +76,7 @@ export function WorkspaceFiles({
   const markdown = isMarkdownFile(file) && markdownScope === fileScope;
   useEffect(() => setMarkdownScope(""), [fileScope]);
   const treeWidth = useFileTreeWidth(active && tab === "files" && treeOpen);
+
   useEffect(() => {
     try {
       localStorage.setItem(WRAP_STORAGE_KEY, String(wrap));
@@ -75,6 +84,7 @@ export function WorkspaceFiles({
       // Wrapping remains available when local storage is unavailable.
     }
   }, [wrap]);
+
   useEffect(() => {
     if (!active || tab !== "files") return;
     if (reference) {
@@ -131,11 +141,13 @@ export function WorkspaceFiles({
       action: { label: "重试", run: () => refresh((value) => value + 1) },
     },
   ]);
+
   if (tab === "diff")
     return <ChangesView hostId={hostId} project={project} active={active} />;
+
   return (
     <div className="workspace-files">
-      <div className="workspace-file-header">
+      <Subbar className="workspace-file-header">
         <div
           className="workspace-file-path"
           title={
@@ -147,6 +159,7 @@ export function WorkspaceFiles({
           {(!reference || reference.directory) && (
             <>
               <button
+                type="button"
                 className="workspace-file-project"
                 aria-label={reference ? "返回所选目录" : "返回项目目录"}
                 title={reference?.path ?? project.path}
@@ -171,58 +184,61 @@ export function WorkspaceFiles({
           </span>
         </div>
         {file && !reference && !loading && !error && truncated && (
-          <span className="workspace-file-truncated">内容已截断</span>
+          <Badge tone="warning" className="workspace-file-truncated">
+            内容已截断
+          </Badge>
         )}
         <div className="workspace-file-actions">
           {isMarkdownFile(file) && (
-            <button
-              className="icon-button"
-              aria-label={markdown ? "查看源码" : "预览 Markdown"}
-              title={markdown ? "查看源码" : "预览 Markdown"}
+            <IconButton
+              size="sm"
+              label={markdown ? "查看源码" : "预览 Markdown"}
+              active={markdown}
               aria-pressed={markdown}
               disabled={!active}
               onClick={() => setMarkdownScope(markdown ? "" : fileScope)}
             >
-              {markdown ? <Code2 size={16} /> : <Eye size={16} />}
-            </button>
+              {markdown ? <Code2 size={15} /> : <Eye size={15} />}
+            </IconButton>
           )}
-          <button
-            className="icon-button"
-            aria-label="自动换行"
-            title="自动换行"
+          <IconButton
+            size="sm"
+            label="自动换行"
+            active={wrap}
             aria-pressed={wrap}
             disabled={markdown}
             onClick={() => setWrap((value) => !value)}
           >
-            <WrapText size={16} />
-          </button>
-          <button
-            className="icon-button"
-            aria-label={treeOpen ? "隐藏文件树" : "显示文件树"}
-            title={treeOpen ? "隐藏文件树" : "显示文件树"}
+            <WrapText size={15} />
+          </IconButton>
+          <IconButton
+            size="sm"
+            label={treeOpen ? "隐藏文件树" : "显示文件树"}
+            active={treeOpen}
             aria-pressed={treeOpen}
             onClick={() => setTreeOpen((value) => !value)}
           >
-            <Folders size={16} />
-          </button>
-          <button
-            className="icon-button"
-            aria-label="刷新"
-            title="刷新"
+            <Folders size={15} />
+          </IconButton>
+          <IconButton
+            size="sm"
+            label="刷新"
             disabled={loading}
             onClick={() => refresh((v) => v + 1)}
           >
-            <RefreshCw size={16} />
-          </button>
+            <RefreshCw size={15} />
+          </IconButton>
         </div>
-      </div>
+      </Subbar>
       <div className="workspace-files-body" ref={treeWidth.container}>
         <div className="workspace-file-content">
           {!file ? (
             <div className="workspace-file-empty">
-              <Folders size={28} aria-hidden="true" />
-              <strong>打开文件</strong>
-              <span>从右侧目录选择文件</span>
+              <EmptyState
+                icon={<Folders size={22} />}
+                title="打开文件"
+                description="从右侧目录选择文件"
+              />
             </div>
           ) : reference ? (
             <SourcePreview
@@ -243,9 +259,7 @@ export function WorkspaceFiles({
               markdown={markdown}
             />
           ) : loading ? (
-            <div className="panel-empty" role="status">
-              正在读取…
-            </div>
+            <StateBlock kind="loading">正在读取…</StateBlock>
           ) : error ? null : (
             <FileTextView
               key={`${project.path}:${file}`}
@@ -255,11 +269,9 @@ export function WorkspaceFiles({
             />
           )}
         </div>
-        <div
+        <SplitHandle
+          label="调整文件目录宽度"
           className="resize-handle workspace-file-resize"
-          role="separator"
-          aria-label="调整文件目录宽度"
-          aria-orientation="vertical"
           aria-valuemin={Math.round(treeWidth.minimum)}
           aria-valuemax={Math.round(treeWidth.maximum)}
           aria-valuenow={treeWidth.width}

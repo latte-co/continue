@@ -2,6 +2,7 @@ import { useEffect, useRef, type ReactNode } from "react";
 import { ArrowLeft } from "lucide-react";
 import type { Workbench } from "./useWorkbench";
 import { SkillsSettings } from "./SkillsSettings";
+import { IconButton, Topbar } from "./ui";
 
 /** Main navigation page. Conversation and workspace remain mounted behind it. */
 export function SkillsPage({
@@ -38,22 +39,24 @@ export function SkillsPage({
         }
       }}
     >
-      <header className="topbar" data-tauri-drag-region="deep">
-        <div className="topbar-project">
-          {controls}
-          <button
-            ref={back}
-            className="icon-button"
-            aria-label="返回对话"
-            title="返回对话"
-            disabled={busy}
-            onClick={onClose}
-          >
-            <ArrowLeft size={16} />
-          </button>
-          <span>技能</span>
-        </div>
-      </header>
+      <Topbar
+        className="topbar"
+        leading={
+          <div className="topbar-project">
+            {controls}
+            <IconButton
+              ref={back}
+              label="返回对话"
+              size="sm"
+              disabled={busy}
+              onClick={onClose}
+            >
+              <ArrowLeft size={16} />
+            </IconButton>
+            <span>技能</span>
+          </div>
+        }
+      />
       <div className="skills-page-body">
         <SkillsSettings
           state={state}

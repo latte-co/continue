@@ -98,7 +98,9 @@ it("folds child commentary together with tools after completion", () => {
   expect(screen.getByText("child progress")).toBeTruthy();
   expect(view.container.querySelector("time")).toBeNull();
   expect(screen.getByText("native read output")).toBeTruthy();
-  expect(screen.getByText(/"file_path": "child.txt"/)).toBeTruthy();
+  expect(
+    screen.getByRole("region", { name: "读取 child.txt的详情" }).textContent,
+  ).toContain("child.txt");
   view.rerender(
     <SubagentTranscript
       task={{ ...task, status: "completed", summary: "child final" }}

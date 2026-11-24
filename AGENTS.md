@@ -29,8 +29,9 @@ DEVELOPMENT.md before changing build or runtime contracts.
   are supported for diagnosis. `cargo generate-lockfile` bootstraps dependencies.
 
 ## Quality and safety
-- For UI work, read docs/design-system.md and reuse apps/desktop/src/tokens.css.
-  Keep shared control styles consistent; validate native focus and disabled states.
+- For UI work, read DESIGN.md first (and docs/design-system.md for workflow invariants),
+  compose shared primitives from apps/desktop/src/ui/, and reuse apps/desktop/src/tokens.css.
+  Keep shared control styles consistent; validate :focus-visible rings and disabled states.
 - Deny warnings in Clippy. No unsafe Rust in our crates.
 - Add focused tests for protocol, persistence, approval, cancellation, reconnect,
   and path-boundary changes. Final-binary tests use a deterministic CLI fixture;

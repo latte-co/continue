@@ -70,18 +70,20 @@ button.annotation-marker:hover:not(:disabled) {
   flex-wrap: wrap;
   padding: 4px;
   gap: 2px;
-  background: var(--color-composer);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--color-elevated) 92%, transparent);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 0;
+  border-radius: var(--radius-card);
   box-shadow: var(--shadow-popover);
 }
 .annotation-selection-menu button {
   display: flex;
   align-items: center;
   gap: 6px;
-  min-height: 30px;
+  min-height: var(--control-height-sm);
   padding: 4px 10px;
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius-control);
   font-size: var(--text-md);
   white-space: nowrap;
   background: transparent;
@@ -89,23 +91,25 @@ button.annotation-marker:hover:not(:disabled) {
 .annotation-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 120;
+  z-index: 200;
 }
 .annotation-popover {
   position: fixed;
   max-height: calc(100vh - 24px);
   overflow: auto;
   overscroll-behavior: contain;
-  background: var(--color-composer);
+  background: color-mix(in srgb, var(--color-elevated) 94%, transparent);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
   color: var(--color-text);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-dialog);
+  border: 0;
+  border-radius: var(--radius-card);
   box-shadow: var(--shadow-popover);
   font-size: var(--text-md);
 }
 .annotation-editor-popover {
   overflow: visible;
-  border-radius: 26px;
+  border-radius: var(--radius-island);
 }
 .annotation-editor-shell {
   padding: 6px 8px 6px 16px;
