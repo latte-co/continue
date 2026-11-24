@@ -18,6 +18,7 @@ import {
   workspaceKey,
 } from "./workspaceState";
 import { resolveSideChatNavigation } from "./sideChatNavigation";
+import { settledSideChatTitle } from "./SideChatHistory";
 import type { StandaloneSideChatTarget } from "./SideChatRecoveryDialog";
 import { requestSideWriteConfirmation } from "./sideWritePrompts";
 import { useEffect, useRef, useState } from "react";
@@ -1241,7 +1242,12 @@ export function useWorkbench() {
       return;
     }
     setStandaloneSideChat(null);
-    openSideChatTab(workspaceKey(target.parent.id), sideId, false);
+    openSideChatTab(
+      workspaceKey(target.parent.id),
+      sideId,
+      false,
+      settledSideChatTitle(target.side),
+    );
     openSession({ ...target.parent, hostId: targetHostId });
   }
   async function loadEarlierHistory(minTurns = 1): Promise<void> {

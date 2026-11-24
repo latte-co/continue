@@ -262,7 +262,8 @@ export default function App() {
               hostId,
               parentId: session.id,
               currentId: sideChatId(workbench.workspace.current),
-              onOpen: (id) => openSideChatTab(workbench.workspaceId, id),
+              onOpen: (id, tabTitle) =>
+                openSideChatTab(workbench.workspaceId, id, false, tabTitle),
             }
           : undefined
       }
@@ -522,6 +523,7 @@ export default function App() {
                       workspaceId={workbench.workspaceId}
                       isDraft={tab.draft}
                       hostId={hostId}
+                      serverId={workbench.serverId}
                       projectPath={project?.path}
                       drafts={drafts}
                       active={active && !workbench.modal && !dialogOpen}

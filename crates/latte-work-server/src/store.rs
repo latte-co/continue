@@ -48,6 +48,20 @@ impl ConfirmedNotStarted {
     }
 }
 
+fn initial_prompt_title(text: &str, is_side_chat: bool) -> String {
+    if is_side_chat {
+        text.lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('>'))
+            .unwrap_or(text.trim())
+            .chars()
+            .take(48)
+            .collect()
+    } else {
+        text.chars().take(48).collect()
+    }
+}
+
 /// The streamable payload of an event plus how a client should reassemble it:
 /// `Text` chunks concatenate into displayable prose, `Json` must be parsed
 /// once fully received.
@@ -356,18 +370,19 @@ impl Store {
             let Ok(mut session) = serde_json::from_str::<Session>(&data) else {
                 continue;
             };
+            let is_side_chat = self.side_parent(&id)?.is_some();
             session.title_requested = if session.native_id.is_some() {
                 match first_prompt
                     .query_row(params![id], |row| row.get::<_, String>(0))
                     .optional()?
-                    .map(|text| text.chars().take(48).collect::<String>())
+                    .map(|text| initial_prompt_title(&text, is_side_chat))
                 {
                     // Opening a native session alone already records its id, so
                     // only a title that moved past the placeholder proves a
                     // chance was consumed; rows that were merely opened keep
                     // theirs. Native history without a locally admitted turn
                     // and a moved-away title is still never regenerated over.
-                    None => session.title != "新任务",
+                    None => session.title != "新任务" && session.title != "侧边聊天",
                     // A manual rename is not a generated title; only an
                     // un-customized title that left the prompt prefix behind
                     // is that proof.
@@ -2262,20 +2277,13 @@ impl Store {
         session.permission_mode = permission_mode.map(str::to_owned);
         let is_side_chat = self.side_parent(id)?.is_some();
         if !session.custom_title && session.title == "新任务" {
-            session.title = text.chars().take(48).collect();
+            session.title = initial_prompt_title(text, false);
         } else if !session.custom_title
             && session.title == "侧边聊天"
             && session.native_id.is_none()
             && is_side_chat
         {
-            session.title = text
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty() && !line.starts_with('>'))
-                .unwrap_or(text.trim())
-                .chars()
-                .take(48)
-                .collect();
+            session.title = initial_prompt_title(text, true);
         }
         let tx = self.db.transaction()?;
         tx.execute(

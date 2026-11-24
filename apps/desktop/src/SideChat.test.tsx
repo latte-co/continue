@@ -13,7 +13,7 @@ import { modelSelectionScope } from "./modelSelectionScope";
 import { DraftStore } from "./drafts";
 import { closeSideChat, SideChat, sideDraftKey } from "./SideChat";
 import { openSideChatTab, useWorkspaceState } from "./workspaceState";
-import type { Request, Session } from "./protocol";
+import type { Event, Request, Session } from "./protocol";
 import { ServerRequestError } from "./api";
 import { annotationPrompt, userMessageContent } from "./annotations";
 import { readWorkspace } from "./workspaceState";
@@ -905,5 +905,344 @@ it("keeps ordinary completed writable side chats banner-free until undo conflict
   );
   await waitFor(() =>
     expect(screen.queryByText(/侧边聊天后台写入待确认/)).toBeNull(),
+  );
+});
+
+it("caches loaded side-chat messages across hide/remount, polls incrementally, and invalidates when serverId changes", async () => {
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  const allEvents = [
+    {
+      seq: 1,
+      at: 1,
+      session_id: child.id,
+      event: { kind: "user" as const, text: "第一问", request_id: "r1" },
+    },
+    {
+      seq: 2,
+      at: 2,
+      session_id: child.id,
+      event: { kind: "text" as const, text: "已缓存的侧聊回复" },
+    },
+  ];
+  let liveEvents = [...allEvents];
+  const pollCursors: number[] = [];
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method === "agent_permissions")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.method === "poll") {
+      pollCursors.push(action.after);
+      return {
+        kind: "events",
+        session: { ...child, status: "completed" },
+        events: liveEvents.filter((entry) => entry.seq > action.after),
+        has_more: false,
+      };
+    }
+    throw new Error("unexpected request");
+  });
+  const baseProps = {
+    parent,
+    workspaceId,
+    sideId: child.id,
+    hostId: "local",
+    serverId: "server-1",
+    drafts,
+    active: true,
+    connected: true,
+    supported: true,
+  };
+  const view = render(<SideChat {...baseProps} />);
+  await screen.findByText("已缓存的侧聊回复");
+  expect(pollCursors).toEqual([0]);
+
+  // Hide and re-open panel while mounted: retains ready state and polls after seq 2.
+  view.rerender(<SideChat {...baseProps} active={false} />);
+  liveEvents = [
+    ...allEvents,
+    {
+      seq: 3,
+      at: 3,
+      session_id: child.id,
+      event: { kind: "text" as const, text: "\n\n增量新增回复" },
+    },
+  ];
+  view.rerender(<SideChat {...baseProps} active />);
+  expect(screen.queryByText("正在读取记录…")).toBeNull();
+  expect(screen.getByText("已缓存的侧聊回复")).toBeTruthy();
+  await screen.findByText("增量新增回复");
+  expect(pollCursors.at(-1)).toBe(2);
+
+  // Switch away to another main conversation (unmount) and remount: restores from cache immediately.
+  view.unmount();
+  const remounted = render(<SideChat {...baseProps} />);
+  expect(screen.queryByText("正在读取记录…")).toBeNull();
+  expect(screen.getByText("已缓存的侧聊回复")).toBeTruthy();
+  expect(screen.getByText("增量新增回复")).toBeTruthy();
+  await waitFor(() => expect(pollCursors.at(-1)).toBe(3));
+
+  // Daemon replacement (serverId change) invalidates that host's cache and reloads from 0.
+  remounted.rerender(<SideChat {...baseProps} serverId="server-2" />);
+  await waitFor(() => expect(pollCursors.at(-1)).toBe(0));
+  await screen.findByText("增量新增回复");
+});
+
+it("shows return-to-latest when scrolled up, preserves reading position across updates and remounts, and resets on close", async () => {
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  openSideChatTab(workspaceId, child.id, false);
+  let seq = 2;
+  const events = [
+    {
+      seq: 1,
+      at: 1,
+      session_id: child.id,
+      event: { kind: "user" as const, text: "问题", request_id: "r1" },
+    },
+    {
+      seq: 2,
+      at: 2,
+      session_id: child.id,
+      event: { kind: "text" as const, text: "第一段回答" },
+    },
+  ];
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method === "agent_permissions")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.method === "close_agent_session") return { kind: "ok" };
+    if (action.method === "poll")
+      return {
+        kind: "events",
+        session: { ...child, status: "running" },
+        events: events.filter((entry) => entry.seq > action.after),
+        has_more: false,
+      };
+    throw new Error("unexpected request");
+  });
+  const props = {
+    parent,
+    workspaceId,
+    sideId: child.id,
+    hostId: "local",
+    drafts,
+    active: true,
+    connected: true,
+    supported: true,
+  };
+  const view = render(<SideChat {...props} />);
+  await screen.findByText("第一段回答");
+  const transcript = document.querySelector(
+    ".side-chat-transcript",
+  ) as HTMLDivElement;
+  Object.defineProperties(transcript, {
+    clientHeight: { value: 300, configurable: true },
+    scrollHeight: { value: 1500, configurable: true },
+    scrollTop: { value: 120, writable: true, configurable: true },
+  });
+  transcript.scrollTo = vi.fn();
+  fireEvent.scroll(transcript);
+  expect(screen.getByRole("button", { name: "回到最新" })).toBeTruthy();
+
+  // Incoming output does not yank scroll while reading earlier messages.
+  events.push({
+    seq: ++seq,
+    at: 3,
+    session_id: child.id,
+    event: { kind: "text" as const, text: "\n\n第二段回答" },
+  });
+  view.rerender(<SideChat {...props} active={false} />);
+  view.rerender(<SideChat {...props} active />);
+  await screen.findByText("第二段回答");
+  expect(transcript.scrollTop).toBe(120);
+  expect(screen.getByRole("button", { name: "回到最新" })).toBeTruthy();
+
+  // Unmount and remount preserves scrolled-up position and button.
+  view.unmount();
+  const remount = render(<SideChat {...props} />);
+  const nextTranscript = document.querySelector(
+    ".side-chat-transcript",
+  ) as HTMLDivElement;
+  Object.defineProperties(nextTranscript, {
+    clientHeight: { value: 300, configurable: true },
+    scrollHeight: { value: 1500, configurable: true },
+  });
+  nextTranscript.scrollTo = vi.fn();
+  expect(nextTranscript.scrollTop).toBe(120);
+  fireEvent.click(screen.getByRole("button", { name: "回到最新" }));
+  expect(nextTranscript.scrollTop).toBe(1500);
+  expect(nextTranscript.scrollTo).toHaveBeenCalledWith({ top: 1500 });
+  expect(screen.queryByRole("button", { name: "回到最新" })).toBeNull();
+
+  // Scroll up again, then explicitly close the tab: reopening starts following latest.
+  nextTranscript.scrollTop = 80;
+  fireEvent.scroll(nextTranscript);
+  expect(screen.getByRole("button", { name: "回到最新" })).toBeTruthy();
+  remount.unmount();
+  await closeSideChat(
+    drafts,
+    "local",
+    parent.id,
+    workspaceId,
+    `sideChat:${child.id}`,
+  );
+  openSideChatTab(workspaceId, child.id, false);
+  render(<SideChat {...props} />);
+  expect(screen.queryByRole("button", { name: "回到最新" })).toBeNull();
+});
+
+it("keeps default tab title while first turn runs and updates tab title after first turn completes", async () => {
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  openSideChatTab(workspaceId, child.id, false);
+  let currentSession: Session = {
+    ...child,
+    title: "侧聊首条问题原始前缀",
+    status: "running",
+    title_requested: false,
+    custom_title: false,
+  };
+  let currentEvents: Event[] = [
+    {
+      seq: 1,
+      at: 1,
+      session_id: child.id,
+      event: {
+        kind: "user",
+        text: "侧聊首条问题原始前缀",
+        request_id: "r1",
+      },
+    },
+  ];
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method === "agent_permissions")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.method === "poll")
+      return {
+        kind: "events",
+        session: currentSession,
+        events: currentEvents.filter((entry) => entry.seq > action.after),
+        has_more: false,
+      };
+    throw new Error("unexpected request");
+  });
+  const props = {
+    parent,
+    workspaceId,
+    sideId: child.id,
+    hostId: "local",
+    drafts,
+    active: true,
+    connected: true,
+    supported: true,
+  };
+  const view = render(<SideChat {...props} />);
+  await screen.findByText("侧聊首条问题原始前缀");
+  expect(
+    readWorkspace(workspaceId).tabs.find(
+      (tab) => tab.id === `sideChat:${child.id}`,
+    ),
+  ).not.toHaveProperty("title");
+
+  // First turn completes and generated title arrives -> tab title updates immediately.
+  currentSession = {
+    ...currentSession,
+    title: "排查侧聊重复加载",
+    status: "completed",
+    title_requested: true,
+  };
+  currentEvents = [
+    ...currentEvents,
+    {
+      seq: 2,
+      at: 2,
+      session_id: child.id,
+      event: {
+        kind: "state" as const,
+        status: "completed" as const,
+        message: null,
+      },
+    },
+  ];
+  view.rerender(<SideChat {...props} active={false} />);
+  view.rerender(<SideChat {...props} active />);
+  await waitFor(() =>
+    expect(
+      readWorkspace(workspaceId).tabs.find(
+        (tab) => tab.id === `sideChat:${child.id}`,
+      ),
+    ).toMatchObject({ title: "排查侧聊重复加载" }),
+  );
+});
+
+it("falls back to the prompt prefix when automatic naming fails after the first turn completes", async () => {
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  openSideChatTab(workspaceId, child.id, false);
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method === "agent_permissions")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.method === "poll")
+      return {
+        kind: "events",
+        session: {
+          ...child,
+          title: "为什么侧聊切回会重新加载",
+          status: "completed",
+          title_requested: true,
+          custom_title: false,
+        },
+        events: [
+          {
+            seq: 1,
+            at: 1,
+            session_id: child.id,
+            event: {
+              kind: "user" as const,
+              text: "> 引用片段\n\n为什么侧聊切回会重新加载",
+              request_id: "r1",
+            },
+          },
+          {
+            seq: 2,
+            at: 2,
+            session_id: child.id,
+            event: {
+              kind: "notice" as const,
+              text: "会话自动命名未完成，保留原名称：unsupported",
+            },
+          },
+          {
+            seq: 3,
+            at: 3,
+            session_id: child.id,
+            event: {
+              kind: "state" as const,
+              status: "completed" as const,
+              message: null,
+            },
+          },
+        ].filter((entry) => entry.seq > action.after),
+        has_more: false,
+      };
+    throw new Error("unexpected request");
+  });
+  render(
+    <SideChat
+      parent={parent}
+      workspaceId={workspaceId}
+      sideId={child.id}
+      hostId="local"
+      drafts={drafts}
+      active
+      connected
+      supported
+    />,
+  );
+  await waitFor(() =>
+    expect(
+      readWorkspace(workspaceId).tabs.find(
+        (tab) => tab.id === `sideChat:${child.id}`,
+      ),
+    ).toMatchObject({ title: "为什么侧聊切回会重新加载" }),
   );
 });

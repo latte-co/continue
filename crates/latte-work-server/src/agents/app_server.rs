@@ -1071,7 +1071,6 @@ impl AgentAdapter for AppServer {
     }
     fn set_side_parent(&mut self, native_id: String) -> Result<()> {
         self.side_parent = Some(native_id);
-        self.title_attempted = true;
         Ok(())
     }
     fn prediction_snapshot(&self, _config: &LaunchConfig) -> Option<crate::predictions::Snapshot> {

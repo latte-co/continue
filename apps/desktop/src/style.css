@@ -7032,6 +7032,17 @@ button.task-info-row:not(:disabled):hover,
   min-height: 0;
   margin-bottom: 0;
 }
+.side-chat-transcript-wrap {
+  position: relative;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+.side-chat-transcript-wrap > .return-latest {
+  bottom: var(--space-2);
+  z-index: 2;
+}
 .side-chat-transcript {
   flex: 1;
   min-height: 0;

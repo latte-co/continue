@@ -840,3 +840,44 @@ it("keeps a single history button when the expanded side chat shares its session
   fireEvent.click(screen.getByRole("tab", { name: "侧边聊天" }));
   expect(screen.getAllByRole("button", { name: "历史" })).toHaveLength(1);
 });
+
+it("displays settled side-chat tab titles while numbering untitled sibling tabs", async () => {
+  const { openSideChatTab, setSideChatTitle } =
+    await import("./workspaceState");
+  const first = crypto.randomUUID();
+  const second = crypto.randomUUID();
+  const completedHistory = crypto.randomUUID();
+  openSideChatTab(props.workspaceId, first, true);
+  openSideChatTab(props.workspaceId, second, true);
+  mocks.request.mockImplementation(async (_host: string, r: Request) => {
+    if (r.method === "side_chat_history")
+      return {
+        kind: "side_chat_history",
+        next: null,
+        sessions: [
+          {
+            id: completedHistory,
+            title: "历史侧聊自动标题",
+            created_at: 1,
+            status: "completed",
+            title_requested: true,
+            custom_title: false,
+          },
+        ],
+      };
+    return { kind: "ok" };
+  });
+  render(<Workspace {...props} sessionId="parent" canOpenSideChat />);
+  expect(screen.getByRole("tab", { name: "侧边聊天 1" })).toBeTruthy();
+  expect(screen.getByRole("tab", { name: "侧边聊天 2" })).toBeTruthy();
+
+  act(() => setSideChatTitle(props.workspaceId, first, "侧聊缓存优化"));
+  expect(screen.getByRole("tab", { name: "侧聊缓存优化" })).toBeTruthy();
+  expect(screen.getByRole("tab", { name: "侧边聊天 2" })).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "历史" }));
+  fireEvent.click(
+    await screen.findByRole("button", { name: /历史侧聊自动标题/ }),
+  );
+  expect(screen.getByRole("tab", { name: "历史侧聊自动标题" })).toBeTruthy();
+});

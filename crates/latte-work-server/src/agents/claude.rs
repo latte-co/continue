@@ -471,7 +471,6 @@ impl AgentAdapter for Claude {
     fn set_side_parent(&mut self, native_id: String) -> Result<()> {
         self.side_parent =
             Some(uuid::Uuid::parse_str(&native_id).context("Claude 主会话 ID 无效")?);
-        self.title_attempted = true;
         Ok(())
     }
     fn command(

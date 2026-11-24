@@ -2172,7 +2172,10 @@ old claim cannot be mistaken for an unowned legacy request or steal a newer owne
 A superseded claim fails before execution and never implicitly reclaims or replays
 the request. Adopted resources are already active and do not reserve a future open.
 Earlier overlapping turns remain protected. Side chats accept direct messages
-without native steering or a message queue.
+without native steering or a message queue, generate a friendly title once after
+their first completed turn through the shared title pipeline, and retain bounded
+in-memory transcript and reading-position state per App run (invalidated when
+the host daemon identity changes).
 If native close itself was unconfirmed, users can verify the process and its
 work on the execution host, then call `ConfirmAgentClosed` with the recorded
 close ID. This works for main and side chats after Server restart, and the

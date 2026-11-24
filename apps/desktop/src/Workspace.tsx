@@ -501,8 +501,12 @@ function WorkspacePage({
         (kind !== "browser" && kind !== "sideChat" && (!connected || !project)),
     }));
   const title = (tab: Tab) =>
-    tab.kind === "sideChat" && sideTabs.length > 1
-      ? `侧边聊天 ${sideTabs.indexOf(tab) + 1}`
+    tab.kind === "sideChat"
+      ? tab.title?.trim() && tab.title.trim() !== labels.sideChat
+        ? tab.title.trim()
+        : sideTabs.length > 1
+          ? `${labels.sideChat} ${sideTabs.indexOf(tab) + 1}`
+          : labels.sideChat
       : tab.kind === "artifact"
         ? tab.name
         : tab.kind === "terminal"
@@ -608,7 +612,9 @@ function WorkspacePage({
               hostId={hostId}
               parentId={sessionId}
               currentId={sideChatId(current)}
-              onOpen={(id) => openSideChatTab(workspaceId, id)}
+              onOpen={(id, tabTitle) =>
+                openSideChatTab(workspaceId, id, false, tabTitle)
+              }
             />
           )}
         {expanded && conversationActions}

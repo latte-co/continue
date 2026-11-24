@@ -18,7 +18,7 @@ export type WorkspaceTab = {
       reference?: FileEntry;
       sessionId?: string;
     }
-  | { id: string; kind: "sideChat"; draft?: boolean }
+  | { id: string; kind: "sideChat"; draft?: boolean; title?: string }
   | {
       id: string;
       kind: "turnChanges";
@@ -148,6 +148,7 @@ export function readWorkspace(key: string): WorkspaceState {
                   !!tab.snapshotSessionId))
             : tab.kind === "sideChat"
               ? (tab.draft === undefined || typeof tab.draft === "boolean") &&
+                (tab.title === undefined || typeof tab.title === "string") &&
                 /^sideChat:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
                   tab.id,
                 )
@@ -301,25 +302,65 @@ export function sideChatId(tab: string) {
     : undefined;
 }
 
+function normalizeSideChatTitle(title?: string) {
+  const trimmed = title?.trim();
+  return trimmed && trimmed !== "侧边聊天" ? trimmed : undefined;
+}
+
 export function openSideChatTab(
   workspaceId: string,
   sideId: string,
   draft = false,
+  title?: string,
 ) {
   const id = sideTabPrefix + sideId;
+  const cleanTitle = normalizeSideChatTitle(title);
   updateWorkspace(workspaceId, (state) => ({
     tabs: state.tabs.some((tab) => tab.id === id)
-      ? draft
-        ? state.tabs
-        : state.tabs.map((tab) =>
-            tab.kind === "sideChat" && tab.id === id && tab.draft
-              ? { ...tab, draft: false }
-              : tab,
-          )
-      : [...state.tabs, { id, kind: "sideChat", draft }],
+      ? state.tabs.map((tab) => {
+          if (tab.kind !== "sideChat" || tab.id !== id) return tab;
+          const nextDraft = draft ? tab.draft : false;
+          const nextTitle = cleanTitle ?? tab.title;
+          return nextDraft === tab.draft && nextTitle === tab.title
+            ? tab
+            : {
+                ...tab,
+                draft: nextDraft,
+                ...(nextTitle ? { title: nextTitle } : {}),
+              };
+        })
+      : [
+          ...state.tabs,
+          {
+            id,
+            kind: "sideChat",
+            draft,
+            ...(cleanTitle ? { title: cleanTitle } : {}),
+          },
+        ],
     current: id,
     visible: true,
     conversationActive: false,
+  }));
+}
+export function setSideChatTitle(
+  workspaceId: string,
+  sideId: string,
+  title: string,
+) {
+  const cleanTitle = normalizeSideChatTitle(title);
+  if (!cleanTitle) return;
+  const id = sideTabPrefix + sideId;
+  const existing = readWorkspace(workspaceId).tabs.find(
+    (tab) => tab.kind === "sideChat" && tab.id === id,
+  );
+  if (existing?.kind !== "sideChat" || existing.title === cleanTitle) return;
+  updateWorkspace(workspaceId, (state) => ({
+    tabs: state.tabs.map((tab) =>
+      tab.kind === "sideChat" && tab.id === id
+        ? { ...tab, title: cleanTitle }
+        : tab,
+    ),
   }));
 }
 export function setSideChatDraft(
@@ -330,7 +371,11 @@ export function setSideChatDraft(
   const id = sideTabPrefix + sideId;
   updateWorkspace(workspaceId, (state) => ({
     tabs: state.tabs.map((tab) =>
-      tab.kind === "sideChat" && tab.id === id ? { ...tab, draft } : tab,
+      tab.kind === "sideChat" && tab.id === id
+        ? draft
+          ? { id: tab.id, kind: "sideChat", draft: true }
+          : { ...tab, draft: false }
+        : tab,
     ),
   }));
 }

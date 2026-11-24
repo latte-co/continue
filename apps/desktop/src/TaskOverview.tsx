@@ -245,7 +245,13 @@ export function TaskOverview({
                 <h2>侧边聊天</h2>
                 <SideChatHistory
                   {...sideChatHistory}
-                  onOpen={(id) => choose(() => sideChatHistory.onOpen(id))}
+                  onOpen={(id, title) =>
+                    choose(() =>
+                      title !== undefined
+                        ? sideChatHistory.onOpen(id, title)
+                        : sideChatHistory.onOpen(id),
+                    )
+                  }
                 />
               </section>
             )}
