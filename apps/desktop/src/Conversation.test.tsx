@@ -2736,3 +2736,39 @@ it("quotes selected reply text and falls back to the full reply for an unrelated
   expect(openSideChat).toHaveBeenLastCalledWith("需要锁来防止并发写入。");
   expect(p.send).not.toHaveBeenCalled();
 });
+
+it("displays, removes, guards slash commands, and submits side-chat quotes added to the main conversation", async () => {
+  const p = props();
+  const currentSession = session("main");
+  const draftKey = JSON.stringify(["local", "main"]);
+  p.drafts.update(draftKey, {
+    quotes: ["第一段侧聊结论", "第二段多余片段"],
+  });
+  render(<Conversation {...p} session={currentSession} />);
+
+  expect(screen.getByLabelText("引用的文本片段")).toBeTruthy();
+  expect(screen.getByText("第一段侧聊结论")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "移除文本片段 2" }));
+  expect(screen.queryByText("第二段多余片段")).toBeNull();
+
+  // Guard native slash commands while quoted snippets are attached.
+  fireEvent.change(input(), { target: { value: "/compact" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送任务" }));
+  expect(
+    await screen.findByText("请先移除引用的文本片段，再使用 Agent 原生命令。"),
+  ).toBeTruthy();
+  expect(p.send).not.toHaveBeenCalled();
+
+  // Submitting with empty prose uses the main-conversation quote prompt and clears quotes.
+  fireEvent.change(input(), { target: { value: "" } });
+  fireEvent.click(screen.getByRole("button", { name: "发送任务" }));
+  await waitFor(() =>
+    expect(p.send).toHaveBeenCalledWith(
+      "> 第一段侧聊结论\n\n请结合以上侧边聊天内容继续。",
+      null,
+      null,
+      null,
+    ),
+  );
+  await waitFor(() => expect(p.drafts.get(draftKey).quotes).toBeUndefined());
+});

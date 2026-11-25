@@ -1241,6 +1241,9 @@ button.recent-notice {
   font-size: var(--text-xs);
   color: var(--color-text-muted);
 }
+.composer-menu-option .composer-command-badge {
+  flex: none;
+}
 .composer-command-menu {
   max-height: min(296px, 40vh);
 }

@@ -3253,6 +3253,9 @@ pub async fn commands(
     if agent == "opencode" {
         return agents::opencode_commands(binary, path, config).await;
     }
+    if agent == "cursor" {
+        return agents::cursor_commands(binary, path, config).await;
+    }
     let mut adapter = agents::create(agent)?;
     let start = adapter.advance(Input::DiscoverCommands)?;
     let mut prepared = adapter.command(binary, path, None, config)?;

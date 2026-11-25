@@ -2091,3 +2091,121 @@ it("uses Tab to drill into directory subpaths and complete files, while Enter di
   fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
   expect(screen.getByRole("button", { name: "移除引用 src" })).toBeTruthy();
 });
+
+it.each([
+  ["claude", "Claude Code"],
+  ["codex", "Codex"],
+  ["traex", "Traex"],
+  ["opencode", "OpenCode"],
+  ["cursor", "Cursor Agent"],
+])(
+  "renders unified commands and skills menu for %s (%s) with skill badges",
+  async (agent) => {
+    mocks.request.mockImplementation(async (_host, req) =>
+      req.method === "agent_commands"
+        ? {
+            kind: "agent_commands",
+            commands: [
+              {
+                name: "compact",
+                description: "压缩会话上下文",
+                argument_hint: "",
+                kind: "command",
+              },
+              {
+                name: "review",
+                description: "审查当前改动",
+                argument_hint: "[说明]",
+                kind: "command",
+              },
+              {
+                name: "fix-ci",
+                display_name: "修复 CI",
+                description: "诊断并修复流水线失败",
+                argument_hint: "[任务说明]",
+                kind: "skill",
+              },
+            ],
+          }
+        : { kind: "files", entries: [] },
+    );
+    render(<Harness agent={agent} />);
+    type("/");
+    await screen.findByRole("option", { name: /修复 CI/ });
+    expect(screen.getByRole("option", { name: /压缩上下文/ })).toBeTruthy();
+    expect(screen.getByRole("option", { name: /代码审查/ })).toBeTruthy();
+    const skillOption = screen.getByRole("option", { name: /修复 CI/ });
+    expect(
+      skillOption.querySelector(".composer-command-badge")?.textContent,
+    ).toBe("技能");
+    expect(mocks.request).toHaveBeenCalledWith("remote", {
+      method: "agent_commands",
+      project_id: "p",
+      agent,
+    });
+  },
+);
+
+it("composes skills with @ references, quotes, and annotations while keeping control commands guarded", async () => {
+  mocks.request.mockImplementation(async (_host, req) =>
+    req.method === "agent_commands"
+      ? {
+          kind: "agent_commands",
+          commands: [
+            {
+              name: "compact",
+              description: "压缩会话上下文",
+              argument_hint: "",
+              kind: "command",
+            },
+            {
+              name: "fix-ci",
+              display_name: "修复 CI",
+              description: "诊断并修复流水线失败",
+              argument_hint: "[任务说明]",
+              kind: "skill",
+            },
+          ],
+        }
+      : {
+          kind: "files",
+          entries: [{ name: "README.md", path: "README.md", directory: false }],
+        },
+  );
+  mocks.send.mockResolvedValue(true);
+  render(
+    <Harness
+      agent="codex"
+      quotes={["请同步修复快照断言"]}
+      annotations={[
+        {
+          id: "a1",
+          quote: "expect(status).toBe(200)",
+          comment: "补充失败分支检查",
+          source: { message: 1, start: 0, end: 24 },
+        },
+      ]}
+    />,
+  );
+  type("/fix");
+  fireEvent.click(await screen.findByRole("option", { name: /修复 CI/ }));
+  expect(inputText()).toBe("/fix-ci ");
+
+  type("/fix-ci 检查 @READ");
+  fireEvent.click(await screen.findByRole("option", { name: /README\.md/ }));
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+  const submitted = mocks.send.mock.calls[0][0] as string;
+  expect(submitted.startsWith("/fix-ci ")).toBe(true);
+  expect(submitted).toContain("README.md");
+  expect(submitted).toContain("请同步修复快照断言");
+  expect(submitted).toContain("补充失败分支检查");
+
+  // Control commands (kind !== "skill") still reject mixing references/quotes/annotations.
+  type("/compact ");
+  fireEvent.click(screen.getByText("发送"));
+  expect(
+    await screen.findByText(/请先移除引用的文本片段，再使用 Agent 原生命令/),
+  ).toBeTruthy();
+  expect(mocks.send).toHaveBeenCalledOnce();
+});

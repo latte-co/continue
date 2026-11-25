@@ -101,16 +101,75 @@ pub(super) fn inspect(directory: &Path, requested: &str) -> Result<Option<SkillI
 }
 
 pub fn find(project: &Path, name: &str) -> Result<Option<SkillInfo>> {
-    let config = crate::agent_environment::variable("CLAUDE_CONFIG_DIR")
+    find_with_env(project, name, &Default::default())
+}
+
+pub(crate) fn find_with_env(
+    project: &Path,
+    name: &str,
+    environment: &latte_work_protocol::AgentEnvironment,
+) -> Result<Option<SkillInfo>> {
+    let config = crate::agent_environment::configured_variable("CLAUDE_CONFIG_DIR", environment)
         .map(PathBuf::from)
         .or_else(|| {
-            crate::agent_environment::variable("HOME")
+            crate::agent_environment::configured_variable("HOME", environment)
                 .map(|home| PathBuf::from(home).join(".claude"))
         })
         .context("无法确定 Agent 配置目录")?;
     find_in(project, &config, name)
 }
-fn find_in(project: &Path, config: &Path, name: &str) -> Result<Option<SkillInfo>> {
+
+pub(crate) fn find_in_roots(roots: &[PathBuf], name: &str) -> Result<Option<SkillInfo>> {
+    if !crate::skills::component(name) {
+        bail!("Skill 名称无效");
+    }
+    let mut match_info: Option<SkillInfo> = None;
+    for root in roots {
+        if let Some(found) = inspect(&root.join(name), name)? {
+            if match_info
+                .as_ref()
+                .is_some_and(|existing| existing.directory != found.directory)
+            {
+                bail!("此 Skill 有多个安装位置，无法确认当前目录");
+            }
+            match_info = Some(found);
+        }
+    }
+    Ok(match_info)
+}
+
+pub(crate) fn scan_roots(roots: &[PathBuf]) -> Vec<(String, SkillInfo)> {
+    const LIMIT: usize = 512;
+    let mut seen_slugs = std::collections::HashSet::new();
+    let mut seen_dirs = std::collections::HashSet::new();
+    let mut found = Vec::new();
+    for root in roots {
+        let Ok(listing) = std::fs::read_dir(root) else {
+            continue;
+        };
+        let mut entries: Vec<_> = listing.take(LIMIT).filter_map(Result::ok).collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            if found.len() >= LIMIT {
+                return found;
+            }
+            let Some(slug) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !crate::skills::component(&slug) || seen_slugs.contains(&slug) {
+                continue;
+            }
+            if let Ok(Some(info)) = inspect(&entry.path(), &slug)
+                && seen_dirs.insert(info.directory.clone())
+            {
+                seen_slugs.insert(slug.clone());
+                found.push((slug, info));
+            }
+        }
+    }
+    found
+}
+pub(crate) fn find_in(project: &Path, config: &Path, name: &str) -> Result<Option<SkillInfo>> {
     let parts: Vec<_> = name.split(':').collect();
     if parts.len() > 2 || !parts.iter().all(|part| crate::skills::component(part)) {
         bail!("Skill 名称无效");

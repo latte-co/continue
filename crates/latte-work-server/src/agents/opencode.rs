@@ -4,8 +4,8 @@ use super::{Action, AgentAdapter, AgentCommand, Input};
 use crate::providers::LaunchConfig;
 use anyhow::{Context, Result, bail, ensure};
 use latte_work_protocol::{
-    AgentSlashCommand, ContextUsage, Effort, EventKind, ExecutionPhase, SubagentStatus,
-    SubagentUpdate, TurnUsage,
+    AgentCommandKind, AgentSlashCommand, ContextUsage, Effort, EventKind, ExecutionPhase,
+    SubagentStatus, SubagentUpdate, TurnUsage,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -248,6 +248,7 @@ pub(super) fn parse_commands(update: &Value) -> Result<Vec<AgentSlashCommand>> {
                     .chars()
                     .take(120)
                     .collect(),
+                kind: Some(AgentCommandKind::Command),
                 ui_action: None,
             })
         })
@@ -258,6 +259,7 @@ pub(super) fn parse_commands(update: &Value) -> Result<Vec<AgentSlashCommand>> {
             display_name: None,
             description: "压缩当前 OpenCode 会话的上下文".into(),
             argument_hint: String::new(),
+            kind: Some(AgentCommandKind::Command),
             ui_action: None,
         });
     }

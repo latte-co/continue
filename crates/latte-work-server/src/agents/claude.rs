@@ -249,6 +249,8 @@ fn count(value: &Value, key: &str) -> Option<f64> {
 
 #[derive(Default)]
 pub struct Claude {
+    cwd: String,
+    environment: latte_work_protocol::AgentEnvironment,
     initial_title: Option<String>,
     title_description: Option<super::titles::Context>,
     title_attempted: bool,
@@ -480,6 +482,8 @@ impl AgentAdapter for Claude {
         resume: Option<&str>,
         config: &LaunchConfig,
     ) -> Result<AgentCommand> {
+        self.cwd = cwd.into();
+        self.environment = config.environment.clone();
         self.native_session_id = resume.map(str::to_owned);
         self.set_accounting_model(
             config
@@ -1131,7 +1135,11 @@ impl Claude {
                     bail!("Claude 未确认侧边聊天的只读权限，请检查 CLI 版本和权限设置");
                 }
                 if matches!(self.phase, Phase::Discovering) {
-                    let commands = parse_commands(&m["response"]["response"]["commands"])?;
+                    let commands = parse_commands_in(
+                        &m["response"]["response"]["commands"],
+                        &self.cwd,
+                        &self.environment,
+                    )?;
                     self.phase = Phase::Finished;
                     return Ok(vec![Action::Commands(commands)]);
                 }
@@ -2095,6 +2103,14 @@ fn subagent_action(
 }
 
 fn parse_commands(value: &Value) -> Result<Vec<latte_work_protocol::AgentSlashCommand>> {
+    parse_commands_in(value, "", &Default::default())
+}
+
+fn parse_commands_in(
+    value: &Value,
+    cwd: &str,
+    environment: &latte_work_protocol::AgentEnvironment,
+) -> Result<Vec<latte_work_protocol::AgentSlashCommand>> {
     let entries = value
         .as_array()
         .context("此 Claude CLI 未返回命令列表，请更新 CLI 后重试")?;
@@ -2118,6 +2134,22 @@ fn parse_commands(value: &Value) -> Result<Vec<latte_work_protocol::AgentSlashCo
         }
         let description = entry["description"].as_str().unwrap_or_default();
         let argument_hint = entry["argumentHint"].as_str().unwrap_or_default();
+        let ui_action = matches!(name, "agents" | "tasks" | "list-agents")
+            .then_some(latte_work_protocol::AgentCommandUiAction::Subagents);
+        let kind = if ui_action.is_some() || entry["builtin"] == true {
+            Some(latte_work_protocol::AgentCommandKind::Command)
+        } else if !cwd.is_empty()
+            && super::claude_skills::find_with_env(std::path::Path::new(cwd), name, environment)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            Some(latte_work_protocol::AgentCommandKind::Skill)
+        } else if entry["builtin"] == false {
+            Some(latte_work_protocol::AgentCommandKind::Command)
+        } else {
+            None
+        };
         result.push(latte_work_protocol::AgentSlashCommand {
             name: name.into(),
             display_name: ["displayName", "display_name", "title"]
@@ -2132,8 +2164,8 @@ fn parse_commands(value: &Value) -> Result<Vec<latte_work_protocol::AgentSlashCo
                 .map(str::to_owned),
             description: description.chars().take(2048).collect(),
             argument_hint: argument_hint.chars().take(512).collect(),
-            ui_action: matches!(name, "agents" | "tasks" | "list-agents")
-                .then_some(latte_work_protocol::AgentCommandUiAction::Subagents),
+            kind,
+            ui_action,
         });
     }
     Ok(result)

@@ -3762,6 +3762,187 @@ async fn agent_commands_discovery_dispatch_resume_and_unsupported_are_native() {
 }
 
 #[tokio::test]
+async fn app_server_commands_and_skills_discover_and_execute_natively_for_codex_and_traex() {
+    let host = Host::start().await;
+    let mut client = host.client().await;
+    let folder = tempfile::tempdir().unwrap();
+    let codex_skill = folder.path().join(".codex/skills/repo-codex-skill");
+    let traex_skill = folder.path().join(".agents/skills/shared-agent-skill");
+    std::fs::create_dir_all(&codex_skill).unwrap();
+    std::fs::create_dir_all(&traex_skill).unwrap();
+    std::fs::write(
+        codex_skill.join("SKILL.md"),
+        "---\nname: 仓库 Codex 技能\ndescription: 仓库级 Codex 技能说明\n---\n步骤\n",
+    )
+    .unwrap();
+    std::fs::write(
+        traex_skill.join("SKILL.md"),
+        "---\nname: 共享 Agent 技能\ndescription: 共享技能说明\n---\n步骤\n",
+    )
+    .unwrap();
+    let project_id = terminal_project(&mut client, folder.path()).await;
+
+    for (agent, builtin_skill, builtin_label, repo_slug) in [
+        (
+            "codex",
+            "fixture-codex-skill",
+            "Codex 技能",
+            "repo-codex-skill",
+        ),
+        (
+            "traex",
+            "fixture-traex-skill",
+            "Traex 技能",
+            "shared-agent-skill",
+        ),
+    ] {
+        let response = ask(
+            &mut client,
+            Request::AgentCommands {
+                agent: agent.into(),
+                project_id: project_id.clone(),
+                provider: Some(latte_work_protocol::TurnProvider::Cli),
+            },
+        )
+        .await;
+        match response {
+            Response::AgentCommands { commands } => {
+                assert!(commands.iter().any(|c| {
+                    c.name == "compact"
+                        && c.kind == Some(latte_work_protocol::AgentCommandKind::Command)
+                }));
+                assert!(commands.iter().any(|c| {
+                    c.name == "review"
+                        && c.kind == Some(latte_work_protocol::AgentCommandKind::Command)
+                }));
+                assert!(commands.iter().any(|c| {
+                    c.name == builtin_skill
+                        && c.display_name.as_deref() == Some(builtin_label)
+                        && c.kind == Some(latte_work_protocol::AgentCommandKind::Skill)
+                }));
+                assert!(commands.iter().any(|c| {
+                    c.name == repo_slug
+                        && c.kind == Some(latte_work_protocol::AgentCommandKind::Skill)
+                }));
+                assert!(!commands.iter().any(|c| c.name.starts_with("disabled-")));
+            }
+            other => panic!("unexpected {agent} commands: {other:?}"),
+        }
+    }
+    assert!(!folder.path().join("codex-inputs").exists());
+    assert!(!folder.path().join("traex-inputs").exists());
+
+    for (agent, skill_slug, expected_skill_title, builtin_skill, prefix, review_prefix) in [
+        (
+            "codex",
+            "repo-codex-skill",
+            "仓库 Codex 技能",
+            "fixture-codex-skill",
+            "CODEX:SKILL:fixture-codex-skill:$fixture-codex-skill 检查 @README.md",
+            "CODEX_REVIEW:",
+        ),
+        (
+            "traex",
+            "shared-agent-skill",
+            "共享 Agent 技能",
+            "fixture-traex-skill",
+            "TRAE:SKILL:fixture-traex-skill:$fixture-traex-skill 检查 @README.md",
+            "TRAE_REVIEW:",
+        ),
+    ] {
+        let Response::Session { session } = ask(
+            &mut client,
+            Request::CreateSession {
+                project_id: project_id.clone(),
+                agent: agent.into(),
+            },
+        )
+        .await
+        else {
+            panic!("create {agent} session");
+        };
+        let id = session.id;
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::SkillInfo {
+                    session_id: id.clone(),
+                    name: skill_slug.into(),
+                }
+            )
+            .await,
+            Response::SkillInfo { skill: Some(info) } if info.name == expected_skill_title
+        ));
+
+        let dispatch = |req_id: &str, text: &str| Request::Send {
+            session_id: id.clone(),
+            request_id: format!("{agent}-{req_id}"),
+            text: text.into(),
+            model: None,
+            effort: None,
+            permission_mode: None,
+            provider: Some(latte_work_protocol::TurnProvider::Cli),
+        };
+
+        let res = ask(
+            &mut client,
+            dispatch("run-skill", &format!("/{builtin_skill} 检查 @README.md")),
+        )
+        .await;
+        assert!(
+            matches!(res, Response::Accepted { duplicate: false }),
+            "{agent} run-skill: {res:?}"
+        );
+        let events = wait(&mut client, &id, Status::Completed).await;
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            EventKind::Notice { text } if text == &format!("已加载 Skill：{builtin_skill}")
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.event, EventKind::Text { text } if text == prefix))
+        );
+
+        assert!(matches!(
+            ask(&mut client, dispatch("run-compact", "/compact")).await,
+            Response::Accepted { duplicate: false }
+        ));
+        let events = wait(&mut client, &id, Status::Completed).await;
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            EventKind::Notice { text } if text == "已压缩会话上下文。"
+        )));
+
+        assert!(matches!(
+            ask(
+                &mut client,
+                dispatch("run-review", "/review 重点检查错误处理")
+            )
+            .await,
+            Response::Accepted { duplicate: false }
+        ));
+        let events = wait(&mut client, &id, Status::Completed).await;
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            EventKind::Text { text }
+                if text.starts_with(review_prefix) && text.contains("重点检查错误处理")
+        )));
+
+        assert!(matches!(
+            ask(&mut client, dispatch("run-unsupported", "/not-a-command")).await,
+            Response::Accepted { duplicate: false }
+        ));
+        let events = wait(&mut client, &id, Status::Failed).await;
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            EventKind::State { status: Status::Failed, message: Some(msg) }
+                if msg.contains("不支持命令 /not-a-command")
+        )));
+    }
+}
+
+#[tokio::test]
 async fn native_child_transcript_is_cached_without_reopening_an_agent_or_replaying_a_prompt() {
     let host = Host::start_with_environment(&[(
         "LATTE_FIXTURE_CHILD_NATIVE_FILE",

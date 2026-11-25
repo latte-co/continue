@@ -122,6 +122,7 @@ export type Subagent = {
   started_at: number | null;
   updated_at: number;
 };
+export type AgentCommandKind = "command" | "skill";
 export type AgentCommandUiAction = "subagents";
 export type ComposerPredictionStatus =
   "pending" | "ready" | "none" | "unsupported" | "failed";
@@ -348,6 +349,7 @@ export type AgentSlashCommand = {
   display_name?: string | null;
   description: string;
   argument_hint: string;
+  kind?: AgentCommandKind;
   /**
    * Presentation hint supplied only for an advertised native command.
    */

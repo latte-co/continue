@@ -359,3 +359,118 @@ async fn cursor_metadata_bounds_output_and_reaps_timeout() {
         Err(nix::errno::Errno::ESRCH)
     );
 }
+
+#[tokio::test]
+async fn cursor_commands_and_skills_scan_local_catalog_safely_without_prompts() {
+    let _permit = fixture_permit().await;
+    let (cli_dir, binary) = probe_fixture(COMPATIBLE_HELP);
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("escaped.md"), "# Escaped\n").unwrap();
+    std::fs::create_dir_all(root.path().join(".git")).unwrap();
+    std::fs::create_dir_all(root.path().join(".cursor/commands")).unwrap();
+    std::fs::create_dir_all(root.path().join(".claude/commands")).unwrap();
+    std::fs::create_dir_all(root.path().join(".cursor/skills/fix-ci")).unwrap();
+    std::fs::create_dir_all(root.path().join(".cursor/skills/hidden-skill")).unwrap();
+    std::fs::write(
+        root.path().join(".cursor/commands/deploy-check.md"),
+        "---\nname: 部署检查\ndescription: 检查部署配置\n---\n执行检查\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(".claude/commands/review-pr.md"),
+        "# PR 审查\n检查变更风险\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("escaped.md"),
+        root.path().join(".cursor/commands/escaped.md"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(".cursor/skills/fix-ci/SKILL.md"),
+        "---\nname: 修复 CI\ndescription: 诊断并修复流水线\n---\n步骤\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(".cursor/skills/hidden-skill/SKILL.md"),
+        "---\nname: 隐藏技能\ndescription: 仅内部调用\nuser-invocable: false\n---\n步骤\n",
+    )
+    .unwrap();
+
+    let mut config = crate::providers::LaunchConfig {
+        environment: AgentEnvironment(BTreeMap::from([(
+            "HOME".into(),
+            root.path().to_string_lossy().into_owned(),
+        )])),
+        traex_model: None,
+        provider: None,
+        settings_dir: root.path().to_path_buf(),
+        model: None,
+        effort: None,
+        permission_mode: None,
+    };
+    let catalog = commands(&binary, root.path().to_str().unwrap(), &config)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(cli_dir.path().join("cursor.args")).unwrap(),
+        "--help\n"
+    );
+    assert_eq!(
+        catalog
+            .iter()
+            .map(|c| (
+                c.name.as_str(),
+                c.display_name.as_deref(),
+                c.description.as_str(),
+                c.kind
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "deploy-check",
+                Some("部署检查"),
+                "检查部署配置",
+                Some(AgentCommandKind::Command),
+            ),
+            (
+                "review-pr",
+                Some("PR 审查"),
+                "PR 审查",
+                Some(AgentCommandKind::Command),
+            ),
+            (
+                "fix-ci",
+                Some("修复 CI"),
+                "诊断并修复流水线",
+                Some(AgentCommandKind::Skill),
+            ),
+        ]
+    );
+    let info = skill_info(root.path(), "fix-ci").unwrap().unwrap();
+    assert_eq!(info.name, "修复 CI");
+    assert_eq!(info.description, "诊断并修复流水线");
+
+    config.provider = Some(crate::providers::ResolvedProvider {
+        metadata: latte_work_protocol::Provider {
+            id: "p".into(),
+            name: "Provider".into(),
+            protocol: latte_work_protocol::ProviderProtocol::AnthropicMessages,
+            base_url: "https://example.invalid".into(),
+            model: "m".into(),
+            models: vec![],
+            model_labels: Default::default(),
+            models_1m: vec![],
+            auth: latte_work_protocol::ProviderAuth::ApiKey,
+            has_credential: true,
+            revision: "1".into(),
+        },
+        credential: "secret".into(),
+    });
+    assert!(
+        commands(&binary, root.path().to_str().unwrap(), &config)
+            .await
+            .is_err()
+    );
+}

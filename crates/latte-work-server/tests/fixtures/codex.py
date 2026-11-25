@@ -102,6 +102,41 @@ for line in sys.stdin:
     elif method == 'config/read':
         config_file = pathlib.Path('codex-native-config.json')
         reply(value, {'config': json.loads(config_file.read_text()) if config_file.exists() else {'model_provider': None, 'model': None, 'developer_instructions': 'NATIVE_CODEX_INSTRUCTIONS'}})
+    elif method == 'skills/list':
+        cwds = params.get('cwds') or [os.getcwd()]
+        cwd_path = pathlib.Path(cwds[0])
+        skills = [
+            {
+                'name': 'fixture-codex-skill',
+                'description': 'Full Codex skill body description',
+                'shortDescription': 'Codex 技能说明',
+                'interface': {'displayName': 'Codex 技能'},
+                'path': str((cwd_path / '.codex/skills/fixture-codex-skill/SKILL.md').resolve()),
+                'scope': 'repo',
+                'enabled': True,
+            },
+            {
+                'name': 'disabled-codex-skill',
+                'description': 'Disabled skill',
+                'path': str((cwd_path / '.codex/skills/disabled/SKILL.md').resolve()),
+                'scope': 'repo',
+                'enabled': False,
+            },
+        ]
+        for root_rel in ('.codex/skills', '.agents/skills'):
+            skills_root = cwd_path / root_rel
+            if skills_root.is_dir():
+                for child in sorted(skills_root.iterdir()):
+                    skill_md = child / 'SKILL.md'
+                    if skill_md.is_file() and all(s['name'] != child.name for s in skills):
+                        skills.append({
+                            'name': child.name,
+                            'description': f'Project skill {child.name}',
+                            'path': str(skill_md.resolve()),
+                            'scope': 'repo',
+                            'enabled': True,
+                        })
+        reply(value, {'data': [{'cwd': str(cwd_path), 'skills': skills, 'errors': []}]})
     elif method == 'thread/fork' or (method == 'thread/resume' and params['threadId'].startswith('side-thread-')):
         if 'sandbox' in params:
             sandbox, approval = {
@@ -181,6 +216,29 @@ for line in sys.stdin:
     elif method == 'thread/name/set':
         notify('thread/name/updated', {'threadName': params['name']})
         reply(value, {})
+    elif method == 'thread/compact/start':
+        assert params['threadId'] == thread
+        count += 1
+        turn = 'turn-' + str(count)
+        with pathlib.Path('codex-inputs').open('a') as f:
+            f.write(json.dumps({'prompt': '/compact', 'params': params, 'pid': os.getpid()}) + '\n')
+        notify('turn/started', {'turn': {'id': turn, 'status': 'inProgress'}})
+        reply(value, {})
+        notify('item/completed', {'item': {'id': 'compact-' + turn, 'type': 'contextCompaction'}})
+        notify('thread/compacted', {})
+        complete()
+    elif method == 'review/start':
+        assert params['threadId'] == thread and params.get('delivery') == 'inline'
+        count += 1
+        turn = 'turn-' + str(count)
+        with pathlib.Path('codex-inputs').open('a') as f:
+            f.write(json.dumps({'prompt': '/review', 'params': params, 'pid': os.getpid()}) + '\n')
+        notify('turn/started', {'turn': {'id': turn, 'status': 'inProgress'}})
+        reply(value, {'turn': {'id': turn, 'status': 'inProgress'}, 'reviewThreadId': thread})
+        notify('item/started', {'item': {'id': 'review-' + turn, 'type': 'enteredReviewMode', 'review': 'current changes'}})
+        notify('item/completed', {'item': {'id': 'review-' + turn, 'type': 'exitedReviewMode',
+                                          'review': 'CODEX_REVIEW:' + json.dumps(params['target'], sort_keys=True, ensure_ascii=False)}})
+        complete()
     elif method == 'turn/start':
         if title_only:
             assert params['threadId'] == thread
@@ -233,7 +291,8 @@ for line in sys.stdin:
         assert params.get('model') in (None, 'codex-test', 'custom-codex')
         count += 1
         turn = 'turn-' + str(count)
-        prompt = params['input'][0]['text']
+        skill_item = params['input'][0] if params['input'][0]['type'] == 'skill' else None
+        prompt = params['input'][1]['text'] if skill_item else params['input'][0]['text']
         turn_prompt = prompt
         if prompt in ('native-provider-selection-drift', 'native-provider-endpoint-drift', 'native-provider-openai-base-url-drift'):
             config_file = pathlib.Path('codex-native-config.json')
@@ -249,6 +308,11 @@ for line in sys.stdin:
             f.write(json.dumps({'prompt': prompt, 'params': params, 'pid': os.getpid()}) + '\n')
         notify('turn/started', {'turn': {'id': turn, 'status': 'inProgress'}})
         reply(value, {'turn': {'id': turn, 'status': 'inProgress'}})
+        if skill_item is not None:
+            notify('item/completed', {'item': {'id': 'user-' + turn, 'type': 'userMessage', 'content': params['input']}})
+            text(f"CODEX:SKILL:{skill_item['name']}:{prompt}")
+            complete()
+            continue
         if prompt == 'eof':
             sys.exit(0)
         if prompt == 'custom-environment':
@@ -333,12 +397,17 @@ for line in sys.stdin:
             complete()
     elif method == 'turn/steer':
         assert params['threadId'] == thread and params['expectedTurnId'] == turn
-        extra = params['input'][0]['text']
+        skill_item = params['input'][0] if params['input'][0]['type'] == 'skill' else None
+        extra = params['input'][1]['text'] if skill_item else params['input'][0]['text']
         if extra == 'reject-steer':
             emit({'id': value['id'], 'error': {'code': -32602, 'message': 'steering rejected'}})
         else:
             reply(value, {'turnId': turn})
-            text('STEER:' + extra)
+            if skill_item is not None:
+                notify('item/completed', {'item': {'id': 'user-steer-' + turn, 'type': 'userMessage', 'content': params['input']}})
+                text(f"STEER:SKILL:{skill_item['name']}:{extra}")
+            else:
+                text('STEER:' + extra)
             if extra == 'hold-steer':
                 # The flushed ack/text precede completion, so tests can observe
                 # a real native handoff without inferring it from elapsed time.

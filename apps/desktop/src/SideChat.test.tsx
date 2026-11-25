@@ -1526,3 +1526,149 @@ it("restores saved scroll position after the transcript cache entry has been evi
     }
   }
 });
+
+it("shows both Add annotation and Add to main conversation when selecting side-chat reply text", async () => {
+  const { props, state, question } = createSideChatReviewFixture();
+  const reply = "终值与 Stage1 排行的差异（语义分改变了什么）";
+  state.events = [
+    ...state.events,
+    {
+      seq: 2,
+      at: 2,
+      session_id: props.sideId,
+      event: { kind: "text", text: reply },
+    },
+    {
+      seq: 3,
+      at: 3,
+      session_id: props.sideId,
+      event: { kind: "state", status: "completed", message: null },
+    },
+  ];
+  const rect = {
+    left: 100,
+    right: 260,
+    top: 160,
+    bottom: 180,
+    width: 160,
+    height: 20,
+    x: 100,
+    y: 160,
+    toJSON: () => ({}),
+  } as DOMRect;
+  const beforeBounding = Range.prototype.getBoundingClientRect;
+  const beforeRects = Range.prototype.getClientRects;
+  Range.prototype.getBoundingClientRect = () => rect;
+  Range.prototype.getClientRects = () => [rect] as unknown as DOMRectList;
+  try {
+    const addToMainChat = vi.fn();
+    render(<SideChat {...props} addToMainChat={addToMainChat} />);
+    await screen.findByText(question);
+    const node = await screen.findByText(reply);
+
+    const selectNode = () => {
+      fireEvent.pointerDown(node);
+      fireEvent.mouseDown(node, { clientX: 0, clientY: 0 });
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      fireEvent.mouseUp(node, { clientX: 20, clientY: 0 });
+    };
+
+    selectNode();
+    expect(screen.getByRole("menuitem", { name: "添加注释" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("menuitem", { name: "添加到主对话" }));
+    expect(addToMainChat).toHaveBeenCalledWith(reply);
+
+    selectNode();
+    fireEvent.click(screen.getByRole("menuitem", { name: "添加注释" }));
+    fireEvent.click(screen.getByRole("button", { name: "提交注释" }));
+    expect(await screen.findByText("1 条注释")).toBeTruthy();
+  } finally {
+    Range.prototype.getBoundingClientRect = beforeBounding;
+    Range.prototype.getClientRects = beforeRects;
+  }
+});
+
+it("receives a late background generated title even after falling back to the prompt prefix", async () => {
+  const { props, state, readTabTitle, question } =
+    createSideChatReviewFixture();
+  state.session = {
+    ...state.session,
+    status: "running",
+    title_requested: false,
+  };
+  const view = render(<SideChat {...props} />);
+  await screen.findByText(question);
+  view.rerender(<SideChat {...props} active={false} />);
+  state.session = {
+    ...state.session,
+    status: "completed",
+    title_requested: true,
+  };
+  await waitFor(() => expect(readTabTitle()).toBe(question), {
+    timeout: 4500,
+  });
+  state.session = {
+    ...state.session,
+    title: "later generated title",
+  };
+  await waitFor(() => expect(readTabTitle()).toBe("later generated title"), {
+    timeout: 1500,
+  });
+}, 8500);
+
+it("skips repeated full-array sizing on idle polls when the active transcript exceeds cache budget", async () => {
+  const { props, state } = createSideChatReviewFixture();
+  const detail = "x".repeat(64 * 1024);
+  const history: Event[] = Array.from({ length: 144 }, (_, index) => ({
+    seq: index + 1,
+    at: 1,
+    session_id: props.sideId,
+    event: { kind: "notice" as const, text: detail },
+  }));
+  let idlePolls = 0;
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method !== "poll")
+      return { kind: "agent_permissions", modes: [] };
+    const page = history.slice(action.after, action.after + 16);
+    if (!page.length) idlePolls += 1;
+    return {
+      kind: "events",
+      session: { ...state.session },
+      events: page,
+      has_more: action.after + page.length < history.length,
+    };
+  });
+  const originalStringify = JSON.stringify;
+  let fullSizes = 0;
+  const spy = vi.spyOn(JSON, "stringify").mockImplementation(function (
+    value,
+    ...rest
+  ) {
+    if (
+      Array.isArray(value) &&
+      value.length === history.length &&
+      (value[0] as Event | undefined)?.session_id === props.sideId
+    ) {
+      fullSizes += 1;
+    }
+    return originalStringify(
+      value,
+      ...(rest as [
+        ((this: unknown, key: string, value: unknown) => unknown)?,
+        (string | number)?,
+      ]),
+    );
+  });
+  try {
+    render(<SideChat {...props} />);
+    await waitFor(() => expect(idlePolls).toBeGreaterThanOrEqual(2), {
+      timeout: 5000,
+    });
+    expect(fullSizes).toBe(1);
+  } finally {
+    spy.mockRestore();
+  }
+});

@@ -32,7 +32,9 @@ import {
   appCommandAction,
   type AppCommandAction,
   hasCommandArguments,
+  isAlwaysNativeCommand,
   isNativeSubagentCommand,
+  leadingSlashCommand,
   supportsSideChatAgent,
   subagentPanelAliases,
   subagentPanelArgumentNotice,
@@ -60,6 +62,7 @@ import {
   type InlineSelection,
 } from "./InlineReferenceInput";
 import { ComposerRichInput } from "./ComposerRichInput";
+import { Badge } from "./ui";
 import {
   hasRichComposerMarkdown,
   smartPasteTransform,
@@ -114,6 +117,7 @@ interface Props {
   sideChat?: boolean;
   context?: ReactNode;
   hasContext?: boolean;
+  quotes?: string[];
   annotations?: Annotation[];
   referenceState?: { scope: string; entries: ComposerReference[] };
   onReferencesChange?: (value: {
@@ -148,6 +152,7 @@ type Option = {
   id: string;
   label: string;
   detail: string;
+  badge?: string;
   icon: "file" | "folder" | "back" | "command";
   uiAction?: AppCommandAction;
   choose: () => void;
@@ -385,6 +390,7 @@ export function Composer(props: Props) {
     !props.predictionBlocked &&
     !props.skillCreator &&
     !(props.hasContext ?? !!props.context) &&
+    !props.quotes?.length &&
     !props.annotations?.length &&
     !attached.length &&
     !menu &&
@@ -702,6 +708,7 @@ export function Composer(props: Props) {
                 title !== item.name
                   ? [title, rawDetail].filter(Boolean).join(" · ")
                   : rawDetail,
+              badge: item.kind === "skill" ? "技能" : undefined,
               icon: "command" as const,
               uiAction: item.ui_action,
               choose: () => command(item.name),
@@ -999,39 +1006,80 @@ export function Composer(props: Props) {
       setNotice("侧边聊天暂不支持 Agent 原生命令，请输入普通消息。");
       return;
     }
-    if (value.trimStart().startsWith("/") && props.annotations?.length) {
+    const nativeCommand = leadingSlashCommand(value);
+    const knownEntry = nativeCommand
+      ? commands.find((command) => command.name === nativeCommand)
+      : undefined;
+    const knownNonSkill =
+      !!nativeCommand &&
+      (isAlwaysNativeCommand(nativeCommand) ||
+        (knownEntry !== undefined && knownEntry.kind !== "skill"));
+    if (knownNonSkill && props.quotes?.length) {
+      setNotice("请先移除引用的文本片段，再使用 Agent 原生命令。");
+      return;
+    }
+    if (knownNonSkill && props.annotations?.length) {
       setNotice("请先移除注释，再使用 Agent 原生命令。");
       return;
     }
-    if (
-      agent !== "opencode" &&
-      value.trimStart().startsWith("/") &&
-      attached.length
-    ) {
+    if (knownNonSkill && attached.length) {
       setNotice("Agent 命令使用原生参数，请先移除项目引用，避免改变命令含义。");
       return;
     }
-    if (!value.trim() && !attached.length && !props.hasContext) return;
+    if (
+      !value.trim() &&
+      !attached.length &&
+      !props.hasContext &&
+      !props.quotes?.length
+    )
+      return;
     const owner = scope;
     const commandContext = currentContext.current;
     submitting.current = true;
     close();
-    const nativeCommand = value.trim().match(/^\/([^\s]+)(?:\s|$)/)?.[1];
     try {
       let catalog = commands;
       if (
         nativeCommand &&
-        agent !== "opencode" &&
-        !catalog.some((command) => command.name === nativeCommand)
+        !knownEntry &&
+        (agent !== "opencode" ||
+          props.quotes?.length ||
+          props.annotations?.length ||
+          attached.length)
       ) {
-        const response = await request(hostId, {
-          method: "agent_commands",
-          agent,
-          project_id: projectId!,
-        });
-        if (response.kind !== "agent_commands")
-          throw new Error("无法读取原生命令列表");
-        catalog = response.commands;
+        try {
+          const response = await request(hostId, {
+            method: "agent_commands",
+            agent,
+            project_id: projectId!,
+          });
+          if (response.kind !== "agent_commands")
+            throw new Error("无法读取原生命令列表");
+          catalog = response.commands;
+        } catch (cause) {
+          if (
+            currentScope.current !== owner ||
+            currentContext.current !== commandContext
+          )
+            return;
+          if (props.quotes?.length) {
+            setNotice("请先移除引用的文本片段，再使用 Agent 原生命令。");
+            return;
+          }
+          if (props.annotations?.length) {
+            setNotice("请先移除注释，再使用 Agent 原生命令。");
+            return;
+          }
+          if (agent !== "opencode") {
+            if (attached.length) {
+              setNotice(
+                "Agent 命令使用原生参数，请先移除项目引用，避免改变命令含义。",
+              );
+              return;
+            }
+            throw cause;
+          }
+        }
         if (
           currentScope.current !== owner ||
           currentContext.current !== commandContext
@@ -1043,27 +1091,62 @@ export function Composer(props: Props) {
         await openAppCommand(uiAction);
         return;
       }
-      if (
-        attached.length &&
-        catalog.some((command) => command.name === nativeCommand)
-      ) {
-        setNotice(
-          "Agent 命令使用原生参数，请先移除项目引用，避免改变命令含义。",
-        );
-        return;
+      const matched = nativeCommand
+        ? catalog.find((command) => command.name === nativeCommand)
+        : undefined;
+      const isSkill = matched?.kind === "skill";
+      if (nativeCommand && !isSkill && (agent !== "opencode" || matched)) {
+        if (props.quotes?.length) {
+          setNotice("请先移除引用的文本片段，再使用 Agent 原生命令。");
+          return;
+        }
+        if (props.annotations?.length) {
+          setNotice("请先移除注释，再使用 Agent 原生命令。");
+          return;
+        }
+        if (attached.length) {
+          setNotice(
+            "Agent 命令使用原生参数，请先移除项目引用，避免改变命令含义。",
+          );
+          return;
+        }
       }
+      const baseText = props.skillCreator ? skillCreatorPrompt(value) : value;
+      const formattedQuotes =
+        !sideChat && props.quotes?.length
+          ? props.quotes.map((quote) =>
+              quote
+                .split("\n")
+                .map((line) => `> ${line}`)
+                .join("\n"),
+            )
+          : [];
+      const quotedText = formattedQuotes.length
+        ? isSkill
+          ? [baseText.trim(), ...formattedQuotes].filter(Boolean).join("\n\n")
+          : [
+              ...formattedQuotes,
+              baseText.trim() ||
+                (props.annotations?.length || attached.length
+                  ? ""
+                  : "请结合以上侧边聊天内容继续。"),
+            ]
+              .filter(Boolean)
+              .join("\n\n")
+        : baseText;
       const prompt = referencePrompt(
-        annotationPrompt(
-          props.skillCreator ? skillCreatorPrompt(value) : value,
-          props.annotations ?? [],
-        ),
+        annotationPrompt(quotedText, props.annotations ?? []),
         attached,
       );
       if (
-        props.annotations?.length &&
+        (props.annotations?.length || (!sideChat && props.quotes?.length)) &&
         new TextEncoder().encode(prompt).length > 128 * 1024
       )
-        throw new Error("消息与注释总内容过长，请缩短后再发送。");
+        throw new Error(
+          props.quotes?.length
+            ? "消息、引用文本与注释总内容过长，请缩短后再发送。"
+            : "消息与注释总内容过长，请缩短后再发送。",
+        );
       if (await onSubmit(prompt)) {
         if (!props.referenceState && currentScope.current === owner)
           setReferences({ scope: owner, entries: [] });
@@ -1419,15 +1502,17 @@ export function Composer(props: Props) {
                     ? FileText
                     : option.icon === "back"
                       ? ArrowLeft
-                      : option.uiAction === "model"
-                        ? Cpu
-                        : option.uiAction === "effort"
-                          ? SlidersHorizontal
-                          : option.uiAction === "subagents"
-                            ? GitFork
-                            : option.uiAction === "side"
-                              ? MessageSquare
-                              : Terminal;
+                      : option.badge
+                        ? Box
+                        : option.uiAction === "model"
+                          ? Cpu
+                          : option.uiAction === "effort"
+                            ? SlidersHorizontal
+                            : option.uiAction === "subagents"
+                              ? GitFork
+                              : option.uiAction === "side"
+                                ? MessageSquare
+                                : Terminal;
               const folderEntry =
                 option.icon === "folder" && option.id.startsWith("entry:")
                   ? entries.find((item) => `entry:${item.path}` === option.id)
@@ -1452,6 +1537,11 @@ export function Composer(props: Props) {
                   <span className="composer-menu-option-primary">
                     {option.icon === "command" ? `/${option.id}` : option.label}
                   </span>
+                  {option.badge && (
+                    <Badge className="composer-command-badge">
+                      {option.badge}
+                    </Badge>
+                  )}
                   {option.detail && <small>{option.detail}</small>}
                   {folderEntry && (
                     <span
@@ -1474,7 +1564,7 @@ export function Composer(props: Props) {
             {loading && (
               <p role="status">
                 {mode === "commands"
-                  ? "正在读取 Agent 原生命令…"
+                  ? "正在读取命令与技能…"
                   : "正在读取项目目录…"}
               </p>
             )}
@@ -1490,7 +1580,7 @@ export function Composer(props: Props) {
                 {mode === "files" && "，可输入目录路径继续查找"}
                 {mode === "commands" &&
                   !sideChat &&
-                  "，以当前 Agent 返回的命令为准"}
+                  "，以当前 Agent 返回的命令与技能为准"}
               </p>
             )}
           </div>
@@ -1892,7 +1982,10 @@ export function Composer(props: Props) {
           () => void submit(),
           !pasting &&
             !retryFiles.length &&
-            (!!value.trim() || !!attached.length || !!props.hasContext),
+            (!!value.trim() ||
+              !!attached.length ||
+              !!props.hasContext ||
+              !!props.quotes?.length),
           localNavigation,
         )}
       </div>

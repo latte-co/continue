@@ -474,6 +474,12 @@ pub struct QueuedMessage {
     pub revision: u32,
     pub created_at: f64,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommandKind {
+    Command,
+    Skill,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct AgentSlashCommand {
     pub name: String,
@@ -481,6 +487,9 @@ pub struct AgentSlashCommand {
     pub display_name: Option<String>,
     pub description: String,
     pub argument_hint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub kind: Option<AgentCommandKind>,
     /// Presentation hint supplied only for an advertised native command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

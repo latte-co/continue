@@ -18,6 +18,7 @@ fn main() {
         SubagentStatus::decl(),
         SubagentUpdate::decl(),
         Subagent::decl(),
+        AgentCommandKind::decl(),
         AgentCommandUiAction::decl(),
         ComposerPredictionStatus::decl(),
         ComposerPredictionSnapshot::decl(),

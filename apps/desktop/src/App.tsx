@@ -32,6 +32,7 @@ import {
   sideChatId,
   openTurnChanges,
   openSubagents,
+  updateWorkspace,
   CONVERSATION_MIN_WIDTH,
 } from "./workspaceState";
 
@@ -40,6 +41,7 @@ export default function App() {
   const workbench = useWorkbench();
   const skillsOpen = workbench.modal === "skills";
   const [skillsBusy, setSkillsBusy] = useState(false);
+  const [mainComposerFocus, setMainComposerFocus] = useState(0);
   const drafts = useRef(new DraftStore()).current;
   const historyScope = JSON.stringify([
     workbench.hostId,
@@ -242,6 +244,25 @@ export default function App() {
     openSideChatTab(owner, sideId, true);
     return true;
   };
+  const addToMainChat =
+    session && !session.archived
+      ? (quote: string) => {
+          const key = JSON.stringify([hostId, session.id]);
+          const current = drafts.get(key);
+          drafts.update(key, {
+            quotes: [...(current.quotes ?? []), quote],
+          });
+          if (
+            workbench.workspace.expanded &&
+            !workbench.workspace.conversationActive
+          ) {
+            updateWorkspace(workbench.workspaceId, {
+              conversationActive: true,
+            });
+          }
+          setMainComposerFocus((value) => value + 1);
+        }
+      : undefined;
   const conversationActions =
     !workbench.modal && !dialogOpen ? (
       <SessionMenuButton state={workbench} />
@@ -375,6 +396,7 @@ export default function App() {
               quoteInSideChat={
                 canOpenSide ? (text) => void showSide(text, true) : undefined
               }
+              focusRequest={mainComposerFocus}
               openTurnChanges={(changes, path) => {
                 if (session)
                   openTurnChanges(
@@ -540,6 +562,7 @@ export default function App() {
                           sideStatus,
                         )
                       }
+                      addToMainChat={addToMainChat}
                     />
                   )
                 : undefined

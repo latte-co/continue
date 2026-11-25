@@ -6,7 +6,8 @@ use crate::runtime::Group;
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::StreamExt;
 use latte_work_protocol::{
-    AgentEnvironment, AgentInfo, AgentPermissionMode, AgentSlashCommand, Effort, Response,
+    AgentCommandKind, AgentEnvironment, AgentInfo, AgentPermissionMode, AgentSlashCommand, Effort,
+    Response,
 };
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, process::Stdio, time::Duration};
@@ -74,17 +75,17 @@ pub(in crate::agents) async fn permission_modes(binary: &str) -> Result<Vec<Agen
     ])
 }
 
-pub(in crate::agents) fn skill_info(
+fn skill_roots(
     project: &std::path::Path,
-    name: &str,
-) -> Result<Option<latte_work_protocol::SkillInfo>> {
+    environment: &AgentEnvironment,
+) -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
-    ensure!(crate::skills::component(name), "Skill 名称无效");
-    let home = crate::agent_environment::variable("HOME").map(PathBuf::from);
-    let config = crate::agent_environment::variable("OPENCODE_CONFIG_DIR")
+    let home =
+        crate::agent_environment::configured_variable("HOME", environment).map(PathBuf::from);
+    let config = crate::agent_environment::configured_variable("OPENCODE_CONFIG_DIR", environment)
         .map(PathBuf::from)
         .or_else(|| {
-            crate::agent_environment::variable("XDG_CONFIG_HOME")
+            crate::agent_environment::configured_variable("XDG_CONFIG_HOME", environment)
                 .map(PathBuf::from)
                 .map(|path| path.join("opencode"))
         })
@@ -110,19 +111,17 @@ pub(in crate::agents) fn skill_info(
     if let Some(home) = home {
         roots.extend([home.join(".agents/skills"), home.join(".claude/skills")]);
     }
-    let mut match_info: Option<latte_work_protocol::SkillInfo> = None;
-    for root in roots {
-        if let Some(found) = crate::agents::claude_skills::inspect(&root.join(name), name)? {
-            if match_info
-                .as_ref()
-                .is_some_and(|existing| existing.directory != found.directory)
-            {
-                bail!("此 Skill 有多个安装位置，无法确认当前目录");
-            }
-            match_info = Some(found);
-        }
-    }
-    Ok(match_info)
+    roots
+}
+
+pub(in crate::agents) fn skill_info(
+    project: &std::path::Path,
+    name: &str,
+) -> Result<Option<latte_work_protocol::SkillInfo>> {
+    crate::agents::claude_skills::find_in_roots(
+        &skill_roots(project, &AgentEnvironment::default()),
+        name,
+    )
 }
 
 struct Probe {
@@ -326,8 +325,44 @@ pub(crate) async fn commands(
         let (id, _) = probe.attach(cwd).await?;
         let result = tokio::time::timeout(Duration::from_secs(5), probe.command_catalog(&id)).await;
         let closed = probe.close(&id).await;
-        let commands = result.context("读取 OpenCode 命令列表超时")??;
+        let mut commands = result.context("读取 OpenCode 命令列表超时")??;
         closed?;
+        let roots = skill_roots(std::path::Path::new(cwd), &config.environment);
+        let skills =
+            tokio::task::spawn_blocking(move || crate::agents::claude_skills::scan_roots(&roots))
+                .await
+                .context("读取 OpenCode 技能目录失败")?;
+        for (slug, info) in skills {
+            if let Some(existing) = commands.iter_mut().find(|c| c.name == slug) {
+                existing.kind = Some(AgentCommandKind::Skill);
+                if existing.display_name.is_none()
+                    && info.name != slug
+                    && info.name.chars().count() <= 80
+                    && !info.name.chars().any(char::is_control)
+                {
+                    existing.display_name = Some(info.name);
+                }
+                if existing.description.is_empty() && !info.description.is_empty() {
+                    existing.description = info.description.chars().take(240).collect();
+                }
+                continue;
+            }
+            if commands.len() >= 1000 {
+                break;
+            }
+            let display_name = (info.name != slug
+                && info.name.chars().count() <= 80
+                && !info.name.chars().any(char::is_control))
+            .then_some(info.name);
+            commands.push(AgentSlashCommand {
+                name: slug,
+                display_name,
+                description: info.description.chars().take(240).collect(),
+                argument_hint: "[任务说明]".into(),
+                kind: Some(AgentCommandKind::Skill),
+                ui_action: None,
+            });
+        }
         Ok(commands)
     })
     .await

@@ -431,6 +431,31 @@ async fn opencode_skill_metadata_reads_project_install_without_starting_agent() 
         current(&mut client, &id).await.agent_session_open,
         Some(false)
     );
+    let catalog = ask(
+        &mut client,
+        Request::AgentCommands {
+            agent: "opencode".into(),
+            project_id,
+            provider: Some(TurnProvider::Cli),
+        },
+    )
+    .await;
+    match catalog {
+        Response::AgentCommands { commands } => {
+            assert!(commands.iter().any(|c| {
+                c.name == "project:check"
+                    && c.kind == Some(latte_work_protocol::AgentCommandKind::Command)
+            }));
+            assert!(commands.iter().any(|c| {
+                c.name == "fixture-opencode-skill"
+                    && c.display_name.as_deref() == Some("Fixture Skill")
+                    && c.description == "Project skill"
+                    && c.kind == Some(latte_work_protocol::AgentCommandKind::Skill)
+            }));
+        }
+        other => panic!("expected opencode commands & skills: {other:?}"),
+    }
+    assert!(!folder.path().join("prompts").exists());
 }
 
 #[tokio::test]

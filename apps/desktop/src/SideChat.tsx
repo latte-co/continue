@@ -36,7 +36,17 @@ import { Button } from "./ui";
 
 const FOLLOW_THRESHOLD = 90;
 const SIDE_TITLE_SETTLE_MS = 2500;
+const SIDE_BG_TITLE_POLL_MS = 15000;
 const MAX_READING_POSITIONS = 64;
+const eventArraySizes = new WeakMap<Event[], number>();
+
+function estimateEventsByteSize(events: Event[]): number {
+  const cached = eventArraySizes.get(events);
+  if (cached !== undefined) return cached;
+  const size = JSON.stringify(events).length * 2;
+  eventArraySizes.set(events, size);
+  return size;
+}
 
 type CachedSideChat = {
   hostId: string;
@@ -82,7 +92,7 @@ class SideChatTranscriptCache {
     const size =
       previous?.events === value.events
         ? previous.size
-        : JSON.stringify(value.events).length * 2;
+        : estimateEventsByteSize(value.events);
     this.totalSize -= previous?.size ?? 0;
     this.entries.delete(key);
     if (size > this.maxSize) return;
@@ -258,6 +268,7 @@ type SideChatComponentProps = {
   supported: boolean;
   supportsInheritPermission?: boolean;
   onStatusChange?: (status: Session["status"]) => void;
+  addToMainChat?: (quote: string) => void;
 };
 
 export function SideChat(props: SideChatComponentProps) {
@@ -279,6 +290,7 @@ function SideChatPane({
   supported,
   supportsInheritPermission = true,
   onStatusChange,
+  addToMainChat,
   draftKey: key,
 }: SideChatComponentProps & { draftKey: string }) {
   const onStatusChangeRef = useRef(onStatusChange);
@@ -410,6 +422,7 @@ function SideChatPane({
   const [away, setAway] = useState(() => !(savedPosition?.follow ?? true));
   const restoredPosition = useRef(false);
   const [titleSettleExpired, setTitleSettleExpired] = useState(false);
+  const [bgTitlePollExpired, setBgTitlePollExpired] = useState(false);
   const [turnSubmitted, setTurnSubmitted] = useState(false);
 
   useEffect(() => {
@@ -425,6 +438,7 @@ function SideChatPane({
       restoredPosition.current = false;
       setAway(false);
       setTitleSettleExpired(false);
+      setBgTitlePollExpired(false);
       setTurnSubmitted(false);
       lastPublishedStatus.current = undefined;
       after.current = 0;
@@ -464,9 +478,8 @@ function SideChatPane({
     !isDraft && effectiveSession
       ? settledSideChatTitle(effectiveSession, hasCompletedTurn)
       : undefined;
-  const awaitingGeneratedTitle = Boolean(
+  const titleGenerationPending = Boolean(
     candidateTitle &&
-    !titleSettleExpired &&
     effectiveSession?.title_requested &&
     !effectiveSession.custom_title &&
     effectiveSession.agent_session_open !== false &&
@@ -474,6 +487,8 @@ function SideChatPane({
     promptPrefix !== undefined &&
     candidateTitle === promptPrefix,
   );
+  const awaitingGeneratedTitle = titleGenerationPending && !titleSettleExpired;
+  const awaitingBackgroundTitle = titleGenerationPending && !bgTitlePollExpired;
   useEffect(() => {
     if (!awaitingGeneratedTitle) return;
     const timer = setTimeout(() => {
@@ -481,6 +496,14 @@ function SideChatPane({
     }, SIDE_TITLE_SETTLE_MS);
     return () => clearTimeout(timer);
   }, [awaitingGeneratedTitle, key]);
+
+  useEffect(() => {
+    if (!awaitingBackgroundTitle) return;
+    const timer = setTimeout(() => {
+      setBgTitlePollExpired(true);
+    }, SIDE_BG_TITLE_POLL_MS);
+    return () => clearTimeout(timer);
+  }, [awaitingBackgroundTitle, key]);
 
   useEffect(() => {
     if (!candidateTitle || awaitingGeneratedTitle) return;
@@ -508,7 +531,7 @@ function SideChatPane({
 
   const unsettledFirstTurn =
     !isDraft &&
-    (awaitingGeneratedTitle ||
+    (awaitingBackgroundTitle ||
       (!candidateTitle &&
         (turnSubmitted ||
           effectiveSession?.status === "running" ||
@@ -606,6 +629,7 @@ function SideChatPane({
             restoredPosition.current = false;
             setAway(false);
             setTitleSettleExpired(false);
+            setBgTitlePollExpired(false);
             setTurnSubmitted(false);
             setSession(undefined);
             setEvents([]);
@@ -922,6 +946,9 @@ function SideChatPane({
                       enabled={active && !busy && !parent.archived}
                       onSave={saveAnnotation}
                       onRemove={removeAnnotation}
+                      addToMainChat={
+                        !parent.archived ? addToMainChat : undefined
+                      }
                     />
                   );
                 if (item.type === "tool")

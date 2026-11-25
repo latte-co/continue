@@ -53,6 +53,41 @@ for line in sys.stdin:
         pass
     elif method == 'config/read':
         reply(value, {'config': {'model_provider': 'fixture-native', 'model': 'seed-test', 'developer_instructions': 'FIXTURE_NATIVE_DEVELOPER_INSTRUCTIONS'}})
+    elif method == 'skills/list':
+        cwds = params.get('cwds') or [os.getcwd()]
+        cwd_path = pathlib.Path(cwds[0])
+        skills = [
+            {
+                'name': 'fixture-traex-skill',
+                'description': 'Full Traex skill body description',
+                'shortDescription': 'Traex 技能说明',
+                'interface': {'displayName': 'Traex 技能'},
+                'path': str((cwd_path / '.agents/skills/fixture-traex-skill/SKILL.md').resolve()),
+                'scope': 'repo',
+                'enabled': True,
+            },
+            {
+                'name': 'disabled-traex-skill',
+                'description': 'Disabled skill',
+                'path': str((cwd_path / '.agents/skills/disabled/SKILL.md').resolve()),
+                'scope': 'repo',
+                'enabled': False,
+            },
+        ]
+        for root_rel in ('.traex/skills', '.trae/skills', '.agents/skills'):
+            skills_root = cwd_path / root_rel
+            if skills_root.is_dir():
+                for child in sorted(skills_root.iterdir()):
+                    skill_md = child / 'SKILL.md'
+                    if skill_md.is_file() and all(s['name'] != child.name for s in skills):
+                        skills.append({
+                            'name': child.name,
+                            'description': f'Project skill {child.name}',
+                            'path': str(skill_md.resolve()),
+                            'scope': 'repo',
+                            'enabled': True,
+                        })
+        reply(value, {'data': [{'cwd': str(cwd_path), 'skills': skills, 'errors': []}]})
     elif method == 'model/list':
         reply(value, {'data': [{'id': 'seed-test', 'displayName': 'Seed Test', 'isDefault': True, 'supportedReasoningEfforts': [{'reasoningEffort': 'high'}]},
             {'id': 'gpt-test', 'displayName': 'GPT Test', 'supportedReasoningEfforts': [{'reasoningEffort': 'high'}],
@@ -114,10 +149,34 @@ for line in sys.stdin:
     elif method == 'thread/name/set':
         notify('thread/name/updated', {'threadName': params['name']})
         reply(value, {})
+    elif method == 'thread/compact/start':
+        assert params['threadId'] == thread
+        count += 1
+        turn = 'turn-' + str(count)
+        with pathlib.Path('traex-inputs').open('a') as record:
+            record.write(json.dumps({'prompt': '/compact', 'params': params, 'pid': os.getpid()}) + '\n')
+        notify('turn/started', {'turn': {'id': turn, 'status': 'inProgress'}})
+        reply(value, {})
+        notify('item/completed', {'item': {'id': 'compact-' + turn, 'type': 'contextCompaction'}})
+        notify('thread/compacted', {})
+        complete()
+    elif method == 'review/start':
+        assert params['threadId'] == thread and params.get('delivery') == 'inline'
+        count += 1
+        turn = 'turn-' + str(count)
+        with pathlib.Path('traex-inputs').open('a') as record:
+            record.write(json.dumps({'prompt': '/review', 'params': params, 'pid': os.getpid()}) + '\n')
+        notify('turn/started', {'turn': {'id': turn, 'status': 'inProgress'}})
+        reply(value, {'turn': {'id': turn, 'status': 'inProgress'}, 'reviewThreadId': thread})
+        notify('item/started', {'item': {'id': 'review-' + turn, 'type': 'enteredReviewMode', 'review': 'current changes'}})
+        notify('item/completed', {'item': {'id': 'review-' + turn, 'type': 'exitedReviewMode',
+                                          'review': 'TRAE_REVIEW:' + json.dumps(params['target'], sort_keys=True, ensure_ascii=False)}})
+        complete()
     elif method == 'turn/start':
         count += 1
         turn = 'turn-' + str(count)
-        prompt = params['input'][0]['text']
+        skill_item = params['input'][0] if params['input'][0]['type'] == 'skill' else None
+        prompt = params['input'][1]['text'] if skill_item else params['input'][0]['text']
         title_prompt = prompt
         assert params['threadId'] == thread
         with pathlib.Path('traex-inputs').open('a') as record:
@@ -129,6 +188,11 @@ for line in sys.stdin:
             continue
         notify('turn/started', {'turn': {'id': turn, 'status': 'inProgress'}})
         reply(value, {'turn': {'id': turn, 'status': 'inProgress'}})
+        if skill_item is not None:
+            notify('item/completed', {'item': {'id': 'user-' + turn, 'type': 'userMessage', 'content': params['input']}})
+            text(f"TRAE:SKILL:{skill_item['name']}:{prompt}")
+            complete()
+            continue
         if prompt == 'eof':
             sys.exit(0)
         if prompt in ('approval', 'question'):
@@ -191,14 +255,19 @@ for line in sys.stdin:
             complete()
     elif method == 'turn/steer':
         assert params['threadId'] == thread and params['expectedTurnId'] == turn
-        extra=params['input'][0]['text']
+        skill_item = params['input'][0] if params['input'][0]['type'] == 'skill' else None
+        extra = params['input'][1]['text'] if skill_item else params['input'][0]['text']
         with pathlib.Path('traex-steers').open('a') as record:
             record.write(json.dumps({'prompt':extra,'params':params,'pid':os.getpid()})+'\n')
         if extra == 'reject-steer':
             emit({'id':value['id'],'error':{'code':-32602,'message':'current turn cannot accept steering'}})
         else:
             reply(value,{'turnId':turn})
-            if extra != 'hold-steer':
+            if skill_item is not None:
+                notify('item/completed', {'item': {'id': 'user-steer-' + turn, 'type': 'userMessage', 'content': params['input']}})
+                text(f"STEER:SKILL:{skill_item['name']}:{extra}")
+                complete()
+            elif extra != 'hold-steer':
                 text('STEER:'+extra)
                 complete()
     elif method == 'turn/interrupt':
