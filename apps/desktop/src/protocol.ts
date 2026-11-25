@@ -14,6 +14,10 @@ export type TerminalInfo = {
   title: string;
   exited: boolean;
   exit_code: number | null;
+  /**
+   * Canonical working directory where this terminal shell was spawned.
+   */
+  cwd?: string;
 };
 export type Status =
   | "ready"
@@ -419,6 +423,8 @@ export type Request =
       terminal_id: string;
       cols: number;
       rows: number;
+      session_id?: string;
+      repo_path?: string;
     }
   | { method: "read_terminal"; terminal_id: string; after: number }
   | { method: "write_terminal"; terminal_id: string; data: Array<number> }
@@ -701,7 +707,12 @@ export type Request =
       name: string;
       files: Array<SkillImportFile>;
     }
-  | { method: "skill_info"; session_id: string; name: string }
+  | {
+      method: "skill_info";
+      provider?: TurnProvider;
+      session_id: string;
+      name: string;
+    }
   | { method: "sources"; session_id: string }
   | {
       method: "preview_source";

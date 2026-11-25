@@ -1,6 +1,7 @@
 //! Prompt-free ACP probes. A disposable native session is deleted on completion.
 use super::{
-    config_option, frame, initialize, options, parse_commands, verify_initialize, version_2,
+    config_option, frame, initialize, legacy_acp_skills, options, parse_commands,
+    verify_initialize, version_2,
 };
 use crate::runtime::Group;
 use anyhow::{Context, Result, bail, ensure};
@@ -117,11 +118,79 @@ fn skill_roots(
 pub(in crate::agents) fn skill_info(
     project: &std::path::Path,
     name: &str,
+    environment: &AgentEnvironment,
 ) -> Result<Option<latte_work_protocol::SkillInfo>> {
-    crate::agents::claude_skills::find_in_roots(
-        &skill_roots(project, &AgentEnvironment::default()),
-        name,
-    )
+    crate::agents::claude_skills::find_in_roots(&skill_roots(project, environment), name)
+}
+
+fn is_opencode_command(
+    project: &std::path::Path,
+    environment: &AgentEnvironment,
+    name: &str,
+) -> bool {
+    use std::path::PathBuf;
+    if matches!(name, "compact" | "init" | "review" | "goal") {
+        return true;
+    }
+    let home =
+        crate::agent_environment::configured_variable("HOME", environment).map(PathBuf::from);
+    let config_dir =
+        crate::agent_environment::configured_variable("OPENCODE_CONFIG_DIR", environment)
+            .map(PathBuf::from)
+            .or_else(|| {
+                crate::agent_environment::configured_variable("XDG_CONFIG_HOME", environment)
+                    .map(PathBuf::from)
+                    .map(|path| path.join("opencode"))
+            })
+            .or_else(|| home.as_ref().map(|h| h.join(".config/opencode")));
+    let md_file = format!("{name}.md");
+    let mut json_configs = Vec::new();
+    for parent in project.ancestors().take(32) {
+        for dir in [".opencode/command", ".opencode/commands"] {
+            if parent.join(dir).join(&md_file).is_file() {
+                return true;
+            }
+        }
+        json_configs.push(parent.join("opencode.json"));
+        json_configs.push(parent.join(".opencode/opencode.json"));
+        if parent.join(".git").exists() {
+            break;
+        }
+    }
+    if let Some(config) = &config_dir {
+        for dir in ["command", "commands"] {
+            if config.join(dir).join(&md_file).is_file() {
+                return true;
+            }
+        }
+        json_configs.push(config.join("opencode.json"));
+    }
+    if let Some(explicit) =
+        crate::agent_environment::configured_variable("OPENCODE_CONFIG", environment)
+    {
+        json_configs.push(PathBuf::from(explicit));
+    }
+    let has_json_command = |raw: &str| {
+        serde_json::from_str::<Value>(raw)
+            .ok()
+            .and_then(|doc| doc.get("commands")?.as_object().cloned())
+            .is_some_and(|cmds| cmds.contains_key(name))
+    };
+    if let Some(inline) =
+        crate::agent_environment::configured_variable("OPENCODE_CONFIG_CONTENT", environment)
+        && let Some(raw) = inline.to_str()
+        && has_json_command(raw)
+    {
+        return true;
+    }
+    for path in json_configs {
+        if let Ok(raw) = crate::agents::claude_skills::read(&path, 256 * 1024)
+            && has_json_command(&raw)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 struct Probe {
@@ -223,12 +292,16 @@ impl Probe {
         }
     }
 
-    async fn attach(&mut self, cwd: &str) -> Result<(String, Value)> {
-        verify_initialize(&self.request("initialize", initialize()).await?)?;
+    async fn attach(&mut self, cwd: &str) -> Result<(String, Value, bool)> {
+        let init = self.request("initialize", initialize()).await?;
+        verify_initialize(&init)?;
+        let legacy = init["agentInfo"]["version"]
+            .as_str()
+            .is_some_and(legacy_acp_skills);
         let result = self
             .request("session/new", json!({"cwd":cwd,"mcpServers":[]}))
             .await?;
-        Ok((super::string(&result, "sessionId")?.into(), result))
+        Ok((super::string(&result, "sessionId")?.into(), result, legacy))
     }
 
     async fn close(&mut self, session_id: &str) -> Result<()> {
@@ -322,18 +395,40 @@ pub(crate) async fn commands(
             super::config::configure(&mut native, config, "", None)?;
         }
         let mut probe = Probe::spawn(native)?;
-        let (id, _) = probe.attach(cwd).await?;
+        let (id, _, legacy) = probe.attach(cwd).await?;
         let result = tokio::time::timeout(Duration::from_secs(5), probe.command_catalog(&id)).await;
         let closed = probe.close(&id).await;
         let mut commands = result.context("读取 OpenCode 命令列表超时")??;
         closed?;
-        let roots = skill_roots(std::path::Path::new(cwd), &config.environment);
-        let skills =
-            tokio::task::spawn_blocking(move || crate::agents::claude_skills::scan_roots(&roots))
-                .await
-                .context("读取 OpenCode 技能目录失败")?;
-        for (slug, info) in skills {
+        let project = std::path::PathBuf::from(cwd);
+        let environment = config.environment.clone();
+        let skills = tokio::task::spawn_blocking(move || {
+            let roots = skill_roots(&project, &environment);
+            let scanned = crate::agents::claude_skills::scan_roots(&roots);
+            scanned
+                .into_iter()
+                .filter_map(|(slug, info)| {
+                    let skill_file = std::path::Path::new(&info.directory).join("SKILL.md");
+                    if let Ok(doc) = crate::agents::claude_skills::read(&skill_file, 64 * 1024)
+                        && (crate::agents::claude_skills::field(&doc, "slash")
+                            .eq_ignore_ascii_case("false")
+                            || crate::agents::claude_skills::field(&doc, "user-invocable")
+                                .eq_ignore_ascii_case("false"))
+                    {
+                        return None;
+                    }
+                    let shadowed = legacy && is_opencode_command(&project, &environment, &slug);
+                    Some((slug, info, shadowed))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .context("读取 OpenCode 技能目录失败")?;
+        for (slug, info, shadowed_in_legacy) in skills {
             if let Some(existing) = commands.iter_mut().find(|c| c.name == slug) {
+                if !legacy || shadowed_in_legacy {
+                    continue;
+                }
                 existing.kind = Some(AgentCommandKind::Skill);
                 if existing.display_name.is_none()
                     && info.name != slug
@@ -388,7 +483,7 @@ pub(in crate::agents) async fn models(
     };
     tokio::time::timeout(Duration::from_secs(12), async {
         let mut probe = Probe::spawn(command(binary, Some(cwd), environment))?;
-        let (id, result) = probe.attach(cwd).await?;
+        let (id, result, _) = probe.attach(cwd).await?;
         let catalog = tokio::time::timeout(
             Duration::from_secs(5),
             probe.model_catalog(&id, result, selected),

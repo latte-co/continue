@@ -10,8 +10,9 @@ import { renderWithStatus as render } from "./test/renderWithStatus";
 import { afterEach, expect, it, vi } from "vitest";
 import { useState } from "react";
 import { WorkspaceFiles } from "./WorkspaceFiles";
-const mocks = vi.hoisted(() => ({ request: vi.fn() }));
+const mocks = vi.hoisted(() => ({ request: vi.fn(), invoke: vi.fn() }));
 vi.mock("./api", () => ({ request: mocks.request, message: String }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 HTMLElement.prototype.scrollIntoView = vi.fn();
 afterEach(() => {
   cleanup();
@@ -685,4 +686,216 @@ it("reloads the open file and tree and resets Markdown preview when project.path
   expect(await screen.findByText("# From /project-b")).toBeTruthy();
   expect(screen.queryByRole("region", { name: "Markdown 预览" })).toBeNull();
   expect(await screen.findByRole("button", { name: "beta.md" })).toBeTruthy();
+});
+
+it("defaults to rendered Markdown preview when opened from the conversation and still toggles or resets cleanly", async () => {
+  let revision = 0;
+  mocks.request.mockImplementation(async (_host, r) =>
+    r.method === "read_file"
+      ? {
+          kind: "content",
+          text: `# ${r.path} v${++revision}`,
+          truncated: false,
+        }
+      : {
+          kind: "files",
+          entries: [
+            { name: "README.md", path: "README.md", directory: false },
+            { name: "NEXT.md", path: "NEXT.md", directory: false },
+          ],
+        },
+  );
+  function ConversationFileHarness() {
+    const [state, setState] = useState<{
+      path: string;
+      file: string;
+      request?: number;
+      hostId: string;
+    }>({
+      path: "",
+      file: "README.md",
+      request: 1,
+      hostId: "local",
+    });
+    return (
+      <>
+        <button
+          onClick={() =>
+            setState((prev) => ({
+              ...prev,
+              file: "README.md",
+              request: (prev.request ?? 1) + 1,
+            }))
+          }
+        >
+          对话再次打开 README.md
+        </button>
+        <button
+          onClick={() =>
+            setState((prev) => ({
+              ...prev,
+              file: "DOCS.markdown",
+              request: (prev.request ?? 1) + 1,
+            }))
+          }
+        >
+          对话打开 DOCS.markdown
+        </button>
+        <button
+          onClick={() => setState((prev) => ({ ...prev, hostId: "ssh" }))}
+        >
+          切换主机
+        </button>
+        <WorkspaceFiles
+          hostId={state.hostId}
+          project={{ id: "p", name: "Project", path: "/project" }}
+          tab="files"
+          active
+          path={state.path}
+          file={state.file}
+          markdownPreviewRequest={state.request}
+          clearMarkdownPreviewRequest={() =>
+            setState((prev) => ({ ...prev, request: undefined }))
+          }
+          navigate={(next) =>
+            setState((prev) => ({
+              ...prev,
+              path: next.path ?? prev.path,
+              file: next.file ?? prev.file,
+              request: undefined,
+            }))
+          }
+        />
+      </>
+    );
+  }
+  render(<ConversationFileHarness />);
+  const preview = await screen.findByRole("region", { name: "Markdown 预览" });
+  expect(
+    within(preview).getByRole("heading", { name: "README.md v1" }),
+  ).toBeTruthy();
+  expect(
+    screen
+      .getByRole("button", { name: "查看源码" })
+      .getAttribute("aria-pressed"),
+  ).toBe("true");
+  expect(
+    screen.getByRole("button", { name: "自动换行" }).hasAttribute("disabled"),
+  ).toBe(true);
+
+  const readCallsBeforeToggle = mocks.request.mock.calls.filter(
+    ([, req]) => req.method === "read_file",
+  ).length;
+  fireEvent.click(screen.getByRole("button", { name: "查看源码" }));
+  expect(
+    screen.getByRole("region", { name: "文件内容" }).textContent,
+  ).toContain("# README.md v1");
+  expect(
+    mocks.request.mock.calls.filter(([, req]) => req.method === "read_file")
+      .length,
+  ).toBe(readCallsBeforeToggle);
+
+  fireEvent.click(screen.getByRole("button", { name: "刷新" }));
+  await waitFor(() =>
+    expect(
+      screen.getByRole("region", { name: "文件内容" }).textContent,
+    ).toContain("# README.md v2"),
+  );
+  expect(screen.queryByRole("region", { name: "Markdown 预览" })).toBeNull();
+
+  fireEvent.click(
+    screen.getByRole("button", { name: "对话再次打开 README.md" }),
+  );
+  expect(
+    within(screen.getByRole("region", { name: "Markdown 预览" })).getByRole(
+      "heading",
+      { name: "README.md v2" },
+    ),
+  ).toBeTruthy();
+
+  fireEvent.click(
+    screen.getByRole("button", { name: "对话打开 DOCS.markdown" }),
+  );
+  expect(
+    await screen.findByRole("heading", { name: "DOCS.markdown v3" }),
+  ).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "NEXT.md" }));
+  await screen.findByText("# NEXT.md v4");
+  expect(screen.queryByRole("region", { name: "Markdown 预览" })).toBeNull();
+
+  fireEvent.click(
+    screen.getByRole("button", { name: "对话再次打开 README.md" }),
+  );
+  expect(
+    await screen.findByRole("heading", { name: "README.md v5" }),
+  ).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "切换主机" }));
+  await screen.findByText("# README.md v6");
+  expect(screen.queryByRole("region", { name: "Markdown 预览" })).toBeNull();
+});
+
+it("renders project PDF files in the right-hand file browser via SourcePreview without calling read_file", async () => {
+  URL.createObjectURL = vi.fn(() => "blob:pdf-page");
+  URL.revokeObjectURL = vi.fn();
+  mocks.invoke.mockImplementation(async (cmd) => {
+    if (cmd === "preview_pdf") return [137, 80, 78, 71];
+    return undefined;
+  });
+  mocks.request.mockImplementation(async (_host, r) => {
+    if (r.method === "files")
+      return {
+        kind: "files",
+        entries: [
+          { name: "book.pdf", path: "docs/book.pdf", directory: false },
+        ],
+      };
+    if (r.method === "preview_source")
+      return {
+        kind: "source_preview",
+        data: [37, 80, 68, 70, 45, 49, 46, 53],
+        next: 8,
+        size: 8,
+        has_more: false,
+        mime_type: "application/pdf",
+      };
+    throw new Error(`Unexpected method: ${r.method}`);
+  });
+
+  const view = render(<Harness tab="files" file="docs/book.pdf" />);
+  const img = await screen.findByRole("img", { name: "book.pdf 首页" });
+  expect(img.getAttribute("src")).toBe("blob:pdf-page");
+  expect(
+    screen.getByRole("button", { name: "自动换行" }).hasAttribute("disabled"),
+  ).toBe(true);
+  expect(mocks.request).toHaveBeenCalledWith("local", {
+    method: "preview_source",
+    project_id: "p",
+    session_id: null,
+    path: "docs/book.pdf",
+    offset: 0,
+  });
+  expect(mocks.invoke).toHaveBeenCalledWith("preview_pdf", {
+    name: "book.pdf",
+    data: [37, 80, 68, 70, 45, 49, 46, 53],
+  });
+
+  fireEvent.click(screen.getByRole("button", { name: "系统预览" }));
+  await waitFor(() =>
+    expect(mocks.invoke).toHaveBeenCalledWith("system_preview", {
+      name: "book.pdf",
+      data: [37, 80, 68, 70, 45, 49, 46, 53],
+    }),
+  );
+  view.unmount();
+
+  mocks.invoke.mockRejectedValueOnce(
+    new Error("无法生成 PDF 预览，请使用系统预览"),
+  );
+  render(<Harness tab="files" file="docs/book.pdf" />);
+  expect(
+    await screen.findByText(/无法生成 PDF 预览，请使用系统预览/),
+  ).toBeTruthy();
+  expect(screen.getByRole("button", { name: "系统预览" })).toBeTruthy();
+  expect(screen.queryByText("此格式可使用系统预览打开。")).toBeNull();
 });

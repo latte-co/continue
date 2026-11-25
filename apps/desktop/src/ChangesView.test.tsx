@@ -1133,3 +1133,81 @@ it("preserves exact child repository paths with leading or trailing spaces", asy
     " child",
   );
 });
+
+it("recovers and keeps the repository switcher available after the selected worktree has been removed", async () => {
+  const { setSelectedGitRepository, getSelectedGitRepository } =
+    await import("./gitRepositories");
+  setSelectedGitRepository("local", project, "old-worktree");
+  const list = [
+    { path: ".", name: "root", kind: "root" as const },
+    { path: "other", name: "other", kind: "repository" as const },
+  ];
+  mocks.request.mockImplementation(async (_host: string, req: Request) => {
+    if (req.method === "git_info" && req.repo_path === "old-worktree") {
+      throw Object.assign(new Error("子仓库目录不存在"), {
+        code: "request_failed",
+      });
+    }
+    if (req.method === "git_info") {
+      return { kind: "git_info", info: { ...info, repositories: list } };
+    }
+    if (req.method === "git_repositories") {
+      return { kind: "git_repositories", repositories: list, truncated: false };
+    }
+    if (req.method === "git_review") {
+      return { kind: "git_review", review: { ...review, entries: [] } };
+    }
+    throw new Error(`unexpected ${req.method}`);
+  });
+  render(<ChangesView {...props} />);
+  expect(
+    await screen.findByRole("combobox", { name: "Git 仓库" }),
+  ).toBeTruthy();
+  await waitFor(() =>
+    expect(mocks.request).toHaveBeenCalledWith(
+      "local",
+      expect.objectContaining({ method: "git_review" }),
+    ),
+  );
+  expect(getSelectedGitRepository("local", project)).toBe(".");
+});
+
+it("keeps the repository switcher rendered when git_info fails on an existing child repository", async () => {
+  const { setSelectedGitRepository } = await import("./gitRepositories");
+  setSelectedGitRepository("local", project, "child");
+  const list = [
+    { path: ".", name: "root", kind: "root" as const },
+    { path: "child", name: "child", kind: "repository" as const },
+  ];
+  mocks.request.mockImplementation(async (_host: string, req: Request) => {
+    if (req.method === "git_info" && req.repo_path === "child") {
+      throw Object.assign(new Error("读取 Git 分支超时"), {
+        code: "request_failed",
+      });
+    }
+    if (req.method === "git_info") {
+      return { kind: "git_info", info: { ...info, repositories: list } };
+    }
+    if (req.method === "git_repositories") {
+      return { kind: "git_repositories", repositories: list, truncated: false };
+    }
+    if (req.method === "git_review") {
+      return { kind: "git_review", review: { ...review, entries: [] } };
+    }
+    throw new Error(`unexpected ${req.method}`);
+  });
+  render(<ChangesView {...props} />);
+  expect(await screen.findByText(/读取 Git 分支超时/)).toBeTruthy();
+  const switcher = await screen.findByRole("combobox", { name: "Git 仓库" });
+  fireEvent.click(switcher);
+  fireEvent.click(screen.getByRole("option", { name: /root/ }));
+  await waitFor(() =>
+    expect(mocks.request).toHaveBeenCalledWith(
+      "local",
+      expect.objectContaining({
+        method: "git_review",
+        base: info.default_base,
+      }),
+    ),
+  );
+});

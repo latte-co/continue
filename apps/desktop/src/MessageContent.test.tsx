@@ -371,6 +371,24 @@ describe("MessageContent markdown file links", () => {
     fireEvent.click(link);
     expect(openFile).toHaveBeenCalledWith("apps/desktop/src/app.ts");
   });
+  it("decodes percent-encoded CJK and spaced PDF links inside the project", () => {
+    const openFile = vi.fn();
+    render(
+      <MessageActionsProvider
+        value={{ openFile, localHost: true, projectRoot: "/repo" }}
+      >
+        <MessageContent
+          text={
+            "见[中文手册](docs/中文手册.pdf)与[设计稿](<docs/Latte Work.pdf>)。"
+          }
+        />
+      </MessageActionsProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "中文手册" }));
+    expect(openFile).toHaveBeenCalledWith("docs/中文手册.pdf");
+    fireEvent.click(screen.getByRole("button", { name: "设计稿" }));
+    expect(openFile).toHaveBeenCalledWith("docs/Latte Work.pdf");
+  });
   it("routes absolute link targets inside the project root through the file tab", () => {
     const openFile = vi.fn();
     render(

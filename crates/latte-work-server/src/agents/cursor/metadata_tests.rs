@@ -448,7 +448,9 @@ async fn cursor_commands_and_skills_scan_local_catalog_safely_without_prompts() 
             ),
         ]
     );
-    let info = skill_info(root.path(), "fix-ci").unwrap().unwrap();
+    let info = skill_info(root.path(), "fix-ci", &config.environment)
+        .unwrap()
+        .unwrap();
     assert_eq!(info.name, "修复 CI");
     assert_eq!(info.description, "诊断并修复流水线");
 

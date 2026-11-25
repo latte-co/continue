@@ -2528,7 +2528,9 @@ async fn terminal_pty_cwd_resize_unicode_reconnect_interrupt_and_exit() {
                     project_id: project_id.clone(),
                     terminal_id: id.clone(),
                     cols: 80,
-                    rows: 24
+                    rows: 24,
+                    session_id: None,
+                    repo_path: None,
                 }
             )
             .await,
@@ -2659,6 +2661,8 @@ async fn terminal_close_kills_shell_that_ignores_hangup() {
                 terminal_id: id.clone(),
                 cols: 80,
                 rows: 24,
+                session_id: None,
+                repo_path: None,
             }
         )
         .await,
@@ -2712,7 +2716,9 @@ async fn terminal_limits_project_isolation_and_close_foreground_process() {
                     project_id: project,
                     terminal_id: id.clone(),
                     cols,
-                    rows: 24
+                    rows: 24,
+                    session_id: None,
+                    repo_path: None,
                 }
             )
             .await,
@@ -2726,7 +2732,9 @@ async fn terminal_limits_project_isolation_and_close_foreground_process() {
                 project_id: project_id.clone(),
                 terminal_id: id.clone(),
                 cols: 80,
-                rows: 24
+                rows: 24,
+                session_id: None,
+                repo_path: None,
             }
         )
         .await,
@@ -2739,7 +2747,9 @@ async fn terminal_limits_project_isolation_and_close_foreground_process() {
                 project_id: other_id.clone(),
                 terminal_id: id.clone(),
                 cols: 80,
-                rows: 24
+                rows: 24,
+                session_id: None,
+                repo_path: None,
             }
         )
         .await,
@@ -2798,6 +2808,8 @@ async fn terminal_limits_project_isolation_and_close_foreground_process() {
             terminal_id: id.clone(),
             cols: 80,
             rows: 24,
+            session_id: None,
+            repo_path: None,
         },
     )
     .await;
@@ -2820,6 +2832,8 @@ async fn terminal_daemon_shutdown_cleans_up_and_restart_never_replays() {
             terminal_id: id.clone(),
             cols: 80,
             rows: 24,
+            session_id: None,
+            repo_path: None,
         },
     )
     .await;
@@ -2977,7 +2991,9 @@ async fn upgrade_refuses_tasks_and_terminals_then_drains_existing_clients() {
                 project_id,
                 terminal_id: terminal_id.clone(),
                 cols: 80,
-                rows: 24
+                rows: 24,
+                session_id: None,
+                repo_path: None,
             }
         )
         .await,
@@ -3389,7 +3405,9 @@ async fn busy_server_with_one_pending_close_releases_other_owned_processes() {
                     project_id: project_id.clone(),
                     terminal_id: id.clone(),
                     cols: 80,
-                    rows: 24
+                    rows: 24,
+                    session_id: None,
+                    repo_path: None,
                 }
             )
             .await,
@@ -3866,6 +3884,7 @@ async fn app_server_commands_and_skills_discover_and_execute_natively_for_codex_
             ask(
                 &mut client,
                 Request::SkillInfo {
+                    provider: None,
                     session_id: id.clone(),
                     name: skill_slug.into(),
                 }
@@ -4861,7 +4880,9 @@ async fn native_idle_shutdown_preserves_busy_terminal_then_exits_after_close() {
                 project_id,
                 terminal_id: id.clone(),
                 cols: 80,
-                rows: 24
+                rows: 24,
+                session_id: None,
+                repo_path: None,
             }
         )
         .await,
@@ -6204,6 +6225,8 @@ async fn turn_changes_freeze_each_request_and_undo_rejects_conflicts_then_reconc
             terminal_id: terminal_id.clone(),
             cols: 80,
             rows: 24,
+            session_id: None,
+            repo_path: None,
         },
     )
     .await;
@@ -6969,6 +6992,7 @@ async fn skill_metadata_is_host_local_read_only_and_preview_requires_explicit_re
     let Response::SkillInfo { skill: Some(info) } = ask(
         &mut client,
         Request::SkillInfo {
+            provider: None,
             session_id: session.id.clone(),
             name: "fixture-review".into(),
         },
@@ -7056,6 +7080,7 @@ async fn skill_metadata_is_host_local_read_only_and_preview_requires_explicit_re
         ask(
             &mut client,
             Request::SkillInfo {
+                provider: None,
                 session_id: session.id.clone(),
                 name: "../../secret".into()
             }
@@ -10151,6 +10176,8 @@ async fn update_project_directory_guards_terminals_and_preserves_claude_resume_f
                 terminal_id: term_id.clone(),
                 cols: 80,
                 rows: 24,
+                session_id: None,
+                repo_path: None,
             },
         )
         .await,
@@ -10364,6 +10391,8 @@ async fn update_project_directory_guards_terminals_and_preserves_claude_resume_f
                 terminal_id: hidden_term_id.clone(),
                 cols: 80,
                 rows: 24,
+                session_id: None,
+                repo_path: None,
             },
         )
         .await,
@@ -10531,4 +10560,342 @@ async fn default_state_dir_uses_latte_continue_data_under_home() {
     drop(client);
     let _ = server_proc.kill();
     let _ = server_proc.wait();
+}
+
+#[tokio::test]
+async fn terminal_opens_in_active_agent_worktree_across_all_agents_and_falls_back_cleanly() {
+    use serde_json::json;
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_git(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        run_git(dir, &["init", "-q", "-b", "main"]);
+        run_git(dir, &["config", "user.name", "Fixture"]);
+        run_git(dir, &["config", "user.email", "fixture@example.test"]);
+        std::fs::write(dir.join("README.md"), "# fixture\n").unwrap();
+        run_git(dir, &["add", "."]);
+        run_git(dir, &["commit", "-qm", "initial"]);
+    }
+
+    let host = Host::start().await;
+    let mut client = host.client().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+
+    let repo_continue = workspace.path().join("continue");
+    let repo_code = workspace.path().join("latte-code");
+    init_git(&repo_continue);
+    init_git(&repo_code);
+
+    let internal_wt = workspace
+        .path()
+        .join(".oh-my-code/worktree/continue/fix-ux");
+    std::fs::create_dir_all(internal_wt.parent().unwrap()).unwrap();
+    run_git(
+        &repo_continue,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "fix/ux",
+            internal_wt.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+
+    let external_wt = external.path().join("codex-ext-wt");
+    run_git(
+        &repo_continue,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/ext",
+            external_wt.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+
+    let canonical_workspace = workspace.path().canonicalize().unwrap();
+    let canonical_internal_wt = internal_wt.canonicalize().unwrap();
+    let canonical_external_wt = external_wt.canonicalize().unwrap();
+    let canonical_code = repo_code.canonicalize().unwrap();
+
+    let project_id = terminal_project(&mut client, workspace.path()).await;
+
+    async fn make_session(client: &mut Client, project_id: &str, agent: &str) -> String {
+        let Response::Session { session } = ask(
+            client,
+            Request::CreateSession {
+                project_id: project_id.into(),
+                agent: agent.into(),
+            },
+        )
+        .await
+        else {
+            panic!("create session");
+        };
+        session.id
+    }
+
+    let codex_sid = make_session(&mut client, &project_id, "codex").await;
+    let traex_sid = make_session(&mut client, &project_id, "traex").await;
+    let claude_sid = make_session(&mut client, &project_id, "claude").await;
+    let opencode_sid = make_session(&mut client, &project_id, "opencode").await;
+    let cursor_sid = make_session(&mut client, &project_id, "cursor").await;
+    let fresh_sid = make_session(&mut client, &project_id, "codex").await;
+
+    // Seed realistic recorded tool events and native session state across all 5 agents.
+    let db = rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
+    let append_tool = |sid: &str, name: &str, input: serde_json::Value| {
+        let data = serde_json::to_string(&EventKind::Tool {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.into(),
+            input,
+        })
+        .unwrap();
+        db.execute(
+            "INSERT INTO events(session_id, at, data) VALUES (?1, 1.0, ?2)",
+            rusqlite::params![sid, data],
+        )
+        .unwrap();
+    };
+
+    // Codex: external worktree commandExecution, followed by default-cwd `gh auth status` & `/tmp`.
+    append_tool(
+        &codex_sid,
+        "Bash",
+        json!({ "command": "cargo test", "cwd": external_wt }),
+    );
+    append_tool(
+        &codex_sid,
+        "Bash",
+        json!({ "command": "gh auth status", "cwd": canonical_workspace }),
+    );
+    append_tool(
+        &codex_sid,
+        "Bash",
+        json!({ "command": "ls", "cwd": "/tmp" }),
+    );
+
+    // Traex: `FileChange` deep inside internal worktree snaps to `internal_wt` root.
+    let deep_dir = internal_wt.join("crates/server/src");
+    std::fs::create_dir_all(&deep_dir).unwrap();
+    append_tool(
+        &traex_sid,
+        "FileChange",
+        json!({ "changes": [{ "path": deep_dir.join("lib.rs") }] }),
+    );
+
+    // Claude: subshell `(cd .oh-my-code/worktree/continue/fix-ux && ...)` + read-only primary `Read`.
+    append_tool(
+        &claude_sid,
+        "Bash",
+        json!({ "command": "(cd .oh-my-code/worktree/continue/fix-ux && cargo check)" }),
+    );
+    append_tool(
+        &claude_sid,
+        "Read",
+        json!({ "file_path": repo_continue.join("README.md") }),
+    );
+    // Give Claude a native_id so `OpenSideChat` can attach a side-chat child session.
+    let mut claude_row: latte_work_protocol::Session = serde_json::from_str(
+        &db.query_row(
+            "SELECT data FROM sessions WHERE id=?1",
+            [&claude_sid],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    claude_row.native_id = Some("11111111-1111-4111-8111-111111111111".into());
+    db.execute(
+        "UPDATE sessions SET data=?1 WHERE id=?2",
+        rusqlite::params![serde_json::to_string(&claude_row).unwrap(), &claude_sid],
+    )
+    .unwrap();
+
+    // OpenCode: cold native session whose exported `location.directory` points to `external_wt`.
+    let mut opencode_row: latte_work_protocol::Session = serde_json::from_str(
+        &db.query_row(
+            "SELECT data FROM sessions WHERE id=?1",
+            [&opencode_sid],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    opencode_row.native_id = Some("ses_wt_export".into());
+    db.execute(
+        "UPDATE sessions SET data=?1 WHERE id=?2",
+        rusqlite::params![serde_json::to_string(&opencode_row).unwrap(), &opencode_sid],
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join("ses_wt_export.json"),
+        json!({
+            "info": { "id": "ses_wt_export", "location": { "directory": external_wt } },
+            "messages": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Cursor: `shellToolCall` with `workingDirectory` in `internal_wt`.
+    append_tool(
+        &cursor_sid,
+        "shellToolCall",
+        json!({ "command": "npm test", "workingDirectory": internal_wt }),
+    );
+    drop(db);
+
+    let Response::Session { session: side } = ask(
+        &mut client,
+        Request::OpenSideChat {
+            session_id: claude_sid.clone(),
+            side_id: None,
+        },
+    )
+    .await
+    else {
+        panic!("open side chat");
+    };
+
+    async fn assert_terminal_pwd(
+        client: &mut Client,
+        project_id: &str,
+        session_id: Option<&str>,
+        repo_path: Option<&str>,
+        expected: &Path,
+    ) {
+        let term_id = uuid::Uuid::new_v4().to_string();
+        let Response::Terminal { terminal } = ask(
+            client,
+            Request::CreateTerminal {
+                project_id: project_id.into(),
+                terminal_id: term_id.clone(),
+                cols: 80,
+                rows: 24,
+                session_id: session_id.map(str::to_owned),
+                repo_path: repo_path.map(str::to_owned),
+            },
+        )
+        .await
+        else {
+            panic!("create terminal");
+        };
+        let expected_str = expected.to_str().unwrap();
+        assert_eq!(terminal.cwd.as_deref(), Some(expected_str));
+        let mut cursor = 0.0;
+        terminal_write(
+            client,
+            &term_id,
+            b"stty -echo; pwd -P; printf 'PWD_DONE\\n'\n",
+        )
+        .await;
+        let output = terminal_until(client, &term_id, &mut cursor, "PWD_DONE\r\n").await;
+        assert!(
+            output.contains(expected_str),
+            "expected PTY pwd `{expected_str}`, got:\n{output}"
+        );
+        ask(
+            client,
+            Request::CloseTerminal {
+                terminal_id: term_id,
+            },
+        )
+        .await;
+    }
+
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&codex_sid),
+        None,
+        &canonical_external_wt,
+    )
+    .await;
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&traex_sid),
+        None,
+        &canonical_internal_wt,
+    )
+    .await;
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&claude_sid),
+        None,
+        &canonical_internal_wt,
+    )
+    .await;
+    // Side chat with no tool calls of its own inherits parent Claude session's worktree!
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&side.id),
+        None,
+        &canonical_internal_wt,
+    )
+    .await;
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&opencode_sid),
+        None,
+        &canonical_external_wt,
+    )
+    .await;
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&cursor_sid),
+        None,
+        &canonical_internal_wt,
+    )
+    .await;
+    // Brand-new session falls back to selected `repo_path` (`latte-code`).
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&fresh_sid),
+        Some("latte-code"),
+        &canonical_code,
+    )
+    .await;
+
+    // Removing the worktree falls back cleanly to `workspace` root instead of failing.
+    run_git(
+        &repo_continue,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            internal_wt.to_str().unwrap(),
+        ],
+    );
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&cursor_sid),
+        None,
+        &canonical_workspace,
+    )
+    .await;
 }

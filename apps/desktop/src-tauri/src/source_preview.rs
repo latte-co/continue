@@ -104,7 +104,13 @@ pub async fn preview_pdf(
         let _permit = RENDERS
             .try_acquire()
             .map_err(|_| "正在生成其他 PDF 预览，请稍后刷新".to_string())?;
-        let copy = local_copy(&app, name, data)?;
+        let pdf_name = if name.to_ascii_lowercase().ends_with(".pdf") {
+            name
+        } else {
+            format!("{name}.pdf")
+        };
+        validate(&pdf_name, &data, 16 * 1024 * 1024)?;
+        let copy = local_copy(&app, pdf_name, data)?;
         let status = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             quicklook()
@@ -122,7 +128,13 @@ pub async fn preview_pdf(
         let mut png = vec![];
         tokio::fs::File::open(&copy.thumbnail)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "无法生成 PDF 预览，请使用系统预览".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?
             .take(8 * 1024 * 1024 + 1)
             .read_to_end(&mut png)
             .await

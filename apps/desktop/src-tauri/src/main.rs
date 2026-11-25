@@ -663,18 +663,19 @@ async fn host_request(
     } else {
         None
     };
-    let response = if matches!(&request, Request::AgentCommands { agent, .. } if agent == "opencode")
-        || matches!(
-            request,
-            Request::Models { .. }
-                | Request::Send { .. }
-                | Request::SendQueued { .. }
-                | Request::DispatchQueuedMessage { .. }
-                | Request::ResumeMessageQueue { .. }
-                | Request::OpenAgentSession { .. }
-                | Request::SubagentHistory { .. }
-                | Request::RenameSession { .. }
-        ) {
+    let response = if matches!(
+        request,
+        Request::AgentCommands { .. }
+            | Request::SkillInfo { .. }
+            | Request::Models { .. }
+            | Request::Send { .. }
+            | Request::SendQueued { .. }
+            | Request::DispatchQueuedMessage { .. }
+            | Request::ResumeMessageQueue { .. }
+            | Request::OpenAgentSession { .. }
+            | Request::SubagentHistory { .. }
+            | Request::RenameSession { .. }
+    ) {
         let provider_host = host_id.clone();
         latte_work_client::request_with_app_agent_config(&client, request, |agent| async move {
             providers::with_store(app, move |store| {

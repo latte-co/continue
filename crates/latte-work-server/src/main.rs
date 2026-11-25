@@ -1,6 +1,7 @@
 //! A single host daemon; `connect` is a disposable local/SSH byte bridge.
 mod admission;
 mod agent_environment;
+mod agent_workdir;
 mod agents;
 mod attachments;
 mod files;
@@ -823,8 +824,17 @@ async fn dispatch_admitted(
             terminal_id,
             cols,
             rows,
+            session_id,
+            repo_path,
         } => {
             let project = db(&s.database, |d| d.project(&project_id))?;
+            let preferred_cwd = agent_workdir::resolve_terminal_cwd(
+                s,
+                &project,
+                session_id.as_deref(),
+                repo_path.as_deref(),
+            )
+            .await;
             let terminals = s.terminals.clone();
             tokio::task::spawn_blocking(move || {
                 terminals
@@ -833,6 +843,7 @@ async fn dispatch_admitted(
                     .create(
                         project_id,
                         Path::new(&project.path),
+                        preferred_cwd.as_deref(),
                         terminal_id,
                         cols,
                         rows,
@@ -1905,11 +1916,29 @@ async fn dispatch_admitted(
                 })
                 .await?
         }
-        Request::SkillInfo { session_id, name } => {
+        Request::SkillInfo {
+            provider,
+            session_id,
+            name,
+        } => {
             let session = db(&s.database, |d| d.session(&session_id))?;
             let project = db(&s.database, |d| d.project(&session.project_id))?;
+            let environment = match provider {
+                Some(latte_work_protocol::TurnProvider::Configured { environment, .. }) => {
+                    latte_work_config::validate_agent_environment(&environment)?;
+                    environment
+                }
+                Some(
+                    latte_work_protocol::TurnProvider::Cli
+                    | latte_work_protocol::TurnProvider::Snapshot(_),
+                ) => latte_work_protocol::AgentEnvironment::default(),
+                None => runtime::session_environment(&s.runs, &session_id)
+                    .await
+                    .unwrap_or_default(),
+            };
             Response::SkillInfo {
-                skill: agents::skill_info(&session.agent, project.path.into(), name).await?,
+                skill: agents::skill_info(&session.agent, project.path.into(), name, environment)
+                    .await?,
             }
         }
         Request::Sources { session_id } => {
@@ -2160,7 +2189,11 @@ async fn dispatch_admitted(
                 files::resolve(Path::new(&p.path), &path)?
             };
             let target = tokio::fs::canonicalize(&requested).await?;
+            let canonical_project = tokio::fs::canonicalize(&p.path).await.ok();
             let mut allowed = target.starts_with(&p.path)
+                || canonical_project
+                    .as_ref()
+                    .is_some_and(|root| target.starts_with(root))
                 || db(&s.database, |d| d.reference_allowed(&project_id, &target))?;
             allowed |= s
                 .attachments

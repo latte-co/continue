@@ -283,6 +283,10 @@ export default {
               send({ type: "reply", id, viaACP: true });
               return;
             }
+            if (request.hasReferences) {
+              send({ type: "reply", id, rejectedReferences: true });
+              return;
+            }
           }
           await ctx.session.command({
             sessionID,

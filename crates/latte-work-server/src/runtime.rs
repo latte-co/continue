@@ -180,6 +180,9 @@ pub enum Control {
     TitleContext {
         reply: oneshot::Sender<Option<LaunchConfig>>,
     },
+    AgentCwd {
+        reply: oneshot::Sender<Option<String>>,
+    },
     Queue {
         action: QueueAction,
         reply: oneshot::Sender<Result<Response, String>>,
@@ -515,6 +518,30 @@ struct TitleSource {
     fingerprint: Option<String>,
     allow_legacy_cli: bool,
 }
+pub async fn session_environment(
+    runs: &Runs,
+    session_id: &str,
+) -> Option<latte_work_protocol::AgentEnvironment> {
+    let control = runs.lock().ok()?.get(session_id)?.control.clone();
+    let (reply, receive) = oneshot::channel();
+    control.try_send(Control::TitleContext { reply }).ok()?;
+    let config = tokio::time::timeout(Duration::from_secs(3), receive)
+        .await
+        .ok()?
+        .ok()??;
+    Some(config.environment)
+}
+
+pub async fn session_agent_cwd(runs: &Runs, session_id: &str) -> Option<String> {
+    let control = runs.lock().ok()?.get(session_id)?.control.clone();
+    let (reply, receive) = oneshot::channel();
+    control.try_send(Control::AgentCwd { reply }).ok()?;
+    tokio::time::timeout(Duration::from_secs(2), receive)
+        .await
+        .ok()?
+        .ok()?
+}
+
 async fn title_source(
     database: &Database,
     session: Session,
@@ -2574,6 +2601,10 @@ async fn actor(
             control = controls.recv() => match control {
                 Some(Control::TitleContext { reply }) => {
                     let _ = reply.send(process.as_ref().map(|p| p.config.clone()));
+                    Ok(())
+                }
+                Some(Control::AgentCwd { reply }) => {
+                    let _ = reply.send(process.as_ref().map(|p| p.agent_cwd.clone()));
                     Ok(())
                 }
                 Some(Control::RenameTitle {title,reply}) => {

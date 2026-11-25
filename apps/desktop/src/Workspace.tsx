@@ -34,11 +34,62 @@ import { WorkspaceFiles } from "./WorkspaceFiles";
 import { SubagentsPanel } from "./SubagentsPanel";
 import type { SubagentsState } from "./useSubagents";
 import { TerminalPane } from "./TerminalPane";
+import {
+  getSelectedGitRepository,
+  normalizeGitRepoPath,
+} from "./gitRepositories";
 import { SidebarToggle } from "./SidebarToggle";
 import { useStatusIssues } from "./statusNotices";
 import { SideChatHistoryButton } from "./SideChatHistory";
 import type { SidebarPreview } from "./useSidebarPreview";
 import { CardList, IconButton, MenuRow, NavRow, Popover } from "./ui";
+
+function trimTrailingSlash(path: string): string {
+  return path.length > 1 ? path.replace(/\/+$/, "") : path;
+}
+
+export function terminalDirectoryBadge(
+  projectPath: string | undefined,
+  cwd: string | undefined,
+): string | null {
+  if (!cwd) return null;
+  const cleanCwd = trimTrailingSlash(cwd);
+  if (!projectPath) return null;
+  const cleanRoot = trimTrailingSlash(projectPath);
+  if (!cleanCwd || cleanCwd === cleanRoot) return null;
+  if (cleanCwd.startsWith(`${cleanRoot}/`)) {
+    const rel = cleanCwd.slice(cleanRoot.length + 1);
+    for (const prefix of [
+      ".oh-my-code/worktree/",
+      ".oh-my-code/worktrees/",
+      ".claude/worktrees/",
+      ".claude/worktree/",
+      ".worktrees/",
+      ".worktree/",
+    ]) {
+      if (rel.startsWith(prefix) && rel.length > prefix.length) {
+        return rel.slice(prefix.length);
+      }
+    }
+    for (const infix of [
+      "/.oh-my-code/worktree/",
+      "/.oh-my-code/worktrees/",
+      "/.claude/worktrees/",
+      "/.claude/worktree/",
+      "/.worktrees/",
+      "/.worktree/",
+    ]) {
+      const idx = rel.indexOf(infix);
+      if (idx > 0 && idx + infix.length < rel.length) {
+        return `${rel.slice(0, idx)}/${rel.slice(idx + infix.length)}`;
+      }
+    }
+    const parts = rel.split("/").filter(Boolean);
+    return parts.length > 2 ? `…/${parts.slice(-2).join("/")}` : rel;
+  }
+  const externalParts = cleanCwd.split("/").filter(Boolean);
+  return externalParts.at(-1) ?? null;
+}
 
 function ConversationTab({
   title,
@@ -445,12 +496,22 @@ function WorkspacePage({
       conversationActive: false,
     }));
     try {
+      const targetSessionId =
+        !conversationActive &&
+        tabs.some((tab) => tab.kind === "sideChat" && tab.id === current)
+          ? sideChatId(current)
+          : sessionId;
+      const selectedRepo = normalizeGitRepoPath(
+        getSelectedGitRepository(hostId, project),
+      );
       const response = await request(hostId, {
         method: "create_terminal",
         project_id: project.id,
         terminal_id: terminalId,
         cols: 80,
         rows: 24,
+        ...(targetSessionId ? { session_id: targetSessionId } : {}),
+        ...(selectedRepo ? { repo_path: selectedRepo } : {}),
       });
       if (response.kind !== "terminal") throw new Error("无法创建终端");
       setTabs((tabs) =>
@@ -510,7 +571,21 @@ function WorkspacePage({
       : tab.kind === "artifact"
         ? tab.name
         : tab.kind === "terminal"
-          ? `${tab.terminal.title} · ${tab.hostName ?? hostName}`
+          ? (() => {
+              const tabProject =
+                tab.project &&
+                (tab.hostId ?? hostId) === hostId &&
+                project?.id === tab.project.id
+                  ? project
+                  : (tab.project ?? project);
+              const badge = terminalDirectoryBadge(
+                tabProject?.path,
+                tab.terminal.cwd,
+              );
+              return badge
+                ? `${tab.terminal.title} (${badge}) · ${tab.hostName ?? hostName}`
+                : `${tab.terminal.title} · ${tab.hostName ?? hostName}`;
+            })()
           : tab.kind === "subagent"
             ? (subagents?.tasks.find((task) => task.id === tab.taskId)?.title ??
               tab.title)
@@ -558,7 +633,11 @@ function WorkspacePage({
                   aria-selected={!conversationActive && current === tab.id}
                   aria-controls={`pane-${tabPrefix}-${tab.id}`}
                   tabIndex={!conversationActive && current === tab.id ? 0 : -1}
-                  title={title(tab)}
+                  title={
+                    tab.kind === "terminal" && tab.terminal.cwd
+                      ? `${title(tab)}\n${tab.terminal.cwd}`
+                      : title(tab)
+                  }
                   onClick={() => select(tab.id)}
                   onKeyDown={navigateTabs}
                 >
@@ -785,9 +864,29 @@ function WorkspacePage({
                 sessionId={tab.sessionId ?? sessionId}
                 path={tab.path ?? ""}
                 file={tab.file ?? ""}
+                markdownPreviewRequest={tab.markdownPreviewRequest}
+                clearMarkdownPreviewRequest={() =>
+                  setTabs((tabs) =>
+                    tabs.map((t) => {
+                      if (
+                        t.id !== tab.id ||
+                        t.kind !== "files" ||
+                        t.markdownPreviewRequest === undefined
+                      )
+                        return t;
+                      const { markdownPreviewRequest: _, ...clean } = t;
+                      return clean;
+                    }),
+                  )
+                }
                 navigate={(value) =>
                   setTabs((tabs) =>
-                    tabs.map((t) => (t.id === tab.id ? { ...t, ...value } : t)),
+                    tabs.map((t) => {
+                      if (t.id !== tab.id) return t;
+                      if (t.kind !== "files") return { ...t, ...value };
+                      const { markdownPreviewRequest: _, ...clean } = t;
+                      return { ...clean, ...value };
+                    }),
                   )
                 }
                 active={

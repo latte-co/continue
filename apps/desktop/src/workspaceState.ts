@@ -17,6 +17,7 @@ export type WorkspaceTab = {
       file?: string;
       reference?: FileEntry;
       sessionId?: string;
+      markdownPreviewRequest?: number;
     }
   | { id: string; kind: "sideChat"; draft?: boolean; title?: string }
   | {
@@ -88,6 +89,19 @@ export function clampWorkspaceWidth(
 const prefix = "latte-work.conversation-workspace.v1:";
 const cache = new Map<string, WorkspaceState>();
 const listeners = new Set<() => void>();
+let nextMarkdownPreviewRequest = 0;
+
+function serializeWorkspace(state: WorkspaceState) {
+  return JSON.stringify({
+    ...state,
+    tabs: state.tabs.map((tab) => {
+      if (tab.kind !== "files" || tab.markdownPreviewRequest === undefined)
+        return tab;
+      const { markdownPreviewRequest: _, ...persisted } = tab;
+      return persisted;
+    }),
+  });
+}
 export function workspaceKey(conversation: string) {
   return conversation;
 }
@@ -257,7 +271,7 @@ export function updateWorkspace(
   }
   cache.set(key, next);
   try {
-    localStorage.setItem(prefix + key, JSON.stringify(next));
+    localStorage.setItem(prefix + key, serializeWorkspace(next));
   } catch {
     /* Keep in-memory state if storage is unavailable. */
   }
@@ -397,25 +411,45 @@ export function openSubagent(workspaceId: string, task: Subagent) {
 export function openWorkspaceResource(
   workspaceId: string,
   kind: "files" | "diff",
-  location: { path?: string; file?: string } = {},
+  location: {
+    path?: string;
+    file?: string;
+    markdownPreview?: boolean;
+  } = {},
 ) {
+  const { markdownPreview, ...rest } = location;
+  const markdownPreviewRequest =
+    kind === "files" && markdownPreview
+      ? ++nextMarkdownPreviewRequest
+      : undefined;
   updateWorkspace(workspaceId, (state) => ({
     tabs: state.tabs.some((tab) => tab.id === kind)
-      ? state.tabs.map((tab) =>
-          tab.id === kind
-            ? kind === "diff"
-              ? { id: kind, kind, ...location }
-              : tab.kind !== "files"
-                ? tab
-                : {
-                    ...tab,
-                    reference: undefined,
-                    sessionId: undefined,
-                    ...location,
-                  }
-            : tab,
-        )
-      : [...state.tabs, { id: kind, kind, ...location }],
+      ? state.tabs.map((tab) => {
+          if (tab.id !== kind) return tab;
+          if (kind === "diff") return { id: kind, kind, ...rest };
+          if (tab.kind !== "files") return tab;
+          const { markdownPreviewRequest: _, ...clean } = tab;
+          return {
+            ...clean,
+            reference: undefined,
+            sessionId: undefined,
+            ...(markdownPreviewRequest !== undefined
+              ? { markdownPreviewRequest }
+              : {}),
+            ...rest,
+          };
+        })
+      : [
+          ...state.tabs,
+          {
+            id: kind,
+            kind,
+            ...(markdownPreviewRequest !== undefined
+              ? { markdownPreviewRequest }
+              : {}),
+            ...rest,
+          },
+        ],
     current: kind,
     visible: true,
     conversationActive: false,
@@ -614,10 +648,12 @@ export function syncProjectInWorkspaces(
             nextTab.path !== undefined ||
             nextTab.file !== undefined ||
             nextTab.reference !== undefined ||
-            nextTab.sessionId !== undefined
+            nextTab.sessionId !== undefined ||
+            nextTab.markdownPreviewRequest !== undefined
           ) {
+            const { markdownPreviewRequest: _, ...cleanTab } = nextTab;
             nextTab = {
-              ...nextTab,
+              ...cleanTab,
               path: undefined,
               file: undefined,
               reference: undefined,
@@ -656,7 +692,7 @@ export function syncProjectInWorkspaces(
     }
     cache.set(key, next);
     try {
-      localStorage.setItem(prefix + key, JSON.stringify(next));
+      localStorage.setItem(prefix + key, serializeWorkspace(next));
     } catch {
       /* Keep synchronized in-memory state when storage is unavailable. */
     }

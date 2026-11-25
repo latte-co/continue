@@ -681,6 +681,23 @@ impl Store {
             .map(|row| Ok(serde_json::from_str(&row?)?))
             .collect()
     }
+    pub fn recent_tool_events(&self, session_id: &str, limit: usize) -> Result<Vec<EventKind>> {
+        let mut query = self.db.prepare(
+            "SELECT data FROM events
+             WHERE session_id=?1 AND length(data) <= 262144
+               AND json_extract(data,'$.kind')='tool'
+             ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let rows = query
+            .query_map(params![session_id, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|raw| serde_json::from_str::<EventKind>(&raw).ok())
+            .collect())
+    }
     pub fn recent_sessions(
         &self,
         before: Option<&RecentCursor>,

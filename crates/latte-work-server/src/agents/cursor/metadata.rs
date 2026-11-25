@@ -771,11 +771,12 @@ pub(crate) async fn commands(
     .context("读取 Cursor 命令与技能目录失败")
 }
 
-pub(crate) fn skill_info(project: &std::path::Path, name: &str) -> Result<Option<SkillInfo>> {
-    crate::agents::claude_skills::find_in_roots(
-        &skill_roots(project, &AgentEnvironment::default()),
-        name,
-    )
+pub(crate) fn skill_info(
+    project: &std::path::Path,
+    name: &str,
+    environment: &AgentEnvironment,
+) -> Result<Option<SkillInfo>> {
+    crate::agents::claude_skills::find_in_roots(&skill_roots(project, environment), name)
 }
 
 #[cfg(test)]

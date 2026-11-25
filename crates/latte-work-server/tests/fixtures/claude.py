@@ -176,7 +176,13 @@ for line in sys.stdin:
             continue
         if '--no-session-persistence' not in sys.argv and '--disable-slash-commands' not in sys.argv:
             with open('fixture-agent-pid','w') as f:f.write(str(os.getpid()))
-        emit({'type':'control_response','response':{'subtype':'success','request_id':value['request_id'],'response':{'current_permission_mode':'plan' if readonly else 'default','commands':[{'name':'compact','description':'Compact history','argumentHint':'[instructions]'},{'name':'project:check','description':os.path.basename(os.getcwd()),'argumentHint':'<target>'},{'name':'agents','description':'Native child agents','argumentHint':''}]}}})
+        discovered_commands=[{'name':'compact','description':'Compact history','argumentHint':'[instructions]'},{'name':'project:check','description':os.path.basename(os.getcwd()),'argumentHint':'<target>'},{'name':'agents','description':'Native child agents','argumentHint':''}]
+        claude_skills_dir=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])/'skills'
+        if claude_skills_dir.is_dir():
+            for child in sorted(claude_skills_dir.iterdir()):
+                if (child/'SKILL.md').is_file() and all(c['name']!=child.name for c in discovered_commands):
+                    discovered_commands.append({'name':child.name,'description':f'Configured skill {child.name}','argumentHint':'[task]'})
+        emit({'type':'control_response','response':{'subtype':'success','request_id':value['request_id'],'response':{'current_permission_mode':'plan' if readonly else 'default','commands':discovered_commands}}})
     elif value['type']=='user':
         text=value['message']['content']
         managed_user_prompt(text)

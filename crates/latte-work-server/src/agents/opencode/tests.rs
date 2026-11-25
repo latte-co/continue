@@ -516,3 +516,80 @@ fn failed_probe_session_reports_original_error() {
     };
     assert!(error.contains("does not belong to cwd"));
 }
+
+#[test]
+fn slash_reference_gating_distinguishes_modern_commands_and_legacy_acp_skills() {
+    // OpenCode 2.3+: ACP `commands` only lists native commands; skills are regular foreground prompts.
+    let mut modern = adapter();
+    modern.legacy_acp_skills = false;
+    modern.commands = Some(vec![AgentSlashCommand {
+        name: "init".into(),
+        display_name: None,
+        description: "Init".into(),
+        argument_hint: String::new(),
+        kind: Some(latte_work_protocol::AgentCommandKind::Command),
+        ui_action: None,
+    }]);
+    let ref_suffix = "\n引用（相对项目；绝对路径在当前主机，按现有权限读取）：\n[{\"type\":\"file\",\"path\":\"README.md\",\"name\":\"README.md\"}]";
+    let rejected = modern.start(&format!("/init 检查{ref_suffix}")).unwrap();
+    assert!(matches!(
+        rejected.as_slice(),
+        [Action::Finished { failed: true, message: Some(msg) }] if msg.contains("请先移除项目引用")
+    ));
+    let skill_actions = modern
+        .start(&format!("/fixture-skill 检查{ref_suffix}"))
+        .unwrap();
+    let (_, sideband) = wire(&skill_actions);
+    assert!(sideband.contains(r#""action":"prompt""#));
+    assert!(sideband.contains("fixture-skill"));
+
+    // OpenCode 2.0-2.2: `commands` mixes commands and skills; sideband decides `viaACP` vs `rejectedReferences`.
+    let mut legacy = adapter();
+    legacy.legacy_acp_skills = true;
+    legacy.commands = Some(vec![
+        AgentSlashCommand {
+            name: "fixture-skill".into(),
+            display_name: None,
+            description: "Skill".into(),
+            argument_hint: String::new(),
+            kind: Some(latte_work_protocol::AgentCommandKind::Skill),
+            ui_action: None,
+        },
+        AgentSlashCommand {
+            name: "init".into(),
+            display_name: None,
+            description: "Init".into(),
+            argument_hint: String::new(),
+            kind: Some(latte_work_protocol::AgentCommandKind::Command),
+            ui_action: None,
+        },
+    ]);
+    let prompt_with_ref = format!("/fixture-skill 检查{ref_suffix}");
+    let (_, sideband) = wire(&legacy.start(&prompt_with_ref).unwrap());
+    assert!(sideband.contains(r#""action":"command""#));
+    assert!(sideband.contains(r#""hasReferences":true"#));
+    let cmd_id = legacy.native_command.clone().unwrap();
+    let (writes, _) = wire(
+        &legacy
+            .sideband(&json!({"type":"reply","id":cmd_id,"viaACP":true}).to_string())
+            .unwrap(),
+    );
+    assert!(writes.contains("session/prompt"));
+    assert!(writes.contains("fixture-skill"));
+    assert!(writes.contains("README.md"));
+
+    let mut legacy_cmd = adapter();
+    legacy_cmd.legacy_acp_skills = true;
+    legacy_cmd.commands = legacy.commands.clone();
+    legacy_cmd
+        .start(&format!("/init 检查{ref_suffix}"))
+        .unwrap();
+    let cmd_id = legacy_cmd.native_command.clone().unwrap();
+    let rejected = legacy_cmd
+        .sideband(&json!({"type":"reply","id":cmd_id,"rejectedReferences":true}).to_string())
+        .unwrap();
+    assert!(matches!(
+        rejected.as_slice(),
+        [Action::Finished { failed: true, message: Some(msg) }] if msg.contains("请先移除项目引用")
+    ));
+}

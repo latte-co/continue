@@ -330,6 +330,7 @@ pub fn provider_model_variants(
 fn codex_skill_info(
     project: &std::path::Path,
     name: &str,
+    environment: &latte_work_protocol::AgentEnvironment,
 ) -> Result<Option<latte_work_protocol::SkillInfo>> {
     let mut roots = Vec::new();
     for parent in project.ancestors().take(32) {
@@ -338,8 +339,9 @@ fn codex_skill_info(
             break;
         }
     }
-    let home = crate::agent_environment::variable("HOME").map(std::path::PathBuf::from);
-    let codex_home = crate::agent_environment::variable("CODEX_HOME")
+    let home = crate::agent_environment::configured_variable("HOME", environment)
+        .map(std::path::PathBuf::from);
+    let codex_home = crate::agent_environment::configured_variable("CODEX_HOME", environment)
         .map(std::path::PathBuf::from)
         .or_else(|| home.as_ref().map(|h| h.join(".codex")));
     if let Some(codex_home) = codex_home {
@@ -354,10 +356,12 @@ fn codex_skill_info(
 fn traex_skill_info(
     project: &std::path::Path,
     name: &str,
+    environment: &latte_work_protocol::AgentEnvironment,
 ) -> Result<Option<latte_work_protocol::SkillInfo>> {
+    let home = crate::agent_environment::configured_variable("HOME", environment)
+        .map(std::path::PathBuf::from);
     if name.contains(':') {
-        let Some(home) = crate::agent_environment::variable("HOME").map(std::path::PathBuf::from)
-        else {
+        let Some(home) = home else {
             return Ok(None);
         };
         for dir in [".trae", ".traex"] {
@@ -374,7 +378,7 @@ fn traex_skill_info(
             break;
         }
     }
-    if let Some(home) = crate::agent_environment::variable("HOME").map(std::path::PathBuf::from) {
+    if let Some(home) = home {
         roots.extend([".trae/skills", ".traex/skills", ".agents/skills"].map(|r| home.join(r)));
     }
     claude_skills::find_in_roots(&roots, name)
@@ -385,16 +389,21 @@ pub async fn skill_info(
     agent: &str,
     project: std::path::PathBuf,
     name: String,
+    environment: latte_work_protocol::AgentEnvironment,
 ) -> Result<Option<latte_work_protocol::SkillInfo>> {
-    let find: fn(&std::path::Path, &str) -> Result<Option<latte_work_protocol::SkillInfo>> =
-        match agent {
-            "claude" => claude_skills::find,
-            "opencode" => opencode::skill_info,
-            "codex" => codex_skill_info,
-            "traex" => traex_skill_info,
-            "cursor" => cursor::skill_info,
-            _ => bail!("此 Agent 尚不支持 Skill 信息"),
-        };
+    type SkillFinder = fn(
+        &std::path::Path,
+        &str,
+        &latte_work_protocol::AgentEnvironment,
+    ) -> Result<Option<latte_work_protocol::SkillInfo>>;
+    let find: SkillFinder = match agent {
+        "claude" => claude_skills::find_with_env,
+        "opencode" => opencode::skill_info,
+        "codex" => codex_skill_info,
+        "traex" => traex_skill_info,
+        "cursor" => cursor::skill_info,
+        _ => bail!("此 Agent 尚不支持 Skill 信息"),
+    };
     static READS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
     let permit = READS
@@ -406,7 +415,7 @@ pub async fn skill_info(
         std::time::Duration::from_secs(3),
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            find(&project, &name)
+            find(&project, &name, &environment)
         }),
     )
     .await

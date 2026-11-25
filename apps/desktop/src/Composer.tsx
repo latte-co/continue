@@ -24,6 +24,7 @@ import {
   X,
 } from "lucide-react";
 import { chooseReferencePath, message, request } from "./api";
+import { useModelConfigVersion } from "./modelConfigVersion";
 import type { AgentSlashCommand, FileEntry } from "./protocol";
 import type { ModelPickerHandle } from "./ModelPicker";
 import {
@@ -344,6 +345,7 @@ export function Composer(props: Props) {
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState(0);
   const [commands, setCommands] = useState<AgentSlashCommand[]>([]);
+  const [commandsLoadedScope, setCommandsLoadedScope] = useState("");
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -353,8 +355,10 @@ export function Composer(props: Props) {
   const [externalError, setExternalError] = useState("");
   const [externalBusy, setExternalBusy] = useState(false);
   const referenceOperation = useRef(0);
+  const configVersion = useModelConfigVersion(hostId, agent);
+  const catalogScope = `${scope}:${configVersion}`;
   const currentContext = useRef("");
-  const commandContext = `${scope}:${sessionId}:${disabled}:${sending}:${hidden}:${connected}`;
+  const commandContext = `${catalogScope}:${sessionId}:${disabled}:${sending}:${hidden}:${connected}`;
   currentContext.current = commandContext;
   const modelCommandGeneration = useRef(0);
   useLayoutEffect(
@@ -452,6 +456,7 @@ export function Composer(props: Props) {
   useEffect(() => {
     close();
     setCommands([]);
+    setCommandsLoadedScope("");
     setNotice("");
     // A different project never inherits references; moving a project directory
     // drops stale project-relative references while keeping absolute attachments.
@@ -467,7 +472,7 @@ export function Composer(props: Props) {
         ),
       });
     }
-  }, [scope]);
+  }, [catalogScope, scope]);
   useEffect(() => {
     if (!sending && !props.referenceState) {
       setReferences({ scope, entries: [] });
@@ -490,6 +495,7 @@ export function Composer(props: Props) {
     let disposed = false;
     setEntries([]);
     setCommands([]);
+    setCommandsLoadedScope("");
     setError("");
     if (sideChat && mode === "commands") {
       setLoading(false);
@@ -511,9 +517,10 @@ export function Composer(props: Props) {
       )
         .then((response) => {
           if (disposed) return;
-          if (mode === "commands" && response.kind === "agent_commands")
+          if (mode === "commands" && response.kind === "agent_commands") {
             setCommands(response.commands);
-          else if (mode === "files" && response.kind === "files")
+            setCommandsLoadedScope(catalogScope);
+          } else if (mode === "files" && response.kind === "files")
             setEntries(response.entries);
           else throw new Error("响应格式不匹配，请更新项目所在主机的 Server");
         })
@@ -539,6 +546,7 @@ export function Composer(props: Props) {
     path,
     revision,
     sideChat,
+    catalogScope,
   ]);
   useEffect(() => {
     setSelected(0);
@@ -1012,8 +1020,10 @@ export function Composer(props: Props) {
       : undefined;
     const knownNonSkill =
       !!nativeCommand &&
-      (isAlwaysNativeCommand(nativeCommand) ||
-        (knownEntry !== undefined && knownEntry.kind !== "skill"));
+      (knownEntry !== undefined
+        ? knownEntry.kind !== "skill"
+        : commandsLoadedScope === catalogScope &&
+          isAlwaysNativeCommand(nativeCommand));
     if (knownNonSkill && props.quotes?.length) {
       setNotice("请先移除引用的文本片段，再使用 Agent 原生命令。");
       return;
@@ -1042,6 +1052,7 @@ export function Composer(props: Props) {
       if (
         nativeCommand &&
         !knownEntry &&
+        commandsLoadedScope !== catalogScope &&
         (agent !== "opencode" ||
           props.quotes?.length ||
           props.annotations?.length ||
@@ -1056,6 +1067,13 @@ export function Composer(props: Props) {
           if (response.kind !== "agent_commands")
             throw new Error("无法读取原生命令列表");
           catalog = response.commands;
+          if (
+            currentScope.current === owner &&
+            currentContext.current === commandContext
+          ) {
+            setCommands(response.commands);
+            setCommandsLoadedScope(catalogScope);
+          }
         } catch (cause) {
           if (
             currentScope.current !== owner ||

@@ -494,6 +494,7 @@ async fn cursor_models_and_unsupported_overrides_are_host_owned() {
         ask(
             &mut client,
             Request::SkillInfo {
+                provider: None,
                 session_id: id.clone(),
                 name: "cursor-skill".into(),
             }

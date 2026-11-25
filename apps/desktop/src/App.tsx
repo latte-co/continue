@@ -10,6 +10,7 @@ import { Folder, PanelRight, SquarePen } from "lucide-react";
 import { request, message } from "./api";
 import { closeSideChat, SideChat, sideDraftKey } from "./SideChat";
 import { Conversation } from "./Conversation";
+import { isMarkdownFile } from "./FileTextView";
 import { supportsSideChatAgent } from "./composerActions";
 import { Workspace } from "./Workspace";
 import { Sidebar } from "./Sidebar";
@@ -410,6 +411,7 @@ export default function App() {
               openFile={(path) =>
                 openWorkspaceResource(workbench.workspaceId, "files", {
                   file: path,
+                  markdownPreview: isMarkdownFile(path),
                 })
               }
               openModelSettings={() => {

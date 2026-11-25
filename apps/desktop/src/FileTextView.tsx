@@ -5,6 +5,10 @@ export function isMarkdownFile(path: string) {
   return /\.(md|markdown)$/i.test(path);
 }
 
+export function isRichPreviewFile(path: string) {
+  return /\.(pdf|png|jpe?g|gif|webp|mp4|webm)$/i.test(path);
+}
+
 export function FileTextView({
   content,
   wrap = false,

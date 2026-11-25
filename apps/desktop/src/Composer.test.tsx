@@ -2209,3 +2209,68 @@ it("composes skills with @ references, quotes, and annotations while keeping con
   ).toBeTruthy();
   expect(mocks.send).toHaveBeenCalledOnce();
 });
+
+it("permits a catalog skill named init with @ references, quotes, and annotations", async () => {
+  mocks.request.mockImplementation(async (_host, req) =>
+    req.method === "agent_commands"
+      ? {
+          kind: "agent_commands",
+          commands: [
+            {
+              name: "compact",
+              description: "压缩会话上下文",
+              argument_hint: "",
+              kind: "command",
+            },
+            {
+              name: "init",
+              display_name: "初始化项目技能",
+              description: "按团队规范初始化配置",
+              argument_hint: "[任务说明]",
+              kind: "skill",
+            },
+          ],
+        }
+      : {
+          kind: "files",
+          entries: [{ name: "README.md", path: "README.md", directory: false }],
+        },
+  );
+  mocks.send.mockResolvedValue(true);
+  const view = render(
+    <Harness
+      agent="codex"
+      quotes={["请同步修复快照断言"]}
+      annotations={[
+        {
+          id: "a1",
+          quote: "expect(status).toBe(200)",
+          comment: "补充失败分支检查",
+          source: { message: 1, start: 0, end: 24 },
+        },
+      ]}
+    />,
+  );
+  // Submitting `/init` directly with quotes before opening `/` menu fetches catalog and permits skill.
+  type("/init 直接提交");
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(1));
+  expect(mocks.send.mock.calls[0][0] as string).toContain("/init 直接提交");
+  expect(mocks.send.mock.calls[0][0] as string).toContain("请同步修复快照断言");
+
+  // Also works after opening `/` menu and attaching an `@` file reference.
+  type("/ini");
+  fireEvent.click(
+    await screen.findByRole("option", { name: /初始化项目技能/ }),
+  );
+  expect(inputText()).toBe("/init ");
+  type("/init 检查 @READ");
+  fireEvent.click(await screen.findByRole("option", { name: /README\.md/ }));
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
+  const submitted = mocks.send.mock.calls[1][0] as string;
+  expect(submitted.startsWith("/init ")).toBe(true);
+  expect(submitted).toContain("README.md");
+  expect(submitted).toContain("补充失败分支检查");
+  view.unmount();
+});

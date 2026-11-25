@@ -74,17 +74,21 @@ for line in sys.stdin:
                 'enabled': False,
             },
         ]
-        for root_rel in ('.traex/skills', '.trae/skills', '.agents/skills'):
-            skills_root = cwd_path / root_rel
+        skill_roots = [cwd_path / '.traex/skills', cwd_path / '.trae/skills', cwd_path / '.agents/skills']
+        home_dir = os.environ.get('HOME')
+        if home_dir:
+            for rel in ('.trae/skills', '.traex/skills', '.agents/skills'):
+                skill_roots.append(pathlib.Path(home_dir) / rel)
+        for skills_root in skill_roots:
             if skills_root.is_dir():
                 for child in sorted(skills_root.iterdir()):
                     skill_md = child / 'SKILL.md'
                     if skill_md.is_file() and all(s['name'] != child.name for s in skills):
                         skills.append({
                             'name': child.name,
-                            'description': f'Project skill {child.name}',
+                            'description': f'Discovered skill {child.name}',
                             'path': str(skill_md.resolve()),
-                            'scope': 'repo',
+                            'scope': 'user' if skills_root.parent != cwd_path else 'repo',
                             'enabled': True,
                         })
         reply(value, {'data': [{'cwd': str(cwd_path), 'skills': skills, 'errors': []}]})

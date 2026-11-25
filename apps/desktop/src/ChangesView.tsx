@@ -280,7 +280,7 @@ export function ChangesView({
         );
       } catch (cause) {
         if (disposed) return;
-        if (!isNotGitRepositoryError(cause)) {
+        if (!isNotGitRepositoryError(cause) && !repoArg) {
           setError(message(cause));
           setLoading(false);
           return;
@@ -293,13 +293,30 @@ export function ChangesView({
           discovered = await readGitRepositories(hostId, project.id);
         } catch (scanCause) {
           if (!disposed) {
-            setError(message(scanCause));
+            setError(
+              message(isNotGitRepositoryError(cause) ? scanCause : cause),
+            );
             setLoading(false);
           }
           return;
         }
         if (disposed) return;
         if (discovered.repositories.length > 0) {
+          if (
+            repoArg &&
+            discovered.repositories.some((repo) => repo.path === repoArg)
+          ) {
+            setDiscoveredRepos({
+              scopeKey: projectKey,
+              list: discovered.repositories,
+              truncated: discovered.truncated,
+              noGit: false,
+            });
+            setInfoState(undefined);
+            setError(message(cause));
+            setLoading(false);
+            return;
+          }
           const matched = matchRepositoryForPath(
             discovered.repositories,
             initialPath,
@@ -312,7 +329,7 @@ export function ChangesView({
                   (repo) => repo.path === selectedRepo,
                 )
               : undefined) ??
-            matched ??
+            (matched && matched.path !== repoArg ? matched : undefined) ??
             discovered.repositories[0];
           setDiscoveredRepos({
             scopeKey: projectKey,
@@ -325,6 +342,9 @@ export function ChangesView({
           setCommitState(undefined);
           setSelectedRepo(chosen.path);
           return;
+        }
+        if (repoArg) {
+          setSelectedRepo(undefined);
         }
         if (discovered.truncated) {
           setDiscoveredRepos({

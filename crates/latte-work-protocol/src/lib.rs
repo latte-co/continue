@@ -29,6 +29,10 @@ pub struct TerminalInfo {
     pub title: String,
     pub exited: bool,
     pub exit_code: Option<u32>,
+    /// Canonical working directory where this terminal shell was spawned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cwd: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -541,6 +545,12 @@ pub enum Request {
         terminal_id: String,
         cols: u16,
         rows: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        repo_path: Option<String>,
     },
     ReadTerminal {
         terminal_id: String,
@@ -963,6 +973,9 @@ pub enum Request {
         files: Vec<SkillImportFile>,
     },
     SkillInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        provider: Option<TurnProvider>,
         session_id: String,
         name: String,
     },

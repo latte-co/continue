@@ -38,7 +38,10 @@ export function TaskOverview({
   const [open, setOpen] = useState(false);
   const trigger = useRef<HTMLButtonElement>(null);
   const popup = useRef<HTMLDivElement>(null);
-  const [selectedRepo] = useSelectedGitRepository(hostId, project);
+  const [selectedRepo, setSelectedRepo] = useSelectedGitRepository(
+    hostId,
+    project,
+  );
   const [changes, setChanges] = useState<{
     count?: number;
     added?: number;
@@ -101,7 +104,7 @@ export function TaskOverview({
             });
           }
         } catch (cause) {
-          if (!isNotGitRepositoryError(cause)) {
+          if (!isNotGitRepositoryError(cause) && !repoArg) {
             if (!disposed) setChanges({ error: message(cause) });
             return;
           }
@@ -112,12 +115,23 @@ export function TaskOverview({
           try {
             discovered = await readGitRepositories(hostId, project.id);
           } catch (scanCause) {
-            if (!disposed) setChanges({ error: message(scanCause) });
+            if (!disposed) {
+              setChanges({
+                error: message(
+                  isNotGitRepositoryError(cause) ? scanCause : cause,
+                ),
+              });
+            }
             return;
           }
           if (disposed) return;
           const { repositories, truncated } = discovered;
+          if (repoArg && repositories.some((repo) => repo.path === repoArg)) {
+            setChanges({ error: message(cause) });
+            return;
+          }
           if (!repositories.length) {
+            if (repoArg) setSelectedRepo(undefined);
             setChanges(
               truncated
                 ? { error: "子目录过多，未能完成 Git 仓库扫描" }
@@ -128,6 +142,9 @@ export function TaskOverview({
           const chosen =
             repositories.find((repo) => repo.path === selectedRepo) ??
             repositories[0];
+          if (repoArg && chosen.path !== repoArg) {
+            setSelectedRepo(chosen.path);
+          }
           const fallbackArg = normalizeGitRepoPath(chosen.path);
           try {
             const response = await request(hostId, {

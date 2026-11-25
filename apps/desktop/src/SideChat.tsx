@@ -36,7 +36,7 @@ import { Button } from "./ui";
 
 const FOLLOW_THRESHOLD = 90;
 const SIDE_TITLE_SETTLE_MS = 2500;
-const SIDE_BG_TITLE_POLL_MS = 15000;
+const SIDE_BG_TITLE_POLL_MS = 180000;
 const MAX_READING_POSITIONS = 64;
 const eventArraySizes = new WeakMap<Event[], number>();
 

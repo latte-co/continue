@@ -151,6 +151,29 @@ describe("classifyLinkHref", () => {
     expect(classifyLinkHref("mailto:a@b")).toEqual({ kind: "text" });
     expect(classifyLinkHref("ftp://host/x")).toEqual({ kind: "text" });
     expect(classifyLinkHref("../outside.ts")).toEqual({ kind: "text" });
+    expect(classifyLinkHref("%2e%2e/outside.pdf")).toEqual({ kind: "text" });
+    expect(classifyLinkHref("%6aavascript:alert(1)")).toEqual({ kind: "text" });
+  });
+  it("decodes percent-encoded CJK and spaced Markdown link paths", () => {
+    expect(
+      classifyLinkHref("docs/%E4%B8%AD%E6%96%87%E6%8A%A5%E5%91%8A.pdf"),
+    ).toEqual({
+      kind: "projectPath",
+      path: "docs/中文报告.pdf",
+      line: undefined,
+    });
+    expect(classifyLinkHref("docs/My%20Report.pdf")).toEqual({
+      kind: "projectPath",
+      path: "docs/My Report.pdf",
+      line: undefined,
+    });
+    expect(
+      classifyLinkHref("file:///repo/docs/%E6%8A%A5%E5%91%8A.pdf"),
+    ).toEqual({
+      kind: "externalPath",
+      path: "/repo/docs/报告.pdf",
+      line: undefined,
+    });
   });
   it("still classifies plain web urls", () => {
     expect(classifyLinkHref("https://example.com/x")).toEqual({

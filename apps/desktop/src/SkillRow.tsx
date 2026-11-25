@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { HoverCard } from "./SidebarHoverCard";
 import { message, request } from "./api";
+import { useModelConfigVersion } from "./modelConfigVersion";
 import type { Project, SkillInfo } from "./protocol";
 import { openArtifact } from "./workspaceState";
 import { useStatusIssues } from "./statusNotices";
@@ -28,14 +29,28 @@ export function SkillRow({
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const pending = useRef<Promise<SkillInfo | null> | null>(null);
-  const context = JSON.stringify([hostId, sessionId, name, active, connected]);
+  const configVersion = useModelConfigVersion(hostId);
+  const context = JSON.stringify([
+    hostId,
+    sessionId,
+    name,
+    active,
+    connected,
+    configVersion,
+  ]);
   const current = useRef({ context, version: 0, mounted: true });
-  if (current.current.context !== context)
+  if (current.current.context !== context) {
+    pending.current = null;
     current.current = {
       ...current.current,
       context,
       version: current.current.version + 1,
     };
+  }
+  useEffect(() => {
+    setInfo(undefined);
+    setError("");
+  }, [hostId, sessionId, name, configVersion]);
   useEffect(() => {
     current.current.mounted = true;
     return () => {

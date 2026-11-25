@@ -123,17 +123,25 @@ for line in sys.stdin:
                 'enabled': False,
             },
         ]
-        for root_rel in ('.codex/skills', '.agents/skills'):
-            skills_root = cwd_path / root_rel
+        skill_roots = [cwd_path / '.codex/skills', cwd_path / '.agents/skills']
+        codex_home = os.environ.get('CODEX_HOME')
+        home_dir = os.environ.get('HOME')
+        if codex_home:
+            skill_roots.append(pathlib.Path(codex_home) / 'skills')
+        elif home_dir:
+            skill_roots.append(pathlib.Path(home_dir) / '.codex/skills')
+        if home_dir:
+            skill_roots.append(pathlib.Path(home_dir) / '.agents/skills')
+        for skills_root in skill_roots:
             if skills_root.is_dir():
                 for child in sorted(skills_root.iterdir()):
                     skill_md = child / 'SKILL.md'
                     if skill_md.is_file() and all(s['name'] != child.name for s in skills):
                         skills.append({
                             'name': child.name,
-                            'description': f'Project skill {child.name}',
+                            'description': f'Discovered skill {child.name}',
                             'path': str(skill_md.resolve()),
-                            'scope': 'repo',
+                            'scope': 'user' if skills_root.parent != cwd_path else 'repo',
                             'enabled': True,
                         })
         reply(value, {'data': [{'cwd': str(cwd_path), 'skills': skills, 'errors': []}]})

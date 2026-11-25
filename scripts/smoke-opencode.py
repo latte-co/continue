@@ -109,7 +109,7 @@ class Model(BaseHTTPRequestHandler):
                 })},
             }]}
             finish = "tool_calls"
-        elif "skill sentinel" in str(last["content"]):
+        elif "skill sentinel" in str(last["content"]) or "/smoke-latte-skill" in str(last["content"]):
             delta = {"role": "assistant", "tool_calls": [{
                 "index": 0, "id": "call_skill", "type": "function",
                 "function": {"name": "skill", "arguments": '{"id":"smoke-latte-skill"}'},

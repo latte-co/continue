@@ -50,6 +50,7 @@ enum AcpInput {
 #[derive(Default)]
 pub struct OpenCode {
     cwd: String,
+    legacy_acp_skills: bool,
     resume: Option<String>,
     repair: Option<Repair>,
     repair_attempted: bool,
@@ -140,6 +141,19 @@ pub(super) fn version_2(value: &str) -> bool {
     let core = value.split(['-', '+']).next().unwrap_or_default();
     let parts: Vec<_> = core.split('.').collect();
     parts.len() == 3 && parts[0] == "2" && parts[1..].iter().all(|part| part.parse::<u64>().is_ok())
+}
+
+pub(super) fn legacy_acp_skills(value: &str) -> bool {
+    let value = value.trim();
+    let value = value.strip_prefix("opencode ").unwrap_or(value);
+    let value = value.strip_prefix('v').unwrap_or(value);
+    let core = value.split(['-', '+']).next().unwrap_or_default();
+    let mut parts = core.split('.');
+    parts.next() == Some("2")
+        && parts
+            .next()
+            .and_then(|minor| minor.parse::<u64>().ok())
+            .is_some_and(|minor| minor < 3)
 }
 
 pub(super) fn frame(value: Value) -> Result<Vec<u8>> {
@@ -378,6 +392,17 @@ impl OpenCode {
                     let prompt = self.slash_prompt.take().context("OpenCode 命令已失效")?;
                     self.native_command = None;
                     return self.start_prompt(&prompt, AcpInput::Skill);
+                }
+                if message["rejectedReferences"] == true {
+                    self.native_command = None;
+                    self.slash_prompt = None;
+                    self.command_waiting_for_end = false;
+                    self.command_acknowledged = false;
+                    self.command_outcome = None;
+                    return Ok(self.finish(
+                        true,
+                        Some("OpenCode 命令使用原生参数，请先移除项目引用".into()),
+                    ));
                 }
                 if message["error"] == true && self.command_waiting_for_end {
                     // Submission failure does not prove that admitted native
@@ -1114,7 +1139,11 @@ impl OpenCode {
 
     fn start(&mut self, text: &str) -> Result<Vec<Action>> {
         let command = self.slash_command(text);
-        if command.is_some() && !crate::sources::references(text).is_empty() {
+        let has_references = !crate::sources::references(text).is_empty();
+        if command.is_some()
+            && has_references
+            && (!self.legacy_acp_skills || command == Some("compact"))
+        {
             return Ok(vec![Action::Finished {
                 failed: true,
                 message: Some("OpenCode 命令使用原生参数，请先移除项目引用".into()),
@@ -1130,7 +1159,11 @@ impl OpenCode {
             }
             let args = text.trim_start()[name.len() + 1..].trim();
             let id = uuid::Uuid::new_v4().to_string();
-            let action = self.sideband_request("command", &id, json!({"name":name,"text":args}))?;
+            let action = self.sideband_request(
+                "command",
+                &id,
+                json!({"name":name,"text":args,"hasReferences":has_references}),
+            )?;
             self.native_command = Some(id);
             self.slash_prompt = Some(text.trim_start().into());
             self.command_outcome = None;
@@ -1229,6 +1262,9 @@ impl OpenCode {
         match kind {
             Request::Initialize => {
                 verify_initialize(result)?;
+                self.legacy_acp_skills = result["agentInfo"]["version"]
+                    .as_str()
+                    .is_some_and(legacy_acp_skills);
                 let mut params = json!({"cwd":self.cwd, "mcpServers":[]});
                 let method = if let Some(id) = &self.resume {
                     params["sessionId"] = json!(id);

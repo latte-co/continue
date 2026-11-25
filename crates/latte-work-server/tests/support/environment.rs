@@ -1055,3 +1055,191 @@ async fn custom_agent_environment_reaches_all_adapters_and_reconfigures_without_
         }
     }
 }
+
+#[tokio::test]
+async fn custom_agent_environment_resolves_agent_commands_and_skill_info_for_cold_and_open_sessions()
+ {
+    let host = Host::start().await;
+    let app = tempfile::tempdir().unwrap();
+    let app_path = app.path();
+    let target = Mutex::new(host.client().await);
+    let mut observer = host.client().await;
+    let project_dir = tempfile::tempdir().unwrap();
+    let Response::Project { project } = ask(
+        &mut observer,
+        Request::AddProject {
+            path: project_dir.path().to_string_lossy().into_owned(),
+            name: None,
+        },
+    )
+    .await
+    else {
+        panic!("project")
+    };
+
+    for (agent, env_key, rel_skill_dir, expected_desc) in [
+        (
+            "codex",
+            "CODEX_HOME",
+            "skills/configured-demo",
+            "expected codex instance file",
+        ),
+        (
+            "claude",
+            "CLAUDE_CONFIG_DIR",
+            "skills/configured-demo",
+            "expected claude instance file",
+        ),
+        (
+            "opencode",
+            "OPENCODE_CONFIG_DIR",
+            "skills/configured-demo",
+            "expected opencode instance file",
+        ),
+        (
+            "cursor",
+            "HOME",
+            ".cursor/skills/configured-demo",
+            "expected cursor instance file",
+        ),
+        (
+            "traex",
+            "HOME",
+            ".trae/skills/configured-demo",
+            "expected traex instance file",
+        ),
+    ] {
+        let instance_dir = tempfile::tempdir().unwrap();
+        let skill_dir = instance_dir.path().join(rel_skill_dir);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: Configured Demo\ndescription: {expected_desc}\n---\nbody\n"),
+        )
+        .unwrap();
+
+        let env = AgentEnvironment(BTreeMap::from([(
+            env_key.into(),
+            instance_dir.path().to_string_lossy().into_owned(),
+        )]));
+        ProviderStore::open(app_path, None)
+            .unwrap()
+            .save_environment("target", agent, env)
+            .unwrap();
+        let resolve = |agent: String| async move {
+            ProviderStore::open(app_path, None)?.launch_for_host("target", &agent)
+        };
+
+        // 1. Desktop-style `AgentCommands` attaches configured environment for every agent.
+        let catalog = request_with_app_agent_config(
+            &target,
+            Request::AgentCommands {
+                agent: agent.into(),
+                project_id: project.id.clone(),
+                provider: None,
+            },
+            resolve,
+        )
+        .await
+        .unwrap();
+        match catalog {
+            Response::AgentCommands { commands } => {
+                assert!(
+                    commands.iter().any(|c| {
+                        c.name == "configured-demo"
+                            && c.kind == Some(latte_work_protocol::AgentCommandKind::Skill)
+                    }),
+                    "{agent} missing configured-demo in commands: {commands:?}"
+                );
+            }
+            other => panic!("expected {agent} commands, got {other:?}"),
+        }
+
+        let Response::Session { session } = ask(
+            &mut observer,
+            Request::CreateSession {
+                project_id: project.id.clone(),
+                agent: agent.into(),
+            },
+        )
+        .await
+        else {
+            panic!("session")
+        };
+
+        // 2. Cold session without `provider` sees default host environment (`None`), while
+        //    `request_with_app_agent_config` attaches the configured environment and resolves it.
+        assert!(matches!(
+            ask(
+                &mut observer,
+                Request::SkillInfo {
+                    provider: None,
+                    session_id: session.id.clone(),
+                    name: "configured-demo".into(),
+                },
+            )
+            .await,
+            Response::SkillInfo { skill: None }
+        ));
+        let cold_info = request_with_app_agent_config(
+            &target,
+            Request::SkillInfo {
+                provider: None,
+                session_id: session.id.clone(),
+                name: "configured-demo".into(),
+            },
+            resolve,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                &cold_info,
+                Response::SkillInfo { skill: Some(info) } if info.description == expected_desc
+            ),
+            "{agent} cold SkillInfo mismatch: {cold_info:?}"
+        );
+
+        // 3. Once the session is opened with the configured environment, direct RPC `SkillInfo`
+        //    with `provider: None` also uses the active session's environment.
+        if matches!(agent, "codex" | "claude") {
+            assert!(matches!(
+                request_with_app_agent_config(
+                    &target,
+                    Request::OpenAgentSession {
+                        session_id: session.id.clone(),
+                        provider: None,
+                    },
+                    resolve,
+                )
+                .await
+                .unwrap(),
+                Response::Ok
+            ));
+            let open_info = ask(
+                &mut observer,
+                Request::SkillInfo {
+                    provider: None,
+                    session_id: session.id.clone(),
+                    name: "configured-demo".into(),
+                },
+            )
+            .await;
+            assert!(
+                matches!(
+                    &open_info,
+                    Response::SkillInfo { skill: Some(info) } if info.description == expected_desc
+                ),
+                "{agent} open-session SkillInfo mismatch: {open_info:?}"
+            );
+            ask(
+                &mut observer,
+                Request::CloseAgentSession {
+                    session_id: session.id,
+                    only_if_idle: None,
+                },
+            )
+            .await;
+        }
+    }
+}

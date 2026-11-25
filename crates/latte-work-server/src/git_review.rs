@@ -329,11 +329,15 @@ async fn discover_submodules_for(
             continue;
         };
         *truncated |= partial;
-        for record in output.split('\0').filter(|entry| !entry.is_empty()) {
-            let Some((_, raw_subpath)) = record.split_once('\n') else {
+        let complete = if partial {
+            output.rfind('\0').map(|end| &output[..end]).unwrap_or("")
+        } else {
+            &output
+        };
+        for record in complete.split('\0').filter(|entry| !entry.is_empty()) {
+            let Some((_, subpath)) = record.split_once('\n') else {
                 continue;
             };
-            let subpath = raw_subpath.trim();
             if valid_path(subpath).is_err() {
                 continue;
             }
@@ -1977,5 +1981,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(spaced_info.branch.as_deref(), Some("spaced-branch"));
+
+        // Deep `.gitmodules` submodule paths with trailing spaces stay verbatim and addressable.
+        let deep_parent = tempfile::tempdir().unwrap();
+        init_repo(deep_parent.path(), "main", "root.txt", "root\n");
+        let deep_subpath = "deps/deep/vendor ";
+        std::fs::create_dir_all(deep_parent.path().join("deps/deep")).unwrap();
+        run(
+            deep_parent.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "-q",
+                "add",
+                external_repo.to_str().unwrap(),
+                deep_subpath,
+            ],
+        );
+        run(
+            deep_parent.path(),
+            &["commit", "-qm", "add deep spaced submodule"],
+        );
+        std::fs::write(
+            deep_parent.path().join(deep_subpath).join("lib.rs"),
+            "pub fn v() -> u8 { 9 }\n",
+        )
+        .unwrap();
+        let (deep_repos, deep_truncated) = discover_repositories(deep_parent.path()).await.unwrap();
+        assert!(!deep_truncated);
+        assert_eq!(
+            deep_repos,
+            vec![
+                GitRepository {
+                    path: ".".into(),
+                    name: deep_parent
+                        .path()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    kind: GitRepositoryKind::Root,
+                },
+                GitRepository {
+                    path: deep_subpath.into(),
+                    name: deep_subpath.into(),
+                    kind: GitRepositoryKind::Submodule,
+                },
+            ]
+        );
+        let deep_resolved = resolve_repository(deep_parent.path(), Some(deep_subpath))
+            .await
+            .unwrap();
+        let deep_review = review(&deep_resolved, GitReviewScope::Worktree, None)
+            .await
+            .unwrap();
+        assert_eq!(deep_review.entries.len(), 1);
+        assert_eq!(deep_review.entries[0].path, "lib.rs");
     }
 }

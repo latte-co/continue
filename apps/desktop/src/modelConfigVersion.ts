@@ -53,7 +53,7 @@ export function getModelConfigVersion(hostId?: string, agent?: string) {
   return total;
 }
 
-export function useModelConfigVersion(hostId: string, agent: string) {
+export function useModelConfigVersion(hostId: string, agent?: string) {
   return useSyncExternalStore(subscribe, () =>
     getModelConfigVersion(hostId, agent),
   );

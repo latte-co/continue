@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -1670,5 +1671,52 @@ it("skips repeated full-array sizing on idle polls when the active transcript ex
     expect(fullSizes).toBe(1);
   } finally {
     spy.mockRestore();
+  }
+});
+
+it("syncs background generated titles arriving more than 17 seconds after turn completion", async () => {
+  vi.useFakeTimers();
+  try {
+    const { props, state, readTabTitle, question } =
+      createSideChatReviewFixture();
+    state.session = {
+      ...state.session,
+      status: "running",
+      title_requested: false,
+    };
+    const view = render(<SideChat {...props} />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
+    expect(screen.getByText(question)).toBeTruthy();
+
+    view.rerender(<SideChat {...props} active={false} />);
+    state.session = {
+      ...state.session,
+      status: "completed",
+      title_requested: true,
+    };
+    // First flush the poll that observes `status: "completed"` so the settle/background effects arm.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(readTabTitle()).toBe(question);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20000);
+    });
+    state.session = {
+      ...state.session,
+      title: "later generated title",
+    };
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(readTabTitle()).toBe("later generated title");
+  } finally {
+    vi.useRealTimers();
   }
 });

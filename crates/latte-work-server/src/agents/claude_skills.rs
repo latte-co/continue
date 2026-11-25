@@ -100,10 +100,6 @@ pub(super) fn inspect(directory: &Path, requested: &str) -> Result<Option<SkillI
     }))
 }
 
-pub fn find(project: &Path, name: &str) -> Result<Option<SkillInfo>> {
-    find_with_env(project, name, &Default::default())
-}
-
 pub(crate) fn find_with_env(
     project: &Path,
     name: &str,

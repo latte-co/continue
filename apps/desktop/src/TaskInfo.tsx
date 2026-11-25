@@ -183,7 +183,10 @@ export function TaskInfo({
         ),
     )
     .at(-1)?.seq;
-  const [selectedRepo] = useSelectedGitRepository(hostId, project);
+  const [selectedRepo, setSelectedRepo] = useSelectedGitRepository(
+    hostId,
+    project,
+  );
   const readChanges = useCallback(async (): Promise<{
     review: GitReview | null;
     repoLabel?: string;
@@ -202,18 +205,31 @@ export function TaskInfo({
         throw new Error("无法读取变更，请检查 Server 版本");
       return { review: response.review, repoLabel: repoArg };
     } catch (error) {
-      if (!isNotGitRepositoryError(error)) throw error;
-      const { repositories, truncated } = await readGitRepositories(
-        hostId,
-        project!.id,
-      );
+      if (!isNotGitRepositoryError(error) && !repoArg) throw error;
+      let discovered: {
+        repositories: { path: string; name: string }[];
+        truncated: boolean;
+      };
+      try {
+        discovered = await readGitRepositories(hostId, project!.id);
+      } catch (scanError) {
+        throw isNotGitRepositoryError(error) ? scanError : error;
+      }
+      const { repositories, truncated } = discovered;
+      if (repoArg && repositories.some((repo) => repo.path === repoArg)) {
+        throw error;
+      }
       if (!repositories.length) {
+        if (repoArg) setSelectedRepo(undefined);
         if (truncated) throw new Error("子目录过多，未能完成 Git 仓库扫描");
         return null;
       }
       const chosen =
         repositories.find((repo) => repo.path === selectedRepo) ??
         repositories[0];
+      if (repoArg && chosen.path !== repoArg) {
+        setSelectedRepo(chosen.path);
+      }
       const fallbackArg = normalizeGitRepoPath(chosen.path);
       try {
         const response = await request(hostId, {

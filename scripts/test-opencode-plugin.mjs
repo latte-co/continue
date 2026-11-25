@@ -278,3 +278,110 @@ for (const version of ["2.0.0", "2.3.0"]) {
       },
     ));
 }
+
+await test("2.0.0: legacy command routing allows skills with references via ACP and rejects native commands with references", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "lw-plugin-cmd-"));
+  const replies = [];
+  const executed = [];
+  let socket, cleanup;
+  let resolveDone;
+  const done = new Promise((resolve) => {
+    resolveDone = resolve;
+  });
+  const server = createServer((conn) => {
+    socket = conn;
+    conn.setEncoding("utf8");
+    let buffer = "";
+    conn.on("data", (chunk) => {
+      buffer += chunk;
+      let idx;
+      while ((idx = buffer.indexOf("\n")) >= 0) {
+        const message = JSON.parse(buffer.slice(0, idx));
+        buffer = buffer.slice(idx + 1);
+        if (message.type === "ready") {
+          for (const req of [
+            {
+              action: "command",
+              id: "skill-ref",
+              sessionID: "root",
+              name: "fixture-skill",
+              text: "check ref",
+              hasReferences: true,
+            },
+            {
+              action: "command",
+              id: "cmd-ref",
+              sessionID: "root",
+              name: "init",
+              text: "check ref",
+              hasReferences: true,
+            },
+            {
+              action: "command",
+              id: "cmd-plain",
+              sessionID: "root",
+              name: "init",
+              text: "plain",
+              hasReferences: false,
+            },
+          ]) {
+            conn.write(JSON.stringify(req) + "\n");
+          }
+        } else if (message.type === "reply") {
+          replies.push(message);
+          if (replies.length === 3) resolveDone();
+        }
+      }
+    });
+  });
+  await new Promise((resolve) =>
+    server.listen(join(directory, "events"), resolve),
+  );
+  try {
+    cleanup = await plugin.setup({
+      app: { version: "2.0.0" },
+      options: { socket: join(directory, "events") },
+      location: { directory },
+      catalog: { model: { list: async () => catalog(10000) } },
+      command: { list: async () => ({ data: [{ name: "init" }] }) },
+      skill: {
+        list: async () => ({ data: [{ name: "fixture-skill", slash: true }] }),
+      },
+      event: {
+        async *subscribe() {
+          await done;
+        },
+      },
+      tool: { async transform() {} },
+      session: {
+        async get() {
+          return { title: "t", location: { directory } };
+        },
+        async command(args) {
+          executed.push(args);
+        },
+        async wait() {},
+      },
+    });
+    await done;
+    assert.deepEqual(
+      replies.find((r) => r.id === "skill-ref"),
+      { type: "reply", id: "skill-ref", viaACP: true },
+    );
+    assert.deepEqual(
+      replies.find((r) => r.id === "cmd-ref"),
+      { type: "reply", id: "cmd-ref", rejectedReferences: true },
+    );
+    assert.deepEqual(
+      replies.find((r) => r.id === "cmd-plain"),
+      { type: "reply", id: "cmd-plain" },
+    );
+    assert.equal(executed.length, 1);
+    assert.equal(executed[0].name, "init");
+  } finally {
+    cleanup?.();
+    socket?.destroy();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(directory, { recursive: true });
+  }
+});
