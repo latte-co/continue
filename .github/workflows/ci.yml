@@ -86,16 +86,36 @@ jobs:
   e2e-host:
     name: E2E final server (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
-    # Allow for a cold build and the full serial server suite on Linux.
+    # Each shard runs deterministically with --test-threads=1 in its own VM.
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            label: Linux
+            label: Linux 1/4
+            shard: 1
+            shards: 4
+          - os: ubuntu-latest
+            label: Linux 2/4
+            shard: 2
+            shards: 4
+          - os: ubuntu-latest
+            label: Linux 3/4
+            shard: 3
+            shards: 4
+          - os: ubuntu-latest
+            label: Linux 4/4
+            shard: 4
+            shards: 4
           - os: macos-latest
-            label: macOS
+            label: macOS 1/2
+            shard: 1
+            shards: 2
+          - os: macos-latest
+            label: macOS 2/2
+            shard: 2
+            shards: 2
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -110,7 +130,7 @@ jobs:
           persist-credentials: false
       - name: Build the legacy daemon separately from the client under test
         run: cargo build --manifest-path .legacy-server/Cargo.toml -p latte-work-server --locked --target-dir "$RUNNER_TEMP/legacy-target"
-      - run: cargo test -p latte-work-server --test e2e --locked -- --test-threads=1
+      - run: python3 scripts/run-e2e-shard.py --shard "${{ matrix.shard }}" --shards "${{ matrix.shards }}"
         env:
           LATTE_WORK_TEST_LEGACY_SERVER: ${{ runner.temp }}/legacy-target/debug/latte-work-server
 

@@ -23,7 +23,9 @@ cookie store and loopback HTTP fixture, without browsing, login state or model c
 generated protocol types, Clippy, workflow/shell scripts, the frontend build,
 and Rustdoc. `make setup` uses public npm registry URLs recorded in the lockfile.
 
-GitHub Actions runs host check/Clippy, UT, final-binary E2E, and release builds
+GitHub Actions runs host check/Clippy, UT, final-binary E2E (partitioned into
+concurrent deterministic shards via `scripts/run-e2e-shard.py`, each keeping
+`--test-threads=1` inside its isolated runner), and release builds
 on Linux and macOS. Frontend UT/build runs on Linux, macOS, and Windows;
 Windows also checks, lints, and tests the portable Rust protocol and client.
 The server uses Unix sockets and process groups, so Windows CI does not claim
