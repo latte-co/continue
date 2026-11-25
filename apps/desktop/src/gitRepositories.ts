@@ -42,8 +42,7 @@ export function isEmptyRepositoryReviewError(error: unknown): boolean {
 export function normalizeGitRepoPath(
   repoPath?: string | null,
 ): string | undefined {
-  const trimmed = repoPath?.trim();
-  return trimmed && trimmed !== "." ? trimmed : undefined;
+  return repoPath && repoPath !== "." ? repoPath : undefined;
 }
 
 export function getSelectedGitRepository(
@@ -60,7 +59,7 @@ export function setSelectedGitRepository(
   repoPath?: string,
 ) {
   const key = projectScopeKey(hostId, project);
-  const value = repoPath?.trim() || undefined;
+  const value = repoPath || undefined;
   const previous = selectedRepositories.get(key);
   if (previous === value) return;
   selectedRepositories.delete(key);
@@ -102,15 +101,23 @@ export async function readGitRepositories(
       method: "git_repositories",
       project_id: projectId,
     });
-    if (response.kind === "git_repositories") {
-      return {
-        repositories: response.repositories,
-        truncated: response.truncated,
-      };
+    if (response.kind !== "git_repositories") {
+      throw new Error("Server 不支持子仓库扫描，请更新后重试");
     }
-    return { repositories: [], truncated: false };
-  } catch {
-    return { repositories: [], truncated: false };
+    return {
+      repositories: response.repositories,
+      truncated: response.truncated,
+    };
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      (error as { code?: unknown }).code === "invalid_request"
+    ) {
+      return { repositories: [], truncated: false };
+    }
+    throw error;
   }
 }
 

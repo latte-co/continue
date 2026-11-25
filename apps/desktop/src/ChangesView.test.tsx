@@ -1006,3 +1006,130 @@ it("discovers child repositories, submodules and worktrees and switches repo_pat
     repo_path: ".oh-my-code/worktree/continue/fix-ux",
   });
 });
+
+function setupMultiRepoResponses() {
+  const list = [
+    { path: ".", name: "root", kind: "root" as const },
+    { path: "child", name: "child", kind: "repository" as const },
+  ];
+  mocks.request.mockImplementation(async (_host: string, req: Request) => {
+    if (req.method === "git_info") {
+      return {
+        kind: "git_info",
+        info: req.repo_path
+          ? {
+              ...info,
+              default_base: "refs/heads/child-main",
+              refs: [
+                { name: "child-main", full_name: "refs/heads/child-main" },
+              ],
+            }
+          : { ...info, repositories: list },
+      };
+    }
+    if (req.method === "git_repositories") {
+      return { kind: "git_repositories", repositories: list, truncated: false };
+    }
+    if (req.method === "git_review") {
+      return { kind: "git_review", review: { ...review, entries: [] } };
+    }
+    throw new Error(`unexpected ${req.method}`);
+  });
+}
+
+it("keeps the repository switcher available when reopening a child repository review", async () => {
+  setupMultiRepoResponses();
+  const initial = render(<ChangesView {...props} />);
+  fireEvent.click(await screen.findByRole("combobox", { name: "Git 仓库" }));
+  fireEvent.click(screen.getByRole("option", { name: /child/ }));
+  await waitFor(() =>
+    expect(mocks.request).toHaveBeenCalledWith(
+      "local",
+      expect.objectContaining({ method: "git_review", repo_path: "child" }),
+    ),
+  );
+  initial.unmount();
+  mocks.request.mockClear();
+
+  render(<ChangesView {...props} />);
+  await waitFor(() =>
+    expect(mocks.request).toHaveBeenCalledWith(
+      "local",
+      expect.objectContaining({ method: "git_review", repo_path: "child" }),
+    ),
+  );
+  expect(screen.queryByRole("combobox", { name: "Git 仓库" })).toBeTruthy();
+});
+
+it("resets to the newly selected repository default base after switching repositories in a sibling session", async () => {
+  const { setSelectedGitRepository } = await import("./gitRepositories");
+  setupMultiRepoResponses();
+  const view = render(<ChangesView {...props} />);
+  await waitFor(() =>
+    expect(mocks.request).toHaveBeenCalledWith(
+      "local",
+      expect.objectContaining({
+        method: "git_review",
+        base: info.default_base,
+      }),
+    ),
+  );
+  view.rerender(<ChangesView {...props} active={false} />);
+  act(() => setSelectedGitRepository("local", project, "child"));
+  view.rerender(<ChangesView {...props} />);
+  await waitFor(() =>
+    expect(mocks.request).toHaveBeenCalledWith(
+      "local",
+      expect.objectContaining({ method: "git_review", repo_path: "child" }),
+    ),
+  );
+  const childReviewCall = mocks.request.mock.calls.find(
+    ([, req]) => req.method === "git_review" && req.repo_path === "child",
+  );
+  expect(childReviewCall?.[1]).toMatchObject({
+    base: "refs/heads/child-main",
+  });
+});
+
+it.each(["timeout", "truncated"] as const)(
+  "does not declare a project repository-free after incomplete discovery (%s)",
+  async (mode) => {
+    mocks.request.mockImplementation(async (_host: string, req: Request) => {
+      if (req.method === "git_info") {
+        throw Object.assign(new Error("no root"), {
+          code: "not_git_repository",
+        });
+      }
+      if (req.method === "git_repositories") {
+        if (mode === "timeout") {
+          throw Object.assign(new Error("扫描 Git 仓库超时"), {
+            code: "request_failed",
+          });
+        }
+        return { kind: "git_repositories", repositories: [], truncated: true };
+      }
+      throw new Error(`unexpected ${req.method}`);
+    });
+    render(<ChangesView {...props} />);
+    await waitFor(() =>
+      expect(mocks.request).toHaveBeenCalledWith(
+        "local",
+        expect.objectContaining({ method: "git_repositories" }),
+      ),
+    );
+    await waitFor(() => expect(screen.queryByText("正在读取变更…")).toBeNull());
+    expect(screen.queryByText("此项目及子目录未发现 Git 仓库")).toBeNull();
+  },
+);
+
+it("preserves exact child repository paths with leading or trailing spaces", async () => {
+  const {
+    setSelectedGitRepository,
+    getSelectedGitRepository,
+    normalizeGitRepoPath,
+  } = await import("./gitRepositories");
+  setSelectedGitRepository("local", project, " child");
+  expect(normalizeGitRepoPath(getSelectedGitRepository("local", project))).toBe(
+    " child",
+  );
+});

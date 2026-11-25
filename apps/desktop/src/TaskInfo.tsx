@@ -203,8 +203,14 @@ export function TaskInfo({
       return { review: response.review, repoLabel: repoArg };
     } catch (error) {
       if (!isNotGitRepositoryError(error)) throw error;
-      const { repositories } = await readGitRepositories(hostId, project!.id);
-      if (!repositories.length) return null;
+      const { repositories, truncated } = await readGitRepositories(
+        hostId,
+        project!.id,
+      );
+      if (!repositories.length) {
+        if (truncated) throw new Error("子目录过多，未能完成 Git 仓库扫描");
+        return null;
+      }
       const chosen =
         repositories.find((repo) => repo.path === selectedRepo) ??
         repositories[0];

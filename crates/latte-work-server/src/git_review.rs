@@ -225,10 +225,7 @@ async fn verify_contained_repository(
 }
 
 pub async fn resolve_repository(project_root: &Path, repo_path: Option<&str>) -> Result<PathBuf> {
-    let Some(subpath) = repo_path
-        .map(str::trim)
-        .filter(|path| !path.is_empty() && *path != ".")
-    else {
+    let Some(subpath) = repo_path.filter(|path| !path.is_empty() && *path != ".") else {
         return Ok(project_root.to_path_buf());
     };
     valid_path(subpath)?;
@@ -610,10 +607,7 @@ pub async fn discover_repositories(project_root: &Path) -> Result<(Vec<GitReposi
 }
 
 pub async fn info_for_project(project_root: &Path, repo_path: Option<&str>) -> Result<GitInfo> {
-    let trimmed = repo_path
-        .map(str::trim)
-        .filter(|path| !path.is_empty() && *path != ".");
-    if let Some(subpath) = trimmed {
+    if let Some(subpath) = repo_path.filter(|path| !path.is_empty() && *path != ".") {
         let repo_root = resolve_repository(project_root, Some(subpath)).await?;
         return info(&repo_root).await;
     }
@@ -1964,5 +1958,24 @@ mod tests {
         assert_eq!(nested[0].kind, GitRepositoryKind::Root);
         assert_eq!(nested[1].path, "vendor/sub-lib");
         assert_eq!(nested[1].kind, GitRepositoryKind::Submodule);
+
+        // Leading-space child directory names remain distinct from trimmed siblings.
+        let spaced_workspace = tempfile::tempdir().unwrap();
+        init_repo(
+            &spaced_workspace.path().join("child"),
+            "plain-branch",
+            "a.txt",
+            "plain\n",
+        );
+        init_repo(
+            &spaced_workspace.path().join(" child"),
+            "spaced-branch",
+            "a.txt",
+            "spaced\n",
+        );
+        let spaced_info = info_for_project(spaced_workspace.path(), Some(" child"))
+            .await
+            .unwrap();
+        assert_eq!(spaced_info.branch.as_deref(), Some("spaced-branch"));
     }
 }

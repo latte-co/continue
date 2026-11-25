@@ -56,11 +56,8 @@ export function ChangesView({
   initialPath?: string;
   initialScope?: ReviewScope;
 }) {
-  const [info, setInfo] = useState<GitInfo>();
   const [scope, setScope] = useState<ReviewScope>(initialScope);
   const userChoseScope = useRef(Boolean(requestId));
-  const [base, setBase] = useState("");
-  const [commit, setCommit] = useState<GitCommit>();
   const [selectedRepo, setSelectedRepo] = useSelectedGitRepository(
     hostId,
     project,
@@ -87,6 +84,34 @@ export function ChangesView({
       ? selectedRepo
       : repositories[0]?.path;
   const repoArg = normalizeGitRepoPath(effectiveRepo);
+  const repoScopeKey = JSON.stringify([
+    hostId,
+    project.id,
+    project.path,
+    repoArg ?? ".",
+  ]);
+  const [infoState, setInfoState] = useState<{
+    scopeKey: string;
+    info: GitInfo;
+  }>();
+  const info =
+    infoState?.scopeKey === repoScopeKey ? infoState.info : undefined;
+  const [baseState, setBaseState] = useState<{
+    scopeKey: string;
+    base: string;
+  }>({ scopeKey: repoScopeKey, base: "" });
+  const base = baseState.scopeKey === repoScopeKey ? baseState.base : "";
+  const setBase = useCallback(
+    (nextBase: string) =>
+      setBaseState({ scopeKey: repoScopeKey, base: nextBase }),
+    [repoScopeKey],
+  );
+  const [commitState, setCommitState] = useState<{
+    scopeKey: string;
+    commit: GitCommit;
+  }>();
+  const commit =
+    commitState?.scopeKey === repoScopeKey ? commitState.commit : undefined;
   const gitMode = [
     "branch",
     "commit",
@@ -160,23 +185,30 @@ export function ChangesView({
     if (restoreFocus) moreTrigger.current?.focus();
   }, []);
   const turnRevision = gitMode ? 0 : revision;
-  const infoContext = useRef("");
+  const lastRepoScopeKey = useRef(repoScopeKey);
   const selection = useRef(selected);
   selection.current = selected;
   useEffect(() => {
     select(scopedInitialPath ?? "");
   }, [scopedInitialPath]);
   useEffect(() => {
-    infoContext.current = "";
     userChoseScope.current = Boolean(requestId);
-    setInfo(undefined);
-    setBase("");
-    setCommit(undefined);
+    setInfoState(undefined);
+    setBaseState({ scopeKey: repoScopeKey, base: "" });
+    setCommitState(undefined);
     setScope((previous) => (previous === "commit" ? "branch" : previous));
     setSnapshot(undefined);
     select(scopedInitialPath ?? "");
     setError("");
   }, [hostId, project.id, project.path]);
+  useEffect(() => {
+    if (lastRepoScopeKey.current === repoScopeKey) return;
+    lastRepoScopeKey.current = repoScopeKey;
+    setScope((previous) => (previous === "commit" ? "branch" : previous));
+    setSnapshot(undefined);
+    select(scopedInitialPath ?? "");
+    setError("");
+  }, [repoScopeKey, scopedInitialPath]);
   useEffect(() => {
     if (!active || !gitMode || noGit) return;
     setLoading(true);
@@ -206,26 +238,46 @@ export function ChangesView({
             setSelectedRepo(matched.path);
             return;
           }
-        } else if (revision > 0 && repositories.length > 0 && repoArg) {
-          const latest = await readGitRepositories(hostId, project.id);
-          if (disposed) return;
-          if (latest.repositories.length) {
-            setDiscoveredRepos({
-              scopeKey: projectKey,
-              list: latest.repositories,
-              truncated: latest.truncated,
-              noGit: false,
-            });
+        } else if (
+          repoArg &&
+          (discoveredRepos?.scopeKey !== projectKey || revision > 0)
+        ) {
+          try {
+            const latest = await readGitRepositories(hostId, project.id);
+            if (disposed) return;
+            if (latest.repositories.length) {
+              const list = latest.repositories.some(
+                (repo) => repo.path === repoArg,
+              )
+                ? latest.repositories
+                : [
+                    ...latest.repositories,
+                    {
+                      path: repoArg,
+                      name: repoArg,
+                      kind: "repository" as const,
+                    },
+                  ];
+              setDiscoveredRepos({
+                scopeKey: projectKey,
+                list,
+                truncated: latest.truncated,
+                noGit: false,
+              });
+            }
+          } catch {
+            if (disposed) return;
           }
         }
-        infoContext.current = JSON.stringify([
-          hostId,
-          project.id,
-          project.path,
-          repoArg ?? ".",
-        ]);
-        setInfo({ ...response.info });
-        setBase((previous) => previous || response.info.default_base || "HEAD");
+        setInfoState({ scopeKey: repoScopeKey, info: { ...response.info } });
+        setBaseState((previous) =>
+          previous.scopeKey === repoScopeKey && previous.base
+            ? previous
+            : {
+                scopeKey: repoScopeKey,
+                base: response.info.default_base || "HEAD",
+              },
+        );
       } catch (cause) {
         if (disposed) return;
         if (!isNotGitRepositoryError(cause)) {
@@ -233,7 +285,19 @@ export function ChangesView({
           setLoading(false);
           return;
         }
-        const discovered = await readGitRepositories(hostId, project.id);
+        let discovered: {
+          repositories: GitRepository[];
+          truncated: boolean;
+        };
+        try {
+          discovered = await readGitRepositories(hostId, project.id);
+        } catch (scanCause) {
+          if (!disposed) {
+            setError(message(scanCause));
+            setLoading(false);
+          }
+          return;
+        }
         if (disposed) return;
         if (discovered.repositories.length > 0) {
           const matched = matchRepositoryForPath(
@@ -256,10 +320,24 @@ export function ChangesView({
             truncated: discovered.truncated,
             noGit: false,
           });
-          setInfo(undefined);
-          setBase("");
-          setCommit(undefined);
+          setInfoState(undefined);
+          setBaseState({ scopeKey: repoScopeKey, base: "" });
+          setCommitState(undefined);
           setSelectedRepo(chosen.path);
+          return;
+        }
+        if (discovered.truncated) {
+          setDiscoveredRepos({
+            scopeKey: projectKey,
+            list: [],
+            truncated: true,
+            noGit: false,
+          });
+          setInfoState(undefined);
+          setError(
+            "子目录过多，扫描范围内未定位到 Git 仓库；请直接打开对应子仓库目录。",
+          );
+          setLoading(false);
           return;
         }
         setDiscoveredRepos({
@@ -268,7 +346,7 @@ export function ChangesView({
           truncated: false,
           noGit: true,
         });
-        setInfo(undefined);
+        setInfoState(undefined);
         setLoading(false);
         if (sessionId && !userChoseScope.current) {
           setScope("task");
@@ -285,6 +363,7 @@ export function ChangesView({
     project.path,
     projectKey,
     repoArg,
+    repoScopeKey,
     noGit,
     revision,
     gitMode,
@@ -292,17 +371,7 @@ export function ChangesView({
   useEffect(() => {
     if (
       !active ||
-      (gitMode &&
-        (noGit ||
-          !info ||
-          infoContext.current !==
-            JSON.stringify([
-              hostId,
-              project.id,
-              project.path,
-              repoArg ?? ".",
-            ]) ||
-          (scope === "branch" && !base)))
+      (gitMode && (noGit || !info || (scope === "branch" && !base)))
     )
       return;
     if (scope === "commit" && !commit) return;
@@ -542,10 +611,9 @@ export function ChangesView({
         value={effectiveRepo ?? repositories[0].path}
         options={repositoryOptions}
         onChange={(nextRepo) => {
-          infoContext.current = "";
-          setInfo(undefined);
-          setBase("");
-          setCommit(undefined);
+          setInfoState(undefined);
+          setBaseState({ scopeKey: repoScopeKey, base: "" });
+          setCommitState(undefined);
           setScope((previous) => (previous === "commit" ? "branch" : previous));
           setSnapshot(undefined);
           setSelectedRepo(nextRepo);
@@ -569,10 +637,12 @@ export function ChangesView({
         scope={scope}
         commit={commit}
         disabled={!active}
-        choose={(value, commit) => {
+        choose={(value, nextCommit) => {
           userChoseScope.current = true;
           setScope(value);
-          if (commit) setCommit(commit);
+          if (nextCommit) {
+            setCommitState({ scopeKey: repoScopeKey, commit: nextCommit });
+          }
           select(value === "turn" ? (initialPath ?? "") : "");
         }}
       />

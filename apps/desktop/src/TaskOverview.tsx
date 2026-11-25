@@ -105,13 +105,24 @@ export function TaskOverview({
             if (!disposed) setChanges({ error: message(cause) });
             return;
           }
-          const { repositories } = await readGitRepositories(
-            hostId,
-            project.id,
-          );
+          let discovered: {
+            repositories: { path: string; name: string }[];
+            truncated: boolean;
+          };
+          try {
+            discovered = await readGitRepositories(hostId, project.id);
+          } catch (scanCause) {
+            if (!disposed) setChanges({ error: message(scanCause) });
+            return;
+          }
           if (disposed) return;
+          const { repositories, truncated } = discovered;
           if (!repositories.length) {
-            setChanges({ nonGit: true });
+            setChanges(
+              truncated
+                ? { error: "子目录过多，未能完成 Git 仓库扫描" }
+                : { nonGit: true },
+            );
             return;
           }
           const chosen =
