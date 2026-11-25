@@ -88,7 +88,7 @@ describe("readable activity projection", () => {
       ]).map((i) => i.type),
     ).toEqual(["tool", "assistant", "tool"]);
   });
-  it("leaves failures and pending approvals outside collapsed groups", () => {
+  it("folds tool failures into phase groups while keeping approvals at top level and marking unrecovered tail failures", () => {
     expect(
       activityTranscript([
         call(1, "a"),
@@ -99,10 +99,50 @@ describe("readable activity projection", () => {
         call(6, "c"),
       ]),
     ).toMatchObject([
-      { type: "tool", status: "completed" },
-      { type: "tool", status: "failed" },
+      {
+        type: "tools",
+        tools: [
+          { type: "tool", status: "completed" },
+          { type: "tool", status: "failed" },
+        ],
+      },
       { type: "event", value: { kind: "approval" } },
       { type: "tool", status: "pending" },
+    ]);
+
+    // Self-healed intermediate failure: unrecovered stays undefined
+    const selfHealed = activityTranscript([
+      call(1, "a"),
+      result(2, "a", true),
+      call(3, "b"),
+      result(4, "b", false),
+      e(5, { kind: "state", status: "completed", message: null }),
+    ]);
+    expect(selfHealed).toMatchObject([
+      {
+        type: "tools",
+        tools: [{ status: "failed" }, { status: "completed" }],
+      },
+    ]);
+    expect(
+      (selfHealed[0] as { unrecovered?: boolean }).unrecovered,
+    ).toBeUndefined();
+
+    // Turn halted directly on a trailing failed tool: unrecovered is true
+    const haltedTail = activityTranscript([
+      call(1, "a"),
+      result(2, "a", false),
+      call(3, "b"),
+      result(4, "b", true),
+      e(5, { kind: "state", status: "failed", message: "命令失败" }),
+    ]);
+    expect(haltedTail).toMatchObject([
+      {
+        type: "tools",
+        unrecovered: true,
+        tools: [{ status: "completed" }, { status: "failed" }],
+      },
+      { type: "event", value: { kind: "state", status: "failed" } },
     ]);
   });
   it("keeps unmatched results rather than attaching them to an unrelated call", () => {
@@ -228,6 +268,15 @@ describe("readable activity projection", () => {
     expect(toolGroupLabel([tools[0], { ...tools[2], status: "pending" }])).toBe(
       "正在探索文件并运行命令",
     );
+    expect(toolGroupLabel([tools[0], { ...tools[2], status: "failed" }])).toBe(
+      "探索了 1 个文件",
+    );
+    expect(
+      toolGroupLabel([
+        { ...tools[0], status: "failed" },
+        { ...tools[0], key: 99, status: "failed" },
+      ]),
+    ).toBe("尝试读取 2 次未通过");
     expect(toolDisplayParts(tools[1])).toEqual({
       verb: "已编辑",
       target: "…/src/b.ts",

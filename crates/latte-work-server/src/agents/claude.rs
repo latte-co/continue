@@ -929,10 +929,11 @@ impl Claude {
             }
             Some("assistant") => {
                 let streamed = self.streamed_children.remove(parent);
+                let synthetic_error = is_synthetic_api_error(m);
                 if let Some(blocks) = m["message"]["content"].as_array() {
                     for block in blocks {
                         match block["type"].as_str() {
-                            Some("text") if known && !streamed => {
+                            Some("text") if known && !streamed && !synthetic_error => {
                                 if let Some(text) = block["text"].as_str() {
                                     output.push(capture(EventKind::Text { text: text.into() }));
                                 }
@@ -1427,7 +1428,8 @@ impl Claude {
                 }
             }
             "assistant" => {
-                if m["parent_tool_use_id"].is_null() {
+                let synthetic_error = is_synthetic_api_error(&m);
+                if m["parent_tool_use_id"].is_null() && !synthetic_error {
                     let message = &m["message"];
                     let usage = &message["usage"];
                     let previous = self.context.clone();
@@ -1444,7 +1446,11 @@ impl Claude {
                 if let Some(blocks) = m["message"]["content"].as_array() {
                     for block in blocks {
                         match block["type"].as_str().unwrap_or_default() {
-                            "text" if !self.streamed && m["parent_tool_use_id"].is_null() => {
+                            "text"
+                                if !self.streamed
+                                    && m["parent_tool_use_id"].is_null()
+                                    && !synthetic_error =>
+                            {
                                 if let Some(text) = block["text"].as_str() {
                                     self.emitted_text = true;
                                     output
@@ -1672,6 +1678,9 @@ impl Claude {
         }
         Ok(output)
     }
+}
+fn is_synthetic_api_error(message: &Value) -> bool {
+    message["isApiErrorMessage"].as_bool().unwrap_or(false) || !message["error"].is_null()
 }
 fn native_task_id(message: &Value) -> Result<&str> {
     message["task_id"]
@@ -2330,6 +2339,66 @@ mod tests {
             encoded(&completed)[0]["request"]["description"],
             "导出 CSV\n\nAssistant reply:\n已导出 CSV 文件"
         );
+    }
+
+    #[test]
+    fn synthetic_api_error_assistant_frame_is_not_duplicated_as_reply_text() {
+        use super::*;
+        let raw_429 = "API Error: Request rejected (429) · [1302][您的账户已达到速率限制，请您控制请求频率][20261125162645e418428b3b184a3a]";
+        let mut agent = Claude {
+            phase: Phase::Running,
+            native_session_id: Some("native-1".into()),
+            ..Default::default()
+        };
+        let actions = agent
+            .decode(json!({
+                "type": "assistant",
+                "isApiErrorMessage": true,
+                "error": "rate_limit",
+                "message": {
+                    "model": "<synthetic>",
+                    "usage": { "input_tokens": 0, "output_tokens": 0 },
+                    "content": [{ "type": "text", "text": raw_429 }]
+                }
+            }))
+            .unwrap();
+        assert!(
+            actions.is_empty(),
+            "synthetic API error assistant frame must not emit duplicate Text or Usage"
+        );
+        let finished = agent
+            .decode(json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": true,
+                "result": raw_429
+            }))
+            .unwrap();
+        assert!(matches!(
+            &finished[..],
+            [Action::Finished { failed: true, message: Some(msg) }] if msg == raw_429
+        ));
+
+        // Non-error <synthetic> assistant output must still emit Text normally.
+        agent
+            .advance(Input::Start {
+                prompt: "查看用量"
+            })
+            .unwrap();
+        let local_reply = agent
+            .decode(json!({
+                "type": "assistant",
+                "isApiErrorMessage": false,
+                "message": {
+                    "model": "<synthetic>",
+                    "content": [{ "type": "text", "text": "Total cost: $0.00" }]
+                }
+            }))
+            .unwrap();
+        assert!(matches!(
+            &local_reply[..],
+            [Action::Event(EventKind::Text { text })] if text == "Total cost: $0.00"
+        ));
     }
 
     #[test]

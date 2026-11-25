@@ -5,6 +5,7 @@ import { MessageContent } from "./MessageContent";
 import { QuestionCard } from "./QuestionCard";
 import { ToolGroup, ToolRow } from "./ToolActivity";
 import { ToolImages } from "./ToolImages";
+import { TurnErrorRow } from "./TurnErrorRow";
 import { TurnTranscript } from "./TurnTranscript";
 import { UserMessage } from "./UserMessage";
 import { WorkingStatus } from "./WorkingStatus";
@@ -305,6 +306,7 @@ export function SideChatRecoveryDialog({
                   return (
                     <ToolRow
                       tool={item}
+                      projectPath={project?.path}
                       loadContext={{ hostId, sessionId: session.id }}
                     />
                   );
@@ -312,6 +314,8 @@ export function SideChatRecoveryDialog({
                   return (
                     <ToolGroup
                       tools={item.tools}
+                      unrecovered={item.unrecovered}
+                      projectPath={project?.path}
                       loadContext={{ hostId, sessionId: session.id }}
                     />
                   );
@@ -321,6 +325,12 @@ export function SideChatRecoveryDialog({
                 const value = item.value;
                 if (value.kind === "notice")
                   return <p className="notice">{value.text}</p>;
+                if (
+                  value.kind === "state" &&
+                  value.status === "failed" &&
+                  value.message
+                )
+                  return <TurnErrorRow message={value.message} />;
                 if (
                   value.kind === "state" &&
                   (value.message || value.status === "unknown")
@@ -337,6 +347,7 @@ export function SideChatRecoveryDialog({
                       resolved={item.resolved}
                       decision={item.decision}
                       tool={item.approvalTool}
+                      projectPath={project?.path}
                       loadContext={{ hostId, sessionId: session.id }}
                       disabled={!connected || busy || !running}
                       busy={busy}

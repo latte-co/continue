@@ -4763,7 +4763,7 @@ printf '%s' "$LATTE_TEST_VALUE"
     std::fs::write(
         &shell,
         format!(
-            "#!/bin/sh\nexport PATH='{}'\nexport LATTE_TEST_VALUE='shell-loaded'\necho startup-banner\nexec /bin/sh -c \"$2\"\n",
+            "#!/bin/sh\nexport PATH='{}'\nexport LATTE_TEST_VALUE='shell-loaded'\necho startup-banner\nwhile [ \"$#\" -gt 1 ]; do shift; done\nexec /bin/sh -c \"$1\"\n",
             shell_path.to_str().unwrap()
         ),
     )

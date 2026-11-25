@@ -271,7 +271,6 @@ export default function App() {
   return (
     <LinkHandling workspaceId={workbench.workspaceId}>
       <div
-        hidden={workbench.modal === "settings"}
         className={`app ${sidebarOpen ? "" : "sidebar-collapsed"}${panel && !skillsOpen ? " workspace-visible" : ""}${merged ? " workspace-merged" : ""}`}
         style={
           {
@@ -390,6 +389,11 @@ export default function App() {
                   file: path,
                 })
               }
+              openModelSettings={() => {
+                workbench.setSettingsReturnToProject(false);
+                workbench.setSettingsTab("providers");
+                workbench.setModal("settings");
+              }}
               drafts={drafts}
               agent={agent}
               agents={workbench.agents}
@@ -422,6 +426,7 @@ export default function App() {
               hasEarlierHistory={workbench.hasEarlierHistory}
               earlierHistoryLoading={workbench.earlierHistoryLoading}
               loadEarlierHistory={workbench.loadEarlierHistory}
+              autoFillTurnNavigator
               readingScope={workbench.readingScope}
               readingPositions={workbench.readingPositions}
               onHistoryReady={historyReady}
@@ -629,12 +634,7 @@ export default function App() {
         </StageIsland>
         <HostDialogs state={workbench} />
       </div>
-      <div hidden={workbench.modal !== "settings"}>
-        <SettingsPage
-          state={workbench}
-          active={workbench.modal === "settings"}
-        />
-      </div>
+      <SettingsPage state={workbench} active={workbench.modal === "settings"} />
       {workbench.standaloneSideChat && (
         <SideChatRecoveryDialog
           key={`${workbench.standaloneSideChat.hostId}:${workbench.standaloneSideChat.sideId}`}

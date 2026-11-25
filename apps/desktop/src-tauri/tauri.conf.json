@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Latte Work",
+  "productName": "Continue One",
   "version": "0.1.0",
   "identifier": "co.latte.work",
   "build": {
@@ -12,16 +12,16 @@
   "app": {
     "windows": [
       {
-        "title": "Latte Work",
+        "title": "Continue One",
         "dragDropEnabled": false,
         "width": 1440,
         "height": 940,
         "minWidth": 960,
         "minHeight": 640,
         "titleBarStyle": "Overlay",
-        "trafficLightPosition": { "x": 16, "y": 24 },
+        "trafficLightPosition": { "x": 16, "y": 27 },
         "hiddenTitle": true,
-        "backgroundColor": "#0e0e0e"
+        "backgroundColor": "#131313"
       }
     ],
     "security": {

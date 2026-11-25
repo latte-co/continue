@@ -111,7 +111,7 @@ export function Select({
     if (!open || !trigger.current) return;
     const box = trigger.current.getBoundingClientRect();
     const hasDescriptions = filtered.some((o) => !!o.description);
-    const optionHeight = isCompactMenu ? 36 : hasDescriptions ? 54 : 38;
+    const optionHeight = hasDescriptions ? 54 : isCompactMenu ? 36 : 38;
     const height = Math.min(
       320,
       Math.max(1, filtered.length) * optionHeight +
@@ -320,7 +320,7 @@ export function Select({
                   id={`${id}-${index}`}
                   tabIndex={-1}
                   key={o.value}
-                  title={isCompactMenu ? o.label : undefined}
+                  title={isCompactMenu && !o.description ? o.label : undefined}
                   className={[
                     active === index ? "highlighted" : "",
                     o.tone ?? "",

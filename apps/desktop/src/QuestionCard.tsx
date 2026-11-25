@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { ChevronRight, MessageCircleQuestion } from "lucide-react";
 import type { Event, QuestionAnswer } from "./protocol";
+import { Button, TextArea } from "./ui";
 
 type QuestionRequest = Extract<Event["event"], { kind: "question" }>;
 type Draft = { selected: number[]; custom: boolean; text: string };
@@ -50,7 +51,7 @@ export function QuestionCard({
     return (
       <details className="question-result activity-row">
         <summary>
-          <MessageCircleQuestion size={16} />
+          <MessageCircleQuestion size={14} className="activity-icon" />
           <span className="activity-label">回答问题</span>
           <span className="activity-status">
             {!resolved
@@ -61,7 +62,7 @@ export function QuestionCard({
                   ? "已跳过"
                   : "已回答"}
           </span>
-          <ChevronRight size={14} className="activity-chevron" />
+          <ChevronRight size={13} className="activity-chevron" />
         </summary>
         <div className="question-record">
           {request.questions.map((question) => {
@@ -154,10 +155,11 @@ export function QuestionCard({
             </label>
           </div>
           {draft(question.id).custom && (
-            <textarea
+            <TextArea
               aria-label={`${question.header || question.text}的自填回答`}
               placeholder="填写回答…"
               maxLength={8000}
+              rows={3}
               value={draft(question.id).text}
               onChange={(event) =>
                 update(question.id, (old) => ({
@@ -170,21 +172,23 @@ export function QuestionCard({
         </fieldset>
       ))}
       <div className="approval-actions">
-        <button
-          type="button"
-          className="secondary"
+        <Button
+          variant="subtle"
+          size="md"
           disabled={disabled || busy}
           onClick={() => onAnswer(null)}
         >
           跳过
-        </button>
-        <button
+        </Button>
+        <Button
           type="submit"
-          className="primary"
+          variant="primary"
+          size="md"
+          busy={busy}
           disabled={disabled || busy || !valid}
         >
           {busy ? "正在提交…" : "提交回答"}
-        </button>
+        </Button>
       </div>
     </form>
   );

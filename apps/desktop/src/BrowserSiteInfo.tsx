@@ -14,7 +14,8 @@ import {
 } from "lucide-react";
 import { SiteIcon } from "./SiteIcon";
 import { webLink } from "./browserLinks";
-import { isHiddenOrInert, Modal, useOverlayLayer } from "./Modal";
+import { isHiddenOrInert, useOverlayLayer } from "./Modal";
+import { Button, Dialog } from "./ui";
 import { message } from "./api";
 
 export type SiteInfo = {
@@ -409,46 +410,47 @@ export function BrowserSiteInfo({
                 </div>
               )}
             </div>
-            {confirm && data && (
-              <div
-                className="modal-backdrop browser-site-confirm-backdrop"
-                onKeyDown={(event) => {
-                  if (event.key === "Escape") {
-                    event.stopPropagation();
-                    if (!busy) setConfirm(false);
-                  }
-                }}
-              >
-                <Modal
-                  className="modal browser-site-confirm"
-                  aria-label="清除网站数据"
-                  onPointerDown={(event) => event.stopPropagation()}
-                >
-                  <h2>清除网站数据？</h2>
-                  <p>
-                    将清除 {data.domains.join("、")} 的 Cookie
-                    和网站数据，可能退出登录，并刷新此页面。该域名下的子站点也会受到影响。
-                  </p>
-                  <footer>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => setConfirm(false)}
-                    >
-                      取消
-                    </button>
-                    <button
-                      type="button"
-                      className="primary"
-                      disabled={busy}
-                      onClick={() => void clearData()}
-                    >
-                      {busy ? "正在清除…" : "清除并刷新"}
-                    </button>
-                  </footer>
-                </Modal>
-              </div>
-            )}
+            <Dialog
+              open={Boolean(confirm && data)}
+              onClose={() => {
+                if (!busy) setConfirm(false);
+              }}
+              busy={busy}
+              size="sm"
+              hideCloseButton
+              ariaLabel="清除网站数据"
+              title="清除网站数据？"
+              backdropClassName="browser-site-confirm-backdrop"
+              className="browser-site-confirm"
+              footer={
+                <>
+                  <Button
+                    variant="subtle"
+                    size="md"
+                    disabled={busy}
+                    onClick={() => setConfirm(false)}
+                  >
+                    取消
+                  </Button>
+                  <Button
+                    variant="danger"
+                    size="md"
+                    busy={busy}
+                    disabled={busy}
+                    onClick={() => void clearData()}
+                  >
+                    {busy ? "正在清除…" : "清除并刷新"}
+                  </Button>
+                </>
+              }
+            >
+              {data && (
+                <p className="ui-field-hint" style={{ margin: 0 }}>
+                  将清除 {data.domains.join("、")} 的 Cookie
+                  和网站数据，可能退出登录，并刷新此页面。该域名下的子站点也会受到影响。
+                </p>
+              )}
+            </Dialog>
           </>,
           document.body,
         )}

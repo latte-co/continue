@@ -1,6 +1,7 @@
 import { copyText } from "./clipboard";
 import { AppearancePreview } from "./AppearancePreview";
 import { MessageContent } from "./MessageContent";
+import { SettingsPane } from "./SettingsPane";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { Check, Copy, RotateCcw, Upload } from "lucide-react";
 import { useAppearance } from "./AppearanceProvider";
@@ -22,8 +23,6 @@ import {
   CardList,
   ColorField,
   NoticeBanner,
-  PageContainer,
-  PageHeader,
   Section,
   SectionHeader,
   Segmented,
@@ -89,7 +88,13 @@ function ColorControl({
   );
 }
 
-export function AppearanceSettings() {
+export function AppearanceSettings({
+  onClose,
+  closeDisabled = false,
+}: {
+  onClose?: () => void;
+  closeDisabled?: boolean;
+} = {}) {
   const { settings, kind, error, update } = useAppearance();
   const [editing, setEditing] = useState<ThemeKind>(kind);
   const [transferring, setTransferring] = useState(false);
@@ -125,12 +130,13 @@ export function AppearanceSettings() {
   }
 
   return (
-    <PageContainer className="settings-panel-content appearance-settings">
-      <PageHeader
-        title="外观"
-        description="让工作台适合你的阅读习惯。修改即时生效，并保存在此设备。"
-      />
-
+    <SettingsPane
+      title="外观"
+      description="让工作台适合你的阅读习惯。修改即时生效，并保存在此设备。"
+      className="appearance-settings"
+      onClose={onClose}
+      closeDisabled={closeDisabled || transferring}
+    >
       <Section>
         <SectionHeader title="主题" />
         <div className="appearance-modes" role="group" aria-label="主题模式">
@@ -263,8 +269,9 @@ export function AppearanceSettings() {
           </Button>
           <Select
             label="主题预设"
+            variant="ghost"
             size="sm"
-            minMenuWidth={140}
+            minMenuWidth={150}
             align="end"
             value={preset}
             options={[
@@ -306,8 +313,10 @@ export function AppearanceSettings() {
           <SettingRow key={font} label={label}>
             <Select
               label={label}
+              variant="ghost"
               size="sm"
-              minMenuWidth={160}
+              minMenuWidth={168}
+              align="end"
               value={theme[font]}
               options={
                 font === "codeFont"
@@ -327,8 +336,9 @@ export function AppearanceSettings() {
             />
             <Select
               label={`${label}字重`}
+              variant="ghost"
               size="sm"
-              minMenuWidth={100}
+              minMenuWidth={112}
               align="end"
               value={theme[weight]}
               options={weights}
@@ -417,6 +427,6 @@ export function AppearanceSettings() {
       <p role="status" className="appearance-notice">
         {notice}
       </p>
-    </PageContainer>
+    </SettingsPane>
   );
 }

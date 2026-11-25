@@ -32,5 +32,5 @@ if ! cmp -s "$requirements" "$venv/requirements.installed"; then
   cp "$requirements" "$venv/requirements.installed"
 fi
 exec "$venv/bin/python" -I scripts/package-dmg.py \
-  --app "$target_dir/release/bundle/macos/Latte Work.app" \
+  --app "$target_dir/release/bundle/macos/Continue One.app" \
   --output-dir "$target_dir/release/bundle/dmg" "$@"

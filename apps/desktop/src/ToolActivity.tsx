@@ -7,10 +7,11 @@ import {
   FilePenLine,
   FileSearch,
   FileText,
-  Layers,
+  Folder,
   LoaderCircle,
   Search,
   Terminal,
+  Wrench,
 } from "lucide-react";
 import {
   diffStringLines,
@@ -82,7 +83,7 @@ function ToolIcon({ tool }: { tool: ToolActivity }) {
   if (kind === "read") return <FileText size={14} className="activity-icon" />;
   if (["task", "agent", "subagent"].includes(kind))
     return <Bot size={14} className="activity-icon" />;
-  return <Layers size={14} className="activity-icon" />;
+  return <Wrench size={14} className="activity-icon" />;
 }
 
 function GroupIcon({
@@ -93,14 +94,16 @@ function GroupIcon({
   pending: boolean;
 }) {
   if (pending) return <LoaderCircle size={14} className="spin activity-icon" />;
-  const kinds = new Set(tools.map((t) => t.name.toLowerCase()));
+  const succeeded = tools.filter((t) => t.status === "completed");
+  const basis = succeeded.length > 0 ? succeeded : tools;
+  const kinds = new Set(basis.map((t) => t.name.toLowerCase()));
   if (kinds.has("edit") || kinds.has("multiedit") || kinds.has("write"))
     return <FilePenLine size={14} className="activity-icon" />;
   if (kinds.size === 1 && kinds.has("bash"))
     return <Terminal size={14} className="activity-icon" />;
   if ([...kinds].every((k) => k === "read" || k === "glob" || k === "grep"))
     return <FileSearch size={14} className="activity-icon" />;
-  return <Layers size={14} className="activity-icon" />;
+  return <Wrench size={14} className="activity-icon" />;
 }
 
 function Status({
@@ -328,14 +331,82 @@ function buildEditPreviewLines(
   };
 }
 
-function ToolDetailBody({
+function normalizeDirectoryPath(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  const unified = trimmed.replace(/\\/g, "/");
+  if (unified === "/" || /^[A-Za-z]:\/$/.test(unified)) return unified;
+  return unified.replace(/\/+$/, "");
+}
+
+/**
+ * Formats a Bash working directory for the header bar, returning `null` when
+ * omitted or identical to `projectPath` so routine root commands stay quiet.
+ */
+export function formatCommandDirectory(
+  rawCwd: string,
+  rawProjectPath?: string,
+): { display: string; full: string } | null {
+  const full = rawCwd.trim();
+  const cwd = normalizeDirectoryPath(full);
+  if (!cwd || cwd === "." || cwd === "./") return null;
+
+  const root = rawProjectPath ? normalizeDirectoryPath(rawProjectPath) : "";
+  if (root) {
+    if (cwd === root) return null;
+    const prefix = root.endsWith("/") ? root : `${root}/`;
+    if (cwd.startsWith(prefix)) {
+      return { display: cwd.slice(prefix.length), full };
+    }
+  }
+
+  if (
+    !cwd.startsWith("/") &&
+    !cwd.startsWith("~") &&
+    !/^[A-Za-z]:\//.test(cwd)
+  ) {
+    return { display: cwd.replace(/^\.\//, ""), full };
+  }
+
+  if (cwd.startsWith("~/")) {
+    const parts = cwd.slice(2).split("/").filter(Boolean);
+    if (parts.length > 3) {
+      return { display: `~/…/${parts.slice(-2).join("/")}`, full };
+    }
+    return { display: cwd, full };
+  }
+
+  const driveMatch = cwd.match(/^([A-Za-z]:)\/(.*)$/);
+  if (driveMatch) {
+    const [, drive, rest] = driveMatch;
+    const parts = rest.split("/").filter(Boolean);
+    if (parts.length > 3) {
+      return { display: `${drive}/…/${parts.slice(-2).join("/")}`, full };
+    }
+    return { display: cwd, full };
+  }
+
+  const parts = cwd.split("/").filter(Boolean);
+  if (parts.length > 3) {
+    return { display: `/${parts[0]}/…/${parts.slice(-2).join("/")}`, full };
+  }
+  return { display: cwd, full };
+}
+
+export function ToolDetailBody({
   tool,
   loadContext,
+  projectPath,
   onOpenSubagents,
+  inputOnly = false,
+  hideToggles = false,
 }: {
   tool: ToolActivity;
   loadContext?: ToolLoadContext;
+  projectPath?: string;
   onOpenSubagents?: () => void;
+  inputOnly?: boolean;
+  hideToggles?: boolean;
 }) {
   const [showFullInput, setShowFullInput] = useState(false);
   const [showResult, setShowResult] = useState(false);
@@ -375,14 +446,16 @@ function ToolDetailBody({
             <pre>{prompt}</pre>
           </div>
         )}
-        <div className="activity-code-body">
-          <FullToolOutput
-            output={tool.output}
-            load={tool.load}
-            loadContext={loadContext}
-            pending={tool.status === "pending"}
-          />
-        </div>
+        {!inputOnly && (
+          <div className="activity-code-body">
+            <FullToolOutput
+              output={tool.output}
+              load={tool.load}
+              loadContext={loadContext}
+              pending={tool.status === "pending"}
+            />
+          </div>
+        )}
       </div>
     );
   }
@@ -390,28 +463,41 @@ function ToolDetailBody({
   if (kind === "bash") {
     const command = strField(tool.input, "command");
     const cwd = strField(tool.input, "cwd") || strField(tool.input, "workdir");
+    const directory = formatCommandDirectory(cwd, projectPath);
     return (
       <div className="activity-well activity-well--terminal">
+        {directory && (
+          <div className="activity-well-header">
+            <span
+              className="activity-well-path activity-terminal-cwd"
+              title={directory.full}
+            >
+              <Folder size={12.5} aria-hidden="true" />
+              <span>{directory.display}</span>
+            </span>
+          </div>
+        )}
         {command && (
           <div className="activity-terminal-prompt">
             <span className="activity-prompt-sigil" aria-hidden="true">
-              {cwd ? `${cwd.split("/").filter(Boolean).at(-1)} $` : "$"}
+              $
             </span>
             <code>{command}</code>
           </div>
         )}
-        <div
-          className={`activity-terminal-stdout${
-            tool.status === "failed" ? " is-error" : ""
-          }`}
-        >
-          <FullToolOutput
-            output={tool.output}
-            load={tool.load}
-            loadContext={loadContext}
-            pending={tool.status === "pending"}
-          />
-        </div>
+        {!inputOnly && (
+          <div className="activity-terminal-stdout">
+            {tool.status === "failed" && tool.output !== undefined && (
+              <div className="activity-output-label">错误输出</div>
+            )}
+            <FullToolOutput
+              output={tool.output}
+              load={tool.load}
+              loadContext={loadContext}
+              pending={tool.status === "pending"}
+            />
+          </div>
+        )}
       </div>
     );
   }
@@ -454,15 +540,20 @@ function ToolDetailBody({
           ),
         );
       const canToggleFullInput =
-        isEditKind ||
-        preview.truncated > 0 ||
-        hasExtraWriteFields ||
-        showFullInput;
+        !inputOnly &&
+        !hideToggles &&
+        (isEditKind ||
+          preview.truncated > 0 ||
+          hasExtraWriteFields ||
+          showFullInput);
       const immediateOutput =
-        tool.status === "failed" ||
-        tool.load !== undefined ||
-        tool.status === "pending";
+        !inputOnly &&
+        (tool.status === "failed" ||
+          tool.load !== undefined ||
+          tool.status === "pending");
       const hasSavedResult =
+        !inputOnly &&
+        !hideToggles &&
         !immediateOutput &&
         tool.output !== undefined &&
         outputText(tool.output).trim().length > 0;
@@ -601,14 +692,16 @@ function ToolDetailBody({
             {meta && <span className="activity-well-meta">{meta}</span>}
           </div>
         )}
-        <div className="activity-code-body">
-          <FullToolOutput
-            output={tool.output}
-            load={tool.load}
-            loadContext={loadContext}
-            pending={tool.status === "pending"}
-          />
-        </div>
+        {!inputOnly && (
+          <div className="activity-code-body">
+            <FullToolOutput
+              output={tool.output}
+              load={tool.load}
+              loadContext={loadContext}
+              pending={tool.status === "pending"}
+            />
+          </div>
+        )}
       </div>
     );
   }
@@ -630,19 +723,21 @@ function ToolDetailBody({
           <pre>{outputText(tool.input!)}</pre>
         </div>
       )}
-      <div className="activity-generic-section">
-        {hasStructuredInput && (
-          <div className="activity-output-label">
-            {tool.status === "failed" ? "错误输出" : "结果"}
-          </div>
-        )}
-        <FullToolOutput
-          output={tool.output}
-          load={tool.load}
-          loadContext={loadContext}
-          pending={tool.status === "pending"}
-        />
-      </div>
+      {!inputOnly && (
+        <div className="activity-generic-section">
+          {hasStructuredInput && (
+            <div className="activity-output-label">
+              {tool.status === "failed" ? "错误输出" : "结果"}
+            </div>
+          )}
+          <FullToolOutput
+            output={tool.output}
+            load={tool.load}
+            loadContext={loadContext}
+            pending={tool.status === "pending"}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -650,10 +745,12 @@ function ToolDetailBody({
 export function ToolRow({
   tool,
   loadContext,
+  projectPath,
   onOpenSubagents,
 }: {
   tool: ToolActivity;
   loadContext?: ToolLoadContext;
+  projectPath?: string;
   onOpenSubagents?: () => void;
 }) {
   const label = toolLabel(tool).replace(/\s+/g, " ");
@@ -691,6 +788,7 @@ export function ToolRow({
         <ToolDetailBody
           tool={tool}
           loadContext={loadContext}
+          projectPath={projectPath}
           onOpenSubagents={onOpenSubagents}
         />
       </div>
@@ -700,28 +798,59 @@ export function ToolRow({
 
 export function ToolGroup({
   tools,
+  unrecovered = false,
   loadContext,
+  projectPath,
   onOpenSubagents,
 }: {
   tools: ToolActivity[];
+  unrecovered?: boolean;
   loadContext?: ToolLoadContext;
+  projectPath?: string;
   onOpenSubagents?: () => void;
 }) {
-  const status = tools.some((t) => t.status === "pending")
+  const pending = tools.some((t) => t.status === "pending");
+  const failedCount = tools.filter((t) => t.status === "failed").length;
+  const allFailed =
+    !pending && tools.length > 0 && failedCount === tools.length;
+  const escalateFailure =
+    !pending &&
+    (allFailed || (unrecovered && tools.at(-1)?.status === "failed"));
+  const status: ToolActivity["status"] = pending
     ? "pending"
-    : tools.some((t) => t.status === "unconfirmed")
-      ? "unconfirmed"
-      : "completed";
+    : escalateFailure
+      ? "failed"
+      : tools.some((t) => t.status === "unconfirmed")
+        ? "unconfirmed"
+        : "completed";
+  const showStepCount = tools.length > 3;
+  const showMutedFailedCount = !pending && failedCount > 0 && !allFailed;
+  const countLabel =
+    showStepCount && showMutedFailedCount
+      ? `· ${tools.length} 步（${failedCount} 项失败）`
+      : showStepCount
+        ? `· ${tools.length} 步`
+        : showMutedFailedCount
+          ? `· ${failedCount} 项失败`
+          : null;
+
   return (
     <details className="activity-group" data-status={status}>
       <summary>
-        <GroupIcon tools={tools} pending={status === "pending"} />
+        {escalateFailure ? (
+          <CircleAlert
+            size={14}
+            className="activity-icon activity-icon--danger"
+          />
+        ) : (
+          <GroupIcon tools={tools} pending={pending} />
+        )}
         <span className="activity-label">
           <span className="activity-group-summary">
             {toolGroupLabel(tools)}
           </span>
-          {tools.length > 3 && (
-            <span className="activity-group-count">· {tools.length} 步</span>
+          {countLabel && (
+            <span className="activity-group-count">{countLabel}</span>
           )}
         </span>
         <Status status={status} hidePending />
@@ -733,6 +862,7 @@ export function ToolGroup({
             key={tool.key}
             tool={tool}
             loadContext={loadContext}
+            projectPath={projectPath}
             onOpenSubagents={onOpenSubagents}
           />
         ))}

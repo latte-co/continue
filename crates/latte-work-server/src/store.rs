@@ -2501,7 +2501,7 @@ impl Store {
             // as bounded heads, so a huge stored row cannot monopolize the
             // window or inflate a response past one frame.
             let size = wire + if joins { 0 } else { id.len() + 96 };
-            if turns == 2
+            if turns == 12
                 || count == 16384
                 || (!joins && events.len() == 128)
                 || (bytes + size > 256 * 1024 && !events.is_empty())

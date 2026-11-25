@@ -245,7 +245,7 @@ export function SkillsSettings({
             />
             <p className="skills-scope-note" style={{ margin: "2px 0 6px" }}>
               {scope === "platform"
-                ? "随 Latte Work 提供，仅注入 Work 启动的 Agent。"
+                ? "随 Continue One 提供，仅注入当前应用启动的 Agent。"
                 : "当前主机的全局技能；文件操作会影响该主机上的其他 Agent。"}
             </p>
             <div

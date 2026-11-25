@@ -752,6 +752,7 @@ function WorkspacePage({
                 taskId={tab.kind === "subagent" ? tab.taskId : undefined}
                 hostId={hostId}
                 sessionId={sessionId}
+                projectPath={project?.path}
                 connected={connected}
                 active={
                   active &&

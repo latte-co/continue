@@ -2,6 +2,7 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import type { ContextUsage, Event, TurnUsage } from "./protocol";
+import { IconButton } from "./ui";
 
 export function usageSnapshot(events: Event[], sessionId?: string) {
   let context: ContextUsage | null = null;
@@ -170,17 +171,17 @@ export function UsageIndicator({
           >
             <header>
               <strong>上下文与用量</strong>
-              <button
-                type="button"
+              <IconButton
                 ref={close}
-                aria-label="关闭用量统计"
+                size="xs"
+                label="关闭用量统计"
                 onClick={() => {
                   setOpen(false);
                   button.current?.focus();
                 }}
               >
-                <X size={16} />
-              </button>
+                <X size={14} />
+              </IconButton>
             </header>
             <section>
               <h3>

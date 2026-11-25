@@ -550,3 +550,83 @@ it.each(["/tmp/report.command", "report.md", "https://example.com/report"])(
     expect(screen.queryByRole("dialog")).toBeNull();
   },
 );
+
+describe("MessageContent GFM tables and inline <br> formatting", () => {
+  it("wraps GFM tables in .markdown-table-wrap, sets CJK column min-width floors, and splits <br> cell items cleanly", () => {
+    const openFile = vi.fn();
+    const markdown = [
+      "| # | 推导层级 | 在 Kubebuilder 仓内直接查到的证据 | 对应到 FC-050 的 Rubric 转化 |",
+      "| --- | --- | --- | --- |",
+      "| 1 | ① 仓库原生 PR 准入与 CI 门禁 | `AGENTS.md`、`Makefile` | 解释工程约束：<br>1. 保留旧 `values.yaml`<br/>2. 统一 `manager.enabled`<br />3. 字面代码块 `<br>` 不转义 |",
+    ].join("\n");
+
+    const { container } = render(
+      <MessageActionsProvider
+        value={{ openFile, localHost: true, projectRoot: "/repo" }}
+      >
+        <MessageContent text={markdown} />
+      </MessageActionsProvider>,
+    );
+
+    const wrap = container.querySelector(".markdown-table-wrap");
+    expect(wrap).toBeTruthy();
+
+    const headers = [
+      ...container.querySelectorAll("thead th"),
+    ] as HTMLElement[];
+    expect(headers).toHaveLength(4);
+    expect(headers[0].style.whiteSpace).toBe("nowrap");
+    expect(headers[1].style.whiteSpace).toBe("nowrap");
+    expect(headers[2].style.minWidth).toBe("9.5rem");
+
+    const cells = [...container.querySelectorAll("tbody td")] as HTMLElement[];
+    expect(cells[0].style.minWidth).toBe("");
+    expect(cells[1].style.minWidth).toBe("9.5rem");
+
+    // <br>, <br/>, and <br /> inside the 4th column split into 4 structured blocks without literal "<br>" leakage.
+    const blocks = cells[3].querySelectorAll(".markdown-cell-block");
+    expect(blocks).toHaveLength(4);
+    expect(blocks[0].textContent).toBe("解释工程约束：");
+    expect(blocks[1].textContent).toContain("1. 保留旧 values.yaml");
+    expect(blocks[2].textContent).toContain("2. 统一 manager.enabled");
+    // Inline code `<br>` stays literal `<code><br></code>` inside the 4th block!
+    expect(blocks[3].querySelector("code")?.textContent).toBe("<br>");
+
+    // Interactive project file chips inside table cells remain clickable.
+    const agentsChip = screen.getAllByRole("button", {
+      name: "在工作区中打开，右键查看更多操作",
+    })[0];
+    fireEvent.click(agentsChip);
+    expect(openFile).toHaveBeenCalledWith("AGENTS.md");
+  });
+
+  it("never executes or renders arbitrary raw HTML tags outside <br>", () => {
+    const { container } = render(
+      <MessageContent
+        text={"安全检查：<script>window.__bad=1</script> 与第一行<br>第二行"}
+      />,
+    );
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.querySelectorAll("br")).toHaveLength(1);
+    expect(container.textContent).toContain("<script>window.__bad=1</script>");
+  });
+
+  it("keeps narrow metadata columns compact on 6-column Rubric tables so trailing columns are not pushed off-screen", () => {
+    const rubric = [
+      "| 组别 | Criterion ID | 执行器 | 门控 | 权重 | 验证判据说明 |",
+      "| --- | --- | --- | --- | --- | --- |",
+      "| A. 核心行为与兼容（50） | `values_toggle_convention_and_default` | `classical`（共享执行） | Blocker | 8 | 验证默认开启并兼容旧键 |",
+    ].join("\n");
+    const { container } = render(<MessageContent text={rubric} />);
+    const table = container.querySelector("table") as HTMLElement;
+    expect(table.dataset.denseCols).toBe("true");
+    const cells = [...container.querySelectorAll("tbody td")] as HTMLElement[];
+    // ASCII/numeric columns (`Criterion ID`, `Blocker`, `8`) do not receive inflated minWidth floors.
+    expect(cells[1].style.minWidth).toBe("");
+    expect(cells[3].style.minWidth).toBe("");
+    expect(cells[4].style.minWidth).toBe("");
+    // CJK columns receive compact dense-mode floors (`6rem`).
+    expect(cells[0].style.minWidth).toBe("6rem");
+    expect(cells[2].style.minWidth).toBe("6rem");
+  });
+});

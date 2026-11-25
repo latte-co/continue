@@ -27,6 +27,8 @@ export type ActivityItem =
       key: number;
       type: "tools";
       tools: ToolActivity[];
+      /** True when the turn halted in failure/stop immediately on this group's trailing failed tool. */
+      unrecovered?: boolean;
     };
 
 /** Candidates for a confirmed completed process, never a live-turn classifier. */
@@ -193,19 +195,23 @@ export function activityTranscript(
     }
   }
   if (terminalIndex < terminal.length) finish();
+  const GROUPABLE_STATUSES: ToolActivity["status"][] = [
+    "pending",
+    "completed",
+    "failed",
+    "unconfirmed",
+  ];
   const grouped: ActivityItem[] = [];
   for (const row of rows) {
     if (row.type === "tool" && attached.has(row)) continue;
     const last = grouped.at(-1);
-    // Failures and approval controls remain visible outside collapsed groups.
-    if (
-      row.type === "tool" &&
-      ["pending", "completed", "unconfirmed"].includes(row.status)
-    ) {
+    // Approval / waiting / denied / expired controls remain visible at top level;
+    // ordinary tool failures stay folded inside their phase cluster.
+    if (row.type === "tool" && GROUPABLE_STATUSES.includes(row.status)) {
       if (last?.type === "tools") last.tools.push(row);
       else if (
         last?.type === "tool" &&
-        ["pending", "completed", "unconfirmed"].includes(last.status)
+        GROUPABLE_STATUSES.includes(last.status)
       )
         grouped.splice(-1, 1, {
           key: last.key,
@@ -215,6 +221,51 @@ export function activityTranscript(
       else grouped.push(row);
     } else grouped.push(row);
   }
+
+  // Mark a trailing tool group `unrecovered` when its turn ended in `failed` or
+  // `stopped` directly on a failed tool without any subsequent recovery step.
+  let turnStart = 0;
+  while (turnStart < grouped.length) {
+    let turnEnd = turnStart + 1;
+    while (turnEnd < grouped.length) {
+      const candidate = grouped[turnEnd];
+      if (candidate.type === "user" && !candidate.handoff) break;
+      turnEnd++;
+    }
+    let halted = false;
+    let lastSubstantive: ActivityItem | undefined;
+    for (let i = turnStart; i < turnEnd; i++) {
+      const item = grouped[i];
+      if (item.type === "event") {
+        if (
+          item.value.kind === "state" &&
+          (item.value.status === "failed" || item.value.status === "stopped")
+        ) {
+          halted = true;
+        } else if (
+          item.value.kind === "approval" ||
+          item.value.kind === "question"
+        ) {
+          lastSubstantive = item;
+        }
+      } else if (
+        item.type === "assistant" ||
+        item.type === "tool" ||
+        item.type === "tools"
+      ) {
+        lastSubstantive = item;
+      }
+    }
+    if (
+      halted &&
+      lastSubstantive?.type === "tools" &&
+      lastSubstantive.tools.at(-1)?.status === "failed"
+    ) {
+      lastSubstantive.unrecovered = true;
+    }
+    turnStart = turnEnd;
+  }
+
   return grouped;
 }
 
@@ -808,7 +859,10 @@ export function toolDisplayParts(
           }
         : { verb: "写入文件", target: "", diff: toolInputDiffStat(tool) };
     case "bash":
-      if (description) return { verb: "运行", target: description };
+      if (description) {
+        const cleaned = description.replace(/^运行\s*/, "");
+        return { verb: "运行", target: cleaned || description };
+      }
       if (command)
         return {
           verb: "运行",
@@ -980,15 +1034,25 @@ function summarizeUnconfirmedTools(tools: ToolActivity[]): string {
 export function toolGroupLabel(tools: ToolActivity[]): string {
   const pending = tools.some((t) => t.status === "pending");
   if (pending) {
-    return `正在${summarizeCompletedTools(tools).replace(/了/g, "")}`;
+    const active = tools.filter((t) => t.status !== "failed");
+    return `正在${summarizeCompletedTools(active.length ? active : tools).replace(/了/g, "")}`;
   }
   const completed = tools.filter((t) => t.status === "completed");
-  const unconfirmed = tools.filter((t) => t.status !== "completed");
-  if (unconfirmed.length === 0) {
-    return summarizeCompletedTools(completed);
+  const failed = tools.filter((t) => t.status === "failed");
+  const unconfirmed = tools.filter((t) => t.status === "unconfirmed");
+
+  if (completed.length > 0) {
+    const base = summarizeCompletedTools(completed);
+    if (unconfirmed.length > 0) {
+      return `${base} · 另有${summarizeUnconfirmedTools(unconfirmed)}待确认`;
+    }
+    return base;
   }
-  if (completed.length === 0) {
-    return `发起${summarizeUnconfirmedTools(unconfirmed)}`;
+  if (failed.length > 0 && unconfirmed.length === 0) {
+    return `尝试${summarizeUnconfirmedTools(failed)}未通过`;
   }
-  return `${summarizeCompletedTools(completed)} · 另有${summarizeUnconfirmedTools(unconfirmed)}待确认`;
+  if (failed.length > 0 && unconfirmed.length > 0) {
+    return `尝试${summarizeUnconfirmedTools(failed)}未通过 · 另有${summarizeUnconfirmedTools(unconfirmed)}待确认`;
+  }
+  return `发起${summarizeUnconfirmedTools(unconfirmed)}`;
 }

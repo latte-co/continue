@@ -2654,6 +2654,15 @@ it("continues filling history until upward scrolling can leave the follow thresh
   fireEvent.scroll(el);
   expect(load).toHaveBeenCalledTimes(3);
   expect(screen.getByRole("button", { name: "回到最新" })).toBeTruthy();
+  // Normal feed scrolling hides the manual load button and auto-chains if still near top
+  expect(screen.queryByRole("button", { name: "加载之前的记录" })).toBeNull();
+  height = 600;
+  rows = [historyRow(50), ...rows];
+  view.rerender(
+    <Conversation {...p} events={rows} loadEarlierHistory={load} />,
+  );
+  // scrollTop became 110 (< 320px prefetch zone), so next screen prefetches automatically
+  await waitFor(() => expect(load).toHaveBeenCalledTimes(4));
 });
 
 it.each([

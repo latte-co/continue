@@ -259,7 +259,10 @@ it.each([
         onBusy={() => {}}
       />,
     );
-    const save = await screen.findByRole("button", { name: "保存关联" });
+    fireEvent.click(
+      await screen.findByRole("button", { name: `编辑 ${name}` }),
+    );
+    const save = screen.getByRole("button", { name: "保存" });
     expect((save as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(
       screen.getByRole("combobox", { name: `${name} 关联 Provider` }),

@@ -284,3 +284,124 @@ it("keeps keyboard previews visible when the marker list itself scrolls", async 
   expect(screen.getByRole("tooltip").textContent).toContain("第三答");
   expect(navigated).not.toHaveBeenCalled();
 });
+
+it("keeps strictly one current marker and replaces the indicator node when scrolling across turns", async () => {
+  const view = mount();
+  await waitFor(() =>
+    expect(marker("第一题").getAttribute("aria-current")).toBe("location"),
+  );
+  const thirdBefore = marker("第三题").querySelector("span")!;
+  scroll.scrollTop = 1200;
+  fireEvent.scroll(scroll);
+  await waitFor(() =>
+    expect(marker("第三题").getAttribute("aria-current")).toBe("location"),
+  );
+  const thirdActive = marker("第三题").querySelector("span")!;
+  expect(thirdActive).not.toBe(thirdBefore);
+  expect(
+    view.container.querySelectorAll(
+      '.turn-navigator-list button[aria-current="location"]',
+    ),
+  ).toHaveLength(1);
+
+  scroll.scrollTop = 520;
+  fireEvent.scroll(scroll);
+  await waitFor(() =>
+    expect(marker("第二题").getAttribute("aria-current")).toBe("location"),
+  );
+  expect(marker("第三题").querySelector("span")).not.toBe(thirdActive);
+  expect(
+    view.container.querySelectorAll(
+      '.turn-navigator-list button[aria-current="location"]',
+    ),
+  ).toHaveLength(1);
+});
+
+it("displays 12 turns per page, flips pages via ^ / v without scrolling the transcript, and follows scroll back", async () => {
+  const manyEvents: Event[] = [];
+  const nextOffsets: Record<string, number> = {};
+  for (let i = 1; i <= 28; i++) {
+    const baseSeq = (i - 1) * 3 + 1;
+    nextOffsets[`s:${baseSeq}`] = (i - 1) * 200;
+    manyEvents.push(
+      {
+        session_id: "s",
+        seq: baseSeq,
+        at: baseSeq * 1000,
+        event: user(`第${i}问`),
+      },
+      {
+        session_id: "s",
+        seq: baseSeq + 1,
+        at: (baseSeq + 1) * 1000,
+        event: reply(`第${i}答`),
+      },
+      {
+        session_id: "s",
+        seq: baseSeq + 2,
+        at: (baseSeq + 2) * 1000,
+        event: done,
+      },
+    );
+  }
+  offsets = nextOffsets;
+  const view = render(<Harness events={manyEvents} />);
+  scroll = view.container.querySelector<HTMLDivElement>(
+    ".conversation-scroll",
+  )!;
+  Object.defineProperties(scroll, {
+    scrollHeight: { configurable: true, value: 5600 },
+    clientHeight: { configurable: true, value: 400 },
+  });
+  scroll.scrollTop = 5200;
+  fireEvent.scroll(scroll);
+
+  await waitFor(() =>
+    expect(marker("第28问").getAttribute("aria-current")).toBe("location"),
+  );
+  // Shows latest 12 turns (17..28); next-page button is disabled at bottom
+  expect(
+    view.container.querySelectorAll(".turn-navigator-list button"),
+  ).toHaveLength(12);
+  expect(screen.queryByRole("button", { name: "跳转到：第16问" })).toBeNull();
+  expect(marker("第17问")).toBeTruthy();
+  const prevBtn = screen.getByRole("button", { name: "上一页轮次" });
+  const nextBtn = screen.getByRole("button", { name: "下一页轮次" });
+  expect(nextBtn.hasAttribute("disabled")).toBe(true);
+  navigated.mockClear();
+
+  // Clicking ^ flips to turns 5..16 WITHOUT scrolling the transcript
+  fireEvent.click(prevBtn);
+  expect(navigated).not.toHaveBeenCalled();
+  expect(scroll.scrollTop).toBe(5200);
+  expect(
+    view.container.querySelectorAll(".turn-navigator-list button"),
+  ).toHaveLength(12);
+  expect(marker("第5问")).toBeTruthy();
+  expect(marker("第16问")).toBeTruthy();
+  expect(nextBtn.hasAttribute("disabled")).toBe(false);
+
+  // Hovering a bar on the flipped page previews it; clicking ^ again reaches 1..12
+  fireEvent.mouseEnter(marker("第8问"));
+  expect(screen.getByRole("tooltip").textContent).toContain("第8答");
+  fireEvent.click(screen.getByRole("button", { name: "上一页轮次" }));
+  expect(marker("第1问")).toBeTruthy();
+  expect(marker("第12问")).toBeTruthy();
+
+  // Clicking v steps back symmetrically (1..12 -> 5..16) without scrolling transcript
+  fireEvent.click(screen.getByRole("button", { name: "下一页轮次" }));
+  expect(marker("第5问")).toBeTruthy();
+  expect(marker("第16问")).toBeTruthy();
+  expect(navigated).not.toHaveBeenCalled();
+
+  // Clicking a marker jumps the transcript to that turn
+  fireEvent.click(marker("第6问"));
+  expect(navigated).toHaveBeenCalledTimes(1);
+  expect(marker("第6问").getAttribute("aria-current")).toBe("location");
+
+  // Manually scrolling the transcript back to the bottom snaps the page back to 17..28
+  scroll.scrollTop = 5200;
+  fireEvent.wheel(scroll);
+  await waitFor(() => expect(marker("第28问")).toBeTruthy());
+  expect(marker("第28问").getAttribute("aria-current")).toBe("location");
+});

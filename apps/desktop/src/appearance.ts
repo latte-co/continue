@@ -111,7 +111,7 @@ function parseTheme(value: unknown): ThemeConfig {
       (v) => typeof v === "string" && ["400", "500", "600"].includes(v),
     )
   ) {
-    throw new Error("主题字段无效，请使用从 Latte Work 复制的主题 JSON。");
+    throw new Error("主题字段无效，请使用从 Continue One 复制的主题 JSON。");
   }
   // Copy only known fields; imported data is never interpreted as CSS or HTML.
   return {
@@ -251,10 +251,21 @@ export function mix(a: string, b: string, ratio: number): string {
   );
 }
 
-/** Shift perceptual lightness while preserving hue/chroma (and exact gray neutrality). */
-function shiftLightness(color: string, deltaL: number): string {
+/** Shift perceptual lightness while preserving (and gently retaining) hue/chroma. */
+function shiftLightness(
+  color: string,
+  deltaL: number,
+  chromaScale = 1,
+): string {
   const [L, a, b] = hexToOklab(color);
-  return oklabToHex(L + deltaL, a, b, isNeutralHex(color));
+  const neutral = isNeutralHex(color);
+  const baseL = deltaL > 0 ? Math.max(L, 0.16) : L;
+  return oklabToHex(
+    baseL + deltaL,
+    neutral ? 0 : a * chromaScale,
+    neutral ? 0 : b * chromaScale,
+    neutral,
+  );
 }
 
 function luminance(color: string): number {
@@ -345,19 +356,21 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
   const fg = theme.foreground;
   const accent = theme.accent;
   const dark = luminance(bg) < 0.4;
-  const depth = 0.036 + (theme.contrast / 100) * 0.105;
+  const scale = 0.65 + (theme.contrast / 100) * 0.7;
   const step = (n: number) => mix(bg, fg, n);
-  const bgL = hexToOklab(bg)[0];
-
   const shell = dark
-    ? shiftLightness(bg, -(0.056 + Math.max(0, bgL - 0.21) * 0.24))
-    : shiftLightness(bg, -(0.046 * (0.75 + theme.contrast / 200)));
-  const sidebarBase = dark ? shell : shiftLightness(bg, -0.044);
-  const surface = step(dark ? depth * 0.88 : depth * 0.55);
-  const card = dark ? step(depth * 0.92) : bg;
-  const elevated = dark ? step(depth * 1.48) : bg;
-  const input = step(dark ? depth * 0.45 : depth * 0.35);
-  const composer = dark ? step(depth * 1.15) : bg;
+    ? shiftLightness(bg, -0.022 * scale, 1.06)
+    : shiftLightness(bg, -0.024 * scale, 1.08);
+  const sidebarBase = shell;
+  const surface = dark
+    ? shiftLightness(bg, 0.03 * scale)
+    : shiftLightness(bg, -0.014 * scale, 1.04);
+  const card = dark ? shiftLightness(bg, 0.03 * scale) : bg;
+  const elevated = dark ? shiftLightness(bg, 0.046 * scale) : bg;
+  const input = dark
+    ? shiftLightness(bg, 0.016 * scale)
+    : shiftLightness(bg, -0.009 * scale, 1.02);
+  const composer = dark ? shiftLightness(bg, 0.036 * scale) : bg;
 
   const surfaces = [bg, sidebarBase, surface, card, elevated, input, composer];
   const textSecondary = ensureContrast(
@@ -389,9 +402,15 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
     "--color-text-secondary": textSecondary,
     "--color-text-muted": textMuted,
     "--color-placeholder": textMuted,
-    "--color-border-subtle": step(dark ? depth * 0.85 : depth * 0.58),
-    "--color-border": step(dark ? depth * 1.32 : depth * 0.95),
-    "--color-border-strong": step(dark ? depth * 1.92 : depth * 1.45),
+    "--color-border-subtle": dark
+      ? shiftLightness(bg, 0.045 * scale)
+      : shiftLightness(bg, -0.042 * scale),
+    "--color-border": dark
+      ? shiftLightness(bg, 0.068 * scale)
+      : shiftLightness(bg, -0.068 * scale),
+    "--color-border-strong": dark
+      ? shiftLightness(bg, 0.098 * scale)
+      : shiftLightness(bg, -0.105 * scale),
     "--color-hover": fg + (dark ? "0d" : "0a"),
     "--color-row-selected": fg + (dark ? "15" : "10"),
     "--color-selected": fg + (dark ? "1c" : "15"),
@@ -425,29 +444,29 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
     "--color-backdrop": dark ? "#0000008c" : "#00000038",
     "--color-selection": accent + "3d",
     "--shadow-island": dark
-      ? "0 0 0 1px rgba(255, 255, 255, 0.085), 0 12px 32px -8px rgba(0, 0, 0, 0.52), inset 0 1px 0 rgba(255, 255, 255, 0.06)"
-      : "0 0 0 1px rgba(0, 0, 0, 0.075), 0 8px 24px -6px rgba(15, 23, 42, 0.07), inset 0 1px 0 #ffffff",
+      ? "0 0 0 1px rgba(255, 255, 255, 0.065), 0 4px 16px -4px rgba(0, 0, 0, 0.24)"
+      : "0 0 0 1px rgba(0, 0, 0, 0.065), 0 4px 16px -6px rgba(15, 23, 42, 0.045)",
     "--shadow-well": dark
-      ? "inset 0 0 0 1px rgba(255, 255, 255, 0.075)"
-      : "inset 0 0 0 1px rgba(0, 0, 0, 0.07)",
+      ? "inset 0 0 0 1px rgba(255, 255, 255, 0.065)"
+      : "inset 0 0 0 1px rgba(0, 0, 0, 0.065)",
     "--shadow-card": dark
-      ? "0 0 0 1px rgba(255, 255, 255, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.045), 0 4px 14px -2px rgba(0, 0, 0, 0.28)"
-      : "0 0 0 1px rgba(0, 0, 0, 0.075), 0 2px 8px rgba(15, 23, 42, 0.035), inset 0 1px 0 #ffffff",
+      ? "0 0 0 1px rgba(255, 255, 255, 0.065)"
+      : "0 0 0 1px rgba(0, 0, 0, 0.065), 0 1px 2px rgba(15, 23, 42, 0.03)",
     "--shadow-elevated": dark
-      ? "0 2px 6px rgba(0, 0, 0, 0.36), 0 0 0 1px rgba(255, 255, 255, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.09)"
-      : "0 1px 3px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0, 0, 0, 0.075), inset 0 1px 0 #ffffff",
+      ? "0 0 0 1px rgba(255, 255, 255, 0.075), 0 2px 6px rgba(0, 0, 0, 0.18)"
+      : "0 0 0 1px rgba(0, 0, 0, 0.065), 0 1px 3px rgba(15, 23, 42, 0.06)",
     "--shadow-composer": dark
-      ? "0 0 0 1px rgba(255, 255, 255, 0.1), 0 0 0 3.5px rgba(255, 255, 255, 0.026), 0 12px 28px -8px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.08)"
-      : "0 0 0 1px rgba(0, 0, 0, 0.095), 0 0 0 3.5px rgba(0, 0, 0, 0.024), 0 10px 24px -6px rgba(15, 23, 42, 0.08), inset 0 1px 0 #ffffff",
+      ? "0 0 0 1px rgba(255, 255, 255, 0.08), 0 2px 8px rgba(0, 0, 0, 0.16)"
+      : "0 0 0 1px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(15, 23, 42, 0.04)",
     "--shadow-composer-focus": dark
-      ? "0 0 0 1px rgba(255, 255, 255, 0.24), 0 0 0 4px rgba(255, 255, 255, 0.055), 0 14px 32px -8px rgba(0, 0, 0, 0.58), inset 0 1px 0 rgba(255, 255, 255, 0.1)"
-      : "0 0 0 1px rgba(24, 24, 27, 0.28), 0 0 0 4px rgba(0, 0, 0, 0.045), 0 12px 28px -6px rgba(15, 23, 42, 0.11), inset 0 1px 0 #ffffff",
+      ? "0 0 0 1px rgba(255, 255, 255, 0.14), 0 2px 8px rgba(0, 0, 0, 0.18)"
+      : "0 0 0 1px rgba(0, 0, 0, 0.15), 0 2px 8px rgba(15, 23, 42, 0.05)",
     "--shadow-dialog": dark
-      ? "0 24px 64px -8px rgba(0, 0, 0, 0.62), 0 0 0 0.5px rgba(255, 255, 255, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.07)"
-      : "0 24px 56px -10px rgba(15, 23, 42, 0.18), 0 0 0 0.5px rgba(0, 0, 0, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.9)",
+      ? "0 16px 40px -8px rgba(0, 0, 0, 0.42), 0 0 0 1px rgba(255, 255, 255, 0.1)"
+      : "0 16px 40px -10px rgba(15, 23, 42, 0.14), 0 0 0 1px rgba(0, 0, 0, 0.085)",
     "--shadow-popover": dark
-      ? "0 20px 48px -8px rgba(0, 0, 0, 0.56), 0 0 0 0.5px rgba(255, 255, 255, 0.11), inset 0 1px 0 rgba(255, 255, 255, 0.07)"
-      : "0 18px 42px -10px rgba(15, 23, 42, 0.16), 0 0 0 0.5px rgba(0, 0, 0, 0.095), inset 0 1px 0 rgba(255, 255, 255, 0.88)",
+      ? "0 12px 28px -6px rgba(0, 0, 0, 0.36), 0 0 0 1px rgba(255, 255, 255, 0.09)"
+      : "0 12px 28px -8px rgba(15, 23, 42, 0.12), 0 0 0 1px rgba(0, 0, 0, 0.08)",
     "--font-ui": fonts[theme.uiFont],
     "--font-content":
       theme.contentFont === "inherit"

@@ -377,4 +377,149 @@ describe("ToolRow and ToolGroup semantic presentation", () => {
     const rawPre = screen.getByText(/new-bulk-2000/);
     expect(rawPre.textContent).toContain("old-bulk-2000");
   });
+
+  it("keeps Bash prompt sigil strictly '$' and renders cwd in header only when outside project root", () => {
+    const { container, rerender } = render(
+      <ToolRow
+        projectPath="/Users/dev/latte-work"
+        tool={{
+          key: 60,
+          type: "tool",
+          name: "Bash",
+          input: {
+            command: "npm test",
+            workdir: "/Users/dev/latte-work/",
+          },
+          output: "ok",
+          status: "completed",
+        }}
+      />,
+    );
+    expect(container.querySelector(".activity-well-header")).toBeNull();
+    expect(container.querySelector(".activity-prompt-sigil")?.textContent).toBe(
+      "$",
+    );
+
+    rerender(
+      <ToolRow
+        projectPath="/Users/dev/latte-work"
+        tool={{
+          key: 61,
+          type: "tool",
+          name: "Bash",
+          input: {
+            command: "vitest run",
+            cwd: "/Users/dev/latte-work/apps/desktop",
+          },
+          output: "ok",
+          status: "completed",
+        }}
+      />,
+    );
+    const subdirHeader = container.querySelector(
+      ".activity-well-header .activity-terminal-cwd",
+    )!;
+    expect(subdirHeader.textContent).toBe("apps/desktop");
+    expect(subdirHeader.getAttribute("title")).toBe(
+      "/Users/dev/latte-work/apps/desktop",
+    );
+    expect(container.querySelector(".activity-prompt-sigil")?.textContent).toBe(
+      "$",
+    );
+
+    rerender(
+      <ToolRow
+        projectPath="/Users/dev/latte-work"
+        tool={{
+          key: 62,
+          type: "tool",
+          name: "Bash",
+          input: {
+            command: "python - <<'PY'\nprint(1)\nPY",
+            cwd: "/data00/home/dev/sandboxes/dot-nera-hierarchy-EBlkGy",
+          },
+          output: "1",
+          status: "completed",
+        }}
+      />,
+    );
+    const externalHeader = container.querySelector(
+      ".activity-well-header .activity-terminal-cwd",
+    )!;
+    expect(externalHeader.textContent).toBe(
+      "/data00/…/sandboxes/dot-nera-hierarchy-EBlkGy",
+    );
+    expect(externalHeader.getAttribute("title")).toBe(
+      "/data00/home/dev/sandboxes/dot-nera-hierarchy-EBlkGy",
+    );
+    expect(container.querySelector(".activity-prompt-sigil")?.textContent).toBe(
+      "$",
+    );
+  });
+
+  it("surfaces self-healed failures as a muted count inside ToolGroup and escalates only all-failed or unrecovered tail groups", () => {
+    const okRead = (key: number): ToolActivity => ({
+      key,
+      type: "tool",
+      name: "Read",
+      input: { file_path: `/repo/file-${key}.ts` },
+      output: "ok",
+      status: "completed",
+    });
+    const failedRead = (key: number): ToolActivity => ({
+      key,
+      type: "tool",
+      name: "Read",
+      input: { file_path: `/repo/missing-${key}.json` },
+      output: "No such file",
+      status: "failed",
+    });
+
+    const { container, rerender } = render(
+      <ToolGroup tools={[okRead(1), failedRead(2), okRead(3), okRead(4)]} />,
+    );
+    const groupSummary = container.querySelector(".activity-group > summary")!;
+    expect(groupSummary.querySelector(".activity-icon--danger")).toBeNull();
+    expect(groupSummary.querySelector(".activity-status.failure")).toBeNull();
+    expect(
+      groupSummary.querySelector(".activity-group-summary")?.textContent,
+    ).toBe("探索了 3 个文件");
+    expect(
+      groupSummary.querySelector(".activity-group-count")?.textContent,
+    ).toBe("· 4 步（1 项失败）");
+    // Level 2 still preserves the failed row's red badge
+    expect(
+      container.querySelectorAll(".activity-children .activity-status.failure"),
+    ).toHaveLength(1);
+
+    // Unrecovered tail failure escalates Level 1 icon + failure badge
+    rerender(
+      <ToolGroup tools={[okRead(1), okRead(2), failedRead(3)]} unrecovered />,
+    );
+    const haltedSummary = container.querySelector(".activity-group > summary")!;
+    expect(
+      haltedSummary.querySelector(".activity-icon--danger"),
+    ).not.toBeNull();
+    expect(
+      haltedSummary.querySelector(".activity-status.failure")?.textContent,
+    ).toBe("失败");
+    expect(
+      haltedSummary.querySelector(".activity-group-count")?.textContent,
+    ).toBe("· 1 项失败");
+
+    // All-failed group also escalates Level 1
+    rerender(<ToolGroup tools={[failedRead(1), failedRead(2)]} />);
+    const allFailedSummary = container.querySelector(
+      ".activity-group > summary",
+    )!;
+    expect(
+      allFailedSummary.querySelector(".activity-icon--danger"),
+    ).not.toBeNull();
+    expect(
+      allFailedSummary.querySelector(".activity-group-summary")?.textContent,
+    ).toBe("尝试读取 2 次未通过");
+    expect(
+      allFailedSummary.querySelector(".activity-status.failure")?.textContent,
+    ).toBe("失败");
+  });
 });

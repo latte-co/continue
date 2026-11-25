@@ -1397,7 +1397,7 @@ fn main() {
                 let quit = tauri::menu::MenuItem::with_id(
                     app,
                     "latte-quit",
-                    "退出 Latte Work",
+                    "退出 Continue One",
                     true,
                     Some("CmdOrCtrl+Q"),
                 )?;

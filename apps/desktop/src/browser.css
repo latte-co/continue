@@ -35,54 +35,63 @@
   display: flex;
   align-items: center;
   gap: var(--space-1);
-  padding: var(--space-2);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-control);
-  background: var(--color-elevated);
+  padding: 5px 8px;
+  border: 0;
+  border-radius: var(--radius-card);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-card);
   z-index: 2;
 }
-.browser-find input {
+.browser-find-icon {
+  color: var(--color-text-muted);
+  margin-left: 2px;
+}
+.browser-find > .ui-input {
   width: 0;
   flex: 1;
-  min-width: 60px;
-  margin: 0;
+  min-width: 80px;
 }
+.browser-find-status,
 .browser-find [role="status"] {
-  font-size: 12px;
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
   white-space: nowrap;
+  padding: 0 4px;
 }
 .browser-notice {
   order: 3;
   flex-shrink: 0;
-  padding: var(--space-2);
-  background: var(--color-elevated);
-  font-size: 12px;
-}
-.browser-library {
-  width: 640px;
+  padding: 6px var(--space-3);
+  border-top: 1px solid var(--color-border-subtle);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
 }
 .browser-records {
-  max-height: 50dvh;
+  max-height: 48dvh;
   overflow-y: auto;
-  margin: var(--space-3) 0;
 }
 .browser-record {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: var(--space-2) 0;
-  border-bottom: 1px solid var(--color-border-subtle);
+  padding: 8px 12px;
 }
-.browser-record > div,
+.browser-record + .browser-record {
+  border-top: 1px solid var(--color-border-subtle);
+}
+.browser-record-info,
 .browser-record-open {
   flex: 1;
   min-width: 0;
   text-align: left;
 }
 .browser-record-open {
+  display: block;
   background: transparent;
   border: 0;
-  padding: var(--space-2);
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
 }
 .browser-record strong,
 .browser-record span,
@@ -93,30 +102,19 @@
   white-space: nowrap;
 }
 .browser-record strong {
-  font-size: 13px;
+  font-size: var(--text-md);
   font-weight: 500;
 }
 .browser-record span,
 .browser-record small {
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--color-text-muted);
-  margin-top: var(--space-1);
+  margin-top: 2px;
 }
-.browser-check {
+.browser-clear-options {
   display: flex;
-  gap: var(--space-2);
-  align-items: center;
-  margin: var(--space-3) 0;
-}
-.browser-check input {
-  width: auto;
-  margin: 0;
-}
-.browser-dialog-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: var(--space-2);
-  margin-top: var(--space-5);
+  flex-direction: column;
+  gap: var(--space-3);
 }
 .browser-toolbar {
   display: flex;
@@ -173,9 +171,7 @@
   z-index: 200;
   width: min(344px, calc(100vw - 16px));
   padding: var(--space-4);
-  background: color-mix(in srgb, var(--color-elevated) 92%, transparent);
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
+  background: var(--color-elevated);
   color: var(--color-text);
   border: 0;
   border-radius: var(--radius-card);
@@ -239,25 +235,6 @@
 .browser-surface p {
   margin: var(--space-4);
   font-size: 13px;
-}
-.browser-settings {
-  max-width: var(--content-width);
-}
-.browser-settings h2 {
-  font-size: 20px;
-  margin-bottom: var(--space-6);
-}
-.browser-settings label {
-  display: block;
-  margin-bottom: var(--space-2);
-  font-size: 12px;
-}
-.browser-settings .select-trigger {
-  width: 100%;
-}
-.browser-settings p {
-  font-size: 13px;
-  margin-top: var(--space-3);
 }
 .link-context-menu {
   min-width: 240px;

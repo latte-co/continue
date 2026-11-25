@@ -11,13 +11,13 @@ static NSApplicationTerminateReply latte_should_terminate(id self, SEL selector,
         for (NSMenuItem *top in app.mainMenu.itemArray) {
             NSMenu *menu = top.submenu;
             for (NSInteger index = 0; index < menu.numberOfItems; index++) {
-                if ([[menu itemAtIndex:index].title isEqualToString:@"退出 Latte Work"]) {
+                if ([[menu itemAtIndex:index].title isEqualToString:@"退出 Continue One"]) {
                     [menu performActionForItemAtIndex:index];
                     return;
                 }
             }
         }
-        NSLog(@"Latte Work: graceful quit menu is unavailable; refusing unverified termination");
+        NSLog(@"Continue One: graceful quit menu is unavailable; refusing unverified termination");
     });
     return NSTerminateCancel;
 }

@@ -1,24 +1,26 @@
 import { useState } from "react";
-import {
-  CardList,
-  NoticeBanner,
-  PageContainer,
-  PageHeader,
-  Select,
-  SettingRow,
-} from "./ui";
+import { CardList, NoticeBanner, Select, SettingRow } from "./ui";
+import { SettingsPane } from "./SettingsPane";
 import { saveLinkTarget, useLinkTarget, type LinkTarget } from "./browserLinks";
 import { message } from "./api";
 
-export function BrowserSettings() {
+export function BrowserSettings({
+  onClose,
+  closeDisabled = false,
+}: {
+  onClose?: () => void;
+  closeDisabled?: boolean;
+} = {}) {
   const target = useLinkTarget();
   const [error, setError] = useState("");
   return (
-    <PageContainer className="browser-settings settings-panel-content">
-      <PageHeader
-        title="浏览器"
-        description="配置对话与文档中外部链接的默认打开位置。"
-      />
+    <SettingsPane
+      title="浏览器"
+      description="配置对话与文档中外部链接的默认打开位置。"
+      className="browser-settings"
+      onClose={onClose}
+      closeDisabled={closeDisabled}
+    >
       <CardList>
         <SettingRow
           label="链接默认打开方式"
@@ -26,8 +28,9 @@ export function BrowserSettings() {
         >
           <Select
             label="链接默认打开方式"
+            variant="ghost"
             size="md"
-            minMenuWidth={240}
+            minMenuWidth={248}
             align="end"
             value={target}
             options={[
@@ -54,6 +57,6 @@ export function BrowserSettings() {
         </SettingRow>
       </CardList>
       {error && <NoticeBanner tone="danger">{error}</NoticeBanner>}
-    </PageContainer>
+    </SettingsPane>
   );
 }

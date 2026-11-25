@@ -74,11 +74,11 @@ export function SkillChangeDialog({
           className="skill-detail-path"
           style={{ padding: "6px 10px", margin: 0 }}
         >
-          {confirm.skill.directory ?? "Latte Work 平台内置技能"}
+          {confirm.skill.directory ?? "Continue One 平台内置技能"}
         </Well>
         <p style={{ margin: 0 }}>
           {confirm.skill.scope === "platform"
-            ? "仅影响此主机上由 Latte Work 启动的 Agent。"
+            ? "仅影响此主机上由 Continue One 启动的 Agent。"
             : confirm.skill.state === "uninstalled"
               ? "会恢复到此主机的全局技能目录，影响使用该目录的其他 Agent。"
               : "会移动当前安装目录，影响这台主机上使用此目录的其他 Agent。"}

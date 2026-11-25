@@ -447,3 +447,44 @@ it("checks contrast across elevated/card surfaces and boosts derived text when f
     ).toBeGreaterThanOrEqual(4.5);
   }
 });
+
+it("keeps tinted palette sidebars visibly aligned with the chosen background hue and reveals scrollbars only while scrolling", () => {
+  vi.useFakeTimers();
+  try {
+    const material = {
+      ...defaultAppearance().dark,
+      ...presets.dark.Material,
+    };
+    const tokens = themeTokens(material);
+    const sidebarHex = tokens["--color-sidebar"].slice(0, 7);
+    const [r, g, b] = [
+      parseInt(sidebarHex.slice(1, 3), 16),
+      parseInt(sidebarHex.slice(3, 5), 16),
+      parseInt(sidebarHex.slice(5, 7), 16),
+    ];
+    // Material (#1E272C) sidebar and elevated hover/popover surfaces stay in the same slate-blue family without a stark brightness cliff.
+    expect(b).toBeGreaterThan(g);
+    expect(g).toBeGreaterThan(r);
+    expect(r).toBeGreaterThanOrEqual(20);
+    expect(contrastRatio(tokens["--color-elevated"], sidebarHex)).toBeLessThan(
+      1.35,
+    );
+
+    const view = render(
+      <AppearanceProvider>
+        <div data-testid="scroller" style={{ overflow: "auto" }} />
+      </AppearanceProvider>,
+    );
+    const scroller = screen.getByTestId("scroller");
+    expect(scroller.dataset.scrollActive).toBeUndefined();
+    fireEvent.scroll(scroller);
+    expect(scroller.dataset.scrollActive).toBe("true");
+    act(() => {
+      vi.advanceTimersByTime(800);
+    });
+    expect(scroller.dataset.scrollActive).toBeUndefined();
+    view.unmount();
+  } finally {
+    vi.useRealTimers();
+  }
+});

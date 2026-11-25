@@ -17,7 +17,7 @@ import { SubagentTranscript } from "./SubagentTranscript";
 import { subagentExecutionStatus } from "./executionStatus";
 import { useStatusIssues } from "./statusNotices";
 import { useTaskDisclosure } from "./useTaskDisclosure";
-import { EmptyState, FloatingPill, NoticeBanner } from "./ui";
+import { CardList, EmptyState, FloatingPill, NoticeBanner } from "./ui";
 
 function SubagentGroup({
   label,
@@ -80,6 +80,7 @@ export function SubagentsPanel({
   taskId,
   hostId = "",
   sessionId,
+  projectPath,
   active = false,
   connected = true,
 }: {
@@ -88,6 +89,7 @@ export function SubagentsPanel({
   taskId?: string;
   hostId?: string;
   sessionId?: string;
+  projectPath?: string;
   active?: boolean;
   connected?: boolean;
 }) {
@@ -187,6 +189,7 @@ export function SubagentsPanel({
                     task={selected}
                     events={transcript.events}
                     prompt={transcript.prompt}
+                    projectPath={projectPath}
                     elapsed={age(selected)}
                     incomplete={transcript.incomplete}
                     readingMore={transcript.readingMore}
@@ -284,40 +287,48 @@ export function SubagentsPanel({
                   : undefined
               }
             >
-              {tasks.map((task) => (
-                <button
-                  key={task.id}
-                  className="subagent-row"
-                  onClick={() => onOpen?.(task)}
-                >
-                  <Bot size={22} className={`subagent-state ${task.status}`} />
-                  <span className="subagent-row-content">
-                    <span className="subagent-title" title={task.title}>
-                      {task.title}
+              <CardList className="subagent-list">
+                {tasks.map((task) => (
+                  <button
+                    type="button"
+                    key={task.id}
+                    className="subagent-row"
+                    onClick={() => onOpen?.(task)}
+                  >
+                    <span
+                      className={`subagent-icon subagent-state ${task.status}`}
+                      aria-hidden="true"
+                    >
+                      <Bot size={15} />
                     </span>
-                    <span className="subagent-metadata">
-                      {task.agent_type?.trim() && (
-                        <>
-                          <span
-                            className="subagent-type"
-                            title={task.agent_type}
-                          >
-                            {task.agent_type}
-                          </span>
-                          <span aria-hidden="true"> · </span>
-                        </>
-                      )}
-                      <span className={`subagent-state ${task.status}`}>
-                        {subagentLabels[task.status]}
-                        {task.status === "running" &&
-                          task.last_tool &&
-                          ` · ${task.last_tool}`}
+                    <span className="subagent-row-content">
+                      <span className="subagent-title" title={task.title}>
+                        {task.title}
+                      </span>
+                      <span className="subagent-metadata">
+                        {task.agent_type?.trim() && (
+                          <>
+                            <span
+                              className="subagent-type"
+                              title={task.agent_type}
+                            >
+                              {task.agent_type}
+                            </span>
+                            <span aria-hidden="true"> · </span>
+                          </>
+                        )}
+                        <span className={`subagent-state ${task.status}`}>
+                          {subagentLabels[task.status]}
+                          {task.status === "running" &&
+                            task.last_tool &&
+                            ` · ${task.last_tool}`}
+                        </span>
                       </span>
                     </span>
-                  </span>
-                  <span className="subagent-age">{age(task)}</span>
-                </button>
-              ))}
+                    <span className="subagent-age">{age(task)}</span>
+                  </button>
+                ))}
+              </CardList>
             </SubagentGroup>
           ),
       )}

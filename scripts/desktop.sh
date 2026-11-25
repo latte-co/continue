@@ -23,6 +23,6 @@ case "$mode" in
 esac
 
 if [[ "$(uname -s)" == Darwin ]]; then
-  ../../scripts/sign-macos.sh "$CARGO_TARGET_DIR/$profile/bundle/macos/Latte Work.app"
+  ../../scripts/sign-macos.sh "$CARGO_TARGET_DIR/$profile/bundle/macos/Continue One.app"
   if [[ "$mode" == package ]]; then ../../scripts/package-dmg.sh; fi
 fi

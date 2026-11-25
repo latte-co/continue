@@ -47,9 +47,9 @@ export interface WorkspaceState {
   conversationActive: boolean;
   width: number;
 }
-export const CONVERSATION_MIN_WIDTH = 240;
+export const CONVERSATION_MIN_WIDTH = 340;
 export const WORKSPACE_MIN_WIDTH = 280;
-export const STAGE_ISLAND_INSET = 7;
+export const STAGE_ISLAND_INSET = 6;
 export const SIDEBAR_HANDLE_WIDTH = 4;
 export const WORKSPACE_HANDLE_WIDTH = 1;
 

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Archive, Folder } from "lucide-react";
 import { message, request } from "./api";
+import { SettingsPane } from "./SettingsPane";
 import type { Session } from "./protocol";
 import type { Workbench } from "./useWorkbench";
 import {
@@ -10,8 +11,6 @@ import {
   FilterBar,
   ItemRow,
   NoticeBanner,
-  PageContainer,
-  PageHeader,
   SearchInput,
   Section,
   SectionHeader,
@@ -22,10 +21,14 @@ export function ArchivedChats({
   state,
   active,
   onBusy,
+  onClose,
+  closeDisabled = false,
 }: {
   state: Workbench;
   active: boolean;
   onBusy: (busy: boolean) => void;
+  onClose?: () => void;
+  closeDisabled?: boolean;
 }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("");
@@ -104,11 +107,13 @@ export function ArchivedChats({
     }));
 
   return (
-    <PageContainer className="settings-panel-content archived-chats">
-      <PageHeader
-        title="已归档的聊天"
-        description="按项目检索并恢复已归档的历史对话记录。"
-      />
+    <SettingsPane
+      title="已归档的聊天"
+      description="按项目检索并恢复已归档的历史对话记录。"
+      className="archived-chats"
+      onClose={onClose}
+      closeDisabled={closeDisabled || busy}
+    >
       <FilterBar className="archive-filters">
         <SearchInput
           aria-label="搜索已归档的聊天"
@@ -119,6 +124,7 @@ export function ArchivedChats({
         />
         <Select
           label="筛选项目"
+          leading={<Folder size={14.5} />}
           size="md"
           minMenuWidth={220}
           align="end"
@@ -198,6 +204,6 @@ export function ArchivedChats({
           }
         />
       )}
-    </PageContainer>
+    </SettingsPane>
   );
 }

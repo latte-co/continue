@@ -46,7 +46,7 @@
 
   /* 4-Tier Control Heights & Bar Heights */
   --titlebar-height: 44px;
-  --topbar-height: 44px;
+  --topbar-height: calc(var(--titlebar-height) - var(--island-inset));
   --subbar-height: 38px;
   --control-height-lg: 36px;
   --control-height-md: 32px;
@@ -59,15 +59,15 @@
   --icon-size: 15.5px;
 
   /* Soft Obsidian Neutral Defaults (Overridden dynamically by appearance.ts) */
-  --color-shell: #0e0e0e;
+  --color-shell: #131313;
   --color-canvas: #181818;
-  --color-sidebar: #0e0e0e;
-  --color-surface: #232323;
-  --color-card: #232323;
-  --color-elevated: #2a2a2a;
+  --color-sidebar: #131313;
+  --color-surface: #1f1f1f;
+  --color-card: #1f1f1f;
+  --color-elevated: #232323;
   --color-well: #f2f2f20c;
-  --color-input: #1e1e1e;
-  --color-composer: #262626;
+  --color-input: #1c1c1c;
+  --color-composer: #202020;
   --color-text: #f2f2f2;
   --color-text-secondary: #c8c8c8;
   --color-text-muted: #a1a1a1;
@@ -103,37 +103,28 @@
   --color-backdrop: #0000008c;
   --color-selection: #f2f2f23d;
 
-  /* 3-Tier Optical Shadows, Retina Subpixel Rings & Double-Bezel Composer */
+  /* 3-Tier Optical Shadows — Crisp Hairlines, Restraint on Static Surfaces */
   --shadow-island:
-    0 0 0 1px rgba(255, 255, 255, 0.085), 0 12px 32px -8px rgba(0, 0, 0, 0.52),
-    inset 0 1px 0 rgba(255, 255, 255, 0.06);
-  --shadow-well: inset 0 0 0 1px rgba(255, 255, 255, 0.075);
-  --shadow-card:
-    0 0 0 1px rgba(255, 255, 255, 0.08),
-    inset 0 1px 0 rgba(255, 255, 255, 0.045),
-    0 4px 14px -2px rgba(0, 0, 0, 0.28);
+    0 0 0 1px rgba(255, 255, 255, 0.065), 0 4px 16px -4px rgba(0, 0, 0, 0.24);
+  --shadow-well: inset 0 0 0 1px rgba(255, 255, 255, 0.065);
+  --shadow-card: 0 0 0 1px rgba(255, 255, 255, 0.065);
   --shadow-elevated:
-    0 2px 6px rgba(0, 0, 0, 0.36), 0 0 0 1px rgba(255, 255, 255, 0.1),
-    inset 0 1px 0 rgba(255, 255, 255, 0.09);
+    0 0 0 1px rgba(255, 255, 255, 0.075), 0 2px 6px rgba(0, 0, 0, 0.18);
   --shadow-composer:
-    0 0 0 1px rgba(255, 255, 255, 0.1), 0 0 0 3.5px rgba(255, 255, 255, 0.026),
-    0 12px 28px -8px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    0 0 0 1px rgba(255, 255, 255, 0.08), 0 2px 8px rgba(0, 0, 0, 0.16);
   --shadow-composer-focus:
-    0 0 0 1px rgba(255, 255, 255, 0.24), 0 0 0 4px rgba(255, 255, 255, 0.055),
-    0 14px 32px -8px rgba(0, 0, 0, 0.58), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+    0 0 0 1px rgba(255, 255, 255, 0.14), 0 2px 8px rgba(0, 0, 0, 0.18);
   --shadow-dialog:
-    0 24px 64px -8px rgba(0, 0, 0, 0.62), 0 0 0 1px rgba(255, 255, 255, 0.12),
-    inset 0 1px 0 rgba(255, 255, 255, 0.07);
+    0 16px 40px -8px rgba(0, 0, 0, 0.42), 0 0 0 1px rgba(255, 255, 255, 0.1);
   --shadow-popover:
-    0 20px 48px -8px rgba(0, 0, 0, 0.56), 0 0 0 1px rgba(255, 255, 255, 0.11),
-    inset 0 1px 0 rgba(255, 255, 255, 0.07);
+    0 12px 28px -6px rgba(0, 0, 0, 0.36), 0 0 0 1px rgba(255, 255, 255, 0.09);
   --focus-ring: 0 0 0 1.5px var(--color-focus-ring);
 
   /* Motion & Layout Widths */
   --duration-fast: 120ms;
   --duration-popover: 130ms;
   --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
-  --island-inset: 7px;
+  --island-inset: 6px;
   --content-width: 760px;
   --conversation-min-width: 260px;
   --content-gutter: clamp(24px, 4vw, 44px);

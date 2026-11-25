@@ -542,7 +542,7 @@ it("clamps split workspace width within StageIsland inset and resize handles so 
     windowWidth,
     sidebarWidth,
   );
-  expect(clampedWithSidebar).toBe(448);
+  expect(clampedWithSidebar).toBe(349);
   const rightEdgeWithSidebar =
     sidebarWidth +
     SIDEBAR_HANDLE_WIDTH +
@@ -550,6 +550,17 @@ it("clamps split workspace width within StageIsland inset and resize handles so 
     WORKSPACE_HANDLE_WIDTH +
     clampedWithSidebar;
   expect(rightEdgeWithSidebar).toBe(windowWidth - STAGE_ISLAND_INSET);
+
+  // Even at max 320px sidebar on a 960px window, conversation keeps >=340px and right panel stays unclipped
+  const clampedMaxSidebar = clampWorkspaceWidth(900, windowWidth, 320);
+  expect(clampedMaxSidebar).toBe(289);
+  expect(
+    320 +
+      SIDEBAR_HANDLE_WIDTH +
+      CONVERSATION_MIN_WIDTH +
+      WORKSPACE_HANDLE_WIDTH +
+      clampedMaxSidebar,
+  ).toBe(windowWidth - STAGE_ISLAND_INSET);
 
   const clampedCollapsed = clampWorkspaceWidth(900, windowWidth, 0);
   expect(

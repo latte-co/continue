@@ -21,6 +21,7 @@ import {
   ArchiveRestore,
 } from "lucide-react";
 import { StatusSignal } from "./ui";
+import { BrandLogo } from "./BrandLogo";
 import { WorkingStatus } from "./WorkingStatus";
 import { SessionHoverCard, ProjectHoverCard } from "./SidebarHoverCard";
 import { SessionTitle } from "./SessionTitle";
@@ -595,11 +596,12 @@ export function Sidebar({
         </button>
       </div>
       <div className="brand">
-        <div className="brand-mark" aria-hidden="true">
-          L<span>••</span>
-        </div>
+        <BrandLogo
+          sessionKey={sessionId ? `${hostId}:${sessionId}` : undefined}
+          status={sessions.find((s) => s.id === sessionId)?.status}
+        />
         <span className="brand-name">
-          Latte<span className="brand-light"> Work</span>
+          Continue<span className="brand-light"> One</span>
         </span>
       </div>
       <button

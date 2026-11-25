@@ -66,12 +66,24 @@ const canFocus = (item: HTMLElement) =>
 const tabbable = (item: HTMLElement) => item.tabIndex >= 0 && canFocus(item);
 const focusable =
   "button, input, textarea, select, a[href], summary, [tabindex]";
-/** Native modal behavior shared by every dialog. Nested dialogs suspend their parent. */
-export function Modal(props: ComponentProps<"section">) {
-  const root = useRef<HTMLElement>(null);
-  const trigger = useRef(document.activeElement as HTMLElement | null);
+/**
+ * Shared modal focus trap, background `inert` lease, and z-index layer registration.
+ * Supports both mount-bound `<Modal>` elements and persistent `active`-toggled shells.
+ */
+export function useModalBehavior(
+  root: RefObject<HTMLElement | null>,
+  active = true,
+) {
+  const wasActive = useRef(false);
+  const trigger = useRef<HTMLElement | null>(null);
+  if (active && !wasActive.current) {
+    trigger.current = document.activeElement as HTMLElement | null;
+  }
+  wasActive.current = active;
+
   useLayoutEffect(() => {
-    const element = root.current!;
+    const element = root.current;
+    if (!active || !element) return;
     stack.push(element);
     const layerHost =
       element.closest<HTMLElement>(
@@ -147,18 +159,32 @@ export function Modal(props: ComponentProps<"section">) {
       const target = trigger.current;
       if (target?.isConnected && canFocus(target)) {
         target.focus();
+        if (element.isConnected) {
+          // React 19's flushMutationEffects restores priorFocusedElem at the end of
+          // mutation commit when a persistent `hidden={!active}` dialog stays mounted.
+          queueMicrotask(() => {
+            if (
+              target.isConnected &&
+              canFocus(target) &&
+              (document.activeElement === document.body ||
+                element.contains(document.activeElement))
+            ) {
+              target.focus();
+            }
+          });
+        }
       } else {
         // Wait for the closing subtree to be removed and all inert leases released.
         // A surviving parent dialog or the trigger's nearest live section is the
         // logical fallback; preserve any focus explicitly moved by the caller.
         queueMicrotask(() => {
-          const active = document.activeElement;
+          const activeEl = document.activeElement;
           if (
-            active instanceof HTMLElement &&
-            active !== document.body &&
-            active.isConnected &&
-            !element.contains(active) &&
-            canFocus(active)
+            activeEl instanceof HTMLElement &&
+            activeEl !== document.body &&
+            activeEl.isConnected &&
+            !element.contains(activeEl) &&
+            canFocus(activeEl)
           )
             return;
           const parent = stack.at(-1);
@@ -176,7 +202,13 @@ export function Modal(props: ComponentProps<"section">) {
         });
       }
     };
-  }, []);
+  }, [root, active]);
+}
+
+/** Native modal behavior shared by every dialog. Nested dialogs suspend their parent. */
+export function Modal(props: ComponentProps<"section">) {
+  const root = useRef<HTMLElement>(null);
+  useModalBehavior(root, true);
   return (
     <section
       {...props}

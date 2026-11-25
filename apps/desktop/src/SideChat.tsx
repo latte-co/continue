@@ -14,6 +14,7 @@ import { QuestionCard } from "./QuestionCard";
 import { TurnTranscript } from "./TurnTranscript";
 import { ToolGroup, ToolRow } from "./ToolActivity";
 import { ToolImages } from "./ToolImages";
+import { TurnErrorRow } from "./TurnErrorRow";
 import { UserMessage } from "./UserMessage";
 import { WorkingStatus } from "./WorkingStatus";
 import { executionStatus } from "./executionStatus";
@@ -24,6 +25,7 @@ import {
 } from "./sideWritePrompts";
 import { LIVE_POLL_MS } from "./usePollingSnapshot";
 import { readWorkspace, setSideChatDraft, sideChatId } from "./workspaceState";
+import { Button } from "./ui";
 
 export const sideDraftKey = (host: string, parent: string, side: string) =>
   JSON.stringify(["side", host, parent, side]);
@@ -538,6 +540,7 @@ export function SideChat({
                 return (
                   <ToolRow
                     tool={item}
+                    projectPath={projectPath}
                     loadContext={
                       session ? { hostId, sessionId: session.id } : undefined
                     }
@@ -547,6 +550,8 @@ export function SideChat({
                 return (
                   <ToolGroup
                     tools={item.tools}
+                    unrecovered={item.unrecovered}
+                    projectPath={projectPath}
                     loadContext={
                       session ? { hostId, sessionId: session.id } : undefined
                     }
@@ -558,6 +563,8 @@ export function SideChat({
               const v = item.value;
               if (v.kind === "notice")
                 return <p className="notice">{v.text}</p>;
+              if (v.kind === "state" && v.status === "failed" && v.message)
+                return <TurnErrorRow message={v.message} />;
               if (v.kind === "state" && (v.message || v.status === "unknown"))
                 return (
                   <p className="notice">{v.message || "侧边聊天状态待确认"}</p>
@@ -569,6 +576,7 @@ export function SideChat({
                     resolved={item.resolved}
                     decision={item.decision}
                     tool={item.approvalTool}
+                    projectPath={projectPath}
                     loadContext={{ hostId, sessionId: session.id }}
                     disabled={disabled || !running}
                     busy={busy}
@@ -618,15 +626,17 @@ export function SideChat({
                 ? "请核对侧边聊天启动的后台进程和外部工具均已停止写入工作区。"
                 : "侧边聊天后台写入待确认。"}
             {showingConfirmation && (
-              <button
-                className="secondary small"
+              <Button
+                variant="subtle"
+                size="xs"
                 onClick={() => setConfirming(undefined)}
               >
                 取消
-              </button>
+              </Button>
             )}
-            <button
-              className="secondary small"
+            <Button
+              variant="subtle"
+              size="xs"
               disabled={
                 !canInteract ||
                 busy ||
@@ -641,7 +651,7 @@ export function SideChat({
                 : closePending
                   ? "核对原生会话关闭"
                   : "核对后台写入已结束"}
-            </button>
+            </Button>
           </div>
         )}
         {(!connected || !supported || readError || error) && (
@@ -652,12 +662,13 @@ export function SideChat({
                 ? "请更新执行主机的 Server 以使用侧边聊天"
                 : readError || error}
             {enabled && readError && (
-              <button
-                className="secondary small"
+              <Button
+                variant="subtle"
+                size="xs"
                 onClick={() => refresh((v) => v + 1)}
               >
                 重新读取
-              </button>
+              </Button>
             )}
           </div>
         )}
