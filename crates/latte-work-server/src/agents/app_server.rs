@@ -286,8 +286,8 @@ impl AppServer {
             bail!("Agent 正在准备本轮任务，消息保留在队列，请稍后再发送");
         }
         let input = if let Some((name, body)) = parse_slash(prompt) {
-            if self.side_parent.is_some() {
-                bail!("侧边聊天不支持原生命令或技能，消息保留在队列");
+            if self.side_parent.is_some() && matches!(name, "compact" | "review") {
+                bail!("侧边聊天不支持原生控制命令 /{name}，消息保留在队列");
             }
             if matches!(name, "compact" | "review") {
                 bail!("请在独立轮次运行 /{name} 命令，消息保留在队列");
@@ -325,8 +325,15 @@ impl AppServer {
     }
     fn start(&mut self, prompt: &str) -> Result<Vec<Action>> {
         if let Some((name, body)) = parse_slash(prompt) {
-            if self.side_parent.is_some() {
-                bail!("侧边聊天不支持原生命令或技能，请使用普通消息");
+            if self.side_parent.is_some() && matches!(name, "compact" | "review") {
+                self.phase = Phase::Ready;
+                self.title_context = None;
+                return Ok(vec![Action::Finished {
+                    failed: true,
+                    message: Some(format!(
+                        "侧边聊天不支持原生控制命令 /{name}，可调用技能或直接提问"
+                    )),
+                }]);
             }
             if name == "compact" {
                 if !body.is_empty() {
@@ -1471,13 +1478,12 @@ impl AgentAdapter for AppServer {
             }
             Input::Start { prompt } => match self.phase {
                 Phase::Fresh => {
-                    if let Some((name, body)) = parse_slash(prompt) {
-                        if self.side_parent.is_some() {
-                            bail!("侧边聊天不支持原生命令或技能");
-                        }
-                        if name == "compact" && !body.is_empty() {
-                            bail!("{} 命令 /compact 不接受额外参数或引用", self.name());
-                        }
+                    if let Some((name, body)) = parse_slash(prompt)
+                        && self.side_parent.is_none()
+                        && name == "compact"
+                        && !body.is_empty()
+                    {
+                        bail!("{} 命令 /compact 不接受额外参数或引用", self.name());
                     }
                     self.pending_prompt = Some(prompt.into());
                     self.initialize()
@@ -2957,7 +2963,7 @@ mod tests {
     }
     #[test]
     fn discover_commands_and_skill_execution_cover_codex_and_traex() {
-        for (codex, binary, label) in [(true, "codex", "Codex"), (false, "traex", "Traex")] {
+        for (codex, binary) in [(true, "codex"), (false, "traex")] {
             let mut discover = AppServer {
                 codex,
                 ..Default::default()
@@ -3145,16 +3151,44 @@ mod tests {
             let relookup = encoded(&agent.advance(Input::Start { prompt: "/fix-ci" }).unwrap());
             assert_eq!(relookup[0]["method"], "skills/list");
 
-            // Side chats reject slash commands/skills explicitly.
+            // Side chats reject control commands (/compact, /review) while permitting skills.
             let mut side = opened();
             side.codex = codex;
             side.side_parent = Some("parent".into());
-            let err = side
-                .advance(Input::Start { prompt: "/compact" })
-                .err()
-                .expect("side chat must reject slash")
-                .to_string();
-            assert!(err.contains(label) || err.contains("侧边聊天"));
+            for blocked in ["/compact", "/review", "/review main"] {
+                let actions = side.advance(Input::Start { prompt: blocked }).expect(
+                    "side chat control slash command settles cleanly without tearing down process",
+                );
+                assert!(matches!(
+                    actions.as_slice(),
+                    [Action::Finished { failed: true, message: Some(msg) }]
+                        if msg.contains("侧边聊天不支持原生控制命令")
+                ));
+            }
+            let lookup = encoded(
+                &side
+                    .advance(Input::Start {
+                        prompt: "/fix-ci 评审侧聊",
+                    })
+                    .unwrap(),
+            );
+            assert_eq!(lookup[0]["method"], "skills/list");
+            let id = lookup[0]["id"].clone();
+            let started = encoded(&message(
+                &mut side,
+                json!({"id": id, "result": {"data": [{"cwd": "/repo", "skills": [{"name": "fix-ci", "description": "Fix CI", "enabled": true, "path": "/skills/fix-ci/SKILL.md"}]}]}}),
+            ));
+            assert_eq!(started[0]["method"], "turn/start");
+            assert_eq!(
+                started[0]["params"]["input"][0],
+                json!({"type": "skill", "name": "fix-ci", "path": "/skills/fix-ci/SKILL.md"})
+            );
+            assert!(
+                started[0]["params"]["input"][1]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("评审侧聊")
+            );
         }
     }
     #[test]

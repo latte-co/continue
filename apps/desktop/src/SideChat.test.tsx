@@ -1720,3 +1720,84 @@ it("syncs background generated titles arriving more than 17 seconds after turn c
     vi.useRealTimers();
   }
 });
+
+it("keeps leading slash skill before quoted context and trailing file references in side chat", async () => {
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  openSideChatTab(workspaceId, child.id, true);
+  const key = sideDraftKey("local", parent.id, child.id);
+  drafts.update(key, {
+    quotes: ["MR 编号与链接：!3"],
+  });
+  let sentText = "";
+  request.mockImplementation(async (_host, action: Request) => {
+    if (action.method === "agent_permissions")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.method === "agent_commands")
+      return {
+        kind: "agent_commands",
+        commands: [
+          {
+            name: "review-code-changes",
+            display_name: "代码评审",
+            description: "按评审契约审查变更",
+            argument_hint: "[范围]",
+            kind: "skill",
+          },
+          {
+            name: "compact",
+            description: "压缩会话上下文",
+            argument_hint: "",
+            kind: "command",
+          },
+        ],
+      };
+    if (action.method === "files")
+      return {
+        kind: "files",
+        entries: [{ name: "README.md", path: "README.md", directory: false }],
+      };
+    if (action.method === "open_side_chat")
+      return { kind: "session", session: child };
+    if (action.method === "send") {
+      sentText = action.text;
+      return { kind: "accepted", duplicate: false };
+    }
+    if (action.method === "poll")
+      return { kind: "events", session: child, events: [], has_more: false };
+    throw new Error(`unexpected ${action.method}`);
+  });
+  render(
+    <ChatTab
+      parent={parent}
+      sideId={child.id}
+      workspaceId={workspaceId}
+      hostId="local"
+      drafts={drafts}
+      active
+      connected
+      supported
+    />,
+  );
+  const input = screen.getByRole<HTMLTextAreaElement>("textbox", {
+    name: "侧边聊天输入",
+  });
+  fireEvent.change(input, {
+    target: {
+      value: "/review-code-changes 评审下 @READ",
+      selectionStart: 32,
+      selectionEnd: 32,
+    },
+  });
+  fireEvent.click(await screen.findByRole("option", { name: /README\.md/ }));
+  const send = screen.getByRole<HTMLButtonElement>("button", {
+    name: "发送侧边聊天消息",
+  });
+  await waitFor(() => expect(send.disabled).toBe(false));
+  fireEvent.click(send);
+  await waitFor(() => expect(sentText).not.toBe(""));
+  expect(
+    sentText.startsWith("/review-code-changes 评审下\n\n> MR 编号与链接：!3"),
+  ).toBe(true);
+  expect(sentText).toMatch(/README\.md.*\]$/);
+});

@@ -3,6 +3,8 @@ import { ArrowDown, Quote, X } from "lucide-react";
 import { ApprovalCard } from "./ApprovalCard";
 import { Composer } from "./Composer";
 import { ComposerAction } from "./ComposerAction";
+import { leadingSlashCommand, referencePrompt } from "./composerActions";
+import { referenceMessage } from "./referenceMessage";
 import { ModelPicker, type ModelPickerHandle } from "./ModelPicker";
 import { modelSelectionScope } from "./modelSelectionScope";
 import { PermissionPicker } from "./PermissionPicker";
@@ -832,10 +834,6 @@ function SideChatPane({
       !modelReady
     )
       return Promise.resolve(false);
-    if (draft.text.trimStart().startsWith("/")) {
-      setError("侧边聊天暂不支持 Agent 原生命令，请输入普通消息。");
-      return Promise.resolve(false);
-    }
     let requests = admissions.get(drafts);
     if (!requests) {
       requests = new Map();
@@ -854,6 +852,26 @@ function SideChatPane({
       );
       return Promise.resolve(false);
     }
+    const formattedQuotes = quotes.map((quote) =>
+      quote
+        .split("\n")
+        .map((line) => `> ${line}`)
+        .join("\n"),
+    );
+    const sendText =
+      formattedQuotes.length && leadingSlashCommand(prompt)
+        ? (() => {
+            const parsed = referenceMessage(prompt);
+            return referencePrompt(
+              [parsed.text.trim(), ...formattedQuotes]
+                .filter(Boolean)
+                .join("\n\n"),
+              parsed.references,
+            );
+          })()
+        : [...formattedQuotes, prompt || "请结合主会话解释引用的文本。"].join(
+            "\n\n",
+          );
     const send: Send =
       old && drafts.isCurrent(key, old.draft)
         ? old.request
@@ -861,15 +879,7 @@ function SideChatPane({
             method: "send",
             session_id: sideId,
             request_id: crypto.randomUUID(),
-            text: [
-              ...quotes.map((quote) =>
-                quote
-                  .split("\n")
-                  .map((line) => `> ${line}`)
-                  .join("\n"),
-              ),
-              prompt || "请结合主会话解释引用的文本。",
-            ].join("\n\n"),
+            text: sendText,
             model,
             effort,
             permission_mode: permission,

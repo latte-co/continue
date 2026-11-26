@@ -243,7 +243,18 @@ export function recognizedComposerCommands(
   const map = new Map<string, ComposerCommandTokenMeta>();
   map.set("model", { name: "model", icon: "model", title: "选择模型" });
   map.set("effort", { name: "effort", icon: "effort", title: "思考强度" });
-  if (sideChat) return map;
+  if (sideChat) {
+    for (const cmd of commands) {
+      if (cmd.kind === "skill" && !map.has(cmd.name)) {
+        map.set(cmd.name, {
+          name: cmd.name,
+          icon: "skill",
+          title: commandTitle(cmd, agent),
+        });
+      }
+    }
+    return map;
+  }
 
   for (const alias of subagentPanelAliases) {
     map.set(alias, { name: alias, icon: "subagents", title: "子智能体" });

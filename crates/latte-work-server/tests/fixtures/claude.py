@@ -6,6 +6,7 @@ import sys,json,time,os,subprocess,threading,pathlib,re
 # Only an explicit test environment enables it; no real managed config is read.
 managed_hook_root = os.environ.get('LATTE_FIXTURE_MANAGED_HOOK_ROOT')
 prediction_process = '--system-prompt' in sys.argv and 'Predict one short' in sys.argv[sys.argv.index('--system-prompt') + 1]
+side_process = '--append-system-prompt' in sys.argv and 'This is a side conversation.' in sys.argv[sys.argv.index('--append-system-prompt') + 1]
 
 def managed_record(file: str, value: dict) -> None:
     if managed_hook_root:
@@ -66,15 +67,15 @@ elif resume_id:
     native_id=resume_id
 project_store=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])/'projects'/re.sub(r'[^a-zA-Z0-9]','-',os.path.realpath(os.getcwd()))
 store=project_store/(native_id+'.jsonl')
-if '--fork-session' in sys.argv or (resume_id and '--disable-slash-commands' in sys.argv):
+if '--fork-session' in sys.argv or (resume_id and side_process):
     assert (project_store/(resume_id+'.jsonl')).is_file()
 readonly='--safe-mode' in sys.argv
-if resume_id and '--fork-session' not in sys.argv and '--disable-slash-commands' in sys.argv and not readonly and pathlib.Path('side-resume-hook-enabled').exists():
+if resume_id and '--fork-session' not in sys.argv and side_process and not readonly and pathlib.Path('side-resume-hook-enabled').exists():
     # Model a SessionStart resume hook: initialization can write without a prompt.
     pathlib.Path('shared.txt').write_text('side resume hook edit\n')
 if readonly:
-    assert '--strict-mcp-config' in sys.argv and '--disable-slash-commands' in sys.argv and '--no-chrome' in sys.argv
-    assert sys.argv[sys.argv.index('--tools')+1]=='Read,Glob,Grep'
+    assert '--strict-mcp-config' in sys.argv and '--disable-slash-commands' not in sys.argv and '--no-chrome' in sys.argv
+    assert sys.argv[sys.argv.index('--tools')+1]=='Read,Glob,Grep,Skill'
     assert '--permission-mode=plan' in sys.argv
     assert json.loads(pathlib.Path(sys.argv[sys.argv.index('--settings')+1]).read_text())['disableAllHooks']
 name=next((arg.split('=',1)[1] for arg in sys.argv if arg.startswith('--name=')),None)
@@ -174,14 +175,14 @@ for line in sys.stdin:
             else:
                 finish_interrupt()
             continue
-        if '--no-session-persistence' not in sys.argv and '--disable-slash-commands' not in sys.argv:
+        if '--no-session-persistence' not in sys.argv and not side_process:
             with open('fixture-agent-pid','w') as f:f.write(str(os.getpid()))
-        discovered_commands=[{'name':'compact','description':'Compact history','argumentHint':'[instructions]'},{'name':'project:check','description':os.path.basename(os.getcwd()),'argumentHint':'<target>'},{'name':'agents','description':'Native child agents','argumentHint':''}]
-        claude_skills_dir=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])/'skills'
-        if claude_skills_dir.is_dir():
-            for child in sorted(claude_skills_dir.iterdir()):
-                if (child/'SKILL.md').is_file() and all(c['name']!=child.name for c in discovered_commands):
-                    discovered_commands.append({'name':child.name,'description':f'Configured skill {child.name}','argumentHint':'[task]'})
+        discovered_commands=[{'name':'compact','description':'Compact history','argumentHint':'[instructions]','builtin':True},{'name':'project:check','description':os.path.basename(os.getcwd()),'argumentHint':'<target>'},{'name':'agents','description':'Native child agents','argumentHint':'','builtin':True}]
+        for skills_dir in [pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])/'skills', pathlib.Path(os.getcwd())/'.claude'/'skills']:
+            if skills_dir.is_dir():
+                for child in sorted(skills_dir.iterdir()):
+                    if (child/'SKILL.md').is_file() and all(c['name']!=child.name for c in discovered_commands):
+                        discovered_commands.append({'name':child.name,'description':f'Configured skill {child.name}','argumentHint':'[task]'})
         emit({'type':'control_response','response':{'subtype':'success','request_id':value['request_id'],'response':{'current_permission_mode':'plan' if readonly else 'default','commands':discovered_commands}}})
     elif value['type']=='user':
         text=value['message']['content']
@@ -190,7 +191,15 @@ for line in sys.stdin:
         turns+=1
         metadata({'type':'user','message':{'content':text},'sessionId':native_id})
         if name: metadata({'type':'custom-title','customTitle':name,'sessionId':native_id})
-        emit({'type':'system','subtype':'init','session_id':native_id,'tools':['Read','Glob','Grep'] if readonly else [],'mcp_servers':[]})
+        emit({'type':'system','subtype':'init','session_id':native_id,'tools':['Read','Glob','Grep','Skill'] if readonly else [],'mcp_servers':[]})
+        if text=='model-skill-call':
+            assert '--disable-slash-commands' not in sys.argv
+            emit({'type':'assistant','message':{'content':[{'type':'tool_use','id':'skill-call-1','name':'Skill','input':{'skill':'review-code-changes'}}]}})
+            emit({'type':'user','message':{'content':[{'type':'tool_result','tool_use_id':'skill-call-1','content':'Loaded skill review-code-changes','is_error':False}]}})
+            emit({'type':'assistant','message':{'content':[{'type':'text','text':'SIDE_MODEL_SKILL_OK'}]}})
+            emit({'type':'result','subtype':'success','is_error':False})
+            emit({'type':'system','subtype':'session_state_changed','state':'idle'})
+            continue
         if text.startswith('/project:check skill-load'):
             catalog_only=text.endswith('native-catalog')
             if catalog_only: emit({'type':'system','subtype':'init','session_id':native_id,'skills':['project:check']})

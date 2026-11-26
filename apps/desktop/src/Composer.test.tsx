@@ -452,8 +452,31 @@ it("detects only standalone mention and slash triggers", () => {
   });
 });
 
-it("offers local settings and does not discover or submit native commands in side chat", () => {
-  render(<Harness sideChat />);
+it("discovers and submits skills in side chat while keeping control commands blocked", async () => {
+  mocks.request.mockImplementation(async (_host, req) =>
+    req.method === "agent_commands"
+      ? {
+          kind: "agent_commands",
+          commands: [
+            {
+              name: "compact",
+              description: "压缩会话上下文",
+              argument_hint: "",
+              kind: "command",
+            },
+            {
+              name: "review-code-changes",
+              display_name: "代码评审",
+              description: "按评审契约审查变更",
+              argument_hint: "[范围]",
+              kind: "skill",
+            },
+          ],
+        }
+      : { kind: "files", entries: [] },
+  );
+  mocks.send.mockResolvedValue(true);
+  const { container } = render(<Harness sideChat />);
   type("/");
   expect(screen.getAllByRole("option")).toHaveLength(2);
   fireEvent.click(screen.getByRole("option", { name: /选择模型/ }));
@@ -463,11 +486,32 @@ it("offers local settings and does not discover or submit native commands in sid
     expect.any(Function),
   );
 
+  // Known built-in control commands fail closed immediately without network or send.
+  mocks.request.mockClear();
   type("/compact ");
   fireEvent.click(screen.getByText("发送"));
-  expect(screen.getByText(/侧边聊天暂不支持 Agent 原生命令/)).toBeTruthy();
+  expect(screen.getByText(/侧边聊天不支持 Agent 原生命令/)).toBeTruthy();
   expect(mocks.request).not.toHaveBeenCalled();
   expect(mocks.send).not.toHaveBeenCalled();
+
+  // Opening `/` in side chat lists `/model`, `/effort`, and skills (hiding `/compact` and `/agents`).
+  type("/");
+  const skillOption = await screen.findByRole("option", {
+    name: /review-code-changes.*代码评审/,
+  });
+  expect(screen.queryByRole("option", { name: /compact/ })).toBeNull();
+  expect(screen.queryByRole("option", { name: /agents/ })).toBeNull();
+  fireEvent.click(skillOption);
+  expect(inputText()).toBe("/review-code-changes ");
+  expect(container.querySelector(".composer-command-pill")?.textContent).toBe(
+    "review-code-changes",
+  );
+
+  type("/review-code-changes 评审下");
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() =>
+    expect(mocks.send).toHaveBeenCalledWith("/review-code-changes 评审下"),
+  );
 });
 it.each([
   ["local", "请检查 /comp", "Enter"],

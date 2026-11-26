@@ -2642,3 +2642,193 @@ async fn open_only_side_resume_journals_hook_writes_without_a_user_turn() {
         "side resume hook edit\n"
     );
 }
+
+#[tokio::test]
+async fn side_chat_supports_model_and_slash_skills_while_rejecting_control_commands() {
+    let host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let claude_skill = root.path().join(".claude/skills/review-code-changes");
+    std::fs::create_dir_all(&claude_skill).unwrap();
+    std::fs::write(
+        claude_skill.join("SKILL.md"),
+        "---\nname: review-code-changes\ndescription: Review diffs\n---\nBody\n",
+    )
+    .unwrap();
+    let codex_skill = root.path().join(".codex/skills/fixture-codex-skill");
+    std::fs::create_dir_all(&codex_skill).unwrap();
+    std::fs::write(
+        codex_skill.join("SKILL.md"),
+        "---\nname: fixture-codex-skill\ndescription: Fixture Codex skill\n---\nBody\n",
+    )
+    .unwrap();
+
+    let mut client = host.client().await;
+    let project = terminal_project(&mut client, root.path()).await;
+
+    // 1. Claude side chat: model-initiated Skill tool (both read-only and writable) + explicit /skill + /compact blocked.
+    let claude_parent = create_session(&mut client, project.clone(), "claude").await;
+    assert!(matches!(
+        send(&mut client, &claude_parent.id, "claude-init", "approve").await,
+        Response::Accepted { duplicate: false }
+    ));
+    let pending = permission(&wait(&mut client, &claude_parent.id, Status::Waiting).await);
+
+    // While parent waits on approval, an `inherit` side chat downgrades to read-only (`permission_mode: None`).
+    let claude_readonly_side = open_side(&mut client, &claude_parent).await;
+    assert!(matches!(
+        send(
+            &mut client,
+            &claude_readonly_side.id,
+            "claude-readonly-model-skill",
+            "model-skill-call"
+        )
+        .await,
+        Response::Accepted { duplicate: false }
+    ));
+    let ro_events = wait(&mut client, &claude_readonly_side.id, Status::Completed).await;
+    assert!(ro_events.iter().any(|e| matches!(
+        &e.event,
+        EventKind::Tool { name, input, .. }
+            if name == "Skill" && input["skill"] == "review-code-changes"
+    )));
+    assert!(ro_events.iter().any(|e| matches!(
+        &e.event,
+        EventKind::Text { text } if text.contains("SIDE_MODEL_SKILL_OK")
+    )));
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::Session {
+                session_id: claude_readonly_side.id.clone()
+            }
+        )
+        .await,
+        Response::Session { session } if session.permission_mode.is_none()
+    ));
+
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::Approve {
+                session_id: claude_parent.id.clone(),
+                request_id: pending,
+                allow: true,
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    wait(&mut client, &claude_parent.id, Status::Completed).await;
+
+    let claude_side = open_side(&mut client, &claude_parent).await;
+    assert!(matches!(
+        send(
+            &mut client,
+            &claude_side.id,
+            "claude-side-model-skill",
+            "model-skill-call"
+        )
+        .await,
+        Response::Accepted { duplicate: false }
+    ));
+    let events = wait(&mut client, &claude_side.id, Status::Completed).await;
+    assert!(events.iter().any(|e| matches!(
+        &e.event,
+        EventKind::Tool { name, input, .. }
+            if name == "Skill" && input["skill"] == "review-code-changes"
+    )));
+    assert!(events.iter().any(|e| matches!(
+        &e.event,
+        EventKind::Text { text } if text.contains("SIDE_MODEL_SKILL_OK")
+    )));
+
+    // Explicit `/review-code-changes` skill succeeds while `/compact` fails closed without tearing down the warm side chat.
+    assert!(matches!(
+        send(
+            &mut client,
+            &claude_side.id,
+            "claude-side-slash-skill",
+            "/review-code-changes 评审下"
+        )
+        .await,
+        Response::Accepted { duplicate: false }
+    ));
+    let slash_events = wait(&mut client, &claude_side.id, Status::Completed).await;
+    assert!(slash_events.iter().any(|e| matches!(
+        &e.event,
+        EventKind::Text { text } if text.contains("/review-code-changes 评审下")
+    )));
+
+    assert!(matches!(
+        send(
+            &mut client,
+            &claude_side.id,
+            "claude-side-compact",
+            "/compact"
+        )
+        .await,
+        Response::Accepted { duplicate: false }
+    ));
+    let blocked_events = wait(&mut client, &claude_side.id, Status::Failed).await;
+    assert!(blocked_events.iter().any(|e| matches!(
+        &e.event,
+        EventKind::State { message: Some(msg), .. } if msg.contains("侧边聊天不支持原生控制命令 /compact")
+    )));
+
+    assert!(matches!(
+        send(
+            &mut client,
+            &claude_side.id,
+            "claude-side-slash-skill-followup",
+            "/review-code-changes 第二轮评审"
+        )
+        .await,
+        Response::Accepted { duplicate: false }
+    ));
+    let followup_events = wait(&mut client, &claude_side.id, Status::Completed).await;
+    assert!(followup_events.iter().any(|e| matches!(
+        &e.event,
+        EventKind::Text { text } if text.contains("/review-code-changes 第二轮评审")
+    )));
+
+    // 2. Codex side chat: explicit `/fixture-codex-skill` succeeds while `/compact` and `/review` fail closed.
+    let codex_parent = create_session(&mut client, project, "codex").await;
+    assert!(matches!(
+        send(&mut client, &codex_parent.id, "codex-init", "hello").await,
+        Response::Accepted { duplicate: false }
+    ));
+    wait(&mut client, &codex_parent.id, Status::Completed).await;
+
+    let codex_side = open_side(&mut client, &codex_parent).await;
+    assert!(matches!(
+        send(
+            &mut client,
+            &codex_side.id,
+            "codex-side-skill",
+            "/fixture-codex-skill 评审侧聊\n\n> 引用片段"
+        )
+        .await,
+        Response::Accepted { duplicate: false }
+    ));
+    let codex_events = wait(&mut client, &codex_side.id, Status::Completed).await;
+    assert!(codex_events.iter().any(|e| matches!(
+        &e.event,
+        EventKind::Text { text } if text.contains("CODEX:SKILL:fixture-codex-skill:") && text.contains("评审侧聊")
+    )));
+
+    assert!(matches!(
+        send(
+            &mut client,
+            &codex_side.id,
+            "codex-side-compact",
+            "/compact"
+        )
+        .await,
+        Response::Accepted { duplicate: false }
+    ));
+    let codex_blocked = wait(&mut client, &codex_side.id, Status::Failed).await;
+    assert!(codex_blocked.iter().any(|e| matches!(
+        &e.event,
+        EventKind::State { message: Some(msg), .. } if msg.contains("侧边聊天不支持原生控制命令 /compact")
+    )));
+}

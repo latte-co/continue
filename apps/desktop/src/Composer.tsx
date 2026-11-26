@@ -519,10 +519,6 @@ export function Composer(props: Props) {
     setCommands([]);
     setCommandsLoadedScope("");
     setError("");
-    if (sideChat && mode === "commands") {
-      setLoading(false);
-      return;
-    }
     setLoading(true);
     if (!connected || !projectId) {
       setError("请先连接项目所在主机");
@@ -698,7 +694,9 @@ export function Composer(props: Props) {
     ...subagentPanelAliases,
     ...commands.filter(isNativeSubagentCommand).map((command) => command.name),
   ];
-  const nativeCommands = sideChat ? [] : commands;
+  const nativeCommands = sideChat
+    ? commands.filter((command) => command.kind === "skill")
+    : commands;
   const action = appCommandAction(value, nativeCommands, sideAgent);
   const localNavigation =
     sideChat && action !== "model" && action !== "effort" ? null : action;
@@ -713,7 +711,8 @@ export function Composer(props: Props) {
             (item) =>
               !sideChat ||
               item.ui_action === "model" ||
-              item.ui_action === "effort",
+              item.ui_action === "effort" ||
+              item.kind === "skill",
           )
           .filter((item) =>
             `${item.name} ${commandTitle(item, agent)} ${item.description} ${item.ui_action === "subagents" ? panelAliases.join(" ") : ""}`
@@ -1031,14 +1030,36 @@ export function Composer(props: Props) {
       await openAppCommand(localNavigation);
       return;
     }
-    if (sideChat && value.trimStart().startsWith("/")) {
-      setNotice("侧边聊天暂不支持 Agent 原生命令，请输入普通消息。");
-      return;
-    }
     const nativeCommand = leadingSlashCommand(value);
     const knownEntry = nativeCommand
       ? commands.find((command) => command.name === nativeCommand)
       : undefined;
+    if (sideChat && action) {
+      setNotice("侧边聊天不支持 Agent 原生命令，可调用技能或输入普通消息。");
+      return;
+    }
+    if (
+      sideChat &&
+      nativeCommand &&
+      (knownEntry !== undefined
+        ? knownEntry.kind !== "skill"
+        : commandsLoadedScope === catalogScope ||
+          nativeCommand === "review" ||
+          (isAlwaysNativeCommand(nativeCommand) &&
+            (agent === "claude" || nativeCommand !== "init")))
+    ) {
+      setNotice("侧边聊天不支持 Agent 原生命令，可调用技能或输入普通消息。");
+      return;
+    }
+    if (
+      sideChat &&
+      nativeCommand &&
+      !knownEntry &&
+      (!connected || !projectId)
+    ) {
+      setNotice("请先连接项目所在主机");
+      return;
+    }
     const knownNonSkill =
       !!nativeCommand &&
       (knownEntry !== undefined
@@ -1074,7 +1095,8 @@ export function Composer(props: Props) {
         nativeCommand &&
         !knownEntry &&
         commandsLoadedScope !== catalogScope &&
-        (agent !== "opencode" ||
+        (sideChat ||
+          agent !== "opencode" ||
           props.quotes?.length ||
           props.annotations?.length ||
           attached.length)
@@ -1101,6 +1123,7 @@ export function Composer(props: Props) {
             currentContext.current !== commandContext
           )
             return;
+          if (sideChat) throw cause;
           if (props.quotes?.length) {
             setNotice("请先移除引用的文本片段，再使用 Agent 原生命令。");
             return;
@@ -1126,7 +1149,10 @@ export function Composer(props: Props) {
           return;
       }
       const uiAction = appCommandAction(value, catalog, sideAgent);
-      if (uiAction) {
+      if (
+        uiAction &&
+        (!sideChat || uiAction === "model" || uiAction === "effort")
+      ) {
         await openAppCommand(uiAction);
         return;
       }
@@ -1134,6 +1160,10 @@ export function Composer(props: Props) {
         ? catalog.find((command) => command.name === nativeCommand)
         : undefined;
       const isSkill = matched?.kind === "skill";
+      if (sideChat && nativeCommand && !isSkill) {
+        setNotice("侧边聊天不支持 Agent 原生命令，可调用技能或输入普通消息。");
+        return;
+      }
       if (nativeCommand && !isSkill && (agent !== "opencode" || matched)) {
         if (props.quotes?.length) {
           setNotice("请先移除引用的文本片段，再使用 Agent 原生命令。");
