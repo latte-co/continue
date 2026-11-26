@@ -60,7 +60,7 @@ export function AppearancePreview() {
           kind: "approval",
           request_id: "preview",
           tool: "Write",
-          input: { file_path: "README.md", content: "# Continue One" },
+          input: { file_path: "README.md", content: "# Continue" },
         }}
         resolved={!running}
         decision={!running ? "allowed" : undefined}

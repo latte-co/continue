@@ -430,3 +430,27 @@ it("lets the user clear an effort override even when the model's levels could no
   expect(onEffortChange).toHaveBeenCalledWith(null);
   expect(document.activeElement).toBe(trigger);
 });
+
+it("renders checkmarks only on active choices and keeps variant chevrons at the trailing edge", () => {
+  render(
+    <ModelSelector
+      value="backend-large"
+      options={options}
+      onChange={vi.fn()}
+      effort="high"
+      levels={["low", "high"]}
+      onEffortChange={vi.fn()}
+      disabled={false}
+    />,
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Model and reasoning effort" }),
+  );
+  const seed = screen.getByRole("menuitemradio", { name: "Seed" });
+  expect(seed.querySelector(".model-option-check")).toBeNull();
+  const group = screen.getByRole("menuitemradio", { name: "GPT Test" });
+  const icons = Array.from(group.querySelectorAll("svg"));
+  expect(icons).toHaveLength(2);
+  expect(icons[0]?.classList.contains("model-option-check")).toBe(true);
+  expect(icons[1]?.classList.contains("model-option-chevron")).toBe(true);
+});

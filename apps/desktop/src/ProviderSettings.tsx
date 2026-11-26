@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronRight, Plus, Server, Trash2 } from "lucide-react";
+import { Plus, Server, Trash2 } from "lucide-react";
 import {
   message,
   providerRequest,
@@ -494,6 +494,7 @@ export function ProviderSettings({
                             label={`删除模型 ${index + 1}`}
                             size="sm"
                             variant="ghost"
+                            intent="danger"
                             onClick={() =>
                               setDraft({
                                 ...draft,
@@ -552,9 +553,9 @@ export function ProviderSettings({
       closeDisabled={closeDisabled || busy}
       actions={
         <Button
-          variant="primary"
-          size="md"
-          leading={<Plus size={15} />}
+          variant="elevated"
+          size="sm"
+          leading={<Plus size={14} />}
           aria-label="添加 Provider"
           disabled={busy || !catalog}
           onClick={startAdd}
@@ -599,42 +600,52 @@ export function ProviderSettings({
                     )
                   }
                   actions={
-                    <>
-                      <Button
-                        variant="subtle"
-                        size="sm"
-                        trailing={<ChevronRight size={14} />}
-                        disabled={busy}
-                        onClick={() => edit(p)}
-                      >
-                        编辑
-                      </Button>
-                      <Button
-                        variant={remove === p.id ? "danger" : "ghost"}
-                        size="sm"
-                        disabled={busy}
-                        onClick={() =>
-                          remove === p.id
-                            ? void mutate({
-                                method: "delete_provider",
-                                id: p.id,
-                              })
-                            : setRemove(p.id)
-                        }
-                      >
-                        {remove === p.id ? "确认删除" : "删除"}
-                      </Button>
-                      {remove === p.id && (
+                    remove === p.id ? (
+                      <>
                         <Button
-                          variant="ghost"
+                          variant="subtle"
                           size="sm"
                           disabled={busy}
                           onClick={() => setRemove(null)}
                         >
                           取消
                         </Button>
-                      )}
-                    </>
+                        <Button
+                          variant="danger"
+                          size="sm"
+                          disabled={busy}
+                          onClick={() =>
+                            void mutate({
+                              method: "delete_provider",
+                              id: p.id,
+                            })
+                          }
+                        >
+                          确认删除
+                        </Button>
+                      </>
+                    ) : (
+                      <>
+                        <Button
+                          variant="subtle"
+                          size="sm"
+                          disabled={busy}
+                          onClick={() => edit(p)}
+                        >
+                          编辑
+                        </Button>
+                        <IconButton
+                          label="删除"
+                          variant="ghost"
+                          intent="danger"
+                          size="sm"
+                          disabled={busy}
+                          onClick={() => setRemove(p.id)}
+                        >
+                          <Trash2 size={14} />
+                        </IconButton>
+                      </>
+                    )
                   }
                 />
               );

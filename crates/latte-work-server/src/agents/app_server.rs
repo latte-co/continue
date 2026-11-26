@@ -431,7 +431,7 @@ impl AppServer {
                     // Older/unknown schemas cannot prove the configured instructions
                     // were read. Preserve native defaults by omitting the override.
                     eprintln!(
-                        "Latte Work：Agent 未返回可识别的 developer_instructions；已跳过平台技能注入，保留原生配置"
+                        "Continue：Agent 未返回可识别的 developer_instructions；已跳过平台技能注入，保留原生配置"
                     );
                     self.platform_instructions.clear();
                 }
@@ -634,7 +634,7 @@ impl AppServer {
                 }])
             }
             _ => Ok(vec![write(
-                json!({"id":message["id"],"error":{"code":-32601,"message":"Unsupported Agent request in Latte Work"}}),
+                json!({"id":message["id"],"error":{"code":-32601,"message":"Unsupported Agent request in Continue"}}),
             )?]),
         }
     }
@@ -1246,7 +1246,7 @@ fn questions(params: &Value) -> Result<Vec<UserQuestion>> {
         .iter()
         .map(|q| {
             if q["isSecret"] == true {
-                bail!("Latte Work 尚不支持 AppServer 密文问题");
+                bail!("Continue 尚不支持 AppServer 密文问题");
             }
             let id = field(q, "id")?.to_owned();
             if !ids.insert(id.clone()) {
@@ -1747,7 +1747,7 @@ mod tests {
                     frames[0]["params"]["developerInstructions"]
                         .as_str()
                         .unwrap_or_default()
-                        .contains("Latte Work platform skill"),
+                        .contains("Continue platform skill"),
                     enabled
                 );
                 assert!(frames[0]["params"].get("input").is_none());
@@ -1770,7 +1770,7 @@ mod tests {
             frames[0]["params"]["developerInstructions"]
                 .as_str()
                 .unwrap()
-                .starts_with("KEEP_USER_INSTRUCTIONS\n\nLatte Work")
+                .starts_with("KEEP_USER_INSTRUCTIONS\n\nContinue")
         );
     }
 

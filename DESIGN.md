@@ -1,7 +1,7 @@
-# Latte Work Design System (`DESIGN.md`)
+# Continue Design System (`DESIGN.md`)
 
 This document is the authoritative visual, geometric, optical-surface,
-interaction, and component contract for the Latte Work desktop client
+interaction, and component contract for the Continue desktop client
 (`apps/desktop/`).
 
 **Core rule — Component-First, Token-First:** Every new or refactored page,
@@ -164,10 +164,36 @@ the subpixel:
 
 | Size Token | CSS Variable | Height | Mandatory Scope |
 | --- | --- | --- | --- |
-| `lg` | `--control-height-lg` | `36px` | Standalone vertical form fields inside `Dialog`s and subview forms (`Field` + `TextInput size="lg"` / `Select size="lg"`). |
-| `md` | `--control-height-md` | `32px` | **Default** for `FilterBar` (`SearchInput` + `Select` + `Button`), `SettingRow` controls, `NavRow`, `MenuRow`, and modal/subview footer CTAs. |
-| `sm` | `--control-height-sm` | `28px` | Compact `Topbar` / `Subbar` / `Composer` toolbar controls, `IconButton` hit targets (`28×28px`), `FloatingPill`, `.composer-menu-option`, and inline `ItemRow` actions (`取消归档`, `编辑`). |
+| `lg` | `--control-height-lg` | `36px` (`34px` on `Button`) | Standalone vertical form fields inside `Dialog`s and subview forms (`Field` + `TextInput size="lg"` / `Select size="lg"`). |
+| `md` | `--control-height-md` | `32px` (`30px` `--button-height` standalone; `32px` inside `FilterBar` / `InputGroup`) | **Default** for `FilterBar` (`SearchInput` + `Select` + `Button`), `SettingRow` controls, `NavRow`, `MenuRow`, and modal/subview footer CTAs. |
+| `sm` | `--control-height-sm` | `28px` | Compact `Topbar` / `Subbar` / `SettingsPane` header actions (`+ 添加`), `IconButton` hit targets (`28×28px`), `FloatingPill`, `.composer-menu-option`, and inline `ItemRow` actions (`取消归档`, `编辑`). |
 | `xs` | `--control-height-xs` | `24px` | Dense inline micro actions (`查看完整输入`, `重试`) and compact `Segmented` items. |
+
+- **Tactile Keycap Button Grammar (`Button` & `IconButton`)**:
+  - **Unified `border-box` Geometry & Optical Icon Compensation**: Every `Button` and
+    `IconButton` reserves a `1px solid` border slot (`transparent` on `ghost`) with
+    size-proportional radii (`8px / 7px / 6px / 5px`) and tighter inline padding on
+    any edge carrying a `leading` or `trailing` icon (`data-has-leading` /
+    `data-has-trailing`), plus crisp `translateY(0.5px)` vertical press without
+    blur-inducing `scale()`.
+  - **Semantic Variant Hierarchy**:
+    - `primary`: Reserved strictly for the single commit CTA of a form, dialog, or
+      approval card (`保存并连接`, `保存`, `创建项目`, `允许一次`, `提交回答`). Never place a
+      high-contrast `primary` slab in `SettingsPane` headers or `FilterBar`s.
+    - `elevated`: Tactile raised keycap (`--color-btn-elevated` + `--color-border-strong`
+      + top inner rim `--color-btn-rim`) for page/toolbar creation triggers (`+ 添加`
+      in `SSHSettings` / `ProviderSettings` / `SkillAddMenu`). Inside
+      `.settings-pane-header`, separate `.settings-pane-toolbar` from the modal
+      close `×` button with a `1px` vertical hairline.
+    - `subtle`: Default secondary keycap (`--color-btn-bg` + `--color-border`) for
+      `取消`, `编辑` (clean label without redundant trailing `>` chevrons), `拒绝`, and
+      `跳过`.
+    - `danger` & `intent="danger"`: Calibrated crimson keycap (`--color-danger-surface`,
+      `--color-danger-border`, `--color-danger-text`) for destructive confirmations
+      (`确认移除`, `确认删除`, `卸载`). Row-level delete icons use `variant="ghost"
+      intent="danger"` (muted at rest, crimson on hover), and inline row
+      confirmations always follow left-to-right `[取消 (subtle)] [确认移除/删除 (danger)]`
+      ordering matching Dialog footers.
 
 - **Toolbar Non-Wrap Priority**: Inside `.ui-page-actions > .ui-filter-bar` (e.g.
   `SkillsSettings`), `.ui-search-wrap` uses `flex: 0 1 220px` (`min-width: 150px`)
@@ -263,14 +289,25 @@ To keep every page visually calm, dense, and cohesive:
     verified `--color-text-muted` token directly (`opacity: 1`), never diluted
     with background `color-mix`, so empty composer and search prompts remain
     legible (`>= 4.75:1`) in Material and custom dark themes.
-- **Three Optical Surface Tiers (Crisp Hairlines, Zero Muddy Drop Shadows)**:
+- **Three Optical Surface Tiers & Cohesive 4-Step Border Ramp**:
+  All container rings, control borders, popover frames, and focus rings derive from
+  one OKLCH-interpolated, `contrast`-scaled ramp (`--color-border-subtle` ->
+  `--color-border` -> `--color-border-strong` -> `--color-focus-ring`) — never
+  disconnected `rgba(255, 255, 255, ...)` outer rings that vanish over dark
+  backdrops or stark `#FFFFFF` focus outlines:
   1. `Well` (`--color-well` + `--shadow-well`): `8px` recessed `1px` inner
-     hairline (`inset 0 0 0 1px ...`) for inputs, selects, code blocks, and
-     `Segmented` tracks.
+     hairline (`inset 0 0 0 1px var(--color-border)`) for inputs, selects, subtle
+     buttons, code blocks, and `Segmented` tracks; focuses in-place via `1px`
+     `--focus-ring-inset` (`inset 0 0 0 1px var(--color-focus-ring)`) without
+     outer geometry expansion.
   2. `Card` (`--color-card` + `--shadow-card`): `10px` grouped surface with `1px`
-     optical perimeter ring (`0 0 0 1px ...`).
-  3. `Elevated` (`--color-elevated` + `--shadow-elevated`): `8px`/`10px` raised
-     surface for active segmented thumbs, `FloatingPill`s, and `Popover`s.
+     `--color-border-subtle` (dark) / `--color-border` (light) perimeter ring.
+  3. `Elevated` (`--color-elevated` + `--shadow-elevated` / `--shadow-popover`):
+     `8px`/`10px` raised surface with opaque `1px` `--color-border` /
+     `--color-border-strong` perimeter. Menu and listbox rows (`MenuRow`,
+     `Select`, `ModelSelector`, context menus) indicate hover/focus strictly via
+     soft row fills (`--color-hover` / `--color-row-selected`) with zero focus
+     border rings (`box-shadow: none`).
 - **Five-State Semantic Signal Grammar (`StatusSignal`)**:
   - `running`: 3-dot emerald pulse (`•••`, `--color-success`)
   - `waiting`: Amber `CirclePause` (`13.5px`, `--color-warning`)

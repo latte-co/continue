@@ -28,7 +28,7 @@ async fn global_skills_over_real_ssh_are_isolated_reversible_and_reconnectable()
         &wrapper,
         format!(
             "#!/bin/sh\nexec {} connect --state-dir {}\n",
-            quote(env!("CARGO_BIN_EXE_latte-work-server")),
+            quote(env!("CARGO_BIN_EXE_latte-continue-server")),
             quote(remote.directory.path().to_str().unwrap())
         ),
     )

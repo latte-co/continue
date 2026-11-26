@@ -9,6 +9,7 @@ export {
 export {
   Button,
   IconButton,
+  type ButtonIntent,
   type ButtonVariant,
   type ControlSize,
 } from "./Button";

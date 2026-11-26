@@ -171,7 +171,7 @@ for line in sys.stdin:
             continue
         assert 'model_backend_variant' not in params.get('config', {}), params
         if 'developerInstructions' in params:
-            assert params['developerInstructions'].startswith('NATIVE_CODEX_INSTRUCTIONS\n\nLatte Work')
+            assert params['developerInstructions'].startswith('NATIVE_CODEX_INSTRUCTIONS\n\nContinue')
         if method == 'thread/resume':
             assert params['threadId'] == thread and params['excludeTurns'] is True
             assert pathlib.Path('codex-inputs').exists()

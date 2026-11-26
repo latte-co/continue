@@ -1309,7 +1309,7 @@ impl Claude {
                     if request["tool_name"] == "AskUserQuestion" {
                         match parse_questions(&request["input"]) {
                             Ok(questions) => output.push(Action::Question { id, tool_use_id: request["tool_use_id"].as_str().map(str::to_owned), input: request["input"].clone(), questions }),
-                            Err(_) => output.push(write_action(json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":{"behavior":"deny","message":"Latte Work 无法读取问题参数；请重新提出有效的问题"}}}))?),
+                            Err(_) => output.push(write_action(json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":{"behavior":"deny","message":"Continue 无法读取问题参数；请重新提出有效的问题"}}}))?),
                         }
                     } else {
                         output.push(Action::Approval {
@@ -1320,7 +1320,7 @@ impl Claude {
                         });
                     }
                 } else {
-                    output.push(write_action(json!({"type":"control_response","response":{"subtype":"error","request_id":id,"error":"Unsupported control request in Latte Work v0.1"}}))?);
+                    output.push(write_action(json!({"type":"control_response","response":{"subtype":"error","request_id":id,"error":"Unsupported control request in Continue v0.1"}}))?);
                 }
             }
             "stream_event" => {
@@ -3969,7 +3969,7 @@ mod tests {
                 .collect();
             assert_eq!(args.iter().any(|s| s == "--append-system-prompt"), enabled);
             assert_eq!(
-                args.iter().any(|s| s.contains("Latte Work platform skill")),
+                args.iter().any(|s| s.contains("Continue platform skill")),
                 enabled
             );
             assert!(!args.iter().any(|s| s == "--add-dir"));

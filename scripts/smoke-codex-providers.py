@@ -18,7 +18,7 @@ import threading
 import time
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--binary', default='target/debug/latte-work-server')
+parser.add_argument('--binary', default='target/debug/latte-continue-server')
 parser.add_argument('--codex', default=shutil.which('codex') or 'codex')
 parser.add_argument('--output', default='target/codex-provider-smoke.json')
 args = parser.parse_args()

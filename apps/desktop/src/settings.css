@@ -52,7 +52,29 @@
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
+  gap: 10px;
+}
+
+.settings-pane-toolbar {
+  display: inline-flex;
+  align-items: center;
   gap: var(--space-2);
+}
+
+.settings-pane-toolbar + .settings-pane-close {
+  position: relative;
+  margin-left: 2px;
+}
+
+.settings-pane-toolbar + .settings-pane-close::before {
+  content: "";
+  position: absolute;
+  left: -7px;
+  top: 6px;
+  bottom: 6px;
+  width: 1px;
+  background: var(--color-border-subtle);
+  pointer-events: none;
 }
 
 .settings-pane-scroll {

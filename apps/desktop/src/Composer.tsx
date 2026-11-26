@@ -1548,7 +1548,7 @@ export function Composer(props: Props) {
           role="group"
           aria-label="已选择技能"
         >
-          <span title="Continue One 内置的技能创建指引；发送需求后创建全局技能">
+          <span title="Continue 内置的技能创建指引；发送需求后创建全局技能">
             <Box size={16} />
             Skill Creator
             <button

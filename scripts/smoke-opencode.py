@@ -376,7 +376,7 @@ export default {
                     send("after-first-failure", "Continue after the rejected native command.")
                     continued = wait("completed")
                     assert continued["session"]["native_id"] == failed_native
-                    assert "Latte Work platform skill" in json.dumps(Model.calls[before:])
+                    assert "Continue platform skill" in json.dumps(Model.calls[before:])
                     send("hook-denies-question", "/restricted")
                     restricted = wait("completed")
                     assert not any(e["event"]["kind"] == "question" for e in restricted["events"])
@@ -449,7 +449,7 @@ export default {
                     time.sleep(.05)
                 assert len(Model.calls) == before + 1
                 assert "Native slash smoke first named turn" in json.dumps(Model.calls[before:])
-                assert "Latte Work platform skill" in json.dumps(Model.calls[before:])
+                assert "Continue platform skill" in json.dumps(Model.calls[before:])
                 assert named_session["title"] == "Initial OpenCode title"
                 rpc("close_agent_session", session_id=named, only_if_idle=True)
                 exported = subprocess.run([cli, "session", "export", "--standalone", named_session["native_id"]],
@@ -495,7 +495,7 @@ export default {
                 send("bypass", "permission sentinel", "bypass_permissions")
                 wait("completed")
                 assert marker.read_text() == "OC_EXECUTED"
-                assert any("Latte Work platform skill" in json.dumps(req) for req in Model.calls)
+                assert any("Continue platform skill" in json.dumps(req) for req in Model.calls)
                 send("steer-start", "steer start sentinel", "bypass_permissions")
                 assert Model.steering_ready.wait(5)
                 send("steered", "steer followup sentinel", "bypass_permissions", queued=True)
@@ -825,7 +825,7 @@ export default {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", default="target/debug/latte-work-server", type=Path)
+    parser.add_argument("--binary", default="target/debug/latte-continue-server", type=Path)
     parser.add_argument("--opencode", default=shutil.which("opencode"), type=Path)
     args = parser.parse_args()
     if args.opencode is None:

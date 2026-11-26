@@ -389,13 +389,14 @@ async fn reconnect_for_cleanup(
 fn local_binary(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let mut binary = std::env::current_exe()
         .map_err(|e| e.to_string())?
-        .with_file_name("latte-work-server");
+        .with_file_name("latte-continue-server");
     if !binary.is_file() {
         let resource = app.path().resource_dir().map_err(|e| e.to_string())?;
-        binary = resource.join("latte-work-server");
+        binary = resource.join("latte-continue-server");
     }
     if cfg!(debug_assertions)
-        && let Ok(path) = std::env::var("LATTE_WORK_SERVER")
+        && let Ok(path) =
+            std::env::var("CONTINUE_SERVER").or_else(|_| std::env::var("LATTE_WORK_SERVER"))
     {
         binary = PathBuf::from(path);
     }
@@ -847,18 +848,59 @@ async fn disconnect_host(state: State<'_, Connections>, host_id: String) -> Resu
     state.passwords.lock().await.remove(&host_id);
     Ok(())
 }
-fn host_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    Ok(app
-        .path()
-        .app_config_dir()
+pub(crate) fn ensure_private_dir(path: &std::path::Path, label: &str) -> Result<(), String> {
+    if path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err(format!("{label}不能是符号链接"));
+    }
+    std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+    if path
+        .symlink_metadata()
         .map_err(|e| e.to_string())?
-        .join("hosts.json"))
+        .file_type()
+        .is_symlink()
+    {
+        return Err(format!("{label}不能是符号链接"));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| e.to_string())
+}
+pub(crate) fn storage_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let root = app
+        .path()
+        .home_dir()
+        .map_err(|e| e.to_string())?
+        .join(".latte/continue");
+    ensure_private_dir(&root, "本地存储目录")?;
+    Ok(root)
+}
+pub(crate) fn app_config_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = storage_root(app)?.join("config");
+    ensure_private_dir(&dir, "应用配置目录")?;
+    Ok(dir)
+}
+pub(crate) fn app_cache_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = storage_root(app)?.join("cache");
+    ensure_private_dir(&dir, "应用缓存目录")?;
+    Ok(dir)
+}
+fn host_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app_config_dir(app)?.join("hosts.json"))
 }
 #[tauri::command]
 fn load_hosts(app: tauri::AppHandle) -> Result<Vec<Host>, String> {
     let path = host_file(&app)?;
     if !path.exists() {
         return Ok(vec![]);
+    }
+    if !path
+        .symlink_metadata()
+        .map_err(|e| e.to_string())?
+        .is_file()
+    {
+        return Err("SSH 主机配置文件无效".into());
     }
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     serde_json::from_slice(&data).map_err(|e| e.to_string())
@@ -898,13 +940,14 @@ async fn save_hosts(app: tauri::AppHandle, hosts: Vec<Host>) -> Result<Vec<Strin
         .await?;
     }
     let path = host_file(&app)?;
-    std::fs::create_dir_all(path.parent().ok_or("无效配置路径")?).map_err(|e| e.to_string())?;
     let temp = path.with_extension("tmp");
     std::fs::write(
         &temp,
         serde_json::to_vec_pretty(&hosts).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
+    std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| e.to_string())?;
     std::fs::rename(temp, path).map_err(|e| e.to_string())?;
     Ok(changed)
 }
@@ -1397,7 +1440,7 @@ fn main() {
                 let quit = tauri::menu::MenuItem::with_id(
                     app,
                     "latte-quit",
-                    "退出 Continue One",
+                    "退出 Continue",
                     true,
                     Some("CmdOrCtrl+Q"),
                 )?;
@@ -1488,7 +1531,7 @@ fn main() {
             read_local_text
         ])
         .build(tauri::generate_context!())
-        .expect("failed to build Latte Work desktop")
+        .expect("failed to build Continue desktop")
         .run(|app, event| {
             if let tauri::RunEvent::ExitRequested { api, .. } = &event {
                 let state = app.state::<Connections>();
@@ -1758,5 +1801,30 @@ for line in sys.stdin:
         assert_eq!(secret, "test-password");
         drop(challenge);
         assert!(!socket.exists());
+    }
+
+    #[test]
+    fn ensure_private_dir_creates_private_latte_continue_subdirs_and_rejects_symlinks() {
+        let home = std::env::temp_dir().join(format!(
+            "continue-storage-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let root = home.join(".latte/continue");
+        let config_dir = root.join("config");
+        let cache_dir = root.join("cache");
+        ensure_private_dir(&root, "本地存储目录").unwrap();
+        ensure_private_dir(&config_dir, "应用配置目录").unwrap();
+        ensure_private_dir(&cache_dir, "应用缓存目录").unwrap();
+        for dir in [&root, &config_dir, &cache_dir] {
+            assert_eq!(
+                std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let symlink_dir = root.join("symlink-config");
+        std::os::unix::fs::symlink(&config_dir, &symlink_dir).unwrap();
+        assert!(ensure_private_dir(&symlink_dir, "应用配置目录").is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

@@ -110,7 +110,7 @@ pub(super) fn configure_provider(
         bail!("Codex 仅支持 OpenAI Responses Provider");
     }
     let mut fields = vec![
-        "name=\"Latte Work\"".to_owned(),
+        "name=\"Continue\"".to_owned(),
         format!("base_url={}", serde_json::to_string(&p.base_url)?),
         "wire_api=\"responses\"".into(),
         "requires_openai_auth=false".into(),

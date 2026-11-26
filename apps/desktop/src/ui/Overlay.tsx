@@ -239,6 +239,7 @@ export function MenuRow({
   leading,
   trailing,
   className,
+  onPointerMove,
   children,
   ...props
 }: ComponentProps<"button"> & {
@@ -258,6 +259,17 @@ export function MenuRow({
       ]
         .filter(Boolean)
         .join(" ")}
+      onPointerMove={(event) => {
+        onPointerMove?.(event);
+        if (
+          !event.defaultPrevented &&
+          !event.currentTarget.disabled &&
+          document.activeElement !== event.currentTarget &&
+          event.currentTarget.closest('[role="menu"]')
+        ) {
+          event.currentTarget.focus({ preventScroll: true });
+        }
+      }}
       {...props}
     >
       <span className="ui-menu-row-main">

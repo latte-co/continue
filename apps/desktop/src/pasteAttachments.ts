@@ -50,7 +50,7 @@ export async function storePastedFile(
   kind = attachmentKind(file.name, file.type),
 ): Promise<ComposerReference> {
   if (file.size > MAX_PASTE_FILE) throw new Error("单个附件不能超过 64 MiB");
-  if (!native) throw new Error("附件需要在 Continue One 桌面应用中使用");
+  if (!native) throw new Error("附件需要在 Continue 桌面应用中使用");
   if (!valid()) throw new Error("附件添加已取消");
   const start = await stage({
     method: "begin_attachment",

@@ -1,4 +1,4 @@
-# Latte Work
+# Continue
 
 A small desktop workspace for coding agents, with local and SSH projects.
 

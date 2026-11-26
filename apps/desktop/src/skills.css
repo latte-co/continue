@@ -45,6 +45,9 @@
   width: 220px;
   color: var(--color-text-muted);
 }
+.skills-settings .skills-search:focus-within {
+  box-shadow: var(--focus-ring-inset);
+}
 .skills-settings .skills-search input {
   min-height: 30px;
   margin: 0;

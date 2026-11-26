@@ -1,4 +1,4 @@
-/* Latte Work UI foundations. See DESIGN.md and src/ui/ before adding tokens. */
+/* Continue UI foundations. See DESIGN.md and src/ui/ before adding tokens. */
 :root {
   --font-ui:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC",
@@ -53,7 +53,7 @@
   --control-height-sm: 28px;
   --control-height-xs: 24px;
   --control-height: var(--control-height-lg);
-  --button-height: var(--control-height-md);
+  --button-height: 30px;
   --menu-item-height: var(--control-height-md);
   --icon-hit-size: var(--control-height-sm);
   --icon-size: 15.5px;
@@ -72,20 +72,25 @@
   --color-text-secondary: #c8c8c8;
   --color-text-muted: #a1a1a1;
   --color-placeholder: #a1a1a1;
-  --color-border-subtle: #272727;
-  --color-border: #303030;
-  --color-border-strong: #3c3c3c;
+  --color-border-subtle: #262626;
+  --color-border: #2f2f2f;
+  --color-border-strong: #383838;
   --color-hover: #f2f2f20d;
   --color-row-selected: #f2f2f214;
   --color-selected: #f2f2f21a;
   --color-focus-background: #f2f2f21f;
-  --color-focus-ring: #e4e4e7;
+  --color-focus-ring: #4f4f4f;
   --color-primary: #f2f2f2;
   --color-primary-hover: #ffffff;
   --color-on-primary: #121212;
-  --color-action: #ffffff;
-  --color-action-hover: #e6e6e6;
+  --color-action: #dfdfdf;
+  --color-action-hover: #f2f2f2;
   --color-on-action: #141414;
+  --color-btn-bg: #222222;
+  --color-btn-hover: #292929;
+  --color-btn-elevated: #282828;
+  --color-btn-elevated-hover: #303030;
+  --color-btn-rim: #ffffff12;
   --color-disabled-bg: #222222;
   --color-disabled-text: #787878;
   --color-stop: #3a3a3a;
@@ -99,26 +104,31 @@
   --color-success: #55c88a;
   --color-warning: #e8b658;
   --color-danger: #f08888;
+  --color-danger-surface: #dc35453d;
+  --color-danger-surface-hover: #dc354557;
+  --color-danger-border: #f0586075;
+  --color-danger-text: #ff9497;
   --color-unread: #6ea4ff;
   --color-backdrop: #0000008c;
   --color-selection: #f2f2f23d;
 
-  /* 3-Tier Optical Shadows — Crisp Hairlines, Restraint on Static Surfaces */
+  /* 3-Tier Optical Shadows — Bound to theme border tokens for uniform contrast */
   --shadow-island:
-    0 0 0 1px rgba(255, 255, 255, 0.065), 0 4px 16px -4px rgba(0, 0, 0, 0.24);
-  --shadow-well: inset 0 0 0 1px rgba(255, 255, 255, 0.065);
-  --shadow-card: 0 0 0 1px rgba(255, 255, 255, 0.065);
+    0 0 0 1px var(--color-border-subtle), 0 4px 16px -4px rgba(0, 0, 0, 0.24);
+  --shadow-well: inset 0 0 0 1px var(--color-border);
+  --shadow-card: 0 0 0 1px var(--color-border-subtle);
   --shadow-elevated:
-    0 0 0 1px rgba(255, 255, 255, 0.075), 0 2px 6px rgba(0, 0, 0, 0.18);
+    0 0 0 1px var(--color-border), 0 2px 6px rgba(0, 0, 0, 0.18);
   --shadow-composer:
-    0 0 0 1px rgba(255, 255, 255, 0.08), 0 2px 8px rgba(0, 0, 0, 0.16);
+    0 0 0 1px var(--color-border), 0 2px 8px rgba(0, 0, 0, 0.16);
   --shadow-composer-focus:
-    0 0 0 1px rgba(255, 255, 255, 0.14), 0 2px 8px rgba(0, 0, 0, 0.18);
+    0 0 0 1px var(--color-focus-ring), 0 2px 8px rgba(0, 0, 0, 0.18);
   --shadow-dialog:
-    0 16px 40px -8px rgba(0, 0, 0, 0.42), 0 0 0 1px rgba(255, 255, 255, 0.1);
+    0 16px 40px -8px rgba(0, 0, 0, 0.42), 0 0 0 1px var(--color-border);
   --shadow-popover:
-    0 12px 28px -6px rgba(0, 0, 0, 0.36), 0 0 0 1px rgba(255, 255, 255, 0.09);
-  --focus-ring: 0 0 0 1.5px var(--color-focus-ring);
+    0 12px 28px -6px rgba(0, 0, 0, 0.36), 0 0 0 1px var(--color-border-strong);
+  --focus-ring: 0 0 0 1px var(--color-focus-ring);
+  --focus-ring-inset: inset 0 0 0 1px var(--color-focus-ring);
 
   /* Motion & Layout Widths */
   --duration-fast: 120ms;

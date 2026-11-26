@@ -13,7 +13,7 @@ if [[ "$mode" == package ]]; then profile=release; flags+=(--release); fi
 cargo build -p latte-work-server "${flags[@]}"
 triple="$(rustc -vV | sed -n 's/^host: //p')"
 mkdir -p apps/desktop/src-tauri/binaries
-cp "$CARGO_TARGET_DIR/$profile/latte-work-server" "apps/desktop/src-tauri/binaries/latte-work-server-$triple"
+cp "$CARGO_TARGET_DIR/$profile/latte-continue-server" "apps/desktop/src-tauri/binaries/latte-continue-server-$triple"
 if [[ "$mode" == prepare ]]; then exit 0; fi
 cd apps/desktop
 case "$mode" in
@@ -23,6 +23,6 @@ case "$mode" in
 esac
 
 if [[ "$(uname -s)" == Darwin ]]; then
-  ../../scripts/sign-macos.sh "$CARGO_TARGET_DIR/$profile/bundle/macos/Continue One.app"
+  ../../scripts/sign-macos.sh "$CARGO_TARGET_DIR/$profile/bundle/macos/Continue.app"
   if [[ "$mode" == package ]]; then ../../scripts/package-dmg.sh; fi
 fi

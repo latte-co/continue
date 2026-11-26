@@ -1,6 +1,7 @@
-# Latte Work contributor guide
+# Continue contributor guide
 
-Latte Work is a Tauri desktop client and a standalone Rust host service. Read
+Continue is a Tauri desktop client (`continue`) and a standalone Rust host service
+(`latte-continue-server`), storing local state under `~/.latte/continue`. Read
 DEVELOPMENT.md before changing build or runtime contracts.
 
 ## Boundaries

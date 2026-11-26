@@ -171,7 +171,7 @@ function MessageLocalImage({
           <span className="message-image-hint">{error}</span>
           <button
             type="button"
-            className="secondary small"
+            className="ui-btn ui-btn--subtle ui-btn--xs"
             onClick={() => retry((value) => value + 1)}
           >
             重试

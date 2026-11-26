@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronRight, Globe2, Monitor, RefreshCw } from "lucide-react";
+import { Globe2, Monitor, RefreshCw } from "lucide-react";
 import {
   agentProviders,
   agentEnvironments,
@@ -468,15 +468,11 @@ export function AgentSettings({
           <Select
             label="运行主机"
             menuTitle="主机"
-            size="md"
+            size="sm"
             minMenuWidth={200}
             align="end"
             leading={
-              host.id === "local" ? (
-                <Monitor size={14.5} />
-              ) : (
-                <Globe2 size={14.5} />
-              )
+              host.id === "local" ? <Monitor size={14} /> : <Globe2 size={14} />
             }
             value={host.id}
             options={state.hosts.map((h) => ({ value: h.id, label: h.name }))}
@@ -489,14 +485,11 @@ export function AgentSettings({
           <IconButton
             label="重新连接"
             variant="subtle"
-            size="md"
+            size="sm"
             disabled={busy}
             onClick={() => setRetry((v) => v + 1)}
           >
-            <RefreshCw
-              size={14.5}
-              className={busy && !serverId ? "spin" : ""}
-            />
+            <RefreshCw size={14} className={busy && !serverId ? "spin" : ""} />
           </IconButton>
         </>
       }
@@ -560,7 +553,6 @@ export function AgentSettings({
                     <Button
                       variant="subtle"
                       size="sm"
-                      trailing={<ChevronRight size={14} />}
                       aria-label={`编辑 ${agent.name}`}
                       disabled={busy}
                       onClick={() => {

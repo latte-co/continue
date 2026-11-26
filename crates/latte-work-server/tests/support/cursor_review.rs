@@ -35,7 +35,7 @@ async fn discovery_host(binary: &Path, incompatible: bool, explicit: bool) -> Ho
     fixture_bridge::prepare(
         directory.path(),
         &environment,
-        Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+        Path::new(env!("CARGO_BIN_EXE_latte-continue-server")),
     );
     let removed = if explicit {
         &[][..]
@@ -586,7 +586,7 @@ async fn cursor_review_permission_denied_path_entry_does_not_hide_later_cli() {
     fixture_bridge::prepare(
         directory.path(),
         &environment,
-        Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+        Path::new(env!("CARGO_BIN_EXE_latte-continue-server")),
     );
     let process = Host::spawn_with_removed_environment(
         directory.path(),

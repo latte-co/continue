@@ -45,14 +45,14 @@ export function SkillAddMenu({
     <>
       <Button
         ref={trigger}
-        variant="primary"
+        variant="elevated"
         size="md"
         className="skills-add"
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? id : undefined}
         disabled={unavailable}
-        trailing={<ChevronDown size={14.5} />}
+        trailing={<ChevronDown size={14} />}
         onClick={() => {
           trigger.current?.focus();
           setExpanded(!open);

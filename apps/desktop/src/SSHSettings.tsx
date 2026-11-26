@@ -1,12 +1,5 @@
 import { useState } from "react";
-import {
-  ChevronRight,
-  FolderOpen,
-  Globe2,
-  Plus,
-  RefreshCw,
-  Trash2,
-} from "lucide-react";
+import { FolderOpen, Globe2, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { CopyButton } from "./MessageContent";
 import { chooseIdentityFile, message, type Host } from "./api";
 import { SettingsPane } from "./SettingsPane";
@@ -28,7 +21,7 @@ import {
 } from "./ui";
 
 const setupCommands =
-  'cargo build --release -p latte-work-server --locked\nmkdir -p "$HOME/.local/bin"\ninstall -m 755 target/release/latte-work-server "$HOME/.local/bin/latte-work-server"';
+  'cargo build --release -p latte-work-server --locked\nmkdir -p "$HOME/.local/bin"\ninstall -m 755 target/release/latte-continue-server "$HOME/.local/bin/latte-continue-server"';
 
 type Auth = NonNullable<Host["auth"]>;
 type Draft = {
@@ -335,7 +328,7 @@ export function SSHSettings({
               <Field
                 label="远程 Server 路径（可选）"
                 htmlFor="ssh-server-path"
-                hint="留空时自动查找远端 ~/.local/bin/latte-work-server 及 PATH。其他安装位置可填写绝对路径。"
+                hint="留空时自动查找远端 ~/.local/bin/latte-continue-server 及 PATH。其他安装位置可填写绝对路径。"
               >
                 <TextInput
                   id="ssh-server-path"
@@ -357,15 +350,15 @@ export function SSHSettings({
   return (
     <SettingsPane
       title="SSH 连接"
-      description="管理远程项目使用的 SSH 主机。远程设备需先安装 Continue One Server。"
+      description="管理远程项目使用的 SSH 主机。远程设备需先安装 Continue Server。"
       className="ssh-settings"
       onClose={onClose}
       closeDisabled={closeDisabled || busy || !!workingHost}
       actions={
         <Button
-          variant="primary"
-          size="md"
-          leading={<Plus size={15} />}
+          variant="elevated"
+          size="sm"
+          leading={<Plus size={14} />}
           disabled={busy || !!workingHost}
           onClick={() => {
             setError("");
@@ -396,7 +389,7 @@ export function SSHSettings({
             <CopyButton text={setupCommands} label="复制安装命令" />
           </li>
           <li>
-            运行 <code>~/.local/bin/latte-work-server --help</code>{" "}
+            运行 <code>~/.local/bin/latte-continue-server --help</code>{" "}
             检查可执行文件，然后添加连接。无需手动常驻启动服务。
           </li>
         </ol>
@@ -460,6 +453,14 @@ export function SSHSettings({
                   confirmingRemove ? (
                     <>
                       <Button
+                        variant="subtle"
+                        size="sm"
+                        disabled={!!workingHost || busy}
+                        onClick={() => setConfirmRemoveId(null)}
+                      >
+                        取消
+                      </Button>
+                      <Button
                         variant="danger"
                         size="sm"
                         disabled={!!workingHost || busy}
@@ -467,20 +468,12 @@ export function SSHSettings({
                       >
                         确认移除
                       </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        disabled={!!workingHost || busy}
-                        onClick={() => setConfirmRemoveId(null)}
-                      >
-                        取消
-                      </Button>
                     </>
                   ) : (
                     <>
                       <IconButton
                         label="重新连接"
-                        variant="subtle"
+                        variant="ghost"
                         size="sm"
                         disabled={!!workingHost || busy}
                         onClick={() => void state.refreshHost(host)}
@@ -490,7 +483,6 @@ export function SSHSettings({
                       <Button
                         variant="subtle"
                         size="sm"
-                        trailing={<ChevronRight size={14} />}
                         disabled={!!workingHost || busy}
                         onClick={() => {
                           setError("");
@@ -503,6 +495,7 @@ export function SSHSettings({
                       <IconButton
                         label={`移除 ${host.name}`}
                         variant="ghost"
+                        intent="danger"
                         size="sm"
                         disabled={!!workingHost || busy}
                         onClick={() => {

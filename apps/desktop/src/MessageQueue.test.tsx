@@ -761,3 +761,20 @@ it("closes the portal on Tab without leaving focus on a removed menu item", asyn
   expect(screen.queryByRole("menu")).toBeNull();
   expect(document.activeElement).toBe(trigger);
 });
+
+it("collapses and expands multi-item queues while previewing the next queued prompt", async () => {
+  mocks.request.mockResolvedValue({
+    kind: "message_queue",
+    entries: multiple(),
+    paused: false,
+    reason: null,
+  });
+  render(<MessageQueue {...props} />);
+  await screen.findByText("待发送 · 3");
+  const collapse = screen.getByRole("button", { name: "收起待发送队列" });
+  fireEvent.click(collapse);
+  expect(screen.queryByRole("list")).toBeNull();
+  expect(screen.getByText("Original message")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "展开待发送队列" }));
+  expect(screen.getAllByRole("listitem")).toHaveLength(3);
+});

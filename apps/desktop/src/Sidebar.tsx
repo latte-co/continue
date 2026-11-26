@@ -600,9 +600,7 @@ export function Sidebar({
           sessionKey={sessionId ? `${hostId}:${sessionId}` : undefined}
           status={sessions.find((s) => s.id === sessionId)?.status}
         />
-        <span className="brand-name">
-          Continue<span className="brand-light"> One</span>
-        </span>
+        <span className="brand-name">Continue</span>
       </div>
       <button
         className="new-task"

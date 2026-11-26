@@ -2,7 +2,7 @@
 use crate::Connections;
 use latte_work_config::ProviderStore;
 use latte_work_protocol::{Request, Response};
-use tauri::{Manager, State};
+use tauri::State;
 
 #[tauri::command]
 pub async fn agent_environments(
@@ -29,14 +29,9 @@ pub async fn with_store<T: Send + 'static>(
     app: tauri::AppHandle,
     operation: impl FnOnce(&mut ProviderStore) -> anyhow::Result<T> + Send + 'static,
 ) -> Result<T, String> {
-    let directory = app.path().app_config_dir().map_err(|e| e.to_string())?;
-    let legacy = app
-        .path()
-        .home_dir()
-        .map_err(|e| e.to_string())?
-        .join(".local/share/latte-work/providers.json");
+    let directory = crate::app_config_dir(&app)?;
     tokio::task::spawn_blocking(move || {
-        let mut store = ProviderStore::open(&directory, Some(&legacy))?;
+        let mut store = ProviderStore::open(&directory, None)?;
         operation(&mut store)
     })
     .await

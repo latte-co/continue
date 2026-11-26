@@ -97,24 +97,6 @@ export function ModelSelector({
     },
     [],
   );
-  useLayoutEffect(() => {
-    if (!hint || !hintCard.current) return;
-    const row = hint.anchor.getBoundingClientRect();
-    const card = hintCard.current.getBoundingClientRect();
-    const right = row.right + 8;
-    setHintPosition({
-      left: Math.max(
-        8,
-        Math.min(
-          right + card.width <= window.innerWidth - 8
-            ? right
-            : row.left - card.width - 8,
-          window.innerWidth - card.width - 8,
-        ),
-      ),
-      top: Math.max(8, Math.min(row.top, window.innerHeight - card.height - 8)),
-    });
-  }, [hint]);
   const [submenuTarget, setSubmenuTarget] = useState<string | null>(null);
   const reasoning = submenuTarget === "effort";
   const variantParent = options.find(
@@ -140,8 +122,8 @@ export function ModelSelector({
   const [position, setPosition] = useState({
     left: 0,
     top: 0,
-    width: 200,
-    maxHeight: 320,
+    width: 248,
+    maxHeight: 384,
   });
   const [subPosition, setSubPosition] = useState({
     left: 0,
@@ -153,6 +135,41 @@ export function ModelSelector({
   const submenu = useRef<HTMLDivElement>(null);
   const footer = useRef<HTMLButtonElement>(null);
   const id = useId();
+  useLayoutEffect(() => {
+    if (!hint || !hintCard.current) return;
+    const row = hint.anchor.getBoundingClientRect();
+    const card = hintCard.current.getBoundingClientRect();
+    const menuRect = menu.current?.getBoundingClientRect();
+    const subRect = submenu.current?.getBoundingClientRect();
+    const rightBound = Math.max(
+      row.right,
+      menuRect?.right ?? 0,
+      subRect && subRect.left > (menuRect?.left ?? 0) ? subRect.right : 0,
+    );
+    const leftBound = Math.min(
+      row.left,
+      menuRect?.left ?? window.innerWidth,
+      subRect && subRect.left < (menuRect?.left ?? window.innerWidth)
+        ? subRect.left
+        : window.innerWidth,
+    );
+    const rightCandidate = rightBound + 8;
+    const leftCandidate = leftBound - card.width - 8;
+    setHintPosition({
+      left: Math.max(
+        8,
+        Math.min(
+          rightCandidate + card.width <= window.innerWidth - 8
+            ? rightCandidate
+            : leftCandidate >= 8
+              ? leftCandidate
+              : row.right + 8,
+          window.innerWidth - card.width - 8,
+        ),
+      ),
+      top: Math.max(8, Math.min(row.top, window.innerHeight - card.height - 8)),
+    });
+  }, [hint, submenuOpen]);
   const selected =
     options
       .flatMap((o) =>
@@ -212,14 +229,14 @@ export function ModelSelector({
     if (!open || !trigger.current) return;
     const box = trigger.current.getBoundingClientRect();
     const height = Math.min(
-      320,
-      (visibleOptions.length + (statusMessage ? 1 : 0)) * 36 + 84,
+      384,
+      (visibleOptions.length + (statusMessage ? 1 : 0)) * 34 + 92,
     );
     const above = Math.max(0, box.top - 14);
     const below = Math.max(0, window.innerHeight - box.bottom - 14);
     const up = above >= height || above >= below;
     const maxHeight = Math.min(height, up ? above : below);
-    const width = Math.min(200, window.innerWidth - 16);
+    const width = Math.min(248, window.innerWidth - 16);
     setPosition({
       left: Math.max(
         8,
@@ -229,11 +246,14 @@ export function ModelSelector({
       width,
       maxHeight,
     });
-    (
+    const initialTarget =
       menu.current?.querySelector<HTMLButtonElement>('[aria-checked="true"]') ??
       menu.current?.querySelector<HTMLButtonElement>("button:not(:disabled)") ??
-      menu.current
-    )?.focus();
+      menu.current;
+    initialTarget?.focus({ preventScroll: true });
+    if (initialTarget instanceof HTMLButtonElement) {
+      initialTarget.scrollIntoView({ block: "nearest" });
+    }
   }, [open, visibleOptions.length, statusMessage]);
   useLayoutEffect(() => {
     const source = anchor();
@@ -241,15 +261,18 @@ export function ModelSelector({
     const row = source.getBoundingClientRect();
     const parent = menu.current.getBoundingClientRect();
     const maxHeight = Math.min(
-      (reasoning ? levels.length + 1 : (variantOptions?.length ?? 0)) * 36 + 10,
+      (reasoning ? levels.length + 1 : (variantOptions?.length ?? 0)) * 34 + 10,
       window.innerHeight - 16,
     );
-    const width = reasoning ? 140 : 220;
+    const width = reasoning ? 156 : 224;
+    const gap = 6;
     setSubPosition({
       left: Math.max(
         8,
         Math.min(
-          parent.left >= width + 8 ? parent.left - width : parent.right,
+          parent.left >= width + gap + 8
+            ? parent.left - width - gap
+            : parent.right + gap,
           window.innerWidth - width - 8,
         ),
       ),
@@ -398,70 +421,78 @@ export function ModelSelector({
                     {statusMessage}
                   </div>
                 )}
-                {visibleOptions.map((o) => (
-                  <button
-                    key={o.value}
-                    type="button"
-                    role="menuitemradio"
-                    data-variant-model={
-                      o.variants?.length ? o.value : undefined
-                    }
-                    aria-haspopup={o.variants?.length ? "menu" : undefined}
-                    aria-expanded={
-                      o.variants?.length
-                        ? submenuTarget === `model:${o.value}`
-                        : undefined
-                    }
-                    aria-controls={
-                      !!o.variants?.length &&
-                      submenuTarget === `model:${o.value}`
-                        ? `${id}-variants`
-                        : undefined
-                    }
-                    aria-checked={
-                      o.value === value ||
-                      !!o.variants?.some((v) => v.value === value)
-                    }
-                    aria-describedby={
-                      hint?.option === o ? `${id}-details` : undefined
-                    }
-                    tabIndex={-1}
-                    onFocus={(e) => showHint(e.currentTarget, o)}
-                    onBlur={hideHint}
-                    onMouseLeave={hideHint}
-                    onMouseEnter={(e) => {
-                      showSubmenu(
-                        o.variants?.length ? `model:${o.value}` : null,
-                      );
-                      e.currentTarget.focus();
-                      showHint(e.currentTarget, o);
-                    }}
-                    onClick={() => {
-                      hideHint();
-                      if (o.variants?.length)
-                        showSubmenu(`model:${o.value}`, true);
-                      else {
-                        onChange(o.value);
-                        close();
+                {visibleOptions.map((o) => {
+                  const isChecked =
+                    o.value === value ||
+                    !!o.variants?.some((v) => v.value === value);
+                  return (
+                    <button
+                      key={o.value}
+                      type="button"
+                      role="menuitemradio"
+                      data-variant-model={
+                        o.variants?.length ? o.value : undefined
                       }
-                    }}
-                  >
-                    <span className="model-option-name">{o.label}</span>
-                    {!!o.variants?.length && (
-                      <ChevronRight size={15} aria-hidden="true" />
-                    )}
-                    {o.description && (
-                      <span className="model-option-alias">
-                        {o.description}
-                      </span>
-                    )}
-                    <Check
-                      size={15}
-                      className="model-option-check"
-                      aria-hidden="true"
-                    />
-                  </button>
-                ))}
+                      aria-haspopup={o.variants?.length ? "menu" : undefined}
+                      aria-expanded={
+                        o.variants?.length
+                          ? submenuTarget === `model:${o.value}`
+                          : undefined
+                      }
+                      aria-controls={
+                        !!o.variants?.length &&
+                        submenuTarget === `model:${o.value}`
+                          ? `${id}-variants`
+                          : undefined
+                      }
+                      aria-checked={isChecked}
+                      aria-describedby={
+                        hint?.option === o ? `${id}-details` : undefined
+                      }
+                      tabIndex={-1}
+                      onFocus={(e) => showHint(e.currentTarget, o)}
+                      onBlur={hideHint}
+                      onMouseLeave={hideHint}
+                      onMouseEnter={(e) => {
+                        showSubmenu(
+                          o.variants?.length ? `model:${o.value}` : null,
+                        );
+                        e.currentTarget.focus({ preventScroll: true });
+                        showHint(e.currentTarget, o);
+                      }}
+                      onClick={() => {
+                        hideHint();
+                        if (o.variants?.length)
+                          showSubmenu(`model:${o.value}`, true);
+                        else {
+                          onChange(o.value);
+                          close();
+                        }
+                      }}
+                    >
+                      <span className="model-option-name">{o.label}</span>
+                      {o.description && (
+                        <span className="model-option-alias">
+                          {o.description}
+                        </span>
+                      )}
+                      {isChecked && (
+                        <Check
+                          size={14}
+                          className="model-option-check"
+                          aria-hidden="true"
+                        />
+                      )}
+                      {!!o.variants?.length && (
+                        <ChevronRight
+                          size={14}
+                          className="model-option-chevron"
+                          aria-hidden="true"
+                        />
+                      )}
+                    </button>
+                  );
+                })}
               </div>
               <div className="model-menu-divider" role="separator" />
               <button
@@ -485,16 +516,20 @@ export function ModelSelector({
                 tabIndex={-1}
                 onMouseEnter={(e) => {
                   showReasoning();
-                  e.currentTarget.focus();
+                  e.currentTarget.focus({ preventScroll: true });
                 }}
                 onClick={() => showReasoning(true)}
               >
-                <SlidersHorizontal size={16} />
+                <SlidersHorizontal size={15} />
                 <span>Effort</span>
                 <span className="model-effort-value">
                   {canChooseEffort ? effortValue : "—"}
                 </span>
-                <ChevronRight size={15} />
+                <ChevronRight
+                  size={14}
+                  className="model-option-chevron"
+                  aria-hidden="true"
+                />
               </button>
             </div>
             {submenuOpen && (
@@ -504,73 +539,94 @@ export function ModelSelector({
                 role="menu"
                 aria-label={reasoning ? "Reasoning effort" : "Model mode"}
                 className="select-popover compact model-effort-menu"
-                style={{ ...subPosition, width: reasoning ? 140 : 220 }}
+                style={{ ...subPosition, width: reasoning ? 156 : 224 }}
                 onScrollCapture={hideHint}
               >
-                {variantOptions?.map((variant) => (
-                  <button
-                    key={variant.value}
-                    type="button"
-                    role="menuitemradio"
-                    aria-checked={variant.value === value}
-                    tabIndex={-1}
-                    aria-label={[variant.label, variant.description]
-                      .filter(Boolean)
-                      .join(" ")}
-                    aria-describedby={
-                      hint?.option === variant ? `${id}-details` : undefined
-                    }
-                    onFocus={(e) =>
-                      showHint(e.currentTarget, variant, variantLabel(variant))
-                    }
-                    onBlur={hideHint}
-                    onMouseLeave={hideHint}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.focus();
-                      showHint(e.currentTarget, variant, variantLabel(variant));
-                    }}
-                    onClick={() => {
-                      onChange(variant.value);
-                      close();
-                    }}
-                  >
-                    <span>{variant.label}</span>
-                    {variant.description && (
-                      <span className="model-effort-value">
-                        {variant.description}
-                      </span>
-                    )}
-                    <Check
-                      size={15}
-                      className="model-option-check"
-                      aria-hidden="true"
-                    />
-                  </button>
-                ))}
-                {reasoning &&
-                  ([null, ...levels] as (Effort | null)[]).map((level) => (
+                {variantOptions?.map((variant) => {
+                  const isVariantChecked = variant.value === value;
+                  return (
                     <button
-                      key={level ?? "auto"}
+                      key={variant.value}
                       type="button"
                       role="menuitemradio"
-                      aria-checked={
-                        level === effort || (!effort && level === null)
-                      }
+                      aria-checked={isVariantChecked}
                       tabIndex={-1}
-                      onMouseEnter={(e) => e.currentTarget.focus()}
+                      aria-label={[variant.label, variant.description]
+                        .filter(Boolean)
+                        .join(" ")}
+                      aria-describedby={
+                        hint?.option === variant ? `${id}-details` : undefined
+                      }
+                      onFocus={(e) =>
+                        showHint(
+                          e.currentTarget,
+                          variant,
+                          variantLabel(variant),
+                        )
+                      }
+                      onBlur={hideHint}
+                      onMouseLeave={hideHint}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.focus({ preventScroll: true });
+                        showHint(
+                          e.currentTarget,
+                          variant,
+                          variantLabel(variant),
+                        );
+                      }}
                       onClick={() => {
-                        onEffortChange(level);
+                        onChange(variant.value);
                         close();
                       }}
                     >
-                      <span>{level ?? "跟随 Agent"}</span>
-                      <Check
-                        size={15}
-                        className="model-option-check"
-                        aria-hidden="true"
-                      />
+                      <span className="model-option-name">{variant.label}</span>
+                      {variant.description && (
+                        <span className="model-effort-value">
+                          {variant.description}
+                        </span>
+                      )}
+                      {isVariantChecked && (
+                        <Check
+                          size={14}
+                          className="model-option-check"
+                          aria-hidden="true"
+                        />
+                      )}
                     </button>
-                  ))}
+                  );
+                })}
+                {reasoning &&
+                  ([null, ...levels] as (Effort | null)[]).map((level) => {
+                    const isLevelChecked =
+                      level === effort || (!effort && level === null);
+                    return (
+                      <button
+                        key={level ?? "auto"}
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={isLevelChecked}
+                        tabIndex={-1}
+                        onMouseEnter={(e) =>
+                          e.currentTarget.focus({ preventScroll: true })
+                        }
+                        onClick={() => {
+                          onEffortChange(level);
+                          close();
+                        }}
+                      >
+                        <span className="model-option-name">
+                          {level ?? "跟随 Agent"}
+                        </span>
+                        {isLevelChecked && (
+                          <Check
+                            size={14}
+                            className="model-option-check"
+                            aria-hidden="true"
+                          />
+                        )}
+                      </button>
+                    );
+                  })}
               </div>
             )}
             {hint && (

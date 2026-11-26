@@ -71,6 +71,7 @@ fn visible_prompt(prompt: &str) -> &str {
     let markers = [
         "<latte-work",
         "<!-- latte-work",
+        "\n\n[Continue",
         "\n\n[Latte Work",
         "\n\nAttached files:",
         "\n引用（相对项目；绝对路径在当前主机，按现有权限读取）：\n",

@@ -117,15 +117,18 @@ export function SettingsPane({
         )}
         {(actions || onClose) && (
           <div className="settings-pane-actions">
-            {!subview && actions}
+            {!subview && actions && (
+              <div className="settings-pane-toolbar">{actions}</div>
+            )}
             {onClose && (
               <IconButton
                 label="关闭设置"
                 size="sm"
+                className="settings-pane-close"
                 disabled={closeDisabled}
                 onClick={onClose}
               >
-                <X size={15.5} />
+                <X size={15} />
               </IconButton>
             )}
           </div>

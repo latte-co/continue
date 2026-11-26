@@ -6,14 +6,16 @@ import {
   useState,
 } from "react";
 import {
-  ListEnd,
-  Pencil,
-  Trash2,
-  Play,
-  MoreHorizontal,
   ArrowUp,
+  ChevronDown,
+  ChevronRight,
+  CircleStop,
   GripVertical,
-  LoaderCircle,
+  ListEnd,
+  MoreHorizontal,
+  Pencil,
+  Play,
+  Trash2,
 } from "lucide-react";
 import { createPortal } from "react-dom";
 import { request, message } from "./api";
@@ -21,6 +23,7 @@ import type { Request, QueuedMessage } from "./protocol";
 import { usePollingSnapshot, LIVE_POLL_MS } from "./usePollingSnapshot";
 import { useStatusIssues } from "./statusNotices";
 import { userMessageContent } from "./annotations";
+import { Button, IconButton, MenuRow, StatusSignal } from "./ui";
 const initial = {
   entries: [] as QueuedMessage[],
   paused: false,
@@ -96,6 +99,7 @@ export function MessageQueue({
     after: boolean;
   }>();
   const [dragging, setDragging] = useState<string>();
+  const [collapsed, setCollapsed] = useState(false);
   const [announcement, setAnnouncement] = useState("");
   const grips = useRef(new Map<string, HTMLButtonElement>());
   const focusAfterReorder = useRef<{ id: string; before: unknown } | undefined>(
@@ -112,6 +116,7 @@ export function MessageQueue({
     acting.current = null;
     setFeedback(undefined);
     setError("");
+    setCollapsed(false);
     setAnnouncement("");
     focusAfterReorder.current = undefined;
     endDrag();
@@ -272,10 +277,17 @@ export function MessageQueue({
     },
   ]);
   const { entries, paused, reason } = state.data;
+  useEffect(() => {
+    if (entries.length <= 1) setCollapsed(false);
+  }, [entries.length]);
   if (!entries.length && (!feedback || feedback.kind === "success"))
     return null;
   const disabled = busy || !connected || !active;
   const canReorder = entries.length > 1 && !disabled;
+  const showHeader = paused || entries.length > 1;
+  const nextPreview = entries[0]
+    ? userMessageContent(entries[0].text).text
+    : "";
   function reorder(
     expected: string[],
     id: string,
@@ -303,54 +315,103 @@ export function MessageQueue({
     );
   }
   return (
-    <section className="message-queue" aria-label="待发送消息">
-      {paused && (
+    <section
+      className="message-queue"
+      data-paused={paused ? "true" : undefined}
+      data-collapsed={collapsed ? "true" : undefined}
+      data-dragging={dragging ? "true" : undefined}
+      aria-label="待发送消息"
+    >
+      {showHeader && (
         <div className="message-queue-heading">
-          <ListEnd size={14} />
-          <span>待发送 · {entries.length}</span>
-          <button
-            disabled={disabled}
-            onClick={() =>
-              void act({
-                method: "resume_message_queue",
-                session_id: sessionId!,
-                provider: null,
-              })
-            }
-          >
-            <Play size={14} />
-            继续排队
-          </button>
+          <div className="message-queue-heading-copy">
+            {paused ? (
+              <StatusSignal status="waiting" />
+            ) : (
+              <ListEnd
+                size={13}
+                className="message-queue-marker"
+                aria-hidden="true"
+              />
+            )}
+            <span className="message-queue-title">
+              待发送 · {entries.length}
+            </span>
+            {paused ? (
+              <span className="message-queue-reason">
+                {reason || "队列已暂停"}
+              </span>
+            ) : (
+              collapsed &&
+              nextPreview && (
+                <span className="message-queue-preview">{nextPreview}</span>
+              )
+            )}
+          </div>
+          <div className="message-queue-heading-actions">
+            {paused && (
+              <Button
+                variant="subtle"
+                size="xs"
+                leading={<Play size={11.5} />}
+                disabled={disabled}
+                onClick={() =>
+                  void act({
+                    method: "resume_message_queue",
+                    session_id: sessionId!,
+                    provider: null,
+                  })
+                }
+              >
+                继续排队
+              </Button>
+            )}
+            {entries.length > 1 && (
+              <IconButton
+                label={collapsed ? "展开待发送队列" : "收起待发送队列"}
+                variant="ghost"
+                size="xs"
+                aria-expanded={!collapsed}
+                onClick={() => setCollapsed((v) => !v)}
+              >
+                {collapsed ? (
+                  <ChevronRight size={13.5} />
+                ) : (
+                  <ChevronDown size={13.5} />
+                )}
+              </IconButton>
+            )}
+          </div>
         </div>
-      )}
-      {paused && (
-        <p className="message-queue-reason">{reason || "队列已暂停"}</p>
       )}
       <span className="visually-hidden" role="status">
         {announcement}
       </span>
-      <ol>
-        {entries.map((entry, index) => {
-          const content = userMessageContent(entry.text);
-          return (
-            <li
-              key={entry.request_id}
-              className={[
-                dragging === entry.request_id ? "message-queue-dragging" : "",
-                dropTarget?.id === entry.request_id
-                  ? dropTarget.after
-                    ? "message-queue-drop-after"
-                    : "message-queue-drop-before"
-                  : "",
-              ].join(" ")}
-            >
-              <>
+      {!collapsed && (
+        <ol>
+          {entries.map((entry, index) => {
+            const content = userMessageContent(entry.text);
+            const rowPending =
+              feedback?.id === entry.request_id && feedback.kind === "pending";
+            return (
+              <li
+                key={entry.request_id}
+                className={[
+                  "message-queue-row",
+                  dragging === entry.request_id ? "message-queue-dragging" : "",
+                  dropTarget?.id === entry.request_id
+                    ? dropTarget.after
+                      ? "message-queue-drop-after"
+                      : "message-queue-drop-before"
+                    : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
+              >
                 {entries.length === 1 && (
-                  <ListEnd
-                    size={14}
-                    className="message-queue-marker"
-                    aria-hidden="true"
-                  />
+                  <span className="message-queue-lead" aria-hidden="true">
+                    <ListEnd size={13.5} className="message-queue-marker" />
+                  </span>
                 )}
                 {entries.length > 1 && (
                   <button
@@ -358,7 +419,8 @@ export function MessageQueue({
                       if (node) grips.current.set(entry.request_id, node);
                       else grips.current.delete(entry.request_id);
                     }}
-                    className="icon-button message-queue-grip"
+                    type="button"
+                    className="message-queue-grip"
                     aria-label={`排序排队消息：${content.text}`}
                     title="拖动排序，或按上、下方向键调整"
                     disabled={!canReorder}
@@ -462,7 +524,14 @@ export function MessageQueue({
                         );
                     }}
                   >
-                    <GripVertical size={14} />
+                    <span className="message-queue-index" aria-hidden="true">
+                      {index + 1}
+                    </span>
+                    <GripVertical
+                      size={13.5}
+                      className="message-queue-grip-icon"
+                      aria-hidden="true"
+                    />
                   </button>
                 )}
                 <span className="message-queue-text" title={content.text}>
@@ -471,83 +540,85 @@ export function MessageQueue({
                     <small> · {content.references.length} 个引用</small>
                   )}
                 </span>
-                <button
-                  className="icon-button"
-                  aria-label={`发送排队消息：${content.text}`}
-                  title="发送给 Agent（不中断当前任务）"
-                  disabled={
-                    disabled ||
-                    (feedback?.id === entry.request_id &&
-                      feedback.kind === "success")
-                  }
-                  aria-busy={
-                    feedback?.id === entry.request_id &&
-                    feedback.kind === "pending"
-                  }
-                  onClick={() =>
-                    void act({
-                      method: "dispatch_queued_message",
-                      interrupt: false,
-                      session_id: sessionId!,
-                      request_id: entry.request_id,
-                      revision: entry.revision,
-                      provider: null,
-                    })
-                  }
+                <div
+                  className="message-queue-actions"
+                  data-busy={rowPending ? "true" : undefined}
                 >
-                  {feedback?.id === entry.request_id &&
-                  feedback.kind === "pending" ? (
-                    <LoaderCircle size={14} className="spin" />
-                  ) : (
-                    <ArrowUp size={14} />
-                  )}
-                </button>
-                <button
-                  className="icon-button"
-                  aria-label={`删除排队消息：${content.text}`}
-                  disabled={disabled}
-                  onClick={() =>
-                    void act({
-                      method: "cancel_queued_message",
-                      session_id: sessionId!,
-                      request_id: entry.request_id,
-                      revision: entry.revision,
-                    })
-                  }
-                >
-                  <Trash2 size={14} />
-                </button>
-                <QueueMessageMenu
-                  disabled={disabled}
-                  canEdit={!!onEdit && !editingBlocked}
-                  stopAndSend={() =>
-                    void act({
-                      method: "dispatch_queued_message",
-                      interrupt: true,
-                      session_id: sessionId!,
-                      request_id: entry.request_id,
-                      revision: entry.revision,
-                      provider: null,
-                    })
-                  }
-                  name={content.text}
-                  edit={() =>
-                    void act({
-                      method: "take_queued_message",
-                      session_id: sessionId!,
-                      request_id: entry.request_id,
-                      revision: entry.revision,
-                    })
-                  }
-                />
-              </>
-            </li>
-          );
-        })}
-      </ol>
+                  <IconButton
+                    label={`发送排队消息：${content.text}`}
+                    title="发送给 Agent（不中断当前任务）"
+                    variant="ghost"
+                    size="xs"
+                    busy={rowPending}
+                    disabled={
+                      disabled ||
+                      (feedback?.id === entry.request_id &&
+                        feedback.kind === "success")
+                    }
+                    onClick={() =>
+                      void act({
+                        method: "dispatch_queued_message",
+                        interrupt: false,
+                        session_id: sessionId!,
+                        request_id: entry.request_id,
+                        revision: entry.revision,
+                        provider: null,
+                      })
+                    }
+                  >
+                    <ArrowUp size={13.5} />
+                  </IconButton>
+                  <IconButton
+                    label={`删除排队消息：${content.text}`}
+                    title="移除"
+                    variant="ghost"
+                    intent="danger"
+                    size="xs"
+                    disabled={disabled}
+                    onClick={() =>
+                      void act({
+                        method: "cancel_queued_message",
+                        session_id: sessionId!,
+                        request_id: entry.request_id,
+                        revision: entry.revision,
+                      })
+                    }
+                  >
+                    <Trash2 size={13.5} />
+                  </IconButton>
+                  <QueueMessageMenu
+                    disabled={disabled}
+                    canEdit={!!onEdit && !editingBlocked}
+                    stopAndSend={() =>
+                      void act({
+                        method: "dispatch_queued_message",
+                        interrupt: true,
+                        session_id: sessionId!,
+                        request_id: entry.request_id,
+                        revision: entry.revision,
+                        provider: null,
+                      })
+                    }
+                    name={content.text}
+                    edit={() =>
+                      void act({
+                        method: "take_queued_message",
+                        session_id: sessionId!,
+                        request_id: entry.request_id,
+                        revision: entry.revision,
+                      })
+                    }
+                  />
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      )}
       {feedback && (
         <p
-          className="message-queue-reason"
+          className="message-queue-feedback"
+          data-tone={feedback.kind === "error" ? "danger" : undefined}
           role={feedback.kind === "error" ? "alert" : "status"}
         >
           {feedback.text}
@@ -574,10 +645,18 @@ function QueueMessageMenu({
   const menu = useRef<HTMLDivElement>(null);
   const [point, setPoint] = useState<{ x: number; y: number }>();
   useLayoutEffect(() => {
-    if (!point || !menu.current) return;
+    if (!point || !menu.current || !trigger.current) return;
+    const anchor = trigger.current.getBoundingClientRect();
     const box = menu.current.getBoundingClientRect();
-    menu.current.style.left = `${Math.max(8, Math.min(point.x - box.width, innerWidth - box.width - 8))}px`;
-    menu.current.style.top = `${Math.max(8, Math.min(point.y, innerHeight - box.height - 8))}px`;
+    const gap = 6;
+    const placeAbove =
+      anchor.top - box.height - gap >= 8 ||
+      anchor.top > innerHeight - anchor.bottom;
+    const top = placeAbove
+      ? Math.max(8, anchor.top - box.height - gap)
+      : Math.min(anchor.bottom + gap, innerHeight - box.height - 8);
+    menu.current.style.left = `${Math.max(8, Math.min(anchor.right - box.width, innerWidth - box.width - 8))}px`;
+    menu.current.style.top = `${Math.max(8, top)}px`;
     menu.current
       .querySelector<HTMLButtonElement>("button:not(:disabled)")
       ?.focus();
@@ -635,12 +714,15 @@ function QueueMessageMenu({
   }, [point]);
   return (
     <>
-      <button
+      <IconButton
         ref={trigger}
-        className="icon-button"
-        aria-label={`排队消息更多操作：${name}`}
+        label={`排队消息更多操作：${name}`}
+        title="更多操作"
+        variant="ghost"
+        size="xs"
         aria-haspopup="menu"
         aria-expanded={!!point}
+        active={!!point}
         disabled={disabled}
         onClick={() => {
           const box = trigger.current!.getBoundingClientRect();
@@ -648,7 +730,7 @@ function QueueMessageMenu({
         }}
       >
         <MoreHorizontal size={14} />
-      </button>
+      </IconButton>
       {point &&
         !disabled &&
         createPortal(
@@ -656,30 +738,30 @@ function QueueMessageMenu({
             ref={menu}
             role="menu"
             aria-label="排队消息操作"
-            className="project-context-menu"
+            className="ui-popover message-queue-menu"
             style={{ position: "fixed", left: point.x, top: point.y }}
           >
-            <button
+            <MenuRow
               role="menuitem"
               disabled={!canEdit}
+              leading={<Pencil size={13.5} />}
               onClick={() => {
                 setPoint(undefined);
                 edit();
               }}
             >
-              <Pencil size={16} />
               编辑消息
-            </button>
-            <button
+            </MenuRow>
+            <MenuRow
               role="menuitem"
+              leading={<CircleStop size={13.5} />}
               onClick={() => {
                 setPoint(undefined);
                 stopAndSend();
               }}
             >
-              <ArrowUp size={16} />
               停止当前并发送
-            </button>
+            </MenuRow>
           </div>,
           document.body,
         )}

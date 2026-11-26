@@ -129,23 +129,31 @@ impl Service {
 #[tokio::main]
 async fn main() {
     if let Err(error) = entry().await {
-        eprintln!("latte-work-server: {error:#}");
+        eprintln!("latte-continue-server: {error:#}");
         std::process::exit(1);
     }
+}
+fn default_state_dir(home: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    let root = PathBuf::from(home.context("HOME missing")?).join(".latte/continue");
+    if root.exists() && root.symlink_metadata()?.file_type().is_symlink() {
+        bail!("状态根目录不能是符号链接");
+    }
+    std::fs::create_dir_all(&root)?;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+    Ok(root.join("data"))
 }
 async fn entry() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" {
         println!(
-            "latte-work-server 0.1.0\nUsage: latte-work-server <serve|connect|connect-local> [--state-dir PATH]\nOne daemon per host user; connect starts it if absent.\nLATTE_WORK_CLAUDE / LATTE_WORK_TRAEX / LATTE_WORK_CODEX: CLI path overrides (default auto-detected claude / traex / codex)."
+            "latte-continue-server 0.1.0\nUsage: latte-continue-server <serve|connect|connect-local> [--state-dir PATH]\nOne daemon per host user; connect starts it if absent.\nLATTE_WORK_CLAUDE / LATTE_WORK_TRAEX / LATTE_WORK_CODEX: CLI path overrides (default auto-detected claude / traex / codex)."
         );
         return Ok(());
     }
     let dir = if args.len() == 3 && args[1] == "--state-dir" {
         PathBuf::from(&args[2])
     } else if args.len() == 1 {
-        PathBuf::from(std::env::var_os("HOME").context("HOME missing")?)
-            .join(".local/share/latte-work")
+        default_state_dir(std::env::var_os("HOME"))?
     } else {
         bail!("无效参数；使用 --help 查看用法");
     };
@@ -212,7 +220,7 @@ async fn connect_socket(dir: &Path) -> Result<UnixStream> {
                     break s;
                 }
                 if tokio::time::Instant::now() > deadline {
-                    bail!("无法连接 Server；请运行 latte-work-server serve 查看诊断");
+                    bail!("无法连接 Server；请运行 latte-continue-server serve 查看诊断");
                 }
                 // A concurrent bridge may win the singleton lock; still wait for its socket.
                 let _ = daemon.try_wait();
@@ -264,7 +272,7 @@ async fn serve(dir: &Path) -> Result<()> {
     let listener = UnixListener::bind(&socket)?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     eprintln!(
-        "Latte Work server {} listening at {}",
+        "Continue server {} listening at {}",
         service.server_id,
         socket.display()
     );
@@ -3089,5 +3097,24 @@ mod skill_admission_tests {
         );
         release.send(()).unwrap();
         job.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn default_state_dir_lives_under_latte_continue_data_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let target = default_state_dir(Some(home.path().as_os_str().to_owned())).unwrap();
+        assert_eq!(target, home.path().join(".latte/continue/data"));
+        let prepared = prepare_dir(&target).unwrap();
+        assert_eq!(prepared, target.canonicalize().unwrap());
+        for dir in [home.path().join(".latte/continue"), prepared.clone()] {
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let link = home.path().join(".latte/continue-link");
+        std::os::unix::fs::symlink(&prepared, &link).unwrap();
+        assert!(prepare_dir(&link).is_err());
     }
 }

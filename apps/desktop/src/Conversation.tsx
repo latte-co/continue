@@ -845,7 +845,7 @@ export function Conversation({
                     ) : (
                       <button
                         type="button"
-                        className="secondary small"
+                        className="ui-btn ui-btn--subtle ui-btn--sm"
                         onClick={() => {
                           setStalledCursor(null);
                           void loadEarlierHistory?.();

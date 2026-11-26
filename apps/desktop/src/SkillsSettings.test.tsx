@@ -37,7 +37,7 @@ const platform: ManagedSkill = {
   scope: "platform",
   state: "enabled",
   directory: null,
-  origin: "Latte Work",
+  origin: "Continue",
 };
 const system: ManagedSkill = {
   id: "file:system",

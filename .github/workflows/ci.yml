@@ -194,8 +194,8 @@ jobs:
       - run: cargo build --release -p latte-work-server --locked
       - uses: actions/upload-artifact@v4
         with:
-          name: latte-work-server-${{ matrix.label }}-${{ runner.arch }}
-          path: target/release/latte-work-server
+          name: latte-continue-server-${{ matrix.label }}-${{ runner.arch }}
+          path: target/release/latte-continue-server
           if-no-files-found: error
 
   desktop-native:
@@ -222,7 +222,7 @@ jobs:
         timeout-minutes: 20
       - uses: actions/upload-artifact@v4
         with:
-          name: latte-work-dmg-${{ runner.arch }}
+          name: continue-dmg-${{ runner.arch }}
           path: |
             target/release/bundle/dmg/*.dmg
             target/release/bundle/dmg/*.sha256

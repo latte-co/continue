@@ -488,3 +488,31 @@ it("keeps tinted palette sidebars visibly aligned with the chosen background hue
     vi.useRealTimers();
   }
 });
+
+it("derives a cohesive monotonic border and focus-ring ramp without stark white cliffs across all presets", () => {
+  for (const kind of ["dark", "light"] as const) {
+    for (const preset of Object.values(presets[kind])) {
+      for (const contrast of [0, 50, 100]) {
+        const tokens = themeTokens({
+          ...defaultAppearance()[kind],
+          ...preset,
+          contrast,
+        });
+        const canvas = tokens["--color-canvas"];
+        const rSubtle = contrastRatio(tokens["--color-border-subtle"], canvas);
+        const rBorder = contrastRatio(tokens["--color-border"], canvas);
+        const rStrong = contrastRatio(tokens["--color-border-strong"], canvas);
+        const rFocus = contrastRatio(tokens["--color-focus-ring"], canvas);
+        expect(rBorder).toBeGreaterThan(rSubtle);
+        expect(rStrong).toBeGreaterThan(rBorder);
+        expect(rFocus).toBeGreaterThan(rStrong);
+        // Focus ring stays calm and proportional instead of jumping to #FFFFFF / #000000.
+        expect(rFocus).toBeLessThan(4.5);
+        expect(tokens["--shadow-well"]).toContain(tokens["--color-border"]);
+        expect(tokens["--focus-ring-inset"]).toContain(
+          tokens["--color-focus-ring"],
+        );
+      }
+    }
+  }
+});

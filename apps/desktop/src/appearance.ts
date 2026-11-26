@@ -111,7 +111,7 @@ function parseTheme(value: unknown): ThemeConfig {
       (v) => typeof v === "string" && ["400", "500", "600"].includes(v),
     )
   ) {
-    throw new Error("主题字段无效，请使用从 Continue One 复制的主题 JSON。");
+    throw new Error("主题字段无效，请使用从 Continue 复制的主题 JSON。");
   }
   // Copy only known fields; imported data is never interpreted as CSS or HTML.
   return {
@@ -386,6 +386,29 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
     4.75,
   );
 
+  const borderSubtle = dark
+    ? shiftLightness(bg, 0.058 * scale)
+    : shiftLightness(bg, -0.048 * scale);
+  const border = dark
+    ? shiftLightness(bg, 0.095 * scale)
+    : shiftLightness(bg, -0.08 * scale);
+  const borderStrong = dark
+    ? shiftLightness(bg, 0.13 * scale)
+    : shiftLightness(bg, -0.12 * scale);
+  const focusRing = dark
+    ? shiftLightness(bg, 0.22 * scale)
+    : shiftLightness(bg, -0.25 * scale);
+  const action = dark ? mix(fg, bg, 0.11) : mix(fg, bg, 0.04);
+  const actionHover = dark ? mix(fg, bg, 0.03) : mix(fg, bg, 0.14);
+  const btnBg = dark ? shiftLightness(bg, 0.042 * scale) : "#ffffff";
+  const btnHover = dark
+    ? shiftLightness(bg, 0.068 * scale)
+    : shiftLightness(bg, -0.022 * scale);
+  const btnElevated = dark ? shiftLightness(bg, 0.064 * scale) : "#ffffff";
+  const btnElevatedHover = dark
+    ? shiftLightness(bg, 0.092 * scale)
+    : shiftLightness(bg, -0.026 * scale);
+
   return {
     "--color-shell": shell,
     "--color-canvas": bg,
@@ -402,31 +425,35 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
     "--color-text-secondary": textSecondary,
     "--color-text-muted": textMuted,
     "--color-placeholder": textMuted,
-    "--color-border-subtle": dark
-      ? shiftLightness(bg, 0.045 * scale)
-      : shiftLightness(bg, -0.042 * scale),
-    "--color-border": dark
-      ? shiftLightness(bg, 0.068 * scale)
-      : shiftLightness(bg, -0.068 * scale),
-    "--color-border-strong": dark
-      ? shiftLightness(bg, 0.098 * scale)
-      : shiftLightness(bg, -0.105 * scale),
+    "--color-border-subtle": borderSubtle,
+    "--color-border": border,
+    "--color-border-strong": borderStrong,
     "--color-hover": fg + (dark ? "0d" : "0a"),
     "--color-row-selected": fg + (dark ? "15" : "10"),
     "--color-selected": fg + (dark ? "1c" : "15"),
     "--color-focus-background": fg + "22",
-    "--color-focus-ring": dark
-      ? mix(fg, "#FFFFFF", 0.2)
-      : mix(fg, "#000000", 0.15),
+    "--color-focus-ring": focusRing,
     "--color-primary": accent,
     "--color-primary-hover": mix(accent, dark ? "#FFFFFF" : "#000000", 0.12),
     "--color-on-primary":
       contrastRatio(accent, "#FFFFFF") > contrastRatio(accent, "#121212")
         ? "#FFFFFF"
         : "#121212",
-    "--color-action": dark ? "#FFFFFF" : "#181818",
-    "--color-action-hover": dark ? "#E6E6E6" : "#2E2E2E",
-    "--color-on-action": dark ? "#141414" : "#FFFFFF",
+    "--color-action": action,
+    "--color-action-hover": actionHover,
+    "--color-on-action":
+      contrastRatio(action, "#FFFFFF") > contrastRatio(action, "#141414")
+        ? "#FFFFFF"
+        : "#141414",
+    "--color-btn-bg": btnBg,
+    "--color-btn-hover": btnHover,
+    "--color-btn-elevated": btnElevated,
+    "--color-btn-elevated-hover": btnElevatedHover,
+    "--color-btn-rim": dark ? "#ffffff12" : "#ffffffcc",
+    "--color-danger-surface": dark ? "#dc35453d" : "#dc262617",
+    "--color-danger-surface-hover": dark ? "#dc354557" : "#dc262626",
+    "--color-danger-border": dark ? "#f0586075" : "#dc262652",
+    "--color-danger-text": dark ? "#ff9497" : "#c92a2a",
     "--color-disabled-bg": step(0.065),
     "--color-disabled-text": textMuted,
     "--color-stop": step(dark ? 0.22 : 0.12),
@@ -444,29 +471,29 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
     "--color-backdrop": dark ? "#0000008c" : "#00000038",
     "--color-selection": accent + "3d",
     "--shadow-island": dark
-      ? "0 0 0 1px rgba(255, 255, 255, 0.065), 0 4px 16px -4px rgba(0, 0, 0, 0.24)"
-      : "0 0 0 1px rgba(0, 0, 0, 0.065), 0 4px 16px -6px rgba(15, 23, 42, 0.045)",
-    "--shadow-well": dark
-      ? "inset 0 0 0 1px rgba(255, 255, 255, 0.065)"
-      : "inset 0 0 0 1px rgba(0, 0, 0, 0.065)",
+      ? `0 0 0 1px ${borderSubtle}, 0 4px 16px -4px rgba(0, 0, 0, 0.24)`
+      : `0 0 0 1px ${borderSubtle}, 0 4px 16px -6px rgba(15, 23, 42, 0.045)`,
+    "--shadow-well": `inset 0 0 0 1px ${border}`,
     "--shadow-card": dark
-      ? "0 0 0 1px rgba(255, 255, 255, 0.065)"
-      : "0 0 0 1px rgba(0, 0, 0, 0.065), 0 1px 2px rgba(15, 23, 42, 0.03)",
+      ? `0 0 0 1px ${borderSubtle}`
+      : `0 0 0 1px ${border}, 0 1px 2px rgba(15, 23, 42, 0.03)`,
     "--shadow-elevated": dark
-      ? "0 0 0 1px rgba(255, 255, 255, 0.075), 0 2px 6px rgba(0, 0, 0, 0.18)"
-      : "0 0 0 1px rgba(0, 0, 0, 0.065), 0 1px 3px rgba(15, 23, 42, 0.06)",
+      ? `0 0 0 1px ${border}, 0 2px 6px rgba(0, 0, 0, 0.18)`
+      : `0 0 0 1px ${border}, 0 1px 3px rgba(15, 23, 42, 0.06)`,
     "--shadow-composer": dark
-      ? "0 0 0 1px rgba(255, 255, 255, 0.08), 0 2px 8px rgba(0, 0, 0, 0.16)"
-      : "0 0 0 1px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(15, 23, 42, 0.04)",
+      ? `0 0 0 1px ${border}, 0 2px 8px rgba(0, 0, 0, 0.16)`
+      : `0 0 0 1px ${border}, 0 2px 8px rgba(15, 23, 42, 0.04)`,
     "--shadow-composer-focus": dark
-      ? "0 0 0 1px rgba(255, 255, 255, 0.14), 0 2px 8px rgba(0, 0, 0, 0.18)"
-      : "0 0 0 1px rgba(0, 0, 0, 0.15), 0 2px 8px rgba(15, 23, 42, 0.05)",
+      ? `0 0 0 1px ${focusRing}, 0 2px 8px rgba(0, 0, 0, 0.18)`
+      : `0 0 0 1px ${focusRing}, 0 2px 8px rgba(15, 23, 42, 0.05)`,
     "--shadow-dialog": dark
-      ? "0 16px 40px -8px rgba(0, 0, 0, 0.42), 0 0 0 1px rgba(255, 255, 255, 0.1)"
-      : "0 16px 40px -10px rgba(15, 23, 42, 0.14), 0 0 0 1px rgba(0, 0, 0, 0.085)",
+      ? `0 16px 40px -8px rgba(0, 0, 0, 0.42), 0 0 0 1px ${border}`
+      : `0 16px 40px -10px rgba(15, 23, 42, 0.14), 0 0 0 1px ${border}`,
     "--shadow-popover": dark
-      ? "0 12px 28px -6px rgba(0, 0, 0, 0.36), 0 0 0 1px rgba(255, 255, 255, 0.09)"
-      : "0 12px 28px -8px rgba(15, 23, 42, 0.12), 0 0 0 1px rgba(0, 0, 0, 0.08)",
+      ? `0 12px 28px -6px rgba(0, 0, 0, 0.36), 0 0 0 1px ${borderStrong}`
+      : `0 12px 28px -8px rgba(15, 23, 42, 0.12), 0 0 0 1px ${border}`,
+    "--focus-ring": `0 0 0 1px ${focusRing}`,
+    "--focus-ring-inset": `inset 0 0 0 1px ${focusRing}`,
     "--font-ui": fonts[theme.uiFont],
     "--font-content":
       theme.contentFont === "inherit"

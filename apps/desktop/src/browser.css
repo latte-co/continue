@@ -150,7 +150,7 @@
 }
 .browser-address:focus-within {
   background: var(--color-well);
-  box-shadow: var(--focus-ring);
+  box-shadow: var(--focus-ring-inset);
 }
 .browser-toolbar .browser-address input {
   background: transparent;

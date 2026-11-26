@@ -1,6 +1,6 @@
 # SSH host setup
 
-The remote host needs OpenSSH, the matching `latte-work-server` executable and an
+The remote host needs OpenSSH, the matching `latte-continue-server` executable and an
 installed and configured Agent CLI. No browser runtime, Node frontend,
 public service port, or Tauri dependency is needed for the server.
 
@@ -9,7 +9,7 @@ compiler for bundled SQLite):
 
 ```sh
 cargo build --release -p latte-work-server --locked
-install -m 755 target/release/latte-work-server "$HOME/.local/bin/latte-work-server"
+install -m 755 target/release/latte-continue-server "$HOME/.local/bin/latte-continue-server"
 ```
 
 Create `~/.local/bin` first if needed. Verify `claude --version` and complete
@@ -19,7 +19,7 @@ service with an explicit absolute CLI path:
 
 ```sh
 LATTE_WORK_CLAUDE=/absolute/path/to/claude \
-  ~/.local/bin/latte-work-server serve
+  ~/.local/bin/latte-continue-server serve
 ```
 
 For OpenCode, verify `opencode --version` reports 2.x. Bind an App Provider to
@@ -38,12 +38,12 @@ verified:
 
 ```sh
 ssh devbox
-ssh devbox /absolute/path/to/latte-work-server --help
+ssh devbox /absolute/path/to/latte-continue-server --help
 ```
 
-In Latte Work, open **设置 → SSH 连接 → 添加**. Enter a display name, SSH host,
+In Continue, open **设置 → SSH 连接 → 添加**. Enter a display name, SSH host,
 and optional port. Leave the Server path empty to find an executable at
-`~/.local/bin/latte-work-server` or on the remote noninteractive SSH `PATH`;
+`~/.local/bin/latte-continue-server` or on the remote noninteractive SSH `PATH`;
 enter an absolute path if installed elsewhere. Detection does not install or
 upgrade the remote binary. Choose one authentication
 mode: **默认身份验证** uses existing OpenSSH config/agent, **身份文件** selects a local

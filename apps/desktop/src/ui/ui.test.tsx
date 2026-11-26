@@ -264,7 +264,7 @@ describe("Latte UI Kit (src/ui)", () => {
           </CardFooter>
         </Card>
         <Disclosure title="准备远程设备" meta="4 步">
-          <p>在远端编译并安装 latte-work-server。</p>
+          <p>在远端编译并安装 latte-continue-server。</p>
         </Disclosure>
         <DataTable caption="模型目录">
           <thead>

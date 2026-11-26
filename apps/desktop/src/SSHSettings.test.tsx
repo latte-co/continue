@@ -29,7 +29,7 @@ function makeState(overrides?: Partial<Workbench>): Workbench {
         name: "Devbox",
         ssh: "user@devbox",
         port: 2222,
-        server_path: "~/.local/bin/latte-work-server",
+        server_path: "~/.local/bin/latte-continue-server",
         auth: "none",
       },
     ],

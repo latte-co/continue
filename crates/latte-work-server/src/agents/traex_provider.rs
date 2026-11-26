@@ -31,7 +31,7 @@ pub(in crate::agents) fn configure(
     // table under a fresh process-owned ID: native config merges tables, so
     // a fixed ID could inherit user-defined headers or authentication.
     let mut fields = vec![
-        "name=\"Latte Work\"".to_owned(),
+        "name=\"Continue\"".to_owned(),
         format!("base_url={}", serde_json::to_string(base.as_str())?),
         format!("wire_api=\"{wire}\""),
         "requires_openai_auth=false".into(),

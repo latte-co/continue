@@ -3,6 +3,11 @@ name = "latte-work-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+default-run = "latte-continue-server"
+
+[[bin]]
+name = "latte-continue-server"
+path = "src/main.rs"
 [dependencies]
 latte-work-config.workspace = true
 latte-work-protocol.workspace = true

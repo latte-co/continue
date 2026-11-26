@@ -60,7 +60,7 @@ def verify_layout(mount):
             raise RuntimeError(f"Non-portable background alias: {alias.target.posix_path}")
         if view["backgroundType"] != 2:
             raise RuntimeError("Image background is not enabled")
-        if ds["Continue One.app"]["Iloc"] != (170, 188) or ds["Applications"]["Iloc"] != (430, 188):
+        if ds["Continue.app"]["Iloc"] != (170, 188) or ds["Applications"]["Iloc"] != (430, 188):
             raise RuntimeError("Installer icon positions changed")
         window = ds["."]["bwsp"]
         if any(window[key] for key in ("ShowToolbar", "ShowSidebar", "ShowStatusBar", "ShowPathbar")):
@@ -87,14 +87,14 @@ def package(app, output_dir):
     if architecture is None:
         raise ValueError(f"Unsupported architectures: {arches}")
     run("codesign", "--verify", "--deep", "--strict", app)
-    output = output_dir / f"Continue-One-{version}-{architecture}.dmg"
-    volume = f"Continue One {version} {architecture}"
+    output = output_dir / f"Continue-{version}-{architecture}.dmg"
+    volume = f"Continue {version} {architecture}"
     # Resolve the temporary path before passing it to mac_alias (macOS /var symlink).
     temp = Path(tempfile.mkdtemp(prefix="latte-dmg-", dir=output_dir)).resolve()
     try:
         stage = temp / "stage"
         stage.mkdir()
-        run("ditto", app, stage / "Continue One.app")
+        run("ditto", app, stage / "Continue.app")
         (stage / "Applications").symlink_to("/Applications")
         image = Image.new("RGB", (1200, 800), "white")
         draw = ImageDraw.Draw(image)
@@ -113,7 +113,7 @@ def package(app, output_dir):
                 ds["."]["icvl"] = ("type", b"icnv")
                 ds["."]["icvp"] = {"arrangeBy": "none", "backgroundColorBlue": 1.0, "backgroundColorGreen": 1.0, "backgroundColorRed": 1.0, "backgroundImageAlias": alias.to_bytes(), "backgroundType": 2, "gridOffsetX": 0.0, "gridOffsetY": 0.0, "gridSpacing": 100.0, "iconSize": 100.0, "labelOnBottom": True, "scrollPositionX": 0.0, "scrollPositionY": 0.0, "showIconPreview": False, "showItemInfo": False, "textSize": 13.0, "viewOptionsVersion": 1}
                 ds["."]["vSrn"] = ("long", 1)
-                ds["Continue One.app"]["Iloc"] = (170, 188)
+                ds["Continue.app"]["Iloc"] = (170, 188)
                 ds["Applications"]["Iloc"] = (430, 188)
             verify_layout(mount)
         candidate = temp / "installer.dmg"
@@ -121,9 +121,9 @@ def package(app, output_dir):
         run("hdiutil", "verify", candidate)
         with mounted(candidate, temp / "verify", readonly=True) as mount:
             verify_layout(mount)
-            bundled = mount / "Continue One.app"
+            bundled = mount / "Continue.app"
             run("codesign", "--verify", "--deep", "--strict", bundled)
-            for name in (info["CFBundleExecutable"], "latte-work-server"):
+            for name in (info["CFBundleExecutable"], "latte-continue-server"):
                 if digest(app / "Contents/MacOS" / name) != digest(bundled / "Contents/MacOS" / name):
                     raise RuntimeError(f"Packaged binary mismatch: {name}")
         checksum = digest(candidate)
