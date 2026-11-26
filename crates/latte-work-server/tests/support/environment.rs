@@ -1289,6 +1289,51 @@ async fn custom_agent_environment_resolves_agent_commands_and_skill_info_for_col
                     "{agent} open-session SkillInfo({slug}) mismatch: {open_info:?}"
                 );
             }
+            if agent == "codex" {
+                // Disabling a same-named project copy in Codex `config.toml` must keep
+                // `AgentCommands` and `SkillInfo` aligned on the enabled user copy.
+                let proj_dup_dir = project_dir.path().join(".codex/skills/dual-demo");
+                write_skill(&proj_dup_dir, "Dual Demo", "disabled project copy");
+                std::fs::write(
+                    instance_dir.path().join("config.toml"),
+                    format!(
+                        "[[skills.config]]\npath = \"{}\"\nenabled = false\n",
+                        proj_dup_dir.join("SKILL.md").display()
+                    ),
+                )
+                .unwrap();
+                let Response::AgentCommands { commands } = request_with_app_agent_config(
+                    &target,
+                    Request::AgentCommands {
+                        agent: "codex".into(),
+                        project_id: project.id.clone(),
+                        provider: None,
+                    },
+                    resolve,
+                )
+                .await
+                .unwrap() else {
+                    panic!("expected codex commands")
+                };
+                assert!(commands.iter().any(|c| c.name == "dual-demo"));
+                let disabled_check = ask(
+                    &mut observer,
+                    Request::SkillInfo {
+                        provider: None,
+                        session_id: session.id.clone(),
+                        name: "dual-demo".into(),
+                    },
+                )
+                .await;
+                assert!(
+                    matches!(
+                        &disabled_check,
+                        Response::SkillInfo { skill: Some(info) } if info.description == custom_dual_desc
+                    ),
+                    "expected enabled user copy when project copy is disabled, got {disabled_check:?}"
+                );
+                let _ = std::fs::remove_dir_all(&proj_dup_dir);
+            }
             ask(
                 &mut observer,
                 Request::CloseAgentSession {

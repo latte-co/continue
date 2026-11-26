@@ -302,36 +302,36 @@ export function ChangesView({
           return;
         }
         if (disposed) return;
+        if (
+          repoArg &&
+          (discovered.truncated ||
+            !isRemovedGitRepositoryError(cause) ||
+            discovered.repositories.some((repo) => repo.path === repoArg))
+        ) {
+          const list = discovered.repositories.some(
+            (repo) => repo.path === repoArg,
+          )
+            ? discovered.repositories
+            : [
+                ...discovered.repositories,
+                {
+                  path: repoArg,
+                  name: repoArg,
+                  kind: "repository" as const,
+                },
+              ];
+          setDiscoveredRepos({
+            scopeKey: projectKey,
+            list,
+            truncated: discovered.truncated,
+            noGit: false,
+          });
+          setInfoState(undefined);
+          setError(message(cause));
+          setLoading(false);
+          return;
+        }
         if (discovered.repositories.length > 0) {
-          if (
-            repoArg &&
-            (discovered.truncated ||
-              !isRemovedGitRepositoryError(cause) ||
-              discovered.repositories.some((repo) => repo.path === repoArg))
-          ) {
-            const list = discovered.repositories.some(
-              (repo) => repo.path === repoArg,
-            )
-              ? discovered.repositories
-              : [
-                  ...discovered.repositories,
-                  {
-                    path: repoArg,
-                    name: repoArg,
-                    kind: "repository" as const,
-                  },
-                ];
-            setDiscoveredRepos({
-              scopeKey: projectKey,
-              list,
-              truncated: discovered.truncated,
-              noGit: false,
-            });
-            setInfoState(undefined);
-            setError(message(cause));
-            setLoading(false);
-            return;
-          }
           const matched = matchRepositoryForPath(
             discovered.repositories,
             initialPath,

@@ -1312,3 +1312,26 @@ it("keeps the selected child repository instead of switching to a sibling when a
   ).toBeTruthy();
   expect(getSelectedGitRepository("local", project)).toBe("group-a/child");
 });
+
+it("keeps the selected nested repository when .git/HEAD is temporarily unreadable even if parent or empty list is returned", async () => {
+  const { setSelectedGitRepository, getSelectedGitRepository } =
+    await import("./gitRepositories");
+  setSelectedGitRepository("local", project, "nested-sub");
+  mocks.request.mockImplementation(async (_host: string, req: Request) => {
+    if (req.method === "git_info" && req.repo_path === "nested-sub") {
+      throw Object.assign(new Error("无权访问子仓库 Git 元数据"), {
+        code: "request_failed",
+      });
+    }
+    if (req.method === "git_repositories") {
+      return { kind: "git_repositories", repositories: [], truncated: true };
+    }
+    throw new Error(`unexpected ${req.method}`);
+  });
+  render(<ChangesView {...props} />);
+  expect(await screen.findByText(/无权访问子仓库 Git 元数据/)).toBeTruthy();
+  expect(
+    await screen.findByRole("combobox", { name: "Git 仓库" }),
+  ).toBeTruthy();
+  expect(getSelectedGitRepository("local", project)).toBe("nested-sub");
+});

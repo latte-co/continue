@@ -74,7 +74,7 @@ for line in sys.stdin:
                 'enabled': False,
             },
         ]
-        skill_roots = [cwd_path / '.traex/skills', cwd_path / '.trae/skills', cwd_path / '.agents/skills']
+        skill_roots = [cwd_path / '.traex/skills', cwd_path / '.trae/skills', cwd_path / '.agents/skills', cwd_path / '.codex/skills']
         traex_home = os.environ.get('TRAEX_HOME')
         codex_home = os.environ.get('CODEX_HOME')
         home_dir = os.environ.get('HOME')
@@ -83,21 +83,49 @@ for line in sys.stdin:
         elif home_dir:
             for rel in ('.trae/skills', '.traex/skills'):
                 skill_roots.append(pathlib.Path(home_dir) / rel)
-        if codex_home:
-            skill_roots.append(pathlib.Path(codex_home) / 'skills')
+        effective_codex_home = pathlib.Path(codex_home) if codex_home else (pathlib.Path(home_dir) / '.codex' if home_dir else None)
+        if effective_codex_home:
+            skill_roots.append(effective_codex_home / 'skills')
         if home_dir:
             skill_roots.append(pathlib.Path(home_dir) / '.agents/skills')
+        disabled_paths = set()
+        if effective_codex_home and (effective_codex_home / 'config.toml').is_file():
+            cur_path, cur_enabled = None, None
+            for raw_line in (effective_codex_home / 'config.toml').read_text().splitlines():
+                stripped = raw_line.split('#', 1)[0].strip()
+                if stripped.startswith('['):
+                    if cur_path is not None and cur_enabled is not None:
+                        if not cur_enabled:
+                            disabled_paths.add(cur_path)
+                        else:
+                            disabled_paths.discard(cur_path)
+                    cur_path, cur_enabled = None, None
+                elif stripped.startswith('path') and '=' in stripped:
+                    val = stripped.split('=', 1)[1].strip().strip('"').strip("'")
+                    cur_path = str(pathlib.Path(val).resolve())
+                elif stripped.startswith('enabled') and '=' in stripped:
+                    val = stripped.split('=', 1)[1].strip()
+                    cur_enabled = (val == 'true')
+            if cur_path is not None and cur_enabled is not None:
+                if not cur_enabled:
+                    disabled_paths.add(cur_path)
+                else:
+                    disabled_paths.discard(cur_path)
         for skills_root in skill_roots:
             if skills_root.is_dir():
                 for child in sorted(skills_root.iterdir()):
                     skill_md = child / 'SKILL.md'
-                    if skill_md.is_file() and all(s['name'] != child.name for s in skills):
+                    if skill_md.is_file():
+                        resolved_md = str(skill_md.resolve())
+                        is_enabled = resolved_md not in disabled_paths
+                        if any(s['name'] == child.name and s['enabled'] for s in skills):
+                            continue
                         skills.append({
                             'name': child.name,
                             'description': f'Discovered skill {child.name}',
-                            'path': str(skill_md.resolve()),
+                            'path': resolved_md,
                             'scope': 'user' if skills_root.parent != cwd_path else 'repo',
-                            'enabled': True,
+                            'enabled': is_enabled,
                         })
         reply(value, {'data': [{'cwd': str(cwd_path), 'skills': skills, 'errors': []}]})
     elif method == 'model/list':

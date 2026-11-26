@@ -7,6 +7,7 @@ mod claude_sessions;
 pub(crate) mod claude_skills;
 pub(crate) mod codex;
 pub(crate) mod codex_jobs;
+mod codex_skills;
 pub(crate) mod codex_title;
 mod opencode;
 mod titles;
@@ -332,27 +333,7 @@ fn codex_skill_info(
     name: &str,
     environment: &latte_work_protocol::AgentEnvironment,
 ) -> Result<Option<latte_work_protocol::SkillInfo>> {
-    let mut roots = Vec::new();
-    for parent in project.ancestors().take(32) {
-        roots.extend([".codex/skills", ".agents/skills"].map(|r| parent.join(r)));
-        if parent.join(".git").exists() {
-            break;
-        }
-    }
-    let home = crate::agent_environment::configured_variable("HOME", environment)
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from);
-    let codex_home = crate::agent_environment::configured_variable("CODEX_HOME", environment)
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| home.as_ref().map(|h| h.join(".codex")));
-    if let Some(codex_home) = codex_home {
-        roots.extend([codex_home.join("skills"), codex_home.join("skills/.system")]);
-    }
-    if let Some(home) = home {
-        roots.push(home.join(".agents/skills"));
-    }
-    claude_skills::find_in_roots(&roots, name)
+    codex_skills::find(project, name, environment)
 }
 
 pub(crate) fn traex_skill_info(
@@ -383,6 +364,16 @@ pub(crate) fn traex_skill_info(
         }
         return Ok(None);
     }
+    let mut config_files = Vec::new();
+    if let Some(codex_home) = &codex_home {
+        config_files.push(codex_home.join("config.toml"));
+    }
+    if let Some(traex_home) = &traex_home {
+        config_files.push(traex_home.join("config.toml"));
+    } else if let Some(home) = &home {
+        config_files.extend([".trae/config.toml", ".traex/config.toml"].map(|r| home.join(r)));
+    }
+    let rules = codex_skills::load_config_rules(&config_files, home.as_deref());
     let mut roots = Vec::new();
     for parent in project.ancestors().take(32) {
         roots.extend([".trae/skills", ".traex/skills", ".agents/skills"].map(|r| parent.join(r)));
@@ -401,7 +392,22 @@ pub(crate) fn traex_skill_info(
     if let Some(home) = home {
         roots.push(home.join(".agents/skills"));
     }
-    claude_skills::find_in_roots(&roots, name)
+    if !crate::skills::component(name) {
+        bail!("Skill 名称无效");
+    }
+    for root in &roots {
+        if let Some(found) = claude_skills::inspect(&root.join(name), name)? {
+            let enabled = std::path::Path::new(&found.directory)
+                .join("SKILL.md")
+                .canonicalize()
+                .map(|md| codex_skills::is_skill_enabled(&rules, &md, &found.name, name))
+                .unwrap_or(true);
+            if enabled {
+                return Ok(Some(found));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Inspect known native skill locations. This never starts an Agent or grants file access.
