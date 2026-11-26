@@ -46,12 +46,7 @@ fn validate(name: &str, data: &[u8], limit: usize) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn local_copy(app: &tauri::AppHandle, name: String, data: Vec<u8>) -> Result<Copy, String> {
     use std::os::unix::fs::PermissionsExt;
-    use tauri::Manager;
-    let root = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| e.to_string())?
-        .join("source-previews");
+    let root = crate::app_cache_dir(app)?.join("source-previews");
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     if root
         .symlink_metadata()

@@ -304,7 +304,7 @@ async fn native_environment_history_and_titles_remain_redacted_after_restart() {
     .unwrap();
     host.process.kill().unwrap();
     host.process.wait().unwrap();
-    host.process = Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+    host.process = Command::new(env!("CARGO_BIN_EXE_latte-continue-server"))
         .args(["serve", "--state-dir"])
         .arg(host.directory.path())
         .env("LATTE_WORK_AGENT_ENV", "inherit")

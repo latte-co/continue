@@ -103,8 +103,14 @@ async fn capture(
     let marker = format!("LATTE_ENV_{}", uuid::Uuid::new_v4().simple());
     let script = format!("/usr/bin/printf '\\0{marker}\\0'; exec /usr/bin/env -0");
     let mut command = Command::new(shell);
+    if name == "fish" {
+        command.arg("-ilc");
+    } else {
+        // Disable job-control monitor mode (+m) so interactive zsh/dash in a
+        // background process group never stops with SIGTTOU on /dev/tty.
+        command.args(["-il", "+m", "-c"]);
+    }
     command
-        .arg("-ilc")
         .arg(script)
         .envs(overrides.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())

@@ -117,7 +117,7 @@ The desktop icon source is `apps/desktop/src-tauri/icons/source.svg`. Run
 Keep the rounded tile within the 80% canvas safe area for consistent Dock sizing.
 
 Provider protocol smoke tests can use a real installed Claude CLI with disposable
-localhost upstream fixtures: `python3 scripts/smoke-providers.py --binary /path/to/latte-work-server --claude /path/to/claude`. This optional native check
+localhost upstream fixtures: `python3 scripts/smoke-providers.py --binary /path/to/latte-continue-server --claude /path/to/claude`. This optional native check
 uses no paid model API; the automated `make ci` suite uses deterministic fixtures.
 See docs/providers.md for module boundaries, persistence and compatibility limits.
 
@@ -163,7 +163,7 @@ inputs or lifecycle updates; descriptions, tool names and `task_type` are not ro
 Store merges preserve the role across native identity changes, progress, close and
 restart. Older records and Servers may omit it; the UI leaves it absent.
 
-Focused checks: `cargo test -p latte-work-server --bin latte-work-server --locked`
+Focused checks: `cargo test -p latte-work-server --bin latte-continue-server --locked`
 for contract/adapter/runtime UT, followed by `make test-e2e` for real server/bridge
 behavior with the deterministic CLI fixture. These do not measure coverage or
 validate a live model service. Internal interface changes do not require a wire
@@ -205,9 +205,9 @@ Each failed probe retires its owned group before a fallback is attempted. Queue 
 reuse Cursor input validation before saving; execution keeps its guard for old rows.
 
 Focused checks: `cargo test -p latte-work-server --test e2e cursor_ --locked -- --test-threads=1`
-and `cargo test -p latte-work-server --bin latte-work-server cursor --locked`.
+and `cargo test -p latte-work-server --bin latte-continue-server cursor --locked`.
 Installed `cargo-llvm-cov` can measure the new modules with
-`cargo llvm-cov -p latte-work-server --bin latte-work-server --locked --json --output-path target/cursor-coverage.json`;
+`cargo llvm-cov -p latte-work-server --bin latte-continue-server --locked --json --output-path target/cursor-coverage.json`;
 report whole-project and Cursor-module coverage separately. Coverage output is local
 build data, never product source. Real account/model turns need separate confirmation
 and are not performed by deterministic fixtures. See [Cursor design](docs/cursor-agent.md).
@@ -1648,7 +1648,7 @@ delivery, preserves its receipt and pauses the queue without replay, instead of
 reporting that an already completed turn exceeded its execution limit.
 
 Reproduce the real CLI queue contract without a model service or login:
-`python3 scripts/smoke-claude-queue.py --binary target/debug/latte-work-server --claude ~/.local/bin/claude --output target/real-queue.json`.
+`python3 scripts/smoke-claude-queue.py --binary target/debug/latte-continue-server --claude ~/.local/bin/claude --output target/real-queue.json`.
 The local fixture provides only Anthropic API responses. The installed CLI must
 accept `--replay-user-messages` and generate its own replay/UUID receipts; the
 script captures those fields, checks two delivered inputs settle together with
@@ -1797,7 +1797,7 @@ Ordinary durable FIFO queueing and explicit stop-and-send use the shared runtime
 Native child activity fences reconfiguration; it is not inferred to be finished
 when the main turn completes. No dependencies or send-request fields are added.
 
-Focused checks: `cargo test -p latte-work-server --bin latte-work-server --locked traex`
+Focused checks: `cargo test -p latte-work-server --bin latte-continue-server --locked traex`
 and `cargo test -p latte-work-server --test e2e --locked traex_ -- --test-threads=1`.
 The deterministic CLI fixture runs no model and requires no login.
 `python3 scripts/smoke-traex.py` validates a real installed CLI's metadata and
@@ -1981,8 +1981,8 @@ Contract baseline: codex-cli 0.162.0 and its generated JSON schema; see
 Focused checks:
 
 ```sh
-cargo test -p latte-work-server --bin latte-work-server --locked app_server
-cargo test -p latte-work-server --bin latte-work-server --locked codex
+cargo test -p latte-work-server --bin latte-continue-server --locked app_server
+cargo test -p latte-work-server --bin latte-continue-server --locked codex
 cargo test -p latte-work-server --test e2e --locked codex_ -- --test-threads=1
 python3 scripts/smoke-codex.py
 python3 scripts/smoke-codex-providers.py

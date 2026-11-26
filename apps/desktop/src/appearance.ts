@@ -26,10 +26,10 @@ export const APPEARANCE_EVENT = "latte-work:appearance";
 export const MAX_THEME_BYTES = 32 * 1024;
 export const fonts = {
   system:
-    '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif',
+    '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC", sans-serif',
   sans: 'Arial, "PingFang SC", sans-serif',
   serif: 'Georgia, "Songti SC", serif',
-  mono: 'ui-monospace, "SFMono-Regular", Menlo, monospace',
+  mono: 'ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace',
 };
 export const codeFonts = {
   system: fonts.mono,
@@ -41,22 +41,22 @@ export const presets: Record<
   Record<string, Pick<ThemeConfig, "accent" | "background" | "foreground">>
 > = {
   dark: {
-    Latte: { accent: "#F1F1F1", background: "#111111", foreground: "#EEEEEE" },
+    Latte: { accent: "#F2F2F2", background: "#181818", foreground: "#F2F2F2" },
     Material: {
       accent: "#82AAFF",
-      background: "#212D33",
-      foreground: "#FFFFFF",
+      background: "#1E272C",
+      foreground: "#F5F7FA",
     },
     Graphite: {
       accent: "#B9A3FF",
-      background: "#222225",
+      background: "#202024",
       foreground: "#ECECF0",
     },
   },
   light: {
-    Latte: { accent: "#2563EB", background: "#FFFFFF", foreground: "#222222" },
-    Paper: { accent: "#806044", background: "#FAF7F2", foreground: "#302C28" },
-    Mint: { accent: "#247564", background: "#F1F7F5", foreground: "#20352F" },
+    Latte: { accent: "#2563EB", background: "#FFFFFF", foreground: "#181818" },
+    Paper: { accent: "#806044", background: "#FAF7F2", foreground: "#2C2824" },
+    Mint: { accent: "#247564", background: "#F4F8F6", foreground: "#1D312B" },
   },
 };
 export function defaultTheme(kind: ThemeKind): ThemeConfig {
@@ -111,7 +111,7 @@ function parseTheme(value: unknown): ThemeConfig {
       (v) => typeof v === "string" && ["400", "500", "600"].includes(v),
     )
   ) {
-    throw new Error("主题字段无效，请使用从 Latte Work 复制的主题 JSON。");
+    throw new Error("主题字段无效，请使用从 Continue 复制的主题 JSON。");
   }
   // Copy only known fields; imported data is never interpreted as CSS or HTML.
   return {
@@ -176,86 +176,324 @@ export function saveAppearance(settings: Appearance): string {
 export function resolveTheme(mode: ThemeMode, systemDark: boolean): ThemeKind {
   return mode === "system" ? (systemDark ? "dark" : "light") : mode;
 }
-function rgb(color: string): number[] {
-  return [1, 3, 5].map((i) => parseInt(color.slice(i, i + 2), 16));
+
+function rgb(color: string): [number, number, number] {
+  return [
+    parseInt(color.slice(1, 3), 16),
+    parseInt(color.slice(3, 5), 16),
+    parseInt(color.slice(5, 7), 16),
+  ];
 }
-export function mix(a: string, b: string, ratio: number): string {
-  const x = rgb(a),
-    y = rgb(b);
+
+function srgbToLinear(channel: number): number {
+  const n = channel / 255;
+  return n <= 0.04045 ? n / 12.92 : ((n + 0.055) / 1.055) ** 2.4;
+}
+
+function linearToSrgbByte(linear: number): number {
+  const c = Math.max(0, Math.min(1, linear));
+  const encoded = c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055;
+  return Math.max(0, Math.min(255, Math.round(encoded * 255)));
+}
+
+function hexToOklab(color: string): [number, number, number] {
+  const [r, g, b] = rgb(color).map(srgbToLinear);
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  return [
+    0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
+    1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
+    0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s,
+  ];
+}
+
+function oklabToHex(L: number, a: number, b: number, neutral: boolean): string {
+  const clampedL = Math.max(0, Math.min(1, L));
+  if (neutral) {
+    const lin = clampedL ** 3;
+    const byte = linearToSrgbByte(lin).toString(16).padStart(2, "0");
+    return `#${byte}${byte}${byte}`;
+  }
+  const l_ = clampedL + 0.3963377774 * a + 0.2158037573 * b;
+  const m_ = clampedL - 0.1055613458 * a - 0.0638541728 * b;
+  const s_ = clampedL - 0.0894841775 * a - 1.291485548 * b;
+  const l = l_ * l_ * l_;
+  const m = m_ * m_ * m_;
+  const s = s_ * s_ * s_;
+  const r = +4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
+  const g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+  const bl = -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s;
   return (
     "#" +
-    x
-      .map((v, i) =>
-        Math.round(v + (y[i] - v) * ratio)
-          .toString(16)
-          .padStart(2, "0"),
-      )
+    [r, g, bl]
+      .map((v) => linearToSrgbByte(v).toString(16).padStart(2, "0"))
       .join("")
   );
 }
+
+function isNeutralHex(color: string): boolean {
+  const [r, g, b] = rgb(color);
+  return r === g && g === b;
+}
+
+/** Perceptually uniform OKLab/OKLCH interpolation serialized to 6-digit hex. */
+export function mix(a: string, b: string, ratio: number): string {
+  const t = Math.max(0, Math.min(1, ratio));
+  const [L1, a1, b1] = hexToOklab(a);
+  const [L2, a2, b2] = hexToOklab(b);
+  const neutral = isNeutralHex(a) && isNeutralHex(b);
+  return oklabToHex(
+    L1 + (L2 - L1) * t,
+    a1 + (a2 - a1) * t,
+    b1 + (b2 - b1) * t,
+    neutral,
+  );
+}
+
+/** Shift perceptual lightness while preserving (and gently retaining) hue/chroma. */
+function shiftLightness(
+  color: string,
+  deltaL: number,
+  chromaScale = 1,
+): string {
+  const [L, a, b] = hexToOklab(color);
+  const neutral = isNeutralHex(color);
+  const baseL = deltaL > 0 ? Math.max(L, 0.16) : L;
+  return oklabToHex(
+    baseL + deltaL,
+    neutral ? 0 : a * chromaScale,
+    neutral ? 0 : b * chromaScale,
+    neutral,
+  );
+}
+
 function luminance(color: string): number {
-  const values = rgb(color).map((v) => {
-    const n = v / 255;
-    return n <= 0.04045 ? n / 12.92 : ((n + 0.055) / 1.055) ** 2.4;
-  });
+  const values = rgb(color).map(srgbToLinear);
   return values[0] * 0.2126 + values[1] * 0.7152 + values[2] * 0.0722;
 }
+
 export function contrastRatio(a: string, b: string): number {
   const l = [luminance(a), luminance(b)].sort((x, y) => y - x);
   return (l[0] + 0.05) / (l[1] + 0.05);
 }
+
+/** Worst-case text-to-surface contrast across canvas, sidebar, cards, inputs, and elevated overlays. */
+export function minimumThemeContrast(theme: ThemeConfig): number {
+  const tokens = themeTokens(theme);
+  const surfaces = [
+    tokens["--color-canvas"],
+    tokens["--color-sidebar"].slice(0, 7),
+    tokens["--color-surface"],
+    tokens["--color-card"],
+    tokens["--color-elevated"],
+    tokens["--color-input"],
+    tokens["--color-composer"],
+  ];
+  const texts = [
+    tokens["--color-text"],
+    tokens["--color-text-secondary"],
+    tokens["--color-text-muted"],
+  ];
+  let worst = Number.POSITIVE_INFINITY;
+  for (const text of texts) {
+    for (const surface of surfaces) {
+      worst = Math.min(worst, contrastRatio(text, surface));
+    }
+  }
+  return worst;
+}
+
+function minContrastAgainst(color: string, against: string[]): number {
+  let worst = Number.POSITIVE_INFINITY;
+  for (const bg of against) {
+    worst = Math.min(worst, contrastRatio(color, bg));
+  }
+  return worst;
+}
+
+/** Guarantee minimum WCAG contrast against reference surfaces via perceptual stepping. */
+function ensureContrast(
+  candidate: string,
+  against: string[],
+  targetFg: string,
+  minRatio = 4.6,
+): string {
+  const candidateRatio = minContrastAgainst(candidate, against);
+  if (candidateRatio >= minRatio) return candidate;
+
+  for (let step = 1; step <= 20; step++) {
+    const current = mix(candidate, targetFg, step * 0.05);
+    if (minContrastAgainst(current, against) >= minRatio) return current;
+  }
+
+  const fgRatio = minContrastAgainst(targetFg, against);
+  const fallbackMin = 4.55;
+  if (fgRatio >= fallbackMin) return targetFg;
+
+  const pole =
+    minContrastAgainst("#ffffff", against) >=
+    minContrastAgainst("#000000", against)
+      ? "#ffffff"
+      : "#000000";
+
+  let best = fgRatio >= candidateRatio ? targetFg : candidate;
+  let bestRatio = Math.max(fgRatio, candidateRatio);
+  for (let step = 1; step <= 20; step++) {
+    const boosted = mix(targetFg, pole, step * 0.05);
+    const ratio = minContrastAgainst(boosted, against);
+    if (ratio >= fallbackMin) return boosted;
+    if (ratio > bestRatio) {
+      best = boosted;
+      bestRatio = ratio;
+    }
+  }
+  return best;
+}
+
 export function themeTokens(theme: ThemeConfig): Record<string, string> {
-  const bg = theme.background,
-    fg = theme.foreground,
-    accent = theme.accent;
+  const bg = theme.background;
+  const fg = theme.foreground;
+  const accent = theme.accent;
   const dark = luminance(bg) < 0.4;
-  const depth = 0.025 + (theme.contrast / 100) * 0.11;
-  const surface = (n: number) => mix(bg, fg, n);
-  const sidebar = surface(depth * (dark ? 0.5 : 0.55));
+  const scale = 0.65 + (theme.contrast / 100) * 0.7;
+  const step = (n: number) => mix(bg, fg, n);
+  const shell = dark
+    ? shiftLightness(bg, -0.022 * scale, 1.06)
+    : shiftLightness(bg, -0.024 * scale, 1.08);
+  const sidebarBase = shell;
+  const surface = dark
+    ? shiftLightness(bg, 0.03 * scale)
+    : shiftLightness(bg, -0.014 * scale, 1.04);
+  const card = dark ? shiftLightness(bg, 0.03 * scale) : bg;
+  const elevated = dark ? shiftLightness(bg, 0.046 * scale) : bg;
+  const input = dark
+    ? shiftLightness(bg, 0.016 * scale)
+    : shiftLightness(bg, -0.009 * scale, 1.02);
+  const composer = dark ? shiftLightness(bg, 0.036 * scale) : bg;
+
+  const surfaces = [bg, sidebarBase, surface, card, elevated, input, composer];
+  const textSecondary = ensureContrast(
+    step(dark ? 0.84 : 0.78),
+    surfaces,
+    fg,
+    7.0,
+  );
+  const textMuted = ensureContrast(
+    step(dark ? 0.68 : 0.62),
+    surfaces,
+    fg,
+    4.75,
+  );
+
+  const borderSubtle = dark
+    ? shiftLightness(bg, 0.058 * scale)
+    : shiftLightness(bg, -0.048 * scale);
+  const border = dark
+    ? shiftLightness(bg, 0.095 * scale)
+    : shiftLightness(bg, -0.08 * scale);
+  const borderStrong = dark
+    ? shiftLightness(bg, 0.13 * scale)
+    : shiftLightness(bg, -0.12 * scale);
+  const focusRing = dark
+    ? shiftLightness(bg, 0.22 * scale)
+    : shiftLightness(bg, -0.25 * scale);
+  const action = dark ? mix(fg, bg, 0.11) : mix(fg, bg, 0.04);
+  const actionHover = dark ? mix(fg, bg, 0.03) : mix(fg, bg, 0.14);
+  const btnBg = dark ? shiftLightness(bg, 0.042 * scale) : "#ffffff";
+  const btnHover = dark
+    ? shiftLightness(bg, 0.068 * scale)
+    : shiftLightness(bg, -0.022 * scale);
+  const btnElevated = dark ? shiftLightness(bg, 0.064 * scale) : "#ffffff";
+  const btnElevatedHover = dark
+    ? shiftLightness(bg, 0.092 * scale)
+    : shiftLightness(bg, -0.026 * scale);
+
   return {
+    "--color-shell": shell,
     "--color-canvas": bg,
     "--color-text": fg,
-    "--color-sidebar": theme.translucentSidebar ? sidebar + "c7" : sidebar,
-    "--color-surface": surface(dark ? depth : depth * 0.65),
-    "--color-elevated": dark ? surface(depth) : bg,
-    "--color-input": surface(depth * 0.25),
-    "--color-composer": dark ? surface(depth + 0.025) : bg,
-    "--color-text-secondary": surface(0.78),
-    "--color-text-muted": surface(dark ? 0.62 : 0.65),
-    "--color-placeholder": surface(dark ? 0.62 : 0.65),
-    "--color-border-subtle": surface(dark ? depth + 0.02 : depth * 0.6),
-    "--color-border": surface(dark ? depth + 0.06 : depth + 0.02),
-    "--color-border-strong": surface(dark ? depth + 0.06 : depth + 0.02),
-    "--color-hover": fg + (dark ? "12" : "09"),
-    "--color-selected": fg + (dark ? "20" : "16"),
-    "--color-focus-background": fg + "29",
+    "--color-sidebar": theme.translucentSidebar
+      ? sidebarBase + "c7"
+      : sidebarBase,
+    "--color-surface": surface,
+    "--color-card": card,
+    "--color-elevated": elevated,
+    "--color-well": fg + (dark ? "0c" : "0a"),
+    "--color-input": input,
+    "--color-composer": composer,
+    "--color-text-secondary": textSecondary,
+    "--color-text-muted": textMuted,
+    "--color-placeholder": textMuted,
+    "--color-border-subtle": borderSubtle,
+    "--color-border": border,
+    "--color-border-strong": borderStrong,
+    "--color-hover": fg + (dark ? "0d" : "0a"),
+    "--color-row-selected": fg + (dark ? "15" : "10"),
+    "--color-selected": fg + (dark ? "1c" : "15"),
+    "--color-focus-background": fg + "22",
+    "--color-focus-ring": focusRing,
     "--color-primary": accent,
-    "--color-primary-hover": mix(accent, dark ? "#FFFFFF" : "#000000", 0.1),
+    "--color-primary-hover": mix(accent, dark ? "#FFFFFF" : "#000000", 0.12),
     "--color-on-primary":
-      contrastRatio(accent, "#FFFFFF") > contrastRatio(accent, "#111111")
+      contrastRatio(accent, "#FFFFFF") > contrastRatio(accent, "#121212")
         ? "#FFFFFF"
-        : "#111111",
-    "--color-action": dark ? "#FFFFFF" : "#222222",
-    "--color-action-hover": dark ? "#EAEAEA" : "#383838",
-    "--color-on-action": dark ? "#222222" : "#FFFFFF",
-    "--color-disabled-bg": surface(0.055),
-    "--color-disabled-text": surface(dark ? 0.62 : 0.65),
-    "--color-stop": surface(dark ? 0.22 : 0.12),
-    "--color-stop-hover": surface(dark ? 0.3 : 0.2),
+        : "#121212",
+    "--color-action": action,
+    "--color-action-hover": actionHover,
+    "--color-on-action":
+      contrastRatio(action, "#FFFFFF") > contrastRatio(action, "#141414")
+        ? "#FFFFFF"
+        : "#141414",
+    "--color-btn-bg": btnBg,
+    "--color-btn-hover": btnHover,
+    "--color-btn-elevated": btnElevated,
+    "--color-btn-elevated-hover": btnElevatedHover,
+    "--color-btn-rim": dark ? "#ffffff12" : "#ffffffcc",
+    "--color-danger-surface": dark ? "#dc35453d" : "#dc262617",
+    "--color-danger-surface-hover": dark ? "#dc354557" : "#dc262626",
+    "--color-danger-border": dark ? "#f0586075" : "#dc262652",
+    "--color-danger-text": dark ? "#ff9497" : "#c92a2a",
+    "--color-disabled-bg": step(0.065),
+    "--color-disabled-text": textMuted,
+    "--color-stop": step(dark ? 0.22 : 0.12),
+    "--color-stop-hover": step(dark ? 0.3 : 0.18),
     "--color-on-stop": fg,
     "--color-brand": accent,
     "--color-code-keyword": dark ? "#CDA4D7" : "#6B3D83",
     "--color-code-string": dark ? "#C4C998" : "#526B20",
     "--color-code-number": dark ? "#A7C6BE" : "#256557",
     "--color-code-type": dark ? "#DFBC85" : "#805616",
-    "--color-success": dark ? "#75C99A" : "#237A48",
-    "--color-warning": dark ? "#E4B66A" : "#946000",
-    "--color-danger": dark ? "#EF9090" : "#C03939",
-    "--color-unread": dark ? "#85AAFF" : "#2563EB",
-    "--color-backdrop": dark ? "#000000a6" : "#00000040",
-    "--color-selection": accent + "44",
-    "--shadow-dialog": dark ? "0 24px 72px #0005" : "0 24px 72px #00000014",
-    "--shadow-popover": dark ? "0 12px 36px #0006" : "0 8px 28px #0000000a",
+    "--color-success": dark ? "#55C88A" : "#1E7A46",
+    "--color-warning": dark ? "#E8B658" : "#946000",
+    "--color-danger": dark ? "#F08888" : "#C03939",
+    "--color-unread": dark ? "#6EA4FF" : "#2563EB",
+    "--color-backdrop": dark ? "#0000008c" : "#00000038",
+    "--color-selection": accent + "3d",
+    "--shadow-island": dark
+      ? `0 0 0 1px ${borderSubtle}, 0 4px 16px -4px rgba(0, 0, 0, 0.24)`
+      : `0 0 0 1px ${borderSubtle}, 0 4px 16px -6px rgba(15, 23, 42, 0.045)`,
+    "--shadow-well": `inset 0 0 0 1px ${border}`,
+    "--shadow-card": dark
+      ? `0 0 0 1px ${borderSubtle}`
+      : `0 0 0 1px ${border}, 0 1px 2px rgba(15, 23, 42, 0.03)`,
+    "--shadow-elevated": dark
+      ? `0 0 0 1px ${border}, 0 2px 6px rgba(0, 0, 0, 0.18)`
+      : `0 0 0 1px ${border}, 0 1px 3px rgba(15, 23, 42, 0.06)`,
+    "--shadow-composer": dark
+      ? `0 0 0 1px ${border}, 0 2px 8px rgba(0, 0, 0, 0.16)`
+      : `0 0 0 1px ${border}, 0 2px 8px rgba(15, 23, 42, 0.04)`,
+    "--shadow-composer-focus": dark
+      ? `0 0 0 1px ${focusRing}, 0 2px 8px rgba(0, 0, 0, 0.18)`
+      : `0 0 0 1px ${focusRing}, 0 2px 8px rgba(15, 23, 42, 0.05)`,
+    "--shadow-dialog": dark
+      ? `0 16px 40px -8px rgba(0, 0, 0, 0.42), 0 0 0 1px ${border}`
+      : `0 16px 40px -10px rgba(15, 23, 42, 0.14), 0 0 0 1px ${border}`,
+    "--shadow-popover": dark
+      ? `0 12px 28px -6px rgba(0, 0, 0, 0.36), 0 0 0 1px ${borderStrong}`
+      : `0 12px 28px -8px rgba(15, 23, 42, 0.12), 0 0 0 1px ${border}`,
+    "--focus-ring": `0 0 0 1px ${focusRing}`,
+    "--focus-ring-inset": `inset 0 0 0 1px ${focusRing}`,
     "--font-ui": fonts[theme.uiFont],
     "--font-content":
       theme.contentFont === "inherit"

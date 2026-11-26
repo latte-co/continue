@@ -23,6 +23,7 @@ import { SideChatRecoveryDialog } from "./SideChatRecoveryDialog";
 import { SshPasswordDialog } from "./SshPasswordDialog";
 import { useWorkbench } from "./useWorkbench";
 import { useSubagents } from "./useSubagents";
+import { IconButton, SplitHandle, StageIsland, Topbar } from "./ui";
 import { latestTurnChanges } from "./transcript";
 import {
   openWorkspaceResource,
@@ -270,7 +271,6 @@ export default function App() {
   return (
     <LinkHandling workspaceId={workbench.workspaceId}>
       <div
-        hidden={workbench.modal === "settings"}
         className={`app ${sidebarOpen ? "" : "sidebar-collapsed"}${panel && !skillsOpen ? " workspace-visible" : ""}${merged ? " workspace-merged" : ""}`}
         style={
           {
@@ -287,349 +287,354 @@ export default function App() {
           onInteractionChange={setSidebarInteraction}
           statusCenter={sidebarVisible ? statusCenter : null}
         />
-        <div
-          className="resize-handle"
-          role="separator"
+        <SplitHandle
+          label="调整侧栏宽度"
+          className="resize-handle sidebar-resize"
           hidden={!sidebarOpen}
-          aria-label="调整侧栏宽度"
           onPointerDown={(e) => resize(e, "left")}
         />
-        <main
-          id="conversation-panel"
-          hidden={skillsOpen}
-          className={`main${conversationHidden ? " conversation-hidden" : ""}`}
-          role={merged ? "tabpanel" : undefined}
-          aria-labelledby={merged ? "conversation-workspace-tab" : undefined}
-          aria-hidden={conversationHidden || skillsOpen || undefined}
-          inert={conversationHidden || skillsOpen}
-        >
-          <header
-            className="topbar"
-            data-tauri-drag-region="deep"
-            inert={merged}
-            aria-hidden={merged || undefined}
+        <StageIsland fullInset={!sidebarOpen}>
+          <main
+            id="conversation-panel"
+            hidden={skillsOpen}
+            className={`main${conversationHidden ? " conversation-hidden" : ""}`}
+            role={merged ? "tabpanel" : undefined}
+            aria-labelledby={merged ? "conversation-workspace-tab" : undefined}
+            aria-hidden={conversationHidden || skillsOpen || undefined}
+            inert={conversationHidden || skillsOpen}
           >
-            <div className="topbar-project">
-              {!sidebarOpen && (
-                <div className="topbar-controls">
-                  {!merged && collapsedStatusCenter}
-                  <SidebarToggle
-                    toggle={toggleSidebar}
-                    preview={sidebarPreview}
-                  />
-                  <button
-                    className="panel-toggle icon-button"
-                    title="新对话 (⌘ N)"
-                    aria-label="新对话"
-                    onClick={() =>
-                      void workbench
-                        .createSession()
-                        .catch((e) => setError(message(e)))
-                    }
-                  >
-                    <SquarePen size={16} />
-                  </button>
+            <Topbar
+              className="topbar"
+              inert={merged}
+              aria-hidden={merged || undefined}
+            >
+              <div className="topbar-project">
+                {!sidebarOpen && (
+                  <div className="topbar-controls">
+                    {!merged && collapsedStatusCenter}
+                    <SidebarToggle
+                      toggle={toggleSidebar}
+                      preview={sidebarPreview}
+                    />
+                    <IconButton
+                      size="sm"
+                      className="panel-toggle"
+                      title="新对话 (⌘ N)"
+                      label="新对话"
+                      onClick={() =>
+                        void workbench
+                          .createSession()
+                          .catch((e) => setError(message(e)))
+                      }
+                    >
+                      <SquarePen size={15.5} />
+                    </IconButton>
+                  </div>
+                )}
+                {!sidebarOpen && (
+                  <span className="titlebar-divider" aria-hidden="true" />
+                )}
+                <div className="topbar-title">
+                  <Folder size={15.5} />
+                  <strong>{project?.name ?? "工作台"}</strong>
+                  <span className="topbar-slash">/</span>
+                  <span>{session?.title ?? "新任务"}</span>
                 </div>
-              )}
-              {!sidebarOpen && (
-                <span className="titlebar-divider" aria-hidden="true" />
-              )}
-              <div className="topbar-title">
-                <Folder size={16} />
-                <strong>{project?.name ?? "工作台"}</strong>
-                <span className="topbar-slash">/</span>
-                <span>{session?.title ?? "新任务"}</span>
               </div>
-            </div>
-            <div className="topbar-actions">
-              {!merged && conversationActions}
-              {overview}
-              <span className="titlebar-divider" aria-hidden="true" />
-              <button
-                className="panel-toggle icon-button"
-                title={panel ? "收起工作区" : "展开工作区"}
-                aria-label={panel ? "收起工作区" : "展开工作区"}
-                aria-expanded={panel}
-                aria-controls="project-workspace"
-                onClick={() => setPanel((v) => !v)}
-              >
-                <PanelRight size={16} />
-              </button>
-            </div>
-          </header>
-          <Conversation
-            composerPrediction={workbench.composerPrediction}
-            captureQueuedPredictionRetirement={
-              workbench.captureQueuedPredictionRetirement
-            }
-            openSubagents={showSubagents}
-            openSideChat={canOpenSide ? showSide : undefined}
-            openBlockingSideChat={
-              workbench.openSideChatSession
-                ? (sideId) => workbench.openSideChatSession(hostId, sideId)
-                : undefined
-            }
-            quoteInSideChat={
-              canOpenSide ? (text) => void showSide(text, true) : undefined
-            }
-            openTurnChanges={(changes, path) => {
-              if (session)
-                openTurnChanges(
-                  workbench.workspaceId,
-                  session.id,
-                  changes.request_id,
-                  changes.summary.baseline_at,
-                  path,
-                );
-            }}
-            openFile={(path) =>
-              openWorkspaceResource(workbench.workspaceId, "files", {
-                file: path,
-              })
-            }
-            drafts={drafts}
-            agent={agent}
-            agents={workbench.agents}
-            selectAgent={workbench.selectAgent}
-            session={session}
-            conversationKey={workbench.workspaceId}
-            hostId={hostId}
-            agentSessionState={
-              session
-                ? workbench.agentSessionState({ ...session, hostId })
-                : undefined
-            }
-            agentSessionError={
-              session
-                ? workbench.agentSessionTransitions[
-                    JSON.stringify([hostId, session.id])
-                  ]?.error
-                : undefined
-            }
-            onModelReady={() =>
-              setError((old) => (old.startsWith("模型不在当前") ? "" : old))
-            }
-            settingsOpen={
-              workbench.modal === "settings" || skillsOpen || conversationHidden
-            }
-            events={events}
-            historyLoading={workbench.historyLoading}
-            hasEarlierHistory={workbench.hasEarlierHistory}
-            earlierHistoryLoading={workbench.earlierHistoryLoading}
-            loadEarlierHistory={workbench.loadEarlierHistory}
-            readingScope={workbench.readingScope}
-            readingPositions={workbench.readingPositions}
-            onHistoryReady={historyReady}
-            connected={connected}
-            connecting={connecting}
-            connectionError={error}
-            connectionLost={workbench.connectionLost}
-            reconnect={() => setRetry((v) => v + 1)}
-            available={agent?.available ?? false}
-            projectName={project?.name}
-            projectId={project?.id}
-            project={project}
-            projects={workbench.projects}
-            hosts={workbench.hosts}
-            selectTaskProject={(target) => {
-              try {
-                workbench.selectTaskProject(target);
-              } catch (cause) {
-                setError(message(cause));
+              <div className="topbar-actions">
+                {!merged && conversationActions}
+                {overview}
+                <span className="titlebar-divider" aria-hidden="true" />
+                <IconButton
+                  size="sm"
+                  active={panel}
+                  className="panel-toggle"
+                  title={panel ? "收起工作区" : "展开工作区"}
+                  label={panel ? "收起工作区" : "展开工作区"}
+                  aria-expanded={panel}
+                  aria-controls="project-workspace"
+                  onClick={() => setPanel((v) => !v)}
+                >
+                  <PanelRight size={15.5} />
+                </IconButton>
+              </div>
+            </Topbar>
+            <Conversation
+              composerPrediction={workbench.composerPrediction}
+              captureQueuedPredictionRetirement={
+                workbench.captureQueuedPredictionRetirement
               }
-            }}
-            openProject={workbench.openProject}
-            send={send}
-            cancel={async () => {
-              if (!session) return false;
-              try {
-                await request(hostId, {
-                  method: "cancel",
-                  session_id: session.id,
-                });
-                return true;
-              } catch (e) {
-                setError(message(e));
-                return false;
+              openSubagents={showSubagents}
+              openSideChat={canOpenSide ? showSide : undefined}
+              openBlockingSideChat={
+                workbench.openSideChatSession
+                  ? (sideId) => workbench.openSideChatSession(hostId, sideId)
+                  : undefined
               }
-            }}
-            answerQuestion={async (id, answers) => {
-              if (!session) return;
-              try {
-                await request(hostId, {
-                  method: "answer_question",
-                  session_id: session.id,
-                  request_id: id,
-                  answers,
-                });
-              } catch (e) {
-                setError(message(e));
+              quoteInSideChat={
+                canOpenSide ? (text) => void showSide(text, true) : undefined
               }
-            }}
-            approve={async (id, allow) => {
-              if (!session) return;
-              try {
-                await request(hostId, {
-                  method: "approve",
-                  session_id: session.id,
-                  request_id: id,
-                  allow,
-                });
-              } catch (e) {
-                setError(message(e));
-              }
-            }}
-          />
-        </main>
-        <div
-          className="resize-handle workspace-resize"
-          hidden={!panel || merged || skillsOpen}
-          role="separator"
-          aria-label="调整工作区宽度"
-          onPointerDown={(e) => resize(e, "right")}
-        />
-        <Workspace
-          sessionId={session?.id}
-          canOpenSideChat={canOpenSide}
-          closeSideChat={
-            session
-              ? (tab) =>
-                  closeSideChat(
-                    drafts,
-                    hostId,
-                    session.id,
+              openTurnChanges={(changes, path) => {
+                if (session)
+                  openTurnChanges(
                     workbench.workspaceId,
-                    tab,
-                  )
-              : undefined
-          }
-          renderSideChat={
-            session
-              ? (tab, active) => (
-                  <SideChat
-                    key={JSON.stringify([hostId, session.id, tab.id])}
-                    parent={session}
-                    sideId={sideChatId(tab.id)!}
-                    workspaceId={workbench.workspaceId}
-                    isDraft={tab.draft}
-                    hostId={hostId}
-                    projectPath={project?.path}
-                    drafts={drafts}
-                    active={active && !workbench.modal && !dialogOpen}
-                    connected={connected}
-                    supported={supportsSide}
-                    supportsInheritPermission={
-                      workbench.supportsSideChatInheritPermission
-                    }
-                  />
-                )
-              : undefined
-          }
-          lastTurnVersion={lastTurnVersion}
-          overview={overview}
-          taskInfo={
-            <TaskInfo
-              key={workbench.workspaceId}
-              workspaceId={workbench.workspaceId}
-              active={
-                panel &&
-                workbench.workspace.current === "taskInfo" &&
-                !(
-                  workbench.workspace.expanded &&
-                  workbench.workspace.conversationActive
-                ) &&
-                workbench.modal !== "settings" &&
-                !skillsOpen &&
-                !dialogOpen
+                    session.id,
+                    changes.request_id,
+                    changes.summary.baseline_at,
+                    path,
+                  );
+              }}
+              openFile={(path) =>
+                openWorkspaceResource(workbench.workspaceId, "files", {
+                  file: path,
+                })
               }
-              running={
-                session?.status === "running" || session?.status === "waiting"
-              }
+              openModelSettings={() => {
+                workbench.setSettingsReturnToProject(false);
+                workbench.setSettingsTab("providers");
+                workbench.setModal("settings");
+              }}
+              drafts={drafts}
+              agent={agent}
+              agents={workbench.agents}
+              selectAgent={workbench.selectAgent}
+              session={session}
+              conversationKey={workbench.workspaceId}
               hostId={hostId}
-              project={project}
-              sessionId={session?.id}
-              connected={connected}
+              agentSessionState={
+                session
+                  ? workbench.agentSessionState({ ...session, hostId })
+                  : undefined
+              }
+              agentSessionError={
+                session
+                  ? workbench.agentSessionTransitions[
+                      JSON.stringify([hostId, session.id])
+                    ]?.error
+                  : undefined
+              }
+              onModelReady={() =>
+                setError((old) => (old.startsWith("模型不在当前") ? "" : old))
+              }
+              settingsOpen={
+                workbench.modal === "settings" ||
+                skillsOpen ||
+                conversationHidden
+              }
               events={events}
-              subagents={subagents}
               historyLoading={workbench.historyLoading}
               hasEarlierHistory={workbench.hasEarlierHistory}
               earlierHistoryLoading={workbench.earlierHistoryLoading}
               loadEarlierHistory={workbench.loadEarlierHistory}
+              autoFillTurnNavigator
+              readingScope={workbench.readingScope}
+              readingPositions={workbench.readingPositions}
+              onHistoryReady={historyReady}
+              connected={connected}
+              connecting={connecting}
+              connectionError={error}
+              connectionLost={workbench.connectionLost}
+              reconnect={() => setRetry((v) => v + 1)}
+              available={agent?.available ?? false}
+              projectName={project?.name}
+              projectId={project?.id}
+              project={project}
+              projects={workbench.projects}
+              hosts={workbench.hosts}
+              selectTaskProject={(target) => {
+                try {
+                  workbench.selectTaskProject(target);
+                } catch (cause) {
+                  setError(message(cause));
+                }
+              }}
+              openProject={workbench.openProject}
+              send={send}
+              cancel={async () => {
+                if (!session) return false;
+                try {
+                  await request(hostId, {
+                    method: "cancel",
+                    session_id: session.id,
+                  });
+                  return true;
+                } catch (e) {
+                  setError(message(e));
+                  return false;
+                }
+              }}
+              answerQuestion={async (id, answers) => {
+                if (!session) return;
+                try {
+                  await request(hostId, {
+                    method: "answer_question",
+                    session_id: session.id,
+                    request_id: id,
+                    answers,
+                  });
+                } catch (e) {
+                  setError(message(e));
+                }
+              }}
+              approve={async (id, allow) => {
+                if (!session) return;
+                try {
+                  await request(hostId, {
+                    method: "approve",
+                    session_id: session.id,
+                    request_id: id,
+                    allow,
+                  });
+                } catch (e) {
+                  setError(message(e));
+                }
+              }}
             />
-          }
-          conversationActions={conversationActions}
-          statusCenter={!sidebarOpen ? collapsedStatusCenter : null}
-          subagents={subagents}
-          workspaceId={workbench.workspaceId}
-          conversationTitle={session?.title ?? "新任务"}
-          sidebarOpen={sidebarOpen}
-          toggleSidebar={toggleSidebar}
-          sidebarPreview={sidebarPreview}
-          hostId={hostId}
-          hostName={host.name}
-          project={project}
-          visible={panel && workbench.modal !== "settings" && !skillsOpen}
-          connected={connected}
-          close={() =>
-            merged ? workbench.restoreWorkspace() : setPanel(false)
-          }
-        />
-        <SkillsPage
-          state={workbench}
-          active={skillsOpen}
-          busy={skillsBusy}
-          onBusy={setSkillsBusy}
-          onCreate={(targetHostId) => {
-            if (!workbench.hosts.some((host) => host.id === targetHostId)) {
-              setError("技能所在主机已移除");
-              return;
+          </main>
+          <SplitHandle
+            label="调整工作区宽度"
+            className="resize-handle workspace-resize"
+            hidden={!panel || merged || skillsOpen}
+            onPointerDown={(e) => resize(e, "right")}
+          />
+          <Workspace
+            sessionId={session?.id}
+            canOpenSideChat={canOpenSide}
+            closeSideChat={
+              session
+                ? (tab) =>
+                    closeSideChat(
+                      drafts,
+                      hostId,
+                      session.id,
+                      workbench.workspaceId,
+                      tab,
+                    )
+                : undefined
             }
-            const target =
-              workbench.projects.find(
-                (p) =>
-                  p.hostId === targetHostId && p.id === workbench.projectId,
-              ) ?? workbench.projects.find((p) => p.hostId === targetHostId);
-            void workbench
-              .createSession(target, targetHostId)
-              .then(() => {
-                drafts.update("new-task", { skillCreator: true });
-              })
-              .catch((cause) => setError(message(cause)));
-          }}
-          onClose={() => {
-            workbench.setModal(null);
-            requestAnimationFrame(() => {
-              (sidebarOpen
-                ? document.getElementById("sidebar-skills")
-                : document.querySelector<HTMLElement>(
-                    ".topbar-controls [data-sidebar-trigger]",
+            renderSideChat={
+              session
+                ? (tab, active) => (
+                    <SideChat
+                      key={JSON.stringify([hostId, session.id, tab.id])}
+                      parent={session}
+                      sideId={sideChatId(tab.id)!}
+                      workspaceId={workbench.workspaceId}
+                      isDraft={tab.draft}
+                      hostId={hostId}
+                      projectPath={project?.path}
+                      drafts={drafts}
+                      active={active && !workbench.modal && !dialogOpen}
+                      connected={connected}
+                      supported={supportsSide}
+                      supportsInheritPermission={
+                        workbench.supportsSideChatInheritPermission
+                      }
+                    />
                   )
-              )?.focus();
-            });
-          }}
-          controls={
-            !sidebarOpen ? (
-              <>
-                <span className="topbar-controls">
-                  {collapsedStatusCenter}
-                  <SidebarToggle
-                    toggle={toggleSidebar}
-                    preview={sidebarPreview}
-                  />
-                </span>
-                <span className="titlebar-divider" aria-hidden="true" />
-              </>
-            ) : null
-          }
-        />
+                : undefined
+            }
+            lastTurnVersion={lastTurnVersion}
+            overview={overview}
+            taskInfo={
+              <TaskInfo
+                key={workbench.workspaceId}
+                workspaceId={workbench.workspaceId}
+                active={
+                  panel &&
+                  workbench.workspace.current === "taskInfo" &&
+                  !(
+                    workbench.workspace.expanded &&
+                    workbench.workspace.conversationActive
+                  ) &&
+                  workbench.modal !== "settings" &&
+                  !skillsOpen &&
+                  !dialogOpen
+                }
+                running={
+                  session?.status === "running" || session?.status === "waiting"
+                }
+                hostId={hostId}
+                project={project}
+                sessionId={session?.id}
+                connected={connected}
+                events={events}
+                subagents={subagents}
+                historyLoading={workbench.historyLoading}
+                hasEarlierHistory={workbench.hasEarlierHistory}
+                earlierHistoryLoading={workbench.earlierHistoryLoading}
+                loadEarlierHistory={workbench.loadEarlierHistory}
+              />
+            }
+            conversationActions={conversationActions}
+            statusCenter={!sidebarOpen ? collapsedStatusCenter : null}
+            subagents={subagents}
+            workspaceId={workbench.workspaceId}
+            conversationTitle={session?.title ?? "新任务"}
+            sidebarOpen={sidebarOpen}
+            toggleSidebar={toggleSidebar}
+            sidebarPreview={sidebarPreview}
+            hostId={hostId}
+            hostName={host.name}
+            project={project}
+            visible={panel && workbench.modal !== "settings" && !skillsOpen}
+            connected={connected}
+            close={() =>
+              merged ? workbench.restoreWorkspace() : setPanel(false)
+            }
+          />
+          <SkillsPage
+            state={workbench}
+            active={skillsOpen}
+            busy={skillsBusy}
+            onBusy={setSkillsBusy}
+            onCreate={(targetHostId) => {
+              if (!workbench.hosts.some((host) => host.id === targetHostId)) {
+                setError("技能所在主机已移除");
+                return;
+              }
+              const target =
+                workbench.projects.find(
+                  (p) =>
+                    p.hostId === targetHostId && p.id === workbench.projectId,
+                ) ?? workbench.projects.find((p) => p.hostId === targetHostId);
+              void workbench
+                .createSession(target, targetHostId)
+                .then(() => {
+                  drafts.update("new-task", { skillCreator: true });
+                })
+                .catch((cause) => setError(message(cause)));
+            }}
+            onClose={() => {
+              workbench.setModal(null);
+              requestAnimationFrame(() => {
+                (sidebarOpen
+                  ? document.getElementById("sidebar-skills")
+                  : document.querySelector<HTMLElement>(
+                      ".topbar-controls [data-sidebar-trigger]",
+                    )
+                )?.focus();
+              });
+            }}
+            controls={
+              !sidebarOpen ? (
+                <>
+                  <span className="topbar-controls">
+                    {collapsedStatusCenter}
+                    <SidebarToggle
+                      toggle={toggleSidebar}
+                      preview={sidebarPreview}
+                    />
+                  </span>
+                  <span className="titlebar-divider" aria-hidden="true" />
+                </>
+              ) : null
+            }
+          />
+        </StageIsland>
         <HostDialogs state={workbench} />
       </div>
-      <div hidden={workbench.modal !== "settings"}>
-        <SettingsPage
-          state={workbench}
-          active={workbench.modal === "settings"}
-        />
-      </div>
+      <SettingsPage state={workbench} active={workbench.modal === "settings"} />
       {workbench.standaloneSideChat && (
         <SideChatRecoveryDialog
           key={`${workbench.standaloneSideChat.hostId}:${workbench.standaloneSideChat.sideId}`}

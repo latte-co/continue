@@ -1,6 +1,6 @@
-import { useEffect, useRef } from "react";
-import { createPortal } from "react-dom";
+import { useRef } from "react";
 import { Check, FileText } from "lucide-react";
+import { MenuRow, Popover } from "./ui";
 
 export function ReviewOptions({
   trigger,
@@ -15,71 +15,36 @@ export function ReviewOptions({
   choose: () => void;
   close: (restoreFocus?: boolean) => void;
 }) {
-  const menu = useRef<HTMLDivElement>(null);
-  const rect = trigger.getBoundingClientRect();
-  useEffect(() => {
-    (
-      menu.current?.querySelector<HTMLButtonElement>("button:not(:disabled)") ??
-      menu.current
-    )?.focus();
-    const outside = (event: PointerEvent) => {
-      if (
-        !menu.current?.contains(event.target as Node) &&
-        !trigger.contains(event.target as Node)
-      )
-        close(false);
-    };
-    const key = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        close();
-      } else if (event.key === "Tab") close(false);
-      else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        menu.current
-          ?.querySelector<HTMLButtonElement>("button:not(:disabled)")
-          ?.focus();
-      }
-    };
-    const resize = () => close(false);
-    document.addEventListener("pointerdown", outside);
-    window.addEventListener("keydown", key, true);
-    window.addEventListener("resize", resize);
-    return () => {
-      document.removeEventListener("pointerdown", outside);
-      window.removeEventListener("keydown", key, true);
-      window.removeEventListener("resize", resize);
-    };
-  }, [trigger, close]);
-  return createPortal(
-    <div
-      ref={menu}
-      tabIndex={-1}
+  const triggerRef = useRef<HTMLElement>(trigger);
+  triggerRef.current = trigger;
+
+  return (
+    <Popover
+      open
+      anchorRef={triggerRef}
+      align="end"
+      minWidth={232}
       role="menu"
-      aria-label="更多差异选项"
-      className="project-context-menu review-options"
-      style={{
-        left: Math.max(8, Math.min(rect.right - 240, window.innerWidth - 248)),
-        top: Math.max(8, Math.min(rect.bottom + 6, window.innerHeight - 120)),
-      }}
+      label="更多差异选项"
+      className="review-options"
+      restoreFocusOnEscape={false}
+      onClose={(restoreFocus = true) => close(restoreFocus)}
     >
-      <button
+      <MenuRow
         role="menuitemcheckbox"
         aria-checked={fullContext && !frozen}
+        active={fullContext && !frozen}
         disabled={frozen}
+        leading={<FileText size={15} />}
+        trailing={fullContext && !frozen ? <Check size={14.5} /> : undefined}
         onClick={() => {
           choose();
-          close();
+          close(true);
         }}
       >
-        <FileText size={16} />
-        <span>加载完整文件</span>
-        {fullContext && !frozen && <Check size={16} />}
-      </button>
-      {frozen && <p>回合快照仅保留采集时的上下文。</p>}
-    </div>,
-    document.body,
+        加载完整文件
+      </MenuRow>
+      {frozen && <p className="ui-menu-note">回合快照仅保留采集时的上下文。</p>}
+    </Popover>
   );
 }

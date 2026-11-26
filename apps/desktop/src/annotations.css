@@ -3,7 +3,7 @@
   isolation: isolate;
 }
 .annotated-message[data-annotations="true"] {
-  padding-right: 28px;
+  padding-right: 24px;
 }
 .annotation-body {
   position: relative;
@@ -18,7 +18,7 @@
 .annotation-highlight {
   position: absolute;
   z-index: 1;
-  background: color-mix(in srgb, var(--color-unread) 32%, transparent);
+  background: color-mix(in srgb, var(--color-unread) 26%, transparent);
   border-radius: 3px;
 }
 .annotation-marker,
@@ -32,18 +32,18 @@ button.annotation-marker {
   gap: 0;
   pointer-events: auto;
   box-sizing: border-box;
-  min-width: 28px;
-  min-height: 28px;
-  height: 28px;
-  padding: 0 6px;
-  border: 1.5px solid #ffffff;
+  min-width: 22px;
+  min-height: 22px;
+  height: 22px;
+  padding: 0 5px;
+  border: 1.5px solid var(--color-canvas);
   border-radius: 999px 999px 999px 4px;
-  background-color: #1677ff;
+  background-color: #2f6fed;
   background-image: none;
   color: #ffffff;
-  box-shadow: 0 4px 12px #0006;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.28);
   font-family: var(--font-ui);
-  font-size: var(--text-md);
+  font-size: var(--text-xs);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   line-height: 1;
@@ -52,16 +52,16 @@ button.annotation-marker {
   pointer-events: none;
 }
 button.annotation-marker:hover:not(:disabled) {
-  background-color: #2984ff;
+  background-color: #3d7bf2;
   background-image: none;
   color: #ffffff;
 }
 :root button.annotation-marker:focus-visible:not(:disabled) {
-  background-color: #2984ff;
+  background-color: #3d7bf2;
   background-image: none;
   box-shadow:
-    0 0 0 2px #1677ff66,
-    0 4px 12px #0006;
+    0 0 0 2px #2f6fed73,
+    0 2px 6px rgba(0, 0, 0, 0.28);
 }
 .annotation-selection-menu {
   position: fixed;
@@ -70,50 +70,56 @@ button.annotation-marker:hover:not(:disabled) {
   flex-wrap: wrap;
   padding: 4px;
   gap: 2px;
-  background: var(--color-composer);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-pill);
+  background: var(--color-elevated);
+  border: 0;
+  border-radius: var(--radius-card);
   box-shadow: var(--shadow-popover);
 }
 .annotation-selection-menu button {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-height: 30px;
-  padding: 4px 10px;
-  border-radius: var(--radius-pill);
-  font-size: var(--text-md);
+  min-height: var(--control-height-sm);
+  height: var(--control-height-sm);
+  padding: 0 10px;
+  border-radius: 6px;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--color-text-secondary);
   white-space: nowrap;
   background: transparent;
+}
+.annotation-selection-menu button:hover:not(:disabled) {
+  background: var(--color-hover);
+  color: var(--color-text);
 }
 .annotation-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 120;
+  z-index: 200;
 }
 .annotation-popover {
   position: fixed;
   max-height: calc(100vh - 24px);
   overflow: auto;
   overscroll-behavior: contain;
-  background: var(--color-composer);
+  background: var(--color-elevated);
   color: var(--color-text);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-dialog);
+  border: 0;
+  border-radius: var(--radius-card);
   box-shadow: var(--shadow-popover);
   font-size: var(--text-md);
 }
 .annotation-editor-popover {
   overflow: visible;
-  border-radius: 26px;
 }
 .annotation-editor-shell {
-  padding: 6px 8px 6px 16px;
+  padding: 5px 5px 5px 12px;
 }
 .annotation-editor {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  align-items: flex-end;
+  gap: 6px;
 }
 .annotation-editor textarea {
   flex: 1;
@@ -126,51 +132,67 @@ button.annotation-marker:hover:not(:disabled) {
   box-shadow: none;
   display: block;
   width: 100%;
-  min-height: 24px;
+  min-height: 28px;
   max-height: 120px;
   resize: none;
   margin: 0;
   padding: 4px 0;
   font-family: var(--font-ui);
-  font-size: var(--text-lg);
-  line-height: var(--leading-ui);
+  font-size: var(--text-md);
+  line-height: 20px;
   overflow-y: auto;
 }
 .annotation-editor textarea::placeholder {
-  color: color-mix(
-    in srgb,
-    var(--color-placeholder) 80%,
-    var(--color-composer)
-  );
+  color: var(--color-placeholder);
+  opacity: 1;
 }
 .annotation-editor-delete {
   flex-shrink: 0;
-  width: 28px;
-  height: 28px;
-  min-height: 28px;
+  width: var(--control-height-sm);
+  height: var(--control-height-sm);
+  min-height: var(--control-height-sm);
   padding: 0;
   justify-content: center;
-  border-radius: var(--radius-pill);
-  color: var(--color-text-secondary);
+  border-radius: 6px;
+  color: var(--color-text-muted);
+}
+.annotation-editor-delete:hover:not(:disabled) {
+  background: var(--color-hover);
+  color: var(--color-danger);
 }
 .annotation-submit {
   flex-shrink: 0;
-  width: 32px;
-  height: 32px;
-  min-height: 32px;
+  width: var(--control-height-sm);
+  height: var(--control-height-sm);
+  min-height: var(--control-height-sm);
   padding: 0;
   justify-content: center;
-  border-radius: 50%;
+  border-radius: 6px;
   background: var(--color-action);
   color: var(--color-on-action);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  transition:
+    background var(--duration-fast) ease,
+    color var(--duration-fast) ease,
+    box-shadow var(--duration-fast) ease,
+    transform 90ms ease;
+}
+.annotation-submit:active:not(:disabled) {
+  transform: scale(0.96);
 }
 .annotation-submit:not(:disabled):hover {
   background: var(--color-action-hover);
 }
+.annotation-submit:disabled {
+  background: var(--color-well);
+  color: var(--color-disabled-text);
+  box-shadow: none;
+  opacity: 0.72;
+}
 .annotation-error {
   color: var(--color-danger);
-  font-size: var(--text-sm);
-  margin: 6px 8px 2px 0;
+  font-size: var(--text-xs);
+  margin: 6px 6px 2px 0;
 }
 .annotation-summary {
   margin: 0 0 8px;
@@ -182,57 +204,75 @@ button.annotation-marker:hover:not(:disabled) {
 .annotation-chip {
   display: inline-flex;
   align-items: center;
-  min-height: 32px;
+  gap: 2px;
+  min-height: 26px;
   padding: 2px;
-  border: 1px solid var(--color-border-strong);
-  border-radius: 10px;
-  background: color-mix(
-    in srgb,
-    var(--color-composer) 84%,
-    var(--color-text) 6%
-  );
+  border: 0;
+  border-radius: var(--radius-control);
+  background: var(--color-hover);
+  box-shadow: var(--shadow-well);
+}
+.user-message-group > .annotation-summary .annotation-chip {
+  background: var(--color-surface);
+}
+.annotation-chip:has(button:disabled) {
+  opacity: 0.55;
 }
 .annotation-chip-trigger {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-height: 28px;
-  padding: 2px 8px;
+  min-height: 22px;
+  height: 22px;
+  padding: 0 6px;
   background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1;
+  border-radius: 6px;
+}
+.annotation-chip-trigger:hover:not(:disabled) {
+  background: var(--color-hover);
   color: var(--color-text);
-  font-size: var(--text-md);
-  border-radius: var(--radius-control);
 }
 .annotation-chip-trigger svg {
-  color: var(--color-text-secondary);
+  color: var(--color-text-muted);
+}
+.annotation-chip-trigger:hover:not(:disabled) svg {
+  color: currentColor;
 }
 .annotation-chip .annotation-clear {
   position: relative;
-  width: 20px;
-  height: 20px;
-  min-width: 20px;
-  min-height: 20px;
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  min-height: 22px;
   padding: 0;
-  margin: 0 4px 0 2px;
+  margin: 0;
   justify-content: center;
-  border-radius: 50%;
-  background: var(--color-action);
-  color: var(--color-on-action);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-text-muted);
 }
 .annotation-chip .annotation-clear::before {
   content: "";
   position: absolute;
-  inset: -4px;
+  inset: -3px;
 }
 .annotation-chip .annotation-clear:not(:disabled):hover {
-  background: var(--color-action-hover);
+  background: var(--color-hover);
+  color: var(--color-text);
+}
+.annotation-chip button:disabled {
+  background: transparent;
+  color: var(--color-disabled-text);
 }
 .annotation-list-popover {
   background: var(--color-elevated);
 }
 .annotation-list {
   list-style: none;
-  padding: 4px 16px;
+  padding: 4px 14px;
   margin: 0;
   max-height: 360px;
   overflow: auto;
@@ -241,16 +281,17 @@ button.annotation-marker:hover:not(:disabled) {
 .annotation-list li {
   display: flex;
   align-items: flex-start;
-  gap: 12px;
-  padding: 12px 0;
+  gap: 10px;
+  padding: 10px 0;
 }
 .annotation-list li + li {
-  border-top: 1px solid var(--color-border);
+  border-top: 1px solid var(--color-border-subtle);
 }
 .annotation-index {
   color: var(--color-text-muted);
-  min-width: 18px;
-  line-height: var(--leading-ui);
+  min-width: 16px;
+  font-size: var(--text-sm);
+  line-height: 20px;
   font-variant-numeric: tabular-nums;
 }
 .annotation-copy {
@@ -261,25 +302,28 @@ button.annotation-marker:hover:not(:disabled) {
 .annotation-copy > span {
   display: block;
   color: var(--color-text-muted);
-  margin-bottom: 2px;
-  font-size: var(--text-md);
+  margin-bottom: 3px;
+  font-size: var(--text-xs);
+  line-height: 1.4;
 }
 .annotation-copy blockquote {
   margin: 0;
-  padding: 0;
-  border: 0;
-  color: var(--color-text);
-  font-size: var(--text-lg);
+  padding: 0 0 0 8px;
+  border-left: 2px solid var(--color-border);
+  color: var(--color-text-secondary);
+  font-size: var(--text-md);
+  line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 .annotation-copy blockquote + span {
-  margin-top: 10px;
+  margin-top: 8px;
 }
 .annotation-copy p {
   margin: 0;
   color: var(--color-text);
-  font-size: var(--text-lg);
+  font-size: var(--text-md);
+  line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -288,12 +332,13 @@ button.annotation-marker:hover:not(:disabled) {
 }
 .annotation-inline-editor {
   display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 6px 4px 10px;
-  border: 1px solid var(--color-border-strong);
-  border-radius: 12px;
-  background: var(--color-composer);
+  align-items: flex-end;
+  gap: 4px;
+  padding: 4px 4px 4px 10px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: var(--color-input);
+  box-shadow: var(--shadow-well);
 }
 .annotation-inline-editor textarea {
   flex: 1;
@@ -312,34 +357,32 @@ button.annotation-marker:hover:not(:disabled) {
   margin: 0;
   padding: 2px 0;
   font-family: var(--font-ui);
-  font-size: var(--text-lg);
-  line-height: var(--leading-ui);
+  font-size: var(--text-md);
+  line-height: 20px;
   overflow-y: auto;
 }
 .annotation-inline-editor textarea::placeholder {
-  color: color-mix(
-    in srgb,
-    var(--color-placeholder) 80%,
-    var(--color-composer)
-  );
+  color: var(--color-placeholder);
+  opacity: 1;
 }
 .annotation-inline-cancel {
   flex-shrink: 0;
-  width: 26px;
-  height: 26px;
-  min-height: 26px;
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
   padding: 0;
   justify-content: center;
-  border-radius: var(--radius-pill);
+  border-radius: 6px;
   color: var(--color-text-muted);
 }
 .annotation-inline-cancel:hover:not(:disabled) {
+  background: var(--color-hover);
   color: var(--color-text);
 }
 .annotation-inline-submit {
-  width: 26px;
-  height: 26px;
-  min-height: 26px;
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
 }
 .annotation-entry-actions {
   display: flex;
@@ -350,18 +393,15 @@ button.annotation-marker:hover:not(:disabled) {
   margin-top: -2px;
 }
 .annotation-entry-actions .icon-button {
-  width: 28px;
-  height: 28px;
-  min-height: 28px;
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
   padding: 0;
   justify-content: center;
+  border-radius: 6px;
   color: var(--color-text-muted);
 }
 .annotation-entry-actions .icon-button:hover:not(:disabled) {
+  background: var(--color-hover);
   color: var(--color-text);
-}
-.annotation-submit:disabled,
-.annotation-chip button:disabled {
-  background: var(--color-disabled-bg);
-  color: var(--color-disabled-text);
 }

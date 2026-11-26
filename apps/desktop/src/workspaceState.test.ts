@@ -1,9 +1,14 @@
 // @vitest-environment jsdom
 import { beforeEach, expect, it, vi } from "vitest";
 import {
+  clampWorkspaceWidth,
+  CONVERSATION_MIN_WIDTH,
   copyWorkspace,
   readWorkspace,
+  SIDEBAR_HANDLE_WIDTH,
+  STAGE_ISLAND_INSET,
   updateWorkspace,
+  WORKSPACE_HANDLE_WIDTH,
   workspaceKey,
   openSubagent,
 } from "./workspaceState";
@@ -527,4 +532,41 @@ it("resets stale files and live diff locations and drops exited terminals when a
     expanded: false,
     conversationActive: false,
   });
+});
+
+it("clamps split workspace width within StageIsland inset and resize handles so right edge is never clipped at 960px", () => {
+  const windowWidth = 960;
+  const sidebarWidth = 260;
+  const clampedWithSidebar = clampWorkspaceWidth(
+    900,
+    windowWidth,
+    sidebarWidth,
+  );
+  expect(clampedWithSidebar).toBe(349);
+  const rightEdgeWithSidebar =
+    sidebarWidth +
+    SIDEBAR_HANDLE_WIDTH +
+    CONVERSATION_MIN_WIDTH +
+    WORKSPACE_HANDLE_WIDTH +
+    clampedWithSidebar;
+  expect(rightEdgeWithSidebar).toBe(windowWidth - STAGE_ISLAND_INSET);
+
+  // Even at max 320px sidebar on a 960px window, conversation keeps >=340px and right panel stays unclipped
+  const clampedMaxSidebar = clampWorkspaceWidth(900, windowWidth, 320);
+  expect(clampedMaxSidebar).toBe(289);
+  expect(
+    320 +
+      SIDEBAR_HANDLE_WIDTH +
+      CONVERSATION_MIN_WIDTH +
+      WORKSPACE_HANDLE_WIDTH +
+      clampedMaxSidebar,
+  ).toBe(windowWidth - STAGE_ISLAND_INSET);
+
+  const clampedCollapsed = clampWorkspaceWidth(900, windowWidth, 0);
+  expect(
+    STAGE_ISLAND_INSET +
+      CONVERSATION_MIN_WIDTH +
+      WORKSPACE_HANDLE_WIDTH +
+      clampedCollapsed,
+  ).toBe(windowWidth - STAGE_ISLAND_INSET);
 });

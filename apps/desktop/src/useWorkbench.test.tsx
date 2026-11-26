@@ -14,6 +14,11 @@ import {
   HostConnectionError,
 } from "./connectionErrors";
 import { useWorkbench } from "./useWorkbench";
+import {
+  SIDEBAR_HANDLE_WIDTH,
+  STAGE_ISLAND_INSET,
+  WORKSPACE_HANDLE_WIDTH,
+} from "./workspaceState";
 import { ServerRequestError } from "./api";
 import type {
   ComposerPredictionSnapshot as Snapshot,
@@ -3391,18 +3396,21 @@ it("lets the workspace grow to the available window and preserves its preferred 
   };
   dragRight();
   const wide = hook.result.current.rightWidth;
+  const openChrome =
+    SIDEBAR_HANDLE_WIDTH + STAGE_ISLAND_INSET + WORKSPACE_HANDLE_WIDTH;
+  const collapsedChrome = STAGE_ISLAND_INSET * 2 + WORKSPACE_HANDLE_WIDTH;
   expect(wide).toBeGreaterThan(600);
-  expect(wide + hook.result.current.leftWidth + 2).toBe(1920 - 240);
+  expect(wide + hook.result.current.leftWidth + openChrome).toBe(1920 - 340);
   resizeWindow(960);
   expect(hook.result.current.rightWidth).toBe(
-    960 - hook.result.current.leftWidth - 240 - 2,
+    960 - hook.result.current.leftWidth - 340 - openChrome,
   );
   resizeWindow(1920);
   expect(hook.result.current.rightWidth).toBe(wide);
   act(() => hook.result.current.toggleSidebar());
   dragRight();
   const withoutSidebar = hook.result.current.rightWidth;
-  expect(withoutSidebar).toBe(1920 - 240 - 1);
+  expect(withoutSidebar).toBe(1920 - 340 - collapsedChrome);
   act(() => hook.result.current.toggleSidebar());
   expect(hook.result.current.rightWidth).toBe(wide);
   act(() => hook.result.current.toggleSidebar());
@@ -3482,7 +3490,11 @@ it("merges once per drag, leaves navigation resizing independent, and restores a
   expect(hook.result.current.workspace).toMatchObject({
     visible: true,
     expanded: false,
-    width: 1440 - 200 - 320 - 2,
+    width:
+      1440 -
+      200 -
+      340 -
+      (SIDEBAR_HANDLE_WIDTH + STAGE_ISLAND_INSET + WORKSPACE_HANDLE_WIDTH),
   });
   expect(document.body.style.userSelect).toBe("");
 });
@@ -3495,7 +3507,9 @@ it("restores a split without left navigation and cleans the drag highlight on ca
     hook.result.current.toggleSidebar();
   });
   act(() => hook.result.current.restoreWorkspace());
-  expect(hook.result.current.rightWidth).toBe(960 - 320 - 1);
+  expect(hook.result.current.rightWidth).toBe(
+    960 - 340 - (STAGE_ISLAND_INSET * 2 + WORKSPACE_HANDLE_WIDTH),
+  );
   const handle = document.createElement("div");
   handle.setPointerCapture = vi.fn();
   act(() =>

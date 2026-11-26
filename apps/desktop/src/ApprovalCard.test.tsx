@@ -110,3 +110,61 @@ it("keeps the load-full affordance for previewed outputs in approval records", a
     expect.any(Function),
   );
 });
+
+it("aligns Bash approval requests and resolved records with the unified terminal command well and cwd header", () => {
+  const bashRequest = {
+    kind: "approval" as const,
+    request_id: "bash-1",
+    tool: "Bash",
+    input: {
+      command: "bash /solution/solve.sh",
+      description: "Verify FC-071 end-to-end",
+      cwd: "/Users/dev/latte-work/packages/verifier",
+    },
+  };
+  const { container, rerender } = render(
+    <ApprovalCard
+      request={bashRequest}
+      projectPath="/Users/dev/latte-work"
+      onDecision={vi.fn()}
+    />,
+  );
+  expect(container.querySelector(".activity-well--terminal")).not.toBeNull();
+  expect(container.querySelector(".activity-prompt-sigil")?.textContent).toBe(
+    "$",
+  );
+  expect(container.querySelector(".activity-terminal-cwd")?.textContent).toBe(
+    "packages/verifier",
+  );
+  expect(container.querySelector(".activity-terminal-stdout")).toBeNull();
+
+  rerender(
+    <ApprovalCard
+      request={bashRequest}
+      resolved
+      decision="allowed"
+      presentation="record"
+      projectPath="/Users/dev/latte-work"
+      tool={{
+        key: 7,
+        type: "tool",
+        name: "Bash",
+        input: bashRequest.input,
+        output: "[1] Exit 0",
+        status: "completed",
+      }}
+      onDecision={vi.fn()}
+    />,
+  );
+  expect(
+    container.querySelector(".approval-result > .activity-output"),
+  ).not.toBeNull();
+  expect(container.querySelector(".activity-verb")?.textContent).toBe("运行");
+  expect(container.querySelector(".activity-prompt-sigil")?.textContent).toBe(
+    "$",
+  );
+  expect(
+    container.querySelector(".activity-terminal-stdout")?.textContent,
+  ).toContain("[1] Exit 0");
+  expect(screen.queryByText("工具结果")).toBeNull();
+});

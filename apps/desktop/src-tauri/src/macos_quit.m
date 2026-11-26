@@ -11,13 +11,13 @@ static NSApplicationTerminateReply latte_should_terminate(id self, SEL selector,
         for (NSMenuItem *top in app.mainMenu.itemArray) {
             NSMenu *menu = top.submenu;
             for (NSInteger index = 0; index < menu.numberOfItems; index++) {
-                if ([[menu itemAtIndex:index].title isEqualToString:@"退出 Latte Work"]) {
+                if ([[menu itemAtIndex:index].title isEqualToString:@"退出 Continue"]) {
                     [menu performActionForItemAtIndex:index];
                     return;
                 }
             }
         }
-        NSLog(@"Latte Work: graceful quit menu is unavailable; refusing unverified termination");
+        NSLog(@"Continue: graceful quit menu is unavailable; refusing unverified termination");
     });
     return NSTerminateCancel;
 }
@@ -35,7 +35,7 @@ static NSApplicationTerminateReply latte_should_terminate(id self, SEL selector,
                 // Add only the missing delegate method; never replace Tao callbacks.
                 if (!class_addMethod(delegateClass, @selector(applicationShouldTerminate:),
                                      (IMP)latte_should_terminate, "Q@:@")) {
-                    NSLog(@"Latte Work: could not install graceful quit routing");
+                    NSLog(@"Continue: could not install graceful quit routing");
                 }
             }];
     }

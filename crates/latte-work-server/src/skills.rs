@@ -128,7 +128,7 @@ impl Skills {
                     .copied()
                     .unwrap_or(SkillState::Enabled),
                 directory: None,
-                origin: "Latte Work".into(),
+                origin: "Continue".into(),
             },
             root: None,
             slug: "latte-work-context".into(),
@@ -516,7 +516,7 @@ impl Skills {
         require_global(project)?;
         self.check_budget()?;
         match scope {
-            SkillScope::Platform => bail!("平台技能随 Latte Work 提供，请从详情安装"),
+            SkillScope::Platform => bail!("平台技能随 Continue 提供，请从详情安装"),
             SkillScope::Project => bail!("技能管理仅支持当前主机的全局技能，不支持项目级安装"),
             SkillScope::System => {}
         }
@@ -732,7 +732,7 @@ pub fn platform_instructions(directory: &Path) -> String {
         Ok(prefs) => prefs,
         Err(error) => {
             eprintln!(
-                "Latte Work：平台技能注入已跳过，请核对 {}：{error}",
+                "Continue：平台技能注入已跳过，请核对 {}：{error}",
                 directory.join("skills.json").display()
             );
             return String::new();
@@ -746,7 +746,7 @@ pub fn platform_instructions(directory: &Path) -> String {
         == SkillState::Enabled
     {
         format!(
-            "Latte Work platform skill (applies to this Work-launched session only):\n{}",
+            "Continue platform skill (applies to this Continue-launched session only):\n{}",
             builtin_body()
         )
     } else {
@@ -810,7 +810,7 @@ mod tests {
     fn platform_context_injects_body_without_yaml_metadata() {
         let (_temp, manager, _) = setup();
         let text = platform_instructions(&manager.directory);
-        assert!(text.contains("# Latte Work"));
+        assert!(text.contains("# Continue"));
         assert!(!text.contains("description:"));
         assert!(!text.contains("---"));
     }

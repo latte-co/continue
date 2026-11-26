@@ -24,11 +24,7 @@ pub struct Downloads {
     save: tokio::sync::Mutex<()>,
 }
 fn file(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("browser-downloads.json"))
+    Ok(crate::app_config_dir(app)?.join("browser-downloads.json"))
 }
 fn load(app: &AppHandle) -> Result<Vec<Download>, String> {
     let path = file(app)?;
@@ -39,11 +35,7 @@ fn load(app: &AppHandle) -> Result<Vec<Download>, String> {
         return Err("下载记录过大".into());
     }
     let items = restore(&std::fs::read(path).map_err(|e| e.to_string())?)?;
-    let cache = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| e.to_string())?
-        .join("browser-downloads");
+    let cache = crate::app_cache_dir(app)?.join("browser-downloads");
     for item in &items {
         if item.status == "interrupted" {
             // This is an app-generated UUID .part file, never a user save path.
@@ -141,11 +133,7 @@ pub fn handle(view: Webview, event: DownloadEvent<'_>) -> bool {
                         .and_then(|name| name.to_str())
                         .unwrap_or("下载文件"),
                 );
-                let directory = app
-                    .path()
-                    .app_cache_dir()
-                    .map_err(|e| e.to_string())?
-                    .join("browser-downloads");
+                let directory = crate::app_cache_dir(&app)?.join("browser-downloads");
                 std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
                 *destination = directory.join(format!("{id}.part"));
                 while items.len() >= LIMIT {

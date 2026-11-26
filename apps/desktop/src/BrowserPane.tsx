@@ -408,7 +408,7 @@ export function BrowserPane({
         {!tab.url && (
           <p className="muted">输入网页地址，或从对话中打开链接。</p>
         )}
-        {!native && <p>请在 Latte Work 桌面应用中打开网页。</p>}
+        {!native && <p>请在 Continue 桌面应用中打开网页。</p>}
       </div>
     </div>
   );

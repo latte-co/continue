@@ -3,6 +3,11 @@ name = "latte-work-desktop"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+default-run = "continue"
+
+[[bin]]
+name = "continue"
+path = "src/main.rs"
 [features]
 custom-protocol = ["tauri/custom-protocol"]
 [build-dependencies]

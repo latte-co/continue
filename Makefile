@@ -72,9 +72,10 @@ types-check: ## Check generated Rust/TypeScript protocol stays synchronized
 	./scripts/check-types.sh
 
 .PHONY: lint-ci
-lint-ci: ## Validate GitHub workflow and shell scripts
+lint-ci: ## Validate GitHub workflow, shell scripts, and lockfile origins
 	actionlint
 	shellcheck scripts/*.sh
+	node scripts/check-npm-lock.mjs
 
 .PHONY: package-dmg
 package-dmg: ## Repackage the existing signed release app without rebuilding

@@ -74,6 +74,38 @@ export function queuedInputReceipts(events: Event[]) {
   return receipts;
 }
 
+function isDuplicateTerminalErrorText(events: Event[], index: number): boolean {
+  const current = events[index];
+  if (current?.event.kind !== "text") return false;
+  const trimmed = current.event.text.trim();
+  if (!trimmed) return false;
+  for (let j = index + 1; j < events.length; j++) {
+    const next = events[j];
+    if (next.session_id !== current.session_id) continue;
+    const kind = next.event.kind;
+    if (
+      kind === "usage" ||
+      kind === "progress" ||
+      kind === "subagent" ||
+      kind === "turn_changes" ||
+      kind === "approval_resolved" ||
+      kind === "question_resolved"
+    )
+      continue;
+    if (kind === "state") {
+      if (next.event.status === "running" || next.event.status === "waiting")
+        continue;
+      return (
+        next.event.status === "failed" &&
+        !!next.event.message &&
+        next.event.message.trim() === trimmed
+      );
+    }
+    return false;
+  }
+  return false;
+}
+
 export function transcript(
   events: Event[],
   receipts = queuedInputReceipts(events),
@@ -108,7 +140,8 @@ export function transcript(
     ),
   );
   const renderedChanges = new Set<string>();
-  for (const { seq, event, at, session_id } of events) {
+  for (let index = 0; index < events.length; index++) {
+    const { seq, event, at, session_id } = events[index];
     if (event.kind === "turn_changes") {
       if (!renderedChanges.has(event.changes.request_id)) {
         items.push({
@@ -147,6 +180,7 @@ export function transcript(
           : {}),
       });
     } else if (event.kind === "text") {
+      if (isDuplicateTerminalErrorText(events, index)) continue;
       const last = items.at(-1);
       if (last?.type === "assistant") last.text += event.text;
       else items.push({ key: seq, type: "assistant", text: event.text });
@@ -179,8 +213,27 @@ export function transcript(
         ? !!event.message
         : event.kind !== "approval_resolved" &&
           event.kind !== "question_resolved"
-    )
+    ) {
+      if (
+        event.kind === "state" &&
+        event.status === "failed" &&
+        event.message
+      ) {
+        for (let k = items.length - 1; k >= 0; k--) {
+          const prev = items[k];
+          if (prev.type === "event" && prev.value.kind === "turn_changes")
+            continue;
+          if (
+            prev.type === "assistant" &&
+            prev.text.trim() === event.message.trim()
+          ) {
+            items.splice(k, 1);
+          }
+          break;
+        }
+      }
       items.push({ key: seq, type: "event", value: event });
+    }
   }
   // Keep the row breaks created during projection: removing invisible metadata
   // must not concatenate distinct assistant paragraphs or mutate saved events.

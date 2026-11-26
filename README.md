@@ -1,4 +1,4 @@
-# Latte Work
+# Continue
 
 A small desktop workspace for coding agents, with local and SSH projects.
 
@@ -48,7 +48,7 @@ make cache-info   # Cargo output path and optional sccache statistics
 ```
 
 See [development](DEVELOPMENT.md), [architecture](docs/architecture.md),
-[SSH setup](docs/remote.md), [UI design system](docs/design-system.md), and
+[SSH setup](docs/remote.md), [UI design system](DESIGN.md) ([workflow details](docs/design-system.md)), and
 [verification](docs/verification.md).
 
 Not included in v0.1: integrated terminal, file editing, automatic remote binary

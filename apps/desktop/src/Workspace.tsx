@@ -13,9 +13,9 @@ import {
   type WorkspaceTab as Tab,
 } from "./workspaceState";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import {
   Bot,
+  ChevronRight,
   Info,
   FileText,
   Globe2,
@@ -38,6 +38,7 @@ import { SidebarToggle } from "./SidebarToggle";
 import { useStatusIssues } from "./statusNotices";
 import { SideChatHistoryButton } from "./SideChatHistory";
 import type { SidebarPreview } from "./useSidebarPreview";
+import { CardList, IconButton, MenuRow, NavRow, Popover } from "./ui";
 
 function ConversationTab({
   title,
@@ -582,18 +583,20 @@ function WorkspacePage({
           })}
         </div>
         {(expanded || tabs.length > 0 || canOpenSideChat) && (
-          <button
+          <IconButton
             ref={trigger}
-            className="icon-button workspace-add"
-            aria-label="添加工作区标签"
+            size="sm"
+            active={menu}
+            className="workspace-add"
+            label="添加工作区标签"
             title="添加标签"
             aria-haspopup="menu"
             aria-expanded={menu}
             disabled={busy}
             onClick={() => setMenu((v) => !v)}
           >
-            <Plus size={18} />
-          </button>
+            <Plus size={16} />
+          </IconButton>
         )}
         <div className="workspace-header-space" data-tauri-drag-region />
         {canOpenSideChat &&
@@ -612,31 +615,31 @@ function WorkspacePage({
         {expanded && overview}
         {expanded && <span className="titlebar-divider" aria-hidden="true" />}
         {!expanded && (
-          <button
-            className="icon-button"
-            aria-label="展开工作区到主区域"
+          <IconButton
+            size="sm"
+            label="展开工作区到主区域"
             title="展开"
             onClick={expand}
           >
-            <Maximize2 size={15} />
-          </button>
+            <Maximize2 size={14.5} />
+          </IconButton>
         )}
-        <button
-          className="icon-button"
+        <IconButton
+          size="sm"
           title={expanded ? "分离右侧栏" : "收起工作区"}
-          aria-label={expanded ? "分离右侧栏" : "收起工作区"}
+          label={expanded ? "分离右侧栏" : "收起工作区"}
           onClick={close}
         >
-          <PanelRight size={16} />
-        </button>
+          <PanelRight size={15.5} />
+        </IconButton>
       </header>
       {menu && trigger.current && (
         <AddMenu
           trigger={trigger.current}
           options={options}
-          close={() => {
+          close={(restoreFocus = true) => {
             setMenu(false);
-            trigger.current?.focus();
+            if (restoreFocus) trigger.current?.focus();
           }}
           choose={(kind) => void add(kind)}
         />
@@ -749,6 +752,7 @@ function WorkspacePage({
                 taskId={tab.kind === "subagent" ? tab.taskId : undefined}
                 hostId={hostId}
                 sessionId={sessionId}
+                projectPath={project?.path}
                 connected={connected}
                 active={
                   active &&
@@ -793,21 +797,22 @@ function WorkspacePage({
       })}
       {!tabs.length && !conversationActive && (
         <div className="workspace-empty" aria-label="工作区入口">
-          <div className="workspace-launchers">
+          <CardList className="workspace-launchers">
             {options.map(({ kind, disabled }) => {
               const Icon = icons[kind];
               return (
-                <button
+                <NavRow
                   key={kind}
                   disabled={disabled}
+                  icon={<Icon size={15.5} />}
+                  trailing={<ChevronRight size={13.5} />}
                   onClick={() => void add(kind)}
                 >
-                  <Icon size={18} />
-                  <span>{labels[kind]}</span>
-                </button>
+                  {labels[kind]}
+                </NavRow>
               );
             })}
-          </div>
+          </CardList>
         </div>
       )}
     </div>
@@ -822,86 +827,37 @@ function AddMenu({
 }: {
   trigger: HTMLButtonElement;
   options: WorkspaceOption[];
-  close: () => void;
+  close: (restoreFocus?: boolean) => void;
   choose: (kind: Kind) => void;
 }) {
-  const menu = useRef<HTMLDivElement>(null);
-  const rect = trigger.getBoundingClientRect();
-  useEffect(() => {
-    menu.current
-      ?.querySelector<HTMLButtonElement>("button:not(:disabled)")
-      ?.focus();
-    const outside = (e: PointerEvent) => {
-      if (
-        !menu.current?.contains(e.target as Node) &&
-        !trigger.contains(e.target as Node)
-      )
-        close();
-    };
-    const key = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        close();
-      }
-      if (e.key === "Tab") close();
-      if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        const buttons = Array.from(
-          menu.current?.querySelectorAll<HTMLButtonElement>(
-            "button:not(:disabled)",
-          ) ?? [],
-        );
-        const index = buttons.indexOf(
-          document.activeElement as HTMLButtonElement,
-        );
-        buttons[
-          e.key === "Home"
-            ? 0
-            : e.key === "End"
-              ? buttons.length - 1
-              : (index + (e.key === "ArrowDown" ? 1 : -1) + buttons.length) %
-                buttons.length
-        ]?.focus();
-      }
-    };
-    document.addEventListener("pointerdown", outside);
-    window.addEventListener("keydown", key, true);
-    window.addEventListener("resize", close);
-    return () => {
-      document.removeEventListener("pointerdown", outside);
-      window.removeEventListener("keydown", key, true);
-      window.removeEventListener("resize", close);
-    };
-  }, [trigger, close]);
-  return createPortal(
-    <div
-      className="workspace-add-menu project-context-menu"
-      ref={menu}
+  const triggerRef = useRef<HTMLElement>(trigger);
+  triggerRef.current = trigger;
+
+  return (
+    <Popover
+      open
+      anchorRef={triggerRef}
+      minWidth={196}
       role="menu"
-      aria-label="添加工作区标签"
-      style={{
-        left: Math.max(8, Math.min(rect.left, window.innerWidth - 232)),
-        top: rect.bottom + 6,
-        maxHeight: Math.max(92, window.innerHeight - rect.bottom - 14),
-      }}
+      label="添加工作区标签"
+      className="workspace-add-menu"
+      restoreFocusOnEscape={false}
+      onClose={(restoreFocus = true) => close(restoreFocus)}
     >
       {options.map(({ kind, disabled }) => {
         const Icon = icons[kind];
         return (
-          <button
+          <MenuRow
             key={kind}
             role="menuitem"
             disabled={disabled}
+            leading={<Icon size={15.5} />}
             onClick={() => choose(kind)}
           >
-            <Icon size={18} />
-            <span>{labels[kind]}</span>
-          </button>
+            {labels[kind]}
+          </MenuRow>
         );
       })}
-    </div>,
-    document.body,
+    </Popover>
   );
 }

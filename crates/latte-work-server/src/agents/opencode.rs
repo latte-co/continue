@@ -166,7 +166,7 @@ fn slash_name(text: &str) -> Option<&str> {
 pub(super) fn initialize() -> Value {
     json!({
         "protocolVersion": 1,
-        "clientInfo": {"name": "Latte Work", "version": env!("CARGO_PKG_VERSION")},
+        "clientInfo": {"name": "Continue", "version": env!("CARGO_PKG_VERSION")},
         "clientCapabilities": {"elicitation":{"form":{}}, "_meta": {(CHILD_CAPABILITY): true}}
     })
 }

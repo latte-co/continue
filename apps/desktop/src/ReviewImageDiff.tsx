@@ -4,6 +4,9 @@ import type { ChangeImage, ChangeImageLoader } from "./changeImageLoader";
 import { imageRead } from "./AttachmentImage";
 import { RasterImage } from "./RasterImage";
 import { message } from "./api";
+import { Button, NoticeBanner, Segmented } from "./ui";
+
+type ImageDiffMode = "split" | "before" | "after";
 
 export function ReviewImageDiff({
   path,
@@ -15,12 +18,14 @@ export function ReviewImageDiff({
   active: boolean;
 }) {
   const [revision, retry] = useState(0);
+  const [mode, setMode] = useState<ImageDiffMode>("split");
   const [state, setState] = useState<{
     load: ChangeImageLoader;
     path: string;
     sides?: { image?: ChangeImage | null; error?: string }[];
     error?: string;
   }>();
+
   useEffect(() => {
     if (!active) return;
     let disposed = false;
@@ -48,34 +53,71 @@ export function ReviewImageDiff({
       disposed = true;
     };
   }, [path, load, active, revision]);
+
   const current =
     state?.load === load && state.path === path ? state : undefined;
+
   const retryButton = (
-    <button
-      className="secondary small"
+    <Button
+      size="xs"
+      variant="subtle"
       disabled={!active}
       onClick={() => retry((v) => v + 1)}
     >
       重试图片预览
-    </button>
+    </Button>
   );
+
+  const visibleSides = current?.sides
+    ? current.sides
+        .map((side, index) => ({ ...side, index }))
+        .filter(({ index }) =>
+          mode === "split"
+            ? true
+            : mode === "before"
+              ? index === 0
+              : index === 1,
+        )
+    : undefined;
+
   return (
     <ImageGallery scope={path} active={active}>
-      <div className="review-image-diff">
-        {current?.sides ? (
-          current.sides.map(({ image, error }, i) => (
-            <figure key={i}>
-              <figcaption>{i ? "修改后" : "修改前"}</figcaption>
+      {current?.sides && (
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "flex-end",
+            padding: "8px 12px 0",
+          }}
+        >
+          <Segmented<ImageDiffMode>
+            label="图片对比视图"
+            value={mode}
+            onChange={setMode}
+            options={[
+              { value: "split", label: "并排" },
+              { value: "before", label: "修改前" },
+              { value: "after", label: "修改后" },
+            ]}
+          />
+        </div>
+      )}
+      <div
+        className={`review-image-diff${mode !== "split" ? " review-image-diff--single" : ""}`}
+      >
+        {visibleSides ? (
+          visibleSides.map(({ image, error, index }) => (
+            <figure key={index}>
+              <figcaption>{index ? "修改后" : "修改前"}</figcaption>
               {error ? (
-                <div role="alert">
-                  <p>{error}</p>
-                  {retryButton}
-                </div>
+                <NoticeBanner tone="danger" action={retryButton}>
+                  {error}
+                </NoticeBanner>
               ) : image ? (
                 <RasterImage
                   bytes={image.bytes}
                   mime={image.mime}
-                  name={`${path} · ${i ? "修改后" : "修改前"}`}
+                  name={`${path} · ${index ? "修改后" : "修改前"}`}
                   active={active}
                 />
               ) : (
@@ -84,16 +126,9 @@ export function ReviewImageDiff({
             </figure>
           ))
         ) : current?.error ? (
-          <div role="alert">
-            <p>{current.error}</p>
-            <button
-              className="secondary small"
-              disabled={!active}
-              onClick={() => retry((v) => v + 1)}
-            >
-              重试图片预览
-            </button>
-          </div>
+          <NoticeBanner tone="danger" action={retryButton}>
+            {current.error}
+          </NoticeBanner>
         ) : (
           <p role="status">正在读取图片…</p>
         )}

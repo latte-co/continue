@@ -722,7 +722,7 @@ async fn stop(host: &mut Host) {
 /// Relaunch the host against the same state directory; the fixture env mirrors
 /// `environment_e2e`'s restart pattern.
 async fn relaunch(host: &mut Host) {
-    host.process = Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+    host.process = Command::new(env!("CARGO_BIN_EXE_latte-continue-server"))
         .args(["serve", "--state-dir"])
         .arg(host.directory.path())
         .env("LATTE_WORK_AGENT_ENV", "inherit")

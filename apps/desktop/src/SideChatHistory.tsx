@@ -1,9 +1,10 @@
-import { useEffect, useId, useRef, useState } from "react";
-import { createPortal } from "react-dom";
+import { useId, useRef, useState } from "react";
 import { History, MessageCircle } from "lucide-react";
 import { message, request, ServerRequestError } from "./api";
 import { MessageTimestamp } from "./MessageTimestamp";
 import type { Session } from "./protocol";
+import { useEffect } from "react";
+import { Badge, Button, IconButton, MenuTitle, NavRow, Popover } from "./ui";
 
 export interface SideChatHistoryProps {
   hostId: string;
@@ -41,6 +42,7 @@ function SideChatHistoryPages({
   const [attempt, retry] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+
   useEffect(() => {
     let disposed = false;
     async function read() {
@@ -97,28 +99,41 @@ function SideChatHistoryPages({
       {sessions.map((session) => {
         const status =
           session.status === "running"
-            ? "执行中"
+            ? { label: "执行中", tone: "brand" as const }
             : session.status === "waiting"
-              ? "等待回应"
+              ? { label: "等待回应", tone: "warning" as const }
               : session.status === "failed"
-                ? "失败"
+                ? { label: "失败", tone: "danger" as const }
                 : session.status === "unknown"
-                  ? "待确认"
+                  ? { label: "待确认", tone: "neutral" as const }
                   : null;
         return (
-          <button
+          <NavRow
             key={session.id}
-            type="button"
-            className="side-chat-history-row"
-            title={session.title}
+            selected={session.id === currentId}
             aria-current={session.id === currentId ? "true" : undefined}
+            title={session.title}
+            icon={<MessageCircle size={14.5} aria-hidden="true" />}
+            trailing={
+              <span
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                }}
+              >
+                {status && (
+                  <Badge tone={status.tone} data-status={session.status}>
+                    {status.label}
+                  </Badge>
+                )}
+                <MessageTimestamp at={session.created_at} label="创建时间" />
+              </span>
+            }
             onClick={() => onOpen(session.id)}
           >
-            <MessageCircle size={15} aria-hidden="true" />
-            <span className="side-chat-history-title">{session.title}</span>
-            {status && <small data-status={session.status}>{status}</small>}
-            <MessageTimestamp at={session.created_at} label="创建时间" />
-          </button>
+            {session.title}
+          </NavRow>
         );
       })}
       {(loading || error || !sessions.length) && (
@@ -127,8 +142,10 @@ function SideChatHistoryPages({
         </p>
       )}
       {(next || error || before) && (
-        <button
-          type="button"
+        <Button
+          variant="ghost"
+          size="xs"
+          fullWidth
           className="task-info-earlier"
           aria-disabled={loading || (!next && !error) || undefined}
           onClick={() => {
@@ -136,7 +153,7 @@ function SideChatHistoryPages({
           }}
         >
           {error ? "重试" : next ? "查看更早记录" : "已显示全部记录"}
-        </button>
+        </Button>
       )}
     </div>
   );
@@ -145,86 +162,54 @@ function SideChatHistoryPages({
 export function SideChatHistoryButton(props: SideChatHistoryProps) {
   const [open, setOpen] = useState(false);
   const trigger = useRef<HTMLButtonElement>(null);
-  const popup = useRef<HTMLDivElement>(null);
   const id = useId();
 
-  useEffect(() => {
-    if (!open) return;
-    popup.current?.focus();
-    function dismiss() {
-      setOpen(false);
-    }
-    function outside(event: PointerEvent) {
-      if (
-        !popup.current?.contains(event.target as Node) &&
-        !trigger.current?.contains(event.target as Node)
-      )
-        dismiss();
-    }
-    document.addEventListener("pointerdown", outside);
-    window.addEventListener("resize", dismiss);
-    return () => {
-      document.removeEventListener("pointerdown", outside);
-      window.removeEventListener("resize", dismiss);
-    };
-  }, [open]);
-  const rect = trigger.current?.getBoundingClientRect();
   return (
     <>
-      <button
-        type="button"
+      <IconButton
         ref={trigger}
-        className="icon-button"
-        title="历史"
-        aria-label="历史"
+        size="sm"
+        active={open}
+        label="历史"
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-controls={open ? id : undefined}
         onClick={() => setOpen((value) => !value)}
       >
-        <History size={16} aria-hidden="true" />
-      </button>
-      {open &&
-        rect &&
-        createPortal(
-          <div
-            id={id}
-            ref={popup}
-            className="side-chat-history-popover"
-            role="dialog"
-            aria-label="历史"
-            tabIndex={-1}
-            style={{
-              right: Math.max(8, window.innerWidth - rect.right),
-              top: rect.bottom + 8,
-            }}
-            onBlur={(event) => {
-              if (
-                !event.currentTarget.contains(event.relatedTarget) &&
-                event.relatedTarget !== trigger.current
-              )
-                setOpen(false);
-            }}
-            onKeyDown={(event) => {
-              if (event.key !== "Escape") return;
-              event.preventDefault();
-              event.stopPropagation();
-              setOpen(false);
-              trigger.current?.focus();
-            }}
-          >
-            <h2>历史</h2>
-            <SideChatHistory
-              {...props}
-              onOpen={(id) => {
-                setOpen(false);
-                trigger.current?.focus();
-                props.onOpen(id);
-              }}
-            />
-          </div>,
-          document.body,
-        )}
+        <History size={15.5} aria-hidden="true" />
+      </IconButton>
+      <Popover
+        id={id}
+        open={open}
+        anchorRef={trigger}
+        align="end"
+        minWidth={288}
+        role="dialog"
+        label="历史"
+        autoFocusMenu
+        className="side-chat-history-popover"
+        onClose={(restoreFocus) => {
+          setOpen(false);
+          if (restoreFocus) trigger.current?.focus();
+        }}
+        onBlur={(event) => {
+          if (
+            !event.currentTarget.contains(event.relatedTarget) &&
+            event.relatedTarget !== trigger.current
+          )
+            setOpen(false);
+        }}
+      >
+        <MenuTitle>历史</MenuTitle>
+        <SideChatHistory
+          {...props}
+          onOpen={(sideId) => {
+            setOpen(false);
+            trigger.current?.focus();
+            props.onOpen(sideId);
+          }}
+        />
+      </Popover>
     </>
   );
 }

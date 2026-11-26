@@ -4,12 +4,17 @@ import {
 } from "./connectionErrors";
 import {
   clampWorkspaceWidth,
+  clampWorkspaceWidthInStage,
   CONVERSATION_MIN_WIDTH,
   copyWorkspace,
   openSideChatTab,
   openSubagents,
+  SIDEBAR_HANDLE_WIDTH,
+  STAGE_ISLAND_INSET,
+  stageAvailableWidth,
   syncProjectInWorkspaces,
   useWorkspaceState,
+  WORKSPACE_HANDLE_WIDTH,
   workspaceKey,
 } from "./workspaceState";
 import { resolveSideChatNavigation } from "./sideChatNavigation";
@@ -449,13 +454,13 @@ export function useWorkbench() {
   );
   function restoreWorkspace() {
     const sidebarWidth = sidebarOpen ? leftWidth : 0;
+    const stageWidth = stageAvailableWidth(window.innerWidth, sidebarWidth);
     setWorkspace({
       visible: true,
       expanded: false,
-      width: clampWorkspaceWidth(
-        window.innerWidth - sidebarWidth - 320 - (sidebarOpen ? 2 : 1),
-        window.innerWidth,
-        sidebarWidth,
+      width: clampWorkspaceWidthInStage(
+        stageWidth - CONVERSATION_MIN_WIDTH - WORKSPACE_HANDLE_WIDTH,
+        stageWidth,
       ),
     });
   }
@@ -1239,12 +1244,12 @@ export function useWorkbench() {
     openSideChatTab(workspaceKey(target.parent.id), sideId, false);
     openSession({ ...target.parent, hostId: targetHostId });
   }
-  async function loadEarlierHistory(): Promise<void> {
+  async function loadEarlierHistory(minTurns = 1): Promise<void> {
     const targetHost = hostId,
       targetSession = sessionId;
     const scope = JSON.stringify([targetHost, targetSession]);
     const cached = historyCache.get(scope);
-    const before = historyCache.before(scope);
+    const initialBefore = historyCache.before(scope);
     const server = hostHellos.current.get(targetHost)?.server_id;
     const connectionVersion = connectionVersions.current.get(targetHost);
     const sendScope = JSON.stringify([
@@ -1255,7 +1260,7 @@ export function useWorkbench() {
     ]);
     if (
       !cached ||
-      !before ||
+      !initialBefore ||
       !historyCache.hasEarlier(scope) ||
       earlierLoads.current.has(scope)
     )
@@ -1263,35 +1268,58 @@ export function useWorkbench() {
     earlierLoads.current.add(scope);
     setEarlierHistoryLoading(true);
     try {
-      const r = await request(targetHost, {
-        method: "history",
-        session_id: targetSession,
-        before,
-      });
-      if (
-        hostHellos.current.get(targetHost)?.server_id !== server ||
-        connectionVersions.current.get(targetHost) !== connectionVersion ||
-        currentHostConnectionVersions.current[targetHost] !== connectionVersion
-      )
-        return;
-      if (r.kind !== "history") throw new Error("无法读取之前的对话记录");
-      if (
-        r.has_more &&
-        (!r.events.length || r.before === null || r.before >= before)
-      )
-        throw new Error("对话分页未前进，请重试");
-      // Valid facts belong to the captured durable scope even after navigation.
-      // Only the transcript publication below depends on the selected page.
-      if (r.session.id === targetSession && r.session.project_id === projectId)
-        harvestPredictionSend(sendScope, r.events, targetSession);
-      const updated = appendEvents(r.events, historyCache.get(scope) ?? cached);
-      historyCache.set(scope, updated, r.has_more, r.before);
+      let currentBefore: number | null = initialBefore;
+      let hasMore = true;
+      let addedTurns = 0;
+      let reads = 0;
+      const maxReads = minTurns > 1 ? Math.min(12, minTurns * 3) : 1;
+      let working = historyCache.get(scope) ?? cached;
+      while (
+        hasMore &&
+        currentBefore !== null &&
+        (reads === 0 || addedTurns < minTurns) &&
+        reads < maxReads
+      ) {
+        const r = await request(targetHost, {
+          method: "history",
+          session_id: targetSession,
+          before: currentBefore,
+        });
+        reads++;
+        if (
+          hostHellos.current.get(targetHost)?.server_id !== server ||
+          connectionVersions.current.get(targetHost) !== connectionVersion ||
+          currentHostConnectionVersions.current[targetHost] !==
+            connectionVersion
+        )
+          return;
+        if (r.kind !== "history") throw new Error("无法读取之前的对话记录");
+        if (
+          r.has_more &&
+          (!r.events.length || r.before === null || r.before >= currentBefore)
+        )
+          throw new Error("对话分页未前进，请重试");
+        // Valid facts belong to the captured durable scope even after navigation.
+        // Only the transcript publication below depends on the selected page.
+        if (
+          r.session.id === targetSession &&
+          r.session.project_id === projectId
+        )
+          harvestPredictionSend(sendScope, r.events, targetSession);
+        addedTurns += r.events.filter(
+          (event) => event.event.kind === "user",
+        ).length;
+        working = appendEvents(r.events, historyCache.get(scope) ?? working);
+        hasMore = r.has_more;
+        currentBefore = r.before;
+        historyCache.set(scope, working, hasMore, currentBefore);
+      }
       if (
         selection.current.hostId === targetHost &&
         selectedSessionId.current === targetSession
       ) {
-        setEvents(updated);
-        setHasEarlierHistory(r.has_more);
+        setEvents(working);
+        setHasEarlierHistory(hasMore);
       }
     } catch (e) {
       if (
@@ -1804,20 +1832,21 @@ export function useWorkbench() {
             Math.min(
               320,
               window.innerWidth -
-                (panel && !merged ? rightWidth : 0) -
+                SIDEBAR_HANDLE_WIDTH -
+                STAGE_ISLAND_INSET -
                 CONVERSATION_MIN_WIDTH -
-                (panel ? 2 : 1),
+                (panel && !merged ? rightWidth + WORKSPACE_HANDLE_WIDTH : 0),
               value,
             ),
           ),
         );
       else {
         if (mergedDuringDrag) return;
-        const splitWidth = clampWorkspaceWidth(
-          value,
-          window.innerWidth,
-          sidebarWidth,
-        );
+        const measuredStage = handle.parentElement?.clientWidth || 0;
+        const splitWidth =
+          measuredStage > 0
+            ? clampWorkspaceWidthInStage(value, measuredStage)
+            : clampWorkspaceWidth(value, window.innerWidth, sidebarWidth);
         if (event.clientX <= sidebarWidth + 24) {
           mergedDuringDrag = true;
           setWorkspace({ expanded: true, conversationActive: true });

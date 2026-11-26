@@ -1918,3 +1918,176 @@ it("drops project-relative references while keeping absolute attachments when pr
     }),
   );
 });
+
+it("renders ordered lists and 🌐 link pills in rich mode, auto-continues on Shift+Enter, and submits clean Markdown on Enter", async () => {
+  mocks.send.mockResolvedValue(true);
+  render(<Harness hostId="local" />);
+  type("1. 22");
+  const rich = await waitFor(() => {
+    const el = screen.getByRole("textbox", { name: "任务输入" });
+    expect(el.classList.contains("composer-rich-input")).toBe(true);
+    return el;
+  });
+  expect(rich.querySelectorAll("ol > li")).toHaveLength(1);
+
+  fireEvent.keyDown(rich, { key: "Enter", shiftKey: true });
+  await waitFor(() => expect(rich.querySelectorAll("ol > li")).toHaveLength(2));
+
+  fireEvent.paste(rich, {
+    clipboardData: {
+      files: [],
+      types: ["text/plain", "text/html"],
+      getData: (mime: string) =>
+        mime === "text/html"
+          ? 'ddd <a href="https://example.com/docs">文档</a>'
+          : "ddd 文档",
+    },
+  });
+
+  await waitFor(() => {
+    const pill = rich.querySelector<HTMLElement>(".composer-link-pill");
+    expect(pill).not.toBeNull();
+    expect(pill?.dataset.linkHref).toBe("https://example.com/docs");
+    expect(pill?.textContent).toBe("文档");
+  });
+
+  fireEvent.keyDown(rich, { key: "Enter" });
+  await waitFor(() =>
+    expect(mocks.send).toHaveBeenCalledWith(
+      "1. 22\n2. ddd [文档](https://example.com/docs)",
+    ),
+  );
+});
+
+it("wraps selected text in textarea into a 🌐 link pill when pasting a URL", async () => {
+  mocks.send.mockResolvedValue(true);
+  render(<Harness hostId="local" />);
+  type("请查看 文档 说明");
+  const textarea = screen.getByRole<HTMLTextAreaElement>("textbox", {
+    name: "任务输入",
+  });
+  const start = "请查看 ".length;
+  textarea.setSelectionRange(start, start + "文档".length);
+  fireEvent.paste(textarea, {
+    clipboardData: {
+      files: [],
+      types: ["text/plain"],
+      getData: (mime: string) =>
+        mime === "text/plain" ? "https://example.com/guide" : "",
+    },
+  });
+
+  const rich = await waitFor(() => {
+    const el = screen.getByRole("textbox", { name: "任务输入" });
+    expect(el.classList.contains("composer-rich-input")).toBe(true);
+    return el;
+  });
+  const pill = rich.querySelector<HTMLElement>(".composer-link-pill");
+  expect(pill?.dataset.linkHref).toBe("https://example.com/guide");
+  expect(pill?.textContent).toBe("文档");
+
+  fireEvent.keyDown(rich, { key: "Enter" });
+  await waitFor(() =>
+    expect(mocks.send).toHaveBeenCalledWith(
+      "请查看 [文档](https://example.com/guide) 说明",
+    ),
+  );
+});
+
+it("renders pasted HTML tables inside the composer and submits GFM Markdown", async () => {
+  mocks.send.mockResolvedValue(true);
+  render(<Harness hostId="local" />);
+  const initial = screen.getByRole("textbox", { name: "任务输入" });
+  fireEvent.paste(initial, {
+    clipboardData: {
+      files: [],
+      types: ["text/plain", "text/html"],
+      getData: (mime: string) =>
+        mime === "text/html"
+          ? "<table><tr><th>列A</th><th>列B</th></tr><tr><td>1</td><td>2</td></tr></table>"
+          : "列A\t列B\n1\t2",
+    },
+  });
+
+  const rich = await waitFor(() => {
+    const el = screen.getByRole("textbox", { name: "任务输入" });
+    expect(el.querySelector("table")).not.toBeNull();
+    return el;
+  });
+  expect(rich.querySelectorAll("th")).toHaveLength(2);
+  expect(rich.querySelectorAll("td")).toHaveLength(2);
+
+  fireEvent.keyDown(rich, { key: "Enter" });
+  await waitFor(() =>
+    expect(mocks.send).toHaveBeenCalledWith(
+      "| 列A | 列B |\n| --- | --- |\n| 1 | 2 |",
+    ),
+  );
+});
+
+it("renders fenced code blocks with language badge, keeps Shift+Enter as newline, and submits on Enter", async () => {
+  mocks.send.mockResolvedValue(true);
+  render(<Harness hostId="local" />);
+  type("```ts\nconst a = 1;");
+  const codeEditor = await waitFor(() => {
+    const el = screen.getByRole("textbox", { name: "任务输入" });
+    expect(el.querySelector("pre.composer-md-codeblock")).not.toBeNull();
+    return el;
+  });
+  expect(
+    codeEditor
+      .querySelector("pre.composer-md-codeblock")
+      ?.getAttribute("data-language"),
+  ).toBe("ts");
+  fireEvent.keyDown(codeEditor, { key: "Enter", shiftKey: true });
+  expect(mocks.send).not.toHaveBeenCalled();
+  fireEvent.keyDown(codeEditor, { key: "Enter" });
+  await waitFor(() =>
+    expect(mocks.send).toHaveBeenCalledWith("```ts\nconst a = 1;\n\n```"),
+  );
+});
+
+it("preserves inline @file reference chips alongside rich Markdown lists", async () => {
+  mocks.send.mockResolvedValue(true);
+  render(<Harness hostId="remote" />);
+  type("1. 检查 @READ");
+  fireEvent.click(await screen.findByRole("option", { name: /README\.md/ }));
+  const rich = screen.getByRole("textbox", { name: "任务输入" });
+  expect(rich.classList.contains("composer-rich-input")).toBe(true);
+  expect(rich.querySelector('[data-reference-path="README.md"]')).toBeTruthy();
+  expect(rich.querySelectorAll("ol > li")).toHaveLength(1);
+
+  fireEvent.keyDown(rich, { key: "Enter" });
+  await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+  expect(referenceMessage(mocks.send.mock.calls[0][0])).toMatchObject({
+    text: "1. 检查",
+    references: [expect.objectContaining({ path: "README.md" })],
+  });
+});
+
+it("uses Tab to drill into directory subpaths and complete files, while Enter directly selects directories or files", async () => {
+  const { unmount } = render(<Harness hostId="local" />);
+  type("@s");
+  await screen.findByRole("option", { name: /^src/ });
+  // Tab on a directory completes `@src/` and drills into its children without attaching yet
+  fireEvent.keyDown(screen.getByRole("textbox"), { key: "Tab" });
+  expect(
+    (screen.getByRole("textbox", { name: "任务输入" }) as HTMLTextAreaElement)
+      .value,
+  ).toBe("@src/");
+  expect(screen.queryByRole("button", { name: "移除引用 src" })).toBeNull();
+  await screen.findByRole("option", { name: /中文 file\.ts/ });
+  // Tab on a file completes and attaches that file
+  fireEvent.keyDown(screen.getByRole("textbox"), { key: "Tab" });
+  expect(
+    screen.getByRole("button", { name: "移除引用 src/中文 file.ts" }),
+  ).toBeTruthy();
+  unmount();
+
+  // Enter on a directory directly selects and attaches the directory
+  render(<Harness hostId="local" />);
+  type("@s");
+  await screen.findByRole("option", { name: /^src/ });
+  fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+  expect(screen.getByRole("button", { name: "移除引用 src" })).toBeTruthy();
+});

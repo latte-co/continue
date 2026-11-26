@@ -81,18 +81,9 @@ App 关联。未关联的环境显式沿用 CLI，忽略目标 Server 中的旧 
 
 ## 凭据与迁移
 
-Provider 和关联保存在 Tauri `app_config_dir()/providers.json`。macOS 默认路径为
-`~/Library/Application Support/co.latte.work/providers.json`。目录权限 700、文件权限 600，
+Provider 和关联保存在 `~/.latte/continue/config/providers.json`。目录权限 700、文件权限 600，
 内容未加密，主机用户可读。通过有界文件锁串行化多个 App 进程的修改，每次操作重新读取，
 使用临时文件和原子替换保存，配置大小上限 128 KiB。
-
-App 文件不存在时，直接读取 `~/.local/share/latte-work/providers.json`，将 Provider 定义、
-凭据、本机关联和 SSH 主机关联一次性迁移到 App 配置。迁移不启动旧 Server，也不修改原文件；
-schema 1 的全局选择仅在指向现有 Anthropic Provider 时保留为本机 Claude 关联；
-OpenAI Provider 或已失效的选择沿用旧版行为，不创建关联，保留各主机的 CLI 默认配置。
-Provider 定义及凭据仍完整迁移。无旧配置时创建空 App 配置，之后不重复导入。
-无效旧文件会报错并保留原文件，不写空配置覆盖它。后续旧版 App 对 Server 配置的修改不会
-自动同步回新版 App。
 
 列表仅返回凭据是否存在，编辑留空保留原值；改地址或认证方式需重新填写凭据。
 凭据只经过原生层及认证通道，不进入 WebView、事件或请求账本；运行中的目标 CLI 可读取
@@ -116,7 +107,7 @@ JSON-RPC 或 rollout；原生配置文件保持不变。
 可选真实 Claude CLI 与本地模拟上游验证：
 
 ```sh
-python3 scripts/smoke-providers.py --binary target/debug/latte-work-server --claude /absolute/path/to/claude
+python3 scripts/smoke-providers.py --binary target/debug/latte-continue-server --claude /absolute/path/to/claude
 ```
 
 ## 会话模型选择
@@ -205,7 +196,7 @@ CLI 的原生 Provider，不保留上轮 App Provider。运行中任务继续使
 真实 CLI 与本地模拟上游（无付费 API 请求）验证：
 
 ```sh
-python3 scripts/smoke-traex-providers.py --binary target/debug/latte-work-server
+python3 scripts/smoke-traex-providers.py --binary target/debug/latte-continue-server
 ```
 
 该检查覆盖三种协议的真实流式回复、认证、模型与 Provider 切换后的原生续聊、恢复 CLI

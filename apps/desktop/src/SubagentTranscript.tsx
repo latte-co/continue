@@ -16,7 +16,7 @@ import { ToolImages } from "./ToolImages";
 import { ProcessDisclosure, ProcessSummary } from "./TurnTranscript";
 import type { Event, Subagent } from "./protocol";
 
-function renderItem(item: ActivityItem) {
+function renderItem(item: ActivityItem, projectPath?: string) {
   if (item.type === "tool_images") return <ToolImages images={item.images} />;
   if (item.type === "assistant")
     return (
@@ -24,8 +24,16 @@ function renderItem(item: ActivityItem) {
         <MessageContent text={item.text} />
       </article>
     );
-  if (item.type === "tool") return <ToolRow tool={item} />;
-  if (item.type === "tools") return <ToolGroup tools={item.tools} />;
+  if (item.type === "tool")
+    return <ToolRow tool={item} projectPath={projectPath} />;
+  if (item.type === "tools")
+    return (
+      <ToolGroup
+        tools={item.tools}
+        unrecovered={item.unrecovered}
+        projectPath={projectPath}
+      />
+    );
   if (item.type === "event" && item.value.kind === "notice")
     return <p className="subagent-empty">{item.value.text}</p>;
   return null;
@@ -38,6 +46,7 @@ export function SubagentTranscript({
   incomplete = false,
   readingMore = false,
   prompt,
+  projectPath,
 }: {
   task: Subagent;
   events: Event[];
@@ -45,6 +54,7 @@ export function SubagentTranscript({
   incomplete?: boolean;
   readingMore?: boolean;
   prompt?: string | null;
+  projectPath?: string;
 }) {
   const processMemory = useRef(new Map<string, boolean>());
   const allItems = activityTranscript(events);
@@ -113,7 +123,7 @@ export function SubagentTranscript({
               <div className="turn-process-content">
                 {segment.items.map((item) => (
                   <ImageGalleryItem key={item.key} id={item.key}>
-                    {renderItem(item)}
+                    {renderItem(item, projectPath)}
                   </ImageGalleryItem>
                 ))}
               </div>
@@ -123,7 +133,7 @@ export function SubagentTranscript({
           <Fragment key={`${task.id}:visible:${segment.items[0].key}`}>
             {segment.items.map((item) => (
               <ImageGalleryItem key={item.key} id={item.key}>
-                {renderItem(item)}
+                {renderItem(item, projectPath)}
               </ImageGalleryItem>
             ))}
           </Fragment>

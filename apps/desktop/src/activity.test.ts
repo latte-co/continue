@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { Event, EventKind } from "./protocol";
-import { activityTranscript, toolLabel, type ToolActivity } from "./activity";
+import {
+  activityTranscript,
+  diffStringLines,
+  toolDisplayParts,
+  toolGroupLabel,
+  toolInputDiffStat,
+  toolLabel,
+  type ToolActivity,
+} from "./activity";
 const e = (seq: number, event: EventKind): Event => ({
   seq,
   event,
@@ -80,7 +88,7 @@ describe("readable activity projection", () => {
       ]).map((i) => i.type),
     ).toEqual(["tool", "assistant", "tool"]);
   });
-  it("leaves failures and pending approvals outside collapsed groups", () => {
+  it("folds tool failures into phase groups while keeping approvals at top level and marking unrecovered tail failures", () => {
     expect(
       activityTranscript([
         call(1, "a"),
@@ -91,10 +99,50 @@ describe("readable activity projection", () => {
         call(6, "c"),
       ]),
     ).toMatchObject([
-      { type: "tool", status: "completed" },
-      { type: "tool", status: "failed" },
+      {
+        type: "tools",
+        tools: [
+          { type: "tool", status: "completed" },
+          { type: "tool", status: "failed" },
+        ],
+      },
       { type: "event", value: { kind: "approval" } },
       { type: "tool", status: "pending" },
+    ]);
+
+    // Self-healed intermediate failure: unrecovered stays undefined
+    const selfHealed = activityTranscript([
+      call(1, "a"),
+      result(2, "a", true),
+      call(3, "b"),
+      result(4, "b", false),
+      e(5, { kind: "state", status: "completed", message: null }),
+    ]);
+    expect(selfHealed).toMatchObject([
+      {
+        type: "tools",
+        tools: [{ status: "failed" }, { status: "completed" }],
+      },
+    ]);
+    expect(
+      (selfHealed[0] as { unrecovered?: boolean }).unrecovered,
+    ).toBeUndefined();
+
+    // Turn halted directly on a trailing failed tool: unrecovered is true
+    const haltedTail = activityTranscript([
+      call(1, "a"),
+      result(2, "a", false),
+      call(3, "b"),
+      result(4, "b", true),
+      e(5, { kind: "state", status: "failed", message: "命令失败" }),
+    ]);
+    expect(haltedTail).toMatchObject([
+      {
+        type: "tools",
+        unrecovered: true,
+        tools: [{ status: "completed" }, { status: "failed" }],
+      },
+      { type: "event", value: { kind: "state", status: "failed" } },
     ]);
   });
   it("keeps unmatched results rather than attaching them to an unrelated call", () => {
@@ -186,6 +234,248 @@ describe("readable activity projection", () => {
         status: "completed",
       }),
     ).toBe("future_agent_tool");
+  });
+
+  it("summarizes tool groups as natural verb phrases and extracts two-tone parts", () => {
+    const tools: ToolActivity[] = [
+      {
+        key: 1,
+        type: "tool",
+        name: "Read",
+        input: { file_path: "/repo/a.ts" },
+        status: "completed",
+      },
+      {
+        key: 2,
+        type: "tool",
+        name: "Edit",
+        input: {
+          file_path: "/repo/src/b.ts",
+          old_string: "const a = 1;",
+          new_string: "const a = 2;\nconst b = 3;",
+        },
+        status: "completed",
+      },
+      {
+        key: 3,
+        type: "tool",
+        name: "Bash",
+        input: { command: "npm test", description: "运行单元测试" },
+        status: "completed",
+      },
+    ];
+    expect(toolGroupLabel(tools)).toBe("探索了文件、编辑了文件并运行了命令");
+    expect(toolGroupLabel([tools[0], { ...tools[2], status: "pending" }])).toBe(
+      "正在探索文件并运行命令",
+    );
+    expect(toolGroupLabel([tools[0], { ...tools[2], status: "failed" }])).toBe(
+      "探索了 1 个文件",
+    );
+    expect(
+      toolGroupLabel([
+        { ...tools[0], status: "failed" },
+        { ...tools[0], key: 99, status: "failed" },
+      ]),
+    ).toBe("尝试读取 2 次未通过");
+    expect(toolDisplayParts(tools[1])).toEqual({
+      verb: "已编辑",
+      target: "…/src/b.ts",
+      monoTarget: true,
+      diff: { added: 2, removed: 1 },
+    });
+  });
+
+  it("uses neutral call counts for unconfirmed tools without asserting file edits, and trims unchanged context in Edit diff stats", () => {
+    const rows = activityTranscript([
+      e(1, {
+        kind: "tool",
+        id: "w1",
+        name: "Write",
+        input: { file_path: "/repo/a.ts", content: "export const a = 1;\n" },
+      }),
+      e(2, {
+        kind: "tool",
+        id: "w2",
+        name: "Write",
+        input: { file_path: "/repo/b.ts", content: "export const b = 2;\n" },
+      }),
+      e(3, { kind: "state", status: "unknown", message: null }),
+    ]);
+    expect(rows).toHaveLength(1);
+    const group = rows[0] as { type: "tools"; tools: ToolActivity[] };
+    expect(group.tools.map((t) => t.status)).toEqual([
+      "unconfirmed",
+      "unconfirmed",
+    ]);
+    const label = toolGroupLabel(group.tools);
+    expect(label).toBe("发起写入 2 次");
+    expect(label).not.toContain("编辑了");
+
+    expect(
+      toolGroupLabel([
+        {
+          key: 10,
+          type: "tool",
+          name: "Read",
+          input: { file_path: "/repo/readme.md" },
+          status: "completed",
+        },
+        ...group.tools,
+      ]),
+    ).toBe("探索了 1 个文件 · 另有写入 2 次待确认");
+
+    const beforeLines = Array.from({ length: 101 }, (_, i) => `line-${i + 1}`);
+    const afterLines = [...beforeLines];
+    afterLines[50] = "line-51-modified";
+    expect(
+      toolInputDiffStat({
+        key: 20,
+        type: "tool",
+        name: "Edit",
+        input: {
+          file_path: "/repo/large.ts",
+          old_string: beforeLines.join("\n"),
+          new_string: afterLines.join("\n"),
+        },
+        status: "completed",
+      }),
+    ).toEqual({ added: 1, removed: 1 });
+
+    const twoHunkAfter = [...beforeLines];
+    twoHunkAfter[1] = "line-2-modified";
+    twoHunkAfter[99] = "line-100-modified";
+    expect(
+      toolInputDiffStat({
+        key: 21,
+        type: "tool",
+        name: "Edit",
+        input: {
+          file_path: "/repo/two-hunks.ts",
+          old_string: beforeLines.join("\n"),
+          new_string: twoHunkAfter.join("\n"),
+        },
+        status: "completed",
+      }),
+    ).toEqual({ added: 2, removed: 2 });
+
+    // 511 lines inserted at top + 900 kept middle lines + 1 replaced tail line (D = 513 > 512)
+    const keptUnique = Array.from({ length: 900 }, (_, i) => `keep-${i + 1}`);
+    const inserted511 = Array.from({ length: 511 }, (_, i) => `ins-${i + 1}`);
+    const old513 = [...keptUnique, "tail-old"].join("\n");
+    const new513 = [...inserted511, ...keptUnique, "tail-new"].join("\n");
+    const anchored = diffStringLines(old513, new513);
+    expect(anchored.approximate).toBe(false);
+    expect({ added: anchored.added, removed: anchored.removed }).toEqual({
+      added: 512,
+      removed: 1,
+    });
+    expect(anchored.ops[0]).toEqual({
+      kind: "add",
+      lineNo: 1,
+      text: "ins-1",
+    });
+
+    // Same 511 + 900 + 1 structure even when all 900 kept lines are identical
+    const keptRepeated = Array.from({ length: 900 }, () => "  return value;");
+    expect(
+      toolInputDiffStat({
+        key: 22,
+        type: "tool",
+        name: "Edit",
+        input: {
+          file_path: "/repo/repeated-keep.ts",
+          old_string: [...keptRepeated, "tail-old"].join("\n"),
+          new_string: [...inserted511, ...keptRepeated, "tail-new"].join("\n"),
+        },
+        status: "completed",
+      }),
+    ).toEqual({ added: 512, removed: 1 });
+
+    // Moving 1 unique comment line across 300 kept lines (both repeated and unique) must report +1/-1, never +300/-300
+    const body300Repeated = Array.from(
+      { length: 300 },
+      (_, i) => `  item: ${i % 10},`,
+    );
+    expect(
+      toolInputDiffStat({
+        key: 24,
+        type: "tool",
+        name: "Edit",
+        input: {
+          file_path: "/repo/moved-comment-repeated.ts",
+          old_string: ["// moved header comment", ...body300Repeated].join(
+            "\n",
+          ),
+          new_string: [...body300Repeated, "// moved header comment"].join(
+            "\n",
+          ),
+        },
+        status: "completed",
+      }),
+    ).toEqual({ added: 1, removed: 1 });
+
+    const body300Unique = Array.from(
+      { length: 300 },
+      (_, i) => `export const val${i} = ${i};`,
+    );
+    expect(
+      toolInputDiffStat({
+        key: 25,
+        type: "tool",
+        name: "Edit",
+        input: {
+          file_path: "/repo/moved-comment-unique.ts",
+          old_string: ["// moved header comment", ...body300Unique].join("\n"),
+          new_string: [...body300Unique, "// moved header comment"].join("\n"),
+        },
+        status: "completed",
+      }),
+    ).toEqual({ added: 1, removed: 1 });
+
+    // Even when >512 insertions combine with a moved unique comment across 900 repeated lines,
+    // the 900-line contiguous block wins over the 1-line moved anchor (+516/-1)
+    const inserted515 = Array.from({ length: 515 }, (_, i) => `hdr-${i + 1}`);
+    expect(
+      toolInputDiffStat({
+        key: 26,
+        type: "tool",
+        name: "Edit",
+        input: {
+          file_path: "/repo/combined-move-and-insert.ts",
+          old_string: ["// lone-moved-comment", ...keptRepeated].join("\n"),
+          new_string: [
+            ...inserted515,
+            ...keptRepeated,
+            "// lone-moved-comment",
+          ].join("\n"),
+        },
+        status: "completed",
+      }),
+    ).toEqual({ added: 516, removed: 1 });
+
+    // Unanchored >512-step edit marks approximate=true and suppresses exact diff badge
+    const unanchoredOld: string[] = [];
+    const unanchoredNew: string[] = [];
+    for (let i = 0; i < 300; i++) {
+      unanchoredOld.push("}", `old-stmt-${i}`);
+      unanchoredNew.push("}", `new-stmt-${i}`);
+    }
+    const simplifiedTool: ToolActivity = {
+      key: 23,
+      type: "tool",
+      name: "Edit",
+      input: {
+        file_path: "/repo/chaotic.ts",
+        old_string: unanchoredOld.join("\n"),
+        new_string: unanchoredNew.join("\n"),
+      },
+      status: "completed",
+    };
+    const simplifiedStat = toolInputDiffStat(simplifiedTool);
+    expect(simplifiedStat?.approximate).toBe(true);
+    const simplifiedParts = toolDisplayParts(simplifiedTool);
+    expect(simplifiedParts.diff).toBeUndefined();
+    expect(simplifiedParts.diffSimplified).toBe(true);
   });
 });
 it("keeps parallel approval decisions bound to explicit tool IDs", () => {

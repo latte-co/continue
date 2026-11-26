@@ -1,13 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import {
-  ArrowLeft,
-  ChevronRight,
-  Folder,
-  LoaderCircle,
-  Server,
-} from "lucide-react";
+import { ArrowLeft, ChevronRight, Folder, LoaderCircle } from "lucide-react";
 import { connect, message, request, type Host } from "./api";
 import type { Response } from "./protocol";
+import { Button, InputGroup, NoticeBanner, TextInput } from "./ui";
 
 export function RemoteFolderBrowser({
   host,
@@ -26,6 +21,7 @@ export function RemoteFolderBrowser({
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const generation = useRef(0);
+
   async function browse(target: string | null) {
     const ticket = ++generation.current;
     setLoading(true);
@@ -51,34 +47,36 @@ export function RemoteFolderBrowser({
       if (ticket === generation.current) setLoading(false);
     }
   }
+
   useEffect(() => {
     void browse(initialPath || null);
     return () => {
       generation.current++;
     };
   }, [host.id]);
+
   return (
     <>
-      <h2>选择文件夹</h2>
-      <p className="folder-browser-host">
-        <Server size={15} />
-        {host.name}
-      </p>
       <form
-        className="remote-path"
         onSubmit={(e) => {
           e.preventDefault();
           void browse(path.trim() || null);
         }}
       >
-        <input
-          autoFocus
-          aria-label="远程目录路径"
-          value={path}
-          onChange={(e) => setPath(e.target.value)}
-          placeholder="输入绝对路径"
-        />
-        <button disabled={loading}>前往</button>
+        <InputGroup>
+          <TextInput
+            autoFocus
+            aria-label="远程目录路径"
+            monospace
+            size="md"
+            value={path}
+            onChange={(e) => setPath(e.target.value)}
+            placeholder="输入绝对路径"
+          />
+          <Button type="submit" variant="subtle" size="md" disabled={loading}>
+            前往
+          </Button>
+        </InputGroup>
       </form>
       <div className="directory-list" aria-busy={loading}>
         <button
@@ -86,12 +84,12 @@ export function RemoteFolderBrowser({
           disabled={loading || !listing?.parent}
           onClick={() => void browse(listing?.parent ?? null)}
         >
-          <ArrowLeft size={16} />
+          <ArrowLeft size={15} />
           上一级
         </button>
         {loading ? (
           <div className="directory-empty">
-            <LoaderCircle size={18} className="spin" />
+            <LoaderCircle size={17} className="spin" />
             正在读取目录…
           </div>
         ) : (
@@ -102,9 +100,9 @@ export function RemoteFolderBrowser({
                 key={entry.path}
                 onClick={() => void browse(entry.path)}
               >
-                <Folder size={17} />
+                <Folder size={16} />
                 <span>{entry.name}</span>
-                <ChevronRight size={15} />
+                <ChevronRight size={14} />
               </button>
             ))}
             {listing?.entries.length === 0 && (
@@ -114,25 +112,23 @@ export function RemoteFolderBrowser({
         )}
       </div>
       {listing?.truncated && (
-        <p>目录较大，仅显示部分条目。可输入完整路径前往。</p>
+        <NoticeBanner tone="warning">
+          目录较大，仅显示部分条目。可输入完整路径前往。
+        </NoticeBanner>
       )}
-      {error && (
-        <div className="form-error" role="alert">
-          {error}
-        </div>
-      )}
-      <div className="modal-actions">
-        <button type="button" onClick={cancel}>
+      {error && <NoticeBanner tone="danger">{error}</NoticeBanner>}
+      <div className="ui-dialog-inline-footer">
+        <Button variant="subtle" size="md" onClick={cancel}>
           返回
-        </button>
-        <button
-          type="button"
-          className="primary"
+        </Button>
+        <Button
+          variant="primary"
+          size="md"
           disabled={loading || !listing || !!error || path !== listing.path}
           onClick={() => listing && select(listing.path)}
         >
           选择此文件夹
-        </button>
+        </Button>
       </div>
     </>
   );

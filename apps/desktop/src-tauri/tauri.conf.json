@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Latte Work",
+  "productName": "Continue",
   "version": "0.1.0",
-  "identifier": "co.latte.work",
+  "identifier": "co.latte.continue",
+  "mainBinaryName": "continue",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
@@ -12,16 +13,16 @@
   "app": {
     "windows": [
       {
-        "title": "Latte Work",
+        "title": "Continue",
         "dragDropEnabled": false,
         "width": 1440,
         "height": 940,
         "minWidth": 960,
         "minHeight": 640,
         "titleBarStyle": "Overlay",
-        "trafficLightPosition": { "x": 16, "y": 24 },
+        "trafficLightPosition": { "x": 16, "y": 27 },
         "hiddenTitle": true,
-        "backgroundColor": "#111111"
+        "backgroundColor": "#131313"
       }
     ],
     "security": {
@@ -31,7 +32,7 @@
   "bundle": {
     "active": true,
     "targets": ["app"],
-    "externalBin": ["binaries/latte-work-server"],
+    "externalBin": ["binaries/latte-continue-server"],
     "icon": ["icons/icon.png", "icons/icon.icns"]
   }
 }

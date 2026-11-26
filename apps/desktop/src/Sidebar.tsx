@@ -9,9 +9,6 @@ import {
   Boxes,
   Folder,
   FolderOpen,
-  CirclePause,
-  CircleAlert,
-  CircleHelp,
   ChevronDown,
   ChevronRight,
   Settings2,
@@ -23,6 +20,8 @@ import {
   PinOff,
   ArchiveRestore,
 } from "lucide-react";
+import { StatusSignal } from "./ui";
+import { BrandLogo } from "./BrandLogo";
 import { WorkingStatus } from "./WorkingStatus";
 import { SessionHoverCard, ProjectHoverCard } from "./SidebarHoverCard";
 import { SessionTitle } from "./SessionTitle";
@@ -472,45 +471,15 @@ export function Sidebar({
                 <WorkingStatus label="" animated />
               </span>
             ) : s.status === "running" ? (
-              <span
-                className="session-progress"
-                role="img"
-                aria-label="执行中"
-                title="执行中"
-              >
-                <i />
-                <i />
-                <i />
-              </span>
+              <StatusSignal status="running" />
             ) : s.status === "waiting" ? (
-              <CirclePause
-                className="session-waiting"
-                size={14}
-                role="img"
-                aria-label="等待确认"
-              >
-                <title>等待确认</title>
-              </CirclePause>
+              <StatusSignal status="waiting" />
             ) : s.status === "failed" && s.unread ? (
-              <CircleAlert
-                size={14}
-                className="failure"
-                role="img"
-                aria-label="执行失败"
-              >
-                <title>执行失败</title>
-              </CircleAlert>
+              <StatusSignal status="failed" />
             ) : s.status === "unknown" ? (
-              <CircleHelp size={14} role="img" aria-label="状态待确认">
-                <title>状态待确认</title>
-              </CircleHelp>
+              <StatusSignal status="unknown" />
             ) : s.unread ? (
-              <span
-                className="unread-dot"
-                role="img"
-                aria-label="未读"
-                title="未读"
-              />
+              <StatusSignal status="unread" />
             ) : list === "recent" && s.hostId !== "local" ? (
               <RemoteGlobeIcon className="recent-remote" />
             ) : null}
@@ -627,12 +596,11 @@ export function Sidebar({
         </button>
       </div>
       <div className="brand">
-        <div className="brand-mark" aria-hidden="true">
-          L<span>••</span>
-        </div>
-        <span className="brand-name">
-          Latte<span className="brand-light"> Work</span>
-        </span>
+        <BrandLogo
+          sessionKey={sessionId ? `${hostId}:${sessionId}` : undefined}
+          status={sessions.find((s) => s.id === sessionId)?.status}
+        />
+        <span className="brand-name">Continue</span>
       </div>
       <button
         className="new-task"
@@ -854,29 +822,19 @@ export function Sidebar({
                       <span className="row-status">
                         {!expanded &&
                           (running ? (
-                            <span
-                              className="session-progress project-activity"
-                              role="img"
-                              aria-label="项目中有对话执行中"
-                              title="有对话执行中"
-                            >
-                              <i />
-                              <i />
-                              <i />
-                            </span>
+                            <StatusSignal
+                              status="running"
+                              label="项目中有对话执行中"
+                            />
                           ) : waiting ? (
-                            <CirclePause
-                              className="session-waiting project-activity"
-                              size={14}
-                              role="img"
-                              aria-label="项目中有对话等待确认"
+                            <StatusSignal
+                              status="waiting"
+                              label="项目中有对话等待确认"
                             />
                           ) : unreadCompleted ? (
-                            <span
-                              className="unread-dot project-activity"
-                              role="img"
-                              aria-label="项目中有未读完成回复"
-                              title="有已完成对话尚未阅读"
+                            <StatusSignal
+                              status="unread"
+                              label="项目中有未读完成回复"
                             />
                           ) : null)}
                       </span>

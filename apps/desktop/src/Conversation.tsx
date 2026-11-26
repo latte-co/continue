@@ -52,9 +52,16 @@ import { UsageIndicator } from "./UsageIndicator";
 import { ModelPicker, type ModelPickerHandle } from "./ModelPicker";
 import { TaskProjectPicker } from "./TaskProjectPicker";
 import { TurnTranscript, turnTranscript } from "./TurnTranscript";
-import { TurnNavigator, turnNavigationEntries } from "./TurnNavigator";
+import {
+  TURN_PAGE_SIZE,
+  TurnNavigator,
+  turnNavigationEntries,
+} from "./TurnNavigator";
 import { ToolGroup, ToolRow } from "./ToolActivity";
 import { ToolImages } from "./ToolImages";
+import { TurnErrorRow, type TurnErrorRecoveryAction } from "./TurnErrorRow";
+import { parseTurnError } from "./turnError";
+import { Button, FloatingPill } from "./ui";
 export const statusNames = {
   ready: "就绪",
   running: "执行中",
@@ -73,6 +80,7 @@ interface Props {
   openSubagents?: () => void;
   openTurnChanges?: (changes: TurnChanges, path?: string) => void;
   openFile?: (path: string) => void;
+  openModelSettings?: () => void;
   drafts: DraftStore;
   agent?: AgentInfo;
   agents?: AgentInfo[];
@@ -85,7 +93,8 @@ interface Props {
   historyLoading?: boolean;
   hasEarlierHistory?: boolean;
   earlierHistoryLoading?: boolean;
-  loadEarlierHistory?: () => Promise<void>;
+  loadEarlierHistory?: (minTurns?: number) => Promise<void>;
+  autoFillTurnNavigator?: boolean;
   readingScope?: string;
   readingPositions?: Map<string, { top: number; follow: boolean }>;
   onHistoryReady?: () => void;
@@ -129,6 +138,7 @@ export function Conversation({
   quoteInSideChat,
   openTurnChanges,
   openFile,
+  openModelSettings,
   drafts,
   agent,
   agents = [],
@@ -142,6 +152,7 @@ export function Conversation({
   hasEarlierHistory = false,
   earlierHistoryLoading = false,
   loadEarlierHistory,
+  autoFillTurnNavigator = false,
   readingScope,
   readingPositions,
   onHistoryReady,
@@ -222,11 +233,13 @@ export function Conversation({
     key: string;
     scope: string;
     draft: Draft;
+    preserveDraft?: boolean;
     accepted?: boolean;
   } | null>(null);
   useLayoutEffect(() => {
     if (
       submission.current?.key === "new-task" &&
+      !submission.current.preserveDraft &&
       previousDraftKey.current === "new-task" &&
       draftKey !== "new-task"
     ) {
@@ -248,6 +261,7 @@ export function Conversation({
     (currentSubmission.key === draftKey || migrated.current === draftKey);
   const concealSubmitted =
     sendingInCurrentScope &&
+    !currentSubmission?.preserveDraft &&
     connected &&
     !!currentSubmission &&
     drafts.isCurrent(draftKey, currentSubmission.draft);
@@ -480,6 +494,69 @@ export function Conversation({
     if (!preparingHistory) onHistoryReady?.();
   }, [preparingHistory, historyScope, onHistoryReady]);
   const lastViewportFill = useRef<string | null>(null);
+  const inFlightAutoCursor = useRef<string | null>(null);
+  const wasEarlierLoading = useRef(earlierHistoryLoading);
+  const [stalledCursor, setStalledCursor] = useState<string | null>(null);
+  const currentHistoryCursor = JSON.stringify([positionScope, events[0]?.seq]);
+
+  function triggerAutoLoadEarlier(cursor: string) {
+    if (
+      !loadEarlierHistory ||
+      !hasEarlierHistory ||
+      earlierHistoryLoading ||
+      lastViewportFill.current === cursor
+    )
+      return;
+    lastViewportFill.current = cursor;
+    inFlightAutoCursor.current = cursor;
+    setStalledCursor(null);
+    void loadEarlierHistory();
+  }
+
+  useEffect(() => {
+    if (wasEarlierLoading.current && !earlierHistoryLoading) {
+      if (inFlightAutoCursor.current === currentHistoryCursor) {
+        setStalledCursor(currentHistoryCursor);
+      }
+      inFlightAutoCursor.current = null;
+    }
+    wasEarlierLoading.current = earlierHistoryLoading;
+  }, [earlierHistoryLoading, currentHistoryCursor]);
+
+  useEffect(() => {
+    setStalledCursor((prev) =>
+      prev && prev !== currentHistoryCursor ? null : prev,
+    );
+  }, [currentHistoryCursor]);
+
+  const lastTurnNavFill = useRef<string | null>(null);
+  useEffect(() => {
+    if (
+      !autoFillTurnNavigator ||
+      preparingHistory ||
+      settingsOpen ||
+      !connected ||
+      !hasEarlierHistory ||
+      earlierHistoryLoading ||
+      !loadEarlierHistory ||
+      turnEntries.length === 0 ||
+      turnEntries.length >= TURN_PAGE_SIZE ||
+      lastTurnNavFill.current === positionScope
+    )
+      return;
+    lastTurnNavFill.current = positionScope;
+    void loadEarlierHistory(TURN_PAGE_SIZE - turnEntries.length);
+  }, [
+    autoFillTurnNavigator,
+    preparingHistory,
+    settingsOpen,
+    connected,
+    hasEarlierHistory,
+    earlierHistoryLoading,
+    loadEarlierHistory,
+    turnEntries.length,
+    positionScope,
+  ]);
   useEffect(() => {
     const el = scroller.current;
     if (
@@ -497,19 +574,21 @@ export function Conversation({
     // space for an upward scroll to enter history-reading mode.
     // Keep a failed/non-advancing cursor attempted until an explicit retry moves
     // it forward; resize notifications must not cause an automatic retry loop.
-    const cursor = JSON.stringify([positionScope, events[0]?.seq]);
+    const cursor = currentHistoryCursor;
     let active = true;
     const fillViewport = () => {
       if (
         !active ||
         document.visibilityState === "hidden" ||
-        el.clientHeight <= 0 ||
-        el.scrollHeight - el.clientHeight >= FOLLOW_THRESHOLD ||
-        lastViewportFill.current === cursor
+        el.clientHeight <= 0
       )
         return;
-      lastViewportFill.current = cursor;
-      void loadEarlierHistory();
+      const needsViewportFill =
+        el.scrollHeight - el.clientHeight < FOLLOW_THRESHOLD;
+      const needsTopPrefetch =
+        !follow.current && el.scrollTop < Math.max(320, el.clientHeight * 0.65);
+      if (!needsViewportFill && !needsTopPrefetch) return;
+      triggerAutoLoadEarlier(cursor);
     };
     fillViewport();
     const observer =
@@ -535,7 +614,10 @@ export function Conversation({
     positionScope,
     events,
   ]);
-  async function submit(prompt: string): Promise<boolean> {
+  async function submit(
+    prompt: string,
+    options?: { preserveDraft?: boolean },
+  ): Promise<boolean> {
     if (
       !prompt.trim() ||
       sending ||
@@ -555,6 +637,7 @@ export function Conversation({
       key: draftKey,
       scope: submissionScope,
       draft,
+      preserveDraft: options?.preserveDraft,
       accepted: undefined as boolean | undefined,
     };
     submission.current = submitted;
@@ -562,15 +645,18 @@ export function Conversation({
     try {
       submitted.accepted = await send(prompt, model, effort, permissionMode);
       if (submitted.accepted) {
-        drafts.clear(draftKey, draft);
-        if (migrated.current) drafts.clear(migrated.current, draft);
+        if (!submitted.preserveDraft) {
+          drafts.clear(draftKey, draft);
+          if (migrated.current) drafts.clear(migrated.current, draft);
+        }
         follow.current = true;
         return true;
       }
       return false;
     } finally {
       submitted.accepted ??= false;
-      if (migrated.current) drafts.clear(draftKey, draft);
+      if (!submitted.preserveDraft && migrated.current)
+        drafts.clear(draftKey, draft);
       setSending(false);
     }
   }
@@ -678,6 +764,21 @@ export function Conversation({
           ref={scroller}
           aria-busy={preparingHistory}
           data-history-loading={preparingHistory}
+          onWheel={(event) => {
+            if (
+              preparingHistory ||
+              event.deltaY >= 0 ||
+              !hasEarlierHistory ||
+              earlierHistoryLoading ||
+              !connected ||
+              settingsOpen
+            )
+              return;
+            const el = scroller.current;
+            if (el && el.scrollTop <= Math.max(320, el.clientHeight * 0.65)) {
+              triggerAutoLoadEarlier(currentHistoryCursor);
+            }
+          }}
           onScroll={() => {
             if (preparingHistory) return;
             const el = scroller.current!;
@@ -690,12 +791,15 @@ export function Conversation({
             });
             setAway(!follow.current);
             if (
-              el.scrollTop < 120 &&
+              !follow.current &&
               hasEarlierHistory &&
               !earlierHistoryLoading &&
-              !follow.current
-            )
-              void loadEarlierHistory?.();
+              connected &&
+              !settingsOpen &&
+              el.scrollTop < Math.max(320, el.clientHeight * 0.65)
+            ) {
+              triggerAutoLoadEarlier(currentHistoryCursor);
+            }
           }}
         >
           {events.length === 0 ? (
@@ -732,21 +836,26 @@ export function Conversation({
             </div>
           ) : (
             <div className="messages" aria-hidden={preparingHistory}>
-              {hasEarlierHistory && (
-                <div className="earlier-history">
-                  <button
-                    className="secondary small"
-                    disabled={earlierHistoryLoading}
-                    onClick={() => void loadEarlierHistory?.()}
-                  >
+              {hasEarlierHistory &&
+                (earlierHistoryLoading ||
+                  stalledCursor === currentHistoryCursor) && (
+                  <div className="earlier-history">
                     {earlierHistoryLoading ? (
-                      <WorkingStatus label="" animated />
+                      <WorkingStatus label="正在加载更早内容…" animated />
                     ) : (
-                      "加载之前的记录"
+                      <button
+                        type="button"
+                        className="ui-btn ui-btn--subtle ui-btn--sm"
+                        onClick={() => {
+                          setStalledCursor(null);
+                          void loadEarlierHistory?.();
+                        }}
+                      >
+                        加载之前的记录
+                      </button>
                     )}
-                  </button>
-                </div>
-              )}
+                  </div>
+                )}
               <ImageGallery
                 scope={historyScope}
                 active={!settingsOpen && !preparingHistory}
@@ -779,7 +888,7 @@ export function Conversation({
                     turns={turns}
                     askInSideChat={quoteInSideChat}
                   >
-                    {(item) =>
+                    {(item, { turn, isLatestTurn }) =>
                       item.type === "user" ? (
                         <UserMessage
                           key={item.key}
@@ -819,6 +928,8 @@ export function Conversation({
                         <ToolRow
                           key={item.key}
                           tool={item}
+                          projectPath={project?.path}
+                          onOpenSubagents={openSubagents}
                           loadContext={
                             session
                               ? { hostId, sessionId: session.id }
@@ -829,6 +940,9 @@ export function Conversation({
                         <ToolGroup
                           key={item.key}
                           tools={item.tools}
+                          unrecovered={item.unrecovered}
+                          projectPath={project?.path}
+                          onOpenSubagents={openSubagents}
                           loadContext={
                             session
                               ? { hostId, sessionId: session.id }
@@ -885,6 +999,7 @@ export function Conversation({
                                 decision={item.decision}
                                 tool={item.approvalTool}
                                 presentation="record"
+                                projectPath={project?.path}
                                 loadContext={
                                   session
                                     ? { hostId, sessionId: session.id }
@@ -895,15 +1010,104 @@ export function Conversation({
                                 }
                               />
                             );
-                          if (v.kind === "state" && v.message)
+                          if (v.kind === "state" && v.message) {
+                            if (v.status === "failed") {
+                              const turnItems = turn.segments.flatMap(
+                                (segment) => segment.items,
+                              );
+                              const lastFailed = [...turnItems]
+                                .reverse()
+                                .find(
+                                  (entry) =>
+                                    entry.type === "event" &&
+                                    entry.value.kind === "state" &&
+                                    entry.value.status === "failed" &&
+                                    !!entry.value.message,
+                                );
+                              const canAct =
+                                isLatestTurn &&
+                                lastFailed?.key === item.key &&
+                                !active &&
+                                !sendingInCurrentScope &&
+                                !stopping &&
+                                !queueEditing &&
+                                !preparingHistory &&
+                                !session?.archived &&
+                                ![
+                                  "opening",
+                                  "restoring",
+                                  "error",
+                                  "unknown",
+                                ].includes(liveSessionState ?? "");
+                              let recoveryAction:
+                                TurnErrorRecoveryAction | undefined;
+                              if (canAct) {
+                                const parsed = parseTurnError(v.message);
+                                if (
+                                  parsed.category === "auth" &&
+                                  openModelSettings
+                                ) {
+                                  recoveryAction = {
+                                    label: "模型设置",
+                                    onClick: openModelSettings,
+                                  };
+                                } else if (
+                                  parsed.category !== "context" &&
+                                  connected &&
+                                  available &&
+                                  modelReady
+                                ) {
+                                  const itemIdx = turnItems.indexOf(item);
+                                  const priorItems =
+                                    itemIdx >= 0
+                                      ? turnItems.slice(0, itemIdx)
+                                      : turnItems;
+                                  const hasPriorProgress = priorItems.some(
+                                    (prior) =>
+                                      prior.type === "tool" ||
+                                      prior.type === "tools" ||
+                                      prior.type === "tool_images" ||
+                                      prior.type === "assistant" ||
+                                      (prior.type === "event" &&
+                                        (prior.value.kind === "turn_changes" ||
+                                          ((prior.value.kind === "approval" ||
+                                            prior.value.kind === "question") &&
+                                            !!prior.resolved))),
+                                  );
+                                  if (hasPriorProgress) {
+                                    recoveryAction = {
+                                      label: "继续",
+                                      onClick: () =>
+                                        void submit("继续", {
+                                          preserveDraft: true,
+                                        }),
+                                    };
+                                  } else if (turn.user?.text) {
+                                    const retryPrompt = turn.user.text;
+                                    recoveryAction = {
+                                      label: "重试",
+                                      onClick: () =>
+                                        void submit(retryPrompt, {
+                                          preserveDraft: true,
+                                        }),
+                                    };
+                                  }
+                                }
+                              }
+                              return (
+                                <TurnErrorRow
+                                  key={item.key}
+                                  message={v.message}
+                                  action={recoveryAction}
+                                />
+                              );
+                            }
                             return (
-                              <div
-                                className={`notice ${v.status === "failed" ? "failure" : ""}`}
-                                key={item.key}
-                              >
+                              <div className="notice" key={item.key}>
                                 {v.message}
                               </div>
                             );
+                          }
                           if (v.kind === "notice")
                             return (
                               <div className="notice" key={item.key}>
@@ -943,14 +1147,14 @@ export function Conversation({
             earlierHistoryLoading={earlierHistoryLoading}
             onLoadEarlier={
               loadEarlierHistory
-                ? () => {
-                    follow.current = false;
-                    setAway(true);
-                    positions.set(positionScope, {
-                      top: scroller.current?.scrollTop ?? 0,
-                      follow: false,
-                    });
-                    void loadEarlierHistory();
+                ? (minTurns) => {
+                    if (!follow.current) {
+                      positions.set(positionScope, {
+                        top: scroller.current?.scrollTop ?? 0,
+                        follow: false,
+                      });
+                    }
+                    void loadEarlierHistory(minTurns);
                   }
                 : undefined
             }
@@ -971,7 +1175,7 @@ export function Conversation({
             </div>
           )}
           {away && !openingSession && (
-            <button
+            <FloatingPill
               className="return-latest"
               aria-label="回到最新"
               title="回到最新"
@@ -983,9 +1187,9 @@ export function Conversation({
                 });
               }}
             >
-              <ArrowDown size={15} />
+              <ArrowDown size={14} />
               <span>回到最新</span>
-            </button>
+            </FloatingPill>
           )}
 
           {!session && (
@@ -1001,9 +1205,14 @@ export function Conversation({
           {!session && draft.skillCreator && !projectName && (
             <div className="skill-creator-context">
               <span>先选择工作目录，再描述要创建的技能。</span>
-              <button disabled={sending} onClick={openProject}>
+              <Button
+                variant="subtle"
+                size="xs"
+                disabled={sending}
+                onClick={openProject}
+              >
                 选择工作目录
-              </button>
+              </Button>
             </div>
           )}
           {!session && selectAgent && agents.length > 1 ? (
@@ -1074,6 +1283,7 @@ export function Conversation({
                 key={JSON.stringify([draftKey, request.request_id])}
                 request={request}
                 tool={tool}
+                projectPath={project?.path}
                 disabled={!connected || stopping || !!submittingApproval}
                 busy={submittingApproval === request.request_id}
                 loadContext={

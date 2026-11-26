@@ -1,25 +1,29 @@
-/* Latte Work UI foundations. See docs/design-system.md before adding tokens. */
+/* Continue UI foundations. See DESIGN.md and src/ui/ before adding tokens. */
 :root {
   --font-ui:
-    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC",
+    sans-serif;
   --font-content: var(--font-ui);
-  --font-code: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --font-code: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
   --weight-ui: 400;
   --weight-content: 400;
   --weight-content-emphasis: 500;
   --weight-code: 400;
+
+  /* 5-Step Typography Scale + Compatibility Aliases */
   --text-xs: 11px;
   --text-sm: 12px;
   --text-md: 13px;
   --text-lg: 14px;
-  --text-body: 15px;
-  --text-subheading: 16px;
-  --text-brand: 18px;
-  --text-heading: 20px;
-  --text-page-title: 24px;
-  --leading-ui: 1.5;
-  --leading-content: 1.75;
+  --text-body: 14px;
+  --text-subheading: 15px;
+  --text-brand: 17px;
+  --text-heading: 18px;
+  --text-page-title: 20px;
+  --leading-ui: 1.48;
+  --leading-content: 1.72;
 
+  /* Spacing Rhythm */
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
@@ -27,65 +31,115 @@
   --space-5: 20px;
   --space-6: 24px;
   --space-8: 32px;
-  --radius-sm: 6px;
-  --radius-control: 8px;
+
+  /* Concentric Corner Geometry Ladder (16 -> 14 -> 12 -> 10 -> 8 -> 5) */
+  --radius-window: 16px;
+  --radius-dialog: 14px;
+  --radius-island: 12px;
   --radius-panel: 12px;
-  --radius-dialog: 16px;
+  --radius-card: 10px;
+  --radius-track: 10px;
+  --radius-control: 8px;
+  --radius-badge: 5px;
+  --radius-sm: 5px;
   --radius-pill: 999px;
 
-  --color-canvas: #111111;
-  --color-sidebar: #1a1a1a;
-  --color-surface: #232323;
+  /* 4-Tier Control Heights & Bar Heights */
+  --titlebar-height: 44px;
+  --topbar-height: calc(var(--titlebar-height) - var(--island-inset));
+  --subbar-height: 38px;
+  --control-height-lg: 36px;
+  --control-height-md: 32px;
+  --control-height-sm: 28px;
+  --control-height-xs: 24px;
+  --control-height: var(--control-height-lg);
+  --button-height: 30px;
+  --menu-item-height: var(--control-height-md);
+  --icon-hit-size: var(--control-height-sm);
+  --icon-size: 15.5px;
+
+  /* Soft Obsidian Neutral Defaults (Overridden dynamically by appearance.ts) */
+  --color-shell: #131313;
+  --color-canvas: #181818;
+  --color-sidebar: #131313;
+  --color-surface: #1f1f1f;
+  --color-card: #1f1f1f;
   --color-elevated: #232323;
-  --color-input: #151515;
-  --color-composer: #282828;
-  --color-text: #eeeeee;
-  --color-text-secondary: #bdbdbd;
-  --color-text-muted: #9a9a9a;
-  --color-placeholder: #9a9a9a;
-  --color-border-subtle: #272727;
-  --color-border: #2c2c2c;
-  --color-border-strong: #303030;
-  --color-hover: #eeeeee12;
-  --color-selected: #eeeeee20;
-  --color-focus-background: #eeeeee29;
-  --color-primary: #f1f1f1;
-  --color-primary-hover: #f2f2f2;
-  --color-on-primary: #111111;
-  --color-action: #ffffff;
-  --color-action-hover: #eaeaea;
-  --color-on-action: #222222;
-  --color-disabled-bg: #1d1d1d;
-  --color-disabled-text: #9a9a9a;
-  --color-stop: #424242;
-  --color-stop-hover: #535353;
-  --color-on-stop: #eeeeee;
-  --color-brand: #f1f1f1;
+  --color-well: #f2f2f20c;
+  --color-input: #1c1c1c;
+  --color-composer: #202020;
+  --color-text: #f2f2f2;
+  --color-text-secondary: #c8c8c8;
+  --color-text-muted: #a1a1a1;
+  --color-placeholder: #a1a1a1;
+  --color-border-subtle: #262626;
+  --color-border: #2f2f2f;
+  --color-border-strong: #383838;
+  --color-hover: #f2f2f20d;
+  --color-row-selected: #f2f2f214;
+  --color-selected: #f2f2f21a;
+  --color-focus-background: #f2f2f21f;
+  --color-focus-ring: #4f4f4f;
+  --color-primary: #f2f2f2;
+  --color-primary-hover: #ffffff;
+  --color-on-primary: #121212;
+  --color-action: #dfdfdf;
+  --color-action-hover: #f2f2f2;
+  --color-on-action: #141414;
+  --color-btn-bg: #222222;
+  --color-btn-hover: #292929;
+  --color-btn-elevated: #282828;
+  --color-btn-elevated-hover: #303030;
+  --color-btn-rim: #ffffff12;
+  --color-disabled-bg: #222222;
+  --color-disabled-text: #787878;
+  --color-stop: #3a3a3a;
+  --color-stop-hover: #484848;
+  --color-on-stop: #f2f2f2;
+  --color-brand: #f2f2f2;
   --color-code-keyword: #cda4d7;
   --color-code-string: #c4c998;
   --color-code-number: #a7c6be;
   --color-code-type: #dfbc85;
-  --color-success: #75c99a;
-  --color-warning: #e4b66a;
-  --color-danger: #ef9090;
-  --color-unread: #85aaff;
-  --color-backdrop: #000000a6;
-  --color-selection: #f1f1f144;
-  --shadow-dialog: 0 24px 72px #0005;
-  --shadow-popover: 0 12px 36px #0006;
-  --duration-fast: 150ms;
+  --color-success: #55c88a;
+  --color-warning: #e8b658;
+  --color-danger: #f08888;
+  --color-danger-surface: #dc35453d;
+  --color-danger-surface-hover: #dc354557;
+  --color-danger-border: #f0586075;
+  --color-danger-text: #ff9497;
+  --color-unread: #6ea4ff;
+  --color-backdrop: #0000008c;
+  --color-selection: #f2f2f23d;
 
-  --control-height: 40px;
-  --button-height: 36px;
-  --menu-item-height: 36px;
-  --icon-hit-size: 28px;
-  /* Native macOS controls and all top bars share this center line. */
-  --titlebar-height: 44px;
-  --content-width: 780px;
-  --conversation-min-width: 240px;
-  --content-gutter: clamp(24px, 4vw, 48px);
+  /* 3-Tier Optical Shadows — Bound to theme border tokens for uniform contrast */
+  --shadow-island:
+    0 0 0 1px var(--color-border-subtle), 0 4px 16px -4px rgba(0, 0, 0, 0.24);
+  --shadow-well: inset 0 0 0 1px var(--color-border);
+  --shadow-card: 0 0 0 1px var(--color-border-subtle);
+  --shadow-elevated:
+    0 0 0 1px var(--color-border), 0 2px 6px rgba(0, 0, 0, 0.18);
+  --shadow-composer:
+    0 0 0 1px var(--color-border), 0 2px 8px rgba(0, 0, 0, 0.16);
+  --shadow-composer-focus:
+    0 0 0 1px var(--color-focus-ring), 0 2px 8px rgba(0, 0, 0, 0.18);
+  --shadow-dialog:
+    0 16px 40px -8px rgba(0, 0, 0, 0.42), 0 0 0 1px var(--color-border);
+  --shadow-popover:
+    0 12px 28px -6px rgba(0, 0, 0, 0.36), 0 0 0 1px var(--color-border-strong);
+  --focus-ring: 0 0 0 1px var(--color-focus-ring);
+  --focus-ring-inset: inset 0 0 0 1px var(--color-focus-ring);
 
-  /* Existing layout and transcript components use these semantic aliases. */
+  /* Motion & Layout Widths */
+  --duration-fast: 120ms;
+  --duration-popover: 130ms;
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --island-inset: 6px;
+  --content-width: 760px;
+  --conversation-min-width: 260px;
+  --content-gutter: clamp(24px, 4vw, 44px);
+
+  /* Existing layout and transcript semantic aliases */
   --bg: var(--color-canvas);
   --surface: var(--color-surface);
   --line: var(--color-border-subtle);

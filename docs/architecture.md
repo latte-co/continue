@@ -7,7 +7,7 @@ React UI → Tauri commands → latte-work-client
                               ├─ local server connect-local bridge
                               └─ OpenSSH → remote server connect bridge
                                                 ↓
-                                   singleton latte-work-server
+                                   singleton latte-continue-server
                                      ├─ SQLite projects/sessions/events
                                      ├─ read-only files / Git
                                      └─ AgentAdapter → native CLI processes
@@ -49,7 +49,10 @@ and advance FIFO. This internal lifecycle extension does not change protocol v1.
 
 ## One daemon per host user
 
-Default state is `~/.local/share/latte-work`. `server.lock` is an OS file lock held
+Default state lives under `~/.latte/continue` (`~/.latte/continue/data` for
+`latte-continue-server` durable state and sockets, `~/.latte/continue/config` for
+desktop App configuration, and `~/.latte/continue/cache` for disposable desktop
+caches). `server.lock` is an OS file lock held
 for the daemon lifetime. `connect` attaches to its private Unix socket, starting
 `serve` only when necessary. Racing launch attempts are serialized by the lock;
 losing bridges attach to the winning daemon. A bridge is not another server.

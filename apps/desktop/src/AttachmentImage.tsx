@@ -225,7 +225,8 @@ export function AttachmentImage({
             <Image size={28} />
             <p>{preview.error}</p>
             <button
-              className="secondary small"
+              type="button"
+              className="ui-btn ui-btn--subtle ui-btn--sm"
               disabled={!connected || !projectId}
               onClick={() => retry((value) => value + 1)}
             >

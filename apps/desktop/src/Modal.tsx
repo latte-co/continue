@@ -1,6 +1,56 @@
-import { useLayoutEffect, useRef, type ComponentProps } from "react";
+import {
+  useLayoutEffect,
+  useRef,
+  type ComponentProps,
+  type RefObject,
+} from "react";
 
 const stack: HTMLElement[] = [];
+const overlayLayers: HTMLElement[] = [];
+const MODAL_BASE_Z_INDEX = 200;
+
+function syncOverlayLayers() {
+  overlayLayers.forEach((layer, index) => {
+    layer.style.zIndex = String(MODAL_BASE_Z_INDEX + index * 10);
+  });
+}
+
+function registerOverlayLayer(layer: HTMLElement): () => void {
+  const existing = overlayLayers.indexOf(layer);
+  if (existing >= 0) overlayLayers.splice(existing, 1);
+  overlayLayers.push(layer);
+  syncOverlayLayers();
+  return () => {
+    const idx = overlayLayers.indexOf(layer);
+    if (idx >= 0) {
+      overlayLayers.splice(idx, 1);
+      layer.style.removeProperty("z-index");
+      syncOverlayLayers();
+    }
+  };
+}
+
+/**
+ * Participates in the shared chronological overlay z-index stack for non-Modal
+ * dialog surfaces (such as BrowserSiteInfo) that can spawn child Modal confirmations.
+ */
+export function useOverlayLayer(
+  ref: RefObject<HTMLElement | null>,
+  active: boolean,
+) {
+  useLayoutEffect(() => {
+    if (!active || !ref.current) return;
+    return registerOverlayLayer(ref.current);
+  }, [ref, active]);
+}
+
+export function isHiddenOrInert(item: HTMLElement | null): boolean {
+  for (let cur = item; cur; cur = cur.parentElement) {
+    if (cur.hidden || cur.inert || cur.hasAttribute("inert")) return true;
+  }
+  return false;
+}
+
 // Different dialogs may suspend the same background node. A previous-value
 // snapshot per dialog would restore stale inert=true when both close together.
 const inertOwners = new Map<
@@ -9,20 +59,37 @@ const inertOwners = new Map<
 >();
 const canFocus = (item: HTMLElement) =>
   !item.matches(":disabled") &&
-  !item.closest("[hidden], [inert]") &&
+  !isHiddenOrInert(item) &&
   getComputedStyle(item).display !== "none" &&
   getComputedStyle(item).visibility !== "hidden" &&
   (!item.closest("details:not([open])") || item.tagName === "SUMMARY");
 const tabbable = (item: HTMLElement) => item.tabIndex >= 0 && canFocus(item);
 const focusable =
   "button, input, textarea, select, a[href], summary, [tabindex]";
-/** Native modal behavior shared by every dialog. Nested dialogs suspend their parent. */
-export function Modal(props: ComponentProps<"section">) {
-  const root = useRef<HTMLElement>(null);
-  const trigger = useRef(document.activeElement as HTMLElement | null);
+/**
+ * Shared modal focus trap, background `inert` lease, and z-index layer registration.
+ * Supports both mount-bound `<Modal>` elements and persistent `active`-toggled shells.
+ */
+export function useModalBehavior(
+  root: RefObject<HTMLElement | null>,
+  active = true,
+) {
+  const wasActive = useRef(false);
+  const trigger = useRef<HTMLElement | null>(null);
+  if (active && !wasActive.current) {
+    trigger.current = document.activeElement as HTMLElement | null;
+  }
+  wasActive.current = active;
+
   useLayoutEffect(() => {
-    const element = root.current!;
+    const element = root.current;
+    if (!active || !element) return;
     stack.push(element);
+    const layerHost =
+      element.closest<HTMLElement>(
+        ".ui-dialog-backdrop, .modal-backdrop, .annotation-backdrop",
+      ) ?? element;
+    const releaseLayer = registerOverlayLayer(layerHost);
     const ancestors: HTMLElement[] = [];
     for (
       let node = trigger.current?.parentElement;
@@ -78,6 +145,7 @@ export function Modal(props: ComponentProps<"section">) {
     document.addEventListener("focusin", focus);
     return () => {
       stack.splice(stack.indexOf(element), 1);
+      releaseLayer();
       document.removeEventListener("keydown", key);
       document.removeEventListener("focusin", focus);
       for (const item of inert) {
@@ -91,25 +159,38 @@ export function Modal(props: ComponentProps<"section">) {
       const target = trigger.current;
       if (target?.isConnected && canFocus(target)) {
         target.focus();
+        if (element.isConnected) {
+          // React 19's flushMutationEffects restores priorFocusedElem at the end of
+          // mutation commit when a persistent `hidden={!active}` dialog stays mounted.
+          queueMicrotask(() => {
+            if (
+              target.isConnected &&
+              canFocus(target) &&
+              (document.activeElement === document.body ||
+                element.contains(document.activeElement))
+            ) {
+              target.focus();
+            }
+          });
+        }
       } else {
         // Wait for the closing subtree to be removed and all inert leases released.
         // A surviving parent dialog or the trigger's nearest live section is the
         // logical fallback; preserve any focus explicitly moved by the caller.
         queueMicrotask(() => {
-          const active = document.activeElement;
+          const activeEl = document.activeElement;
           if (
-            active instanceof HTMLElement &&
-            active !== document.body &&
-            active.isConnected &&
-            !element.contains(active) &&
-            canFocus(active)
+            activeEl instanceof HTMLElement &&
+            activeEl !== document.body &&
+            activeEl.isConnected &&
+            !element.contains(activeEl) &&
+            canFocus(activeEl)
           )
             return;
           const parent = stack.at(-1);
           const regions = parent ? [parent] : ancestors;
           for (const region of regions) {
-            if (!region.isConnected || region.closest("[hidden], [inert]"))
-              continue;
+            if (!region.isConnected || isHiddenOrInert(region)) continue;
             const candidate = Array.from(
               region.querySelectorAll<HTMLElement>(focusable),
             ).find(tabbable);
@@ -121,7 +202,13 @@ export function Modal(props: ComponentProps<"section">) {
         });
       }
     };
-  }, []);
+  }, [root, active]);
+}
+
+/** Native modal behavior shared by every dialog. Nested dialogs suspend their parent. */
+export function Modal(props: ComponentProps<"section">) {
+  const root = useRef<HTMLElement>(null);
+  useModalBehavior(root, true);
   return (
     <section
       {...props}

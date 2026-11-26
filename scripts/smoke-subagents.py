@@ -17,7 +17,7 @@ import threading
 import time
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--binary', default='target/debug/latte-work-server')
+parser.add_argument('--binary', default='target/debug/latte-continue-server')
 parser.add_argument('--claude', default=str(Path.home() / '.local/bin/claude'))
 parser.add_argument('--pause-for-ui', action='store_true', help='Keep the isolated server alive for native UI checks; print release/finish marker paths.')
 args = parser.parse_args()

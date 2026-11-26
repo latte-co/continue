@@ -702,14 +702,14 @@ fn ssh_command(
     ]);
     let remote_command = if binary.is_empty() {
         // Noninteractive SSH often omits ~/.local/bin from PATH.
-        let discover = r#"if [ -x "$HOME/.local/bin/latte-work-server" ]; then
-  exec "$HOME/.local/bin/latte-work-server" connect
+        let discover = r#"if [ -x "$HOME/.local/bin/latte-continue-server" ]; then
+  exec "$HOME/.local/bin/latte-continue-server" connect
 fi
-candidate=$(command -v latte-work-server 2>/dev/null || true)
+candidate=$(command -v latte-continue-server 2>/dev/null || true)
 if [ -n "$candidate" ] && [ -x "$candidate" ]; then
   exec "$candidate" connect
 fi
-printf '%s\n' '{"kind":"error","code":"server_not_found","message":"远程未找到 latte-work-server；请先安装或填写绝对路径"}'"#;
+printf '%s\n' '{"kind":"error","code":"server_not_found","message":"远程未找到 latte-continue-server；请先安装或填写绝对路径"}'"#;
         format!("exec /bin/sh -c {}", shell_quote(discover))
     } else {
         format!("exec {} connect", shell_quote(binary))
@@ -973,8 +973,8 @@ for line in sys.stdin:
             .unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         };
-        let local = local_bin.join("latte-work-server");
-        let fallback = path_bin.join("latte-work-server");
+        let local = local_bin.join("latte-continue-server");
+        let fallback = path_bin.join("latte-continue-server");
         make_binary(&local, "local");
         make_binary(&fallback, "path");
         assert_eq!(run().stdout, b"local:connect\n");

@@ -14,7 +14,6 @@ import {
   Folder,
   PanelRight,
   RefreshCw,
-  Search,
   WrapText,
 } from "lucide-react";
 import type { GitReviewFile } from "./protocol";
@@ -23,6 +22,7 @@ import { ReviewDiff } from "./ReviewDiff";
 import { ReviewImageDiff } from "./ReviewImageDiff";
 import type { ChangeImageLoader } from "./changeImageLoader";
 import { useStatusIssues } from "./statusNotices";
+import { Badge, DiffStat, IconButton, SearchInput, Subbar } from "./ui";
 
 type DiffContent = { text: string; truncated: boolean };
 type Loader = (path: string) => Promise<DiffContent>;
@@ -41,14 +41,15 @@ export function DiffStats({
   file: Pick<GitReviewFile, "added" | "removed" | "binary">;
 }) {
   return file.binary ? (
-    <small>二进制</small>
+    <Badge>二进制</Badge>
   ) : file.added === null || file.removed === null ? (
-    <small>未统计</small>
+    <Badge>未统计</Badge>
   ) : (
-    <span className="change-totals">
-      <b>+{file.added}</b>
-      <em>-{file.removed}</em>
-    </span>
+    <DiffStat
+      added={file.added}
+      removed={file.removed}
+      className="change-totals"
+    />
   );
 }
 /** Serialize admission to a small bounded set of independent visible-file reads. */
@@ -470,59 +471,59 @@ export function ReviewWorkspace({
   }
   return (
     <div className="git-review">
-      <div className="git-review-toolbar">
+      <Subbar className="git-review-toolbar">
         <div className="review-scope-control">
           <div className="review-scope-summary">
             {scopeControl}
             {!loading && files.length > 0 && (
-              <span className="change-totals">
-                <b>+{added}</b>
-                <em>-{removed}</em>
-              </span>
+              <DiffStat
+                added={added}
+                removed={removed}
+                className="change-totals"
+              />
             )}
           </div>
           {comparisonControl}
         </div>
         <div className="git-review-actions">
           {additionalActions}
-          <button
-            className="icon-button"
-            aria-label="刷新变更"
-            title="刷新变更"
+          <IconButton
+            size="sm"
+            label="刷新变更"
             disabled={!active || loading}
             onClick={refresh}
           >
-            <RefreshCw size={16} />
-          </button>
-          <button
-            className="icon-button"
-            aria-label="自动换行"
-            title="自动换行"
+            <RefreshCw size={15} />
+          </IconButton>
+          <IconButton
+            size="sm"
+            label="自动换行"
+            active={wrap}
             aria-pressed={wrap}
             onClick={() => setWrap((v) => !v)}
           >
-            <WrapText size={16} />
-          </button>
-          <button
-            className="icon-button"
-            aria-label="并排差异"
-            title="并排差异"
+            <WrapText size={15} />
+          </IconButton>
+          <IconButton
+            size="sm"
+            label="并排差异"
+            active={split}
             aria-pressed={split}
             onClick={() => setSplit((v) => !v)}
           >
-            <Columns2 size={16} />
-          </button>
-          <button
-            className="icon-button"
-            aria-label="文件列表"
-            title="文件列表"
+            <Columns2 size={15} />
+          </IconButton>
+          <IconButton
+            size="sm"
+            label="文件列表"
+            active={filesVisible}
             aria-pressed={filesVisible}
             onClick={() => showFiles((v) => !v)}
           >
-            <PanelRight size={16} />
-          </button>
+            <PanelRight size={15} />
+          </IconButton>
         </div>
-      </div>
+      </Subbar>
       {overlay}
       {notices}
       <div className={`git-review-body${filesVisible ? "" : " files-hidden"}`}>
@@ -596,12 +597,11 @@ export function ReviewWorkspace({
         </div>
         {filesVisible && (
           <aside className="git-review-files" aria-label="变更文件">
-            <div className="git-review-filter">
-              <Search size={14} />
-              <input
+            <div style={{ padding: "8px 8px 4px" }}>
+              <SearchInput
+                size="sm"
                 aria-label="筛选文件"
                 placeholder="筛选文件…"
-                spellCheck={false}
                 value={filter}
                 onChange={(event) => {
                   setFilter(event.target.value);

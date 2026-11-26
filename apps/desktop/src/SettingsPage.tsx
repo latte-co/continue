@@ -1,27 +1,28 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Archive,
-  ArrowLeft,
+  Compass,
   Globe2,
   MessageSquare,
-  Settings2,
   Palette,
+  Settings2,
 } from "lucide-react";
 import { ArchivedChats } from "./ArchivedChats";
 import { AgentSettings } from "./AgentSettings";
 import { ProviderSettings } from "./ProviderSettings";
 import { SSHSettings } from "./SSHSettings";
 import type { Workbench } from "./useWorkbench";
-
 import { BrowserSettings } from "./BrowserSettings";
 import { AppearanceSettings } from "./AppearanceSettings";
+import { isHiddenOrInert, useModalBehavior } from "./Modal";
+import { NavRow } from "./ui";
 
 const tabs = [
-  { id: "browser", label: "浏览器", icon: Globe2 },
-  { id: "appearance", label: "外观", icon: Palette },
   { id: "agents", label: "连接与 Agent", icon: MessageSquare },
-  { id: "providers", label: "模型", icon: Settings2 },
   { id: "ssh", label: "SSH 连接", icon: Globe2 },
+  { id: "providers", label: "模型", icon: Settings2 },
+  { id: "browser", label: "浏览器", icon: Compass },
+  { id: "appearance", label: "外观", icon: Palette },
   { id: "archived", label: "已归档的聊天", icon: Archive },
 ] as const;
 
@@ -37,46 +38,60 @@ export function SettingsPage({
   const [agentBusy, setAgentBusy] = useState(false);
   const [providerBusy, setProviderBusy] = useState(false);
   const [sshBusy, setSshBusy] = useState(false);
-  const navigation = useRef<HTMLDivElement>(null);
   const [archiveBusy, setArchiveBusy] = useState(false);
+  const navigation = useRef<HTMLDivElement>(null);
+  const dialog = useRef<HTMLElement>(null);
   const busy = agentBusy || providerBusy || sshBusy || archiveBusy;
+
+  useModalBehavior(dialog, active);
+
   useEffect(() => {
     if (!active) return;
     navigation.current
       ?.querySelector<HTMLButtonElement>(`#settings-tab-${tab}`)
       ?.focus();
   }, [active]);
-  useEffect(() => {
-    if (!active) return;
-    const key = (event: KeyboardEvent) => {
-      if (
-        !event.defaultPrevented &&
-        event.key === "Escape" &&
-        !busy &&
-        !document.querySelector(".ssh-password-modal") &&
-        !document.querySelector(".ssh-modal")
-      )
-        close();
-    };
-    window.addEventListener("keydown", key);
-    return () => window.removeEventListener("keydown", key);
-  }, [active, busy, state.setModal, state.settingsReturnToProject]);
+
   function close() {
     if (!busy) {
       state.setModal(state.settingsReturnToProject ? "project" : null);
       state.setSettingsReturnToProject(false);
     }
   }
+
   return (
-    <div className="settings-page">
+    <div
+      className="ui-dialog-backdrop settings-modal-backdrop"
+      hidden={!active}
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget && !busy) close();
+      }}
+    >
       <div className="settings-window-drag" data-tauri-drag-region />
-      <div className="settings-layout">
+      <section
+        ref={dialog}
+        className="settings-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="设置"
+        tabIndex={-1}
+        onKeyDown={(event) => {
+          if (
+            !event.defaultPrevented &&
+            !event.nativeEvent.isComposing &&
+            event.key === "Escape" &&
+            !busy &&
+            !isHiddenOrInert(dialog.current) &&
+            !document.querySelector(".ssh-password-modal")
+          ) {
+            event.preventDefault();
+            event.stopPropagation();
+            close();
+          }
+        }}
+      >
         <aside className="settings-navigation">
           <h1>设置</h1>
-          <button className="settings-back" onClick={close} disabled={busy}>
-            <ArrowLeft size={16} />
-            返回工作台
-          </button>
           <div
             ref={navigation}
             role="tablist"
@@ -107,53 +122,28 @@ export function SettingsPage({
             }}
           >
             {tabs.map(({ id, label, icon: Icon }) => (
-              <button
+              <NavRow
                 key={id}
                 id={`settings-tab-${id}`}
                 role="tab"
+                selected={tab === id}
                 aria-selected={tab === id}
                 aria-controls={`settings-panel-${id}`}
                 tabIndex={tab === id ? 0 : -1}
                 disabled={busy}
+                icon={<Icon size={15.5} />}
                 onClick={() => setTab(id)}
               >
-                <Icon size={17} />
                 {label}
-              </button>
+              </NavRow>
             ))}
           </div>
         </aside>
-        <main className="settings-body" aria-label="设置">
-          <section
-            id="settings-panel-browser"
-            role="tabpanel"
-            aria-labelledby="settings-tab-browser"
-            hidden={tab !== "browser"}
-          >
-            <BrowserSettings />
-          </section>
-          <section
-            id="settings-panel-archived"
-            role="tabpanel"
-            aria-labelledby="settings-tab-archived"
-            hidden={tab !== "archived"}
-          >
-            <ArchivedChats
-              state={state}
-              active={active && tab === "archived"}
-              onBusy={setArchiveBusy}
-            />
-          </section>
-          <section
-            id="settings-panel-appearance"
-            role="tabpanel"
-            aria-labelledby="settings-tab-appearance"
-            hidden={tab !== "appearance"}
-          >
-            {tab === "appearance" && <AppearanceSettings />}
-          </section>
+
+        <div className="settings-body">
           <section
             id="settings-panel-agents"
+            className="settings-tabpanel"
             role="tabpanel"
             aria-labelledby="settings-tab-agents"
             hidden={tab !== "agents"}
@@ -162,10 +152,27 @@ export function SettingsPage({
               state={state}
               active={active && tab === "agents"}
               onBusy={setAgentBusy}
+              onClose={close}
+              closeDisabled={busy}
+            />
+          </section>
+          <section
+            id="settings-panel-ssh"
+            className="settings-tabpanel"
+            role="tabpanel"
+            aria-labelledby="settings-tab-ssh"
+            hidden={tab !== "ssh"}
+          >
+            <SSHSettings
+              state={state}
+              onBusy={setSshBusy}
+              onClose={close}
+              closeDisabled={busy}
             />
           </section>
           <section
             id="settings-panel-providers"
+            className="settings-tabpanel"
             role="tabpanel"
             aria-labelledby="settings-tab-providers"
             hidden={tab !== "providers"}
@@ -173,18 +180,47 @@ export function SettingsPage({
             <ProviderSettings
               active={active && tab === "providers"}
               onBusy={setProviderBusy}
+              onClose={close}
+              closeDisabled={busy}
             />
           </section>
           <section
-            id="settings-panel-ssh"
+            id="settings-panel-browser"
+            className="settings-tabpanel"
             role="tabpanel"
-            aria-labelledby="settings-tab-ssh"
-            hidden={tab !== "ssh"}
+            aria-labelledby="settings-tab-browser"
+            hidden={tab !== "browser"}
           >
-            <SSHSettings state={state} onBusy={setSshBusy} />
+            <BrowserSettings onClose={close} closeDisabled={busy} />
           </section>
-        </main>
-      </div>
+          <section
+            id="settings-panel-appearance"
+            className="settings-tabpanel"
+            role="tabpanel"
+            aria-labelledby="settings-tab-appearance"
+            hidden={tab !== "appearance"}
+          >
+            {tab === "appearance" && (
+              <AppearanceSettings onClose={close} closeDisabled={busy} />
+            )}
+          </section>
+          <section
+            id="settings-panel-archived"
+            className="settings-tabpanel"
+            role="tabpanel"
+            aria-labelledby="settings-tab-archived"
+            hidden={tab !== "archived"}
+          >
+            <ArchivedChats
+              state={state}
+              active={active && tab === "archived"}
+              onBusy={setArchiveBusy}
+              onClose={close}
+              closeDisabled={busy}
+            />
+          </section>
+        </div>
+      </section>
     </div>
   );
 }

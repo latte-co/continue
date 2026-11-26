@@ -1,7 +1,6 @@
-import { Modal } from "./Modal";
 import { useEffect, useState } from "react";
-import { X } from "lucide-react";
 import { message, type Host } from "./api";
+import { Button, Dialog, Field, NoticeBanner, TextInput } from "./ui";
 
 export function SshPasswordDialog({
   host,
@@ -15,6 +14,7 @@ export function SshPasswordDialog({
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) {
@@ -25,6 +25,7 @@ export function SshPasswordDialog({
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
   }, [busy, cancel]);
+
   async function connect(event: React.FormEvent) {
     event.preventDefault();
     if (busy || !password) return;
@@ -39,57 +40,63 @@ export function SshPasswordDialog({
       setBusy(false);
     }
   }
+
   return (
-    <div className="modal-backdrop ssh-password-backdrop">
-      <Modal
-        className="modal ssh-password-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label={`连接 ${host.name}`}
+    <Dialog
+      open
+      size="sm"
+      className="ssh-password-modal"
+      backdropClassName="ssh-password-backdrop"
+      ariaLabel={`连接 ${host.name}`}
+      title={`连接 ${host.name}`}
+      description={`请输入 SSH 密码以连接 ${host.ssh}。本次运行期间重连无需再次输入。`}
+      closeLabel="稍后连接"
+      busy={busy}
+      onClose={cancel}
+      footer={
+        <>
+          <Button variant="subtle" size="md" disabled={busy} onClick={cancel}>
+            稍后
+          </Button>
+          <Button
+            type="submit"
+            form="ssh-password-form"
+            variant="primary"
+            size="md"
+            busy={busy}
+            disabled={busy || !password}
+          >
+            {busy ? "正在连接…" : "连接"}
+          </Button>
+        </>
+      }
+    >
+      <form
+        id="ssh-password-form"
+        onSubmit={(event) => void connect(event)}
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: "var(--space-3)",
+        }}
       >
-        <button
-          className="modal-close icon-button"
-          aria-label="稍后连接"
-          disabled={busy}
-          onClick={cancel}
+        <Field
+          label="SSH 密码"
+          htmlFor="ssh-password-input"
+          hint="密码仅保留在应用内存中，关闭应用后清除。"
         >
-          <X size={18} />
-        </button>
-        <h2>连接 {host.name}</h2>
-        <p>请输入 SSH 密码以连接 {host.ssh}。本次运行期间重连无需再次输入。</p>
-        <form onSubmit={(event) => void connect(event)}>
-          <label>
-            SSH 密码
-            <input
-              autoFocus
-              required
-              type="password"
-              autoComplete="off"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-            />
-          </label>
-          <p className="form-note">密码仅保留在应用内存中，关闭应用后清除。</p>
-          {error && (
-            <div className="form-error" role="alert">
-              {error}
-            </div>
-          )}
-          <div className="modal-actions">
-            <button
-              type="button"
-              className="secondary"
-              disabled={busy}
-              onClick={cancel}
-            >
-              稍后
-            </button>
-            <button className="primary" disabled={busy || !password}>
-              {busy ? "正在连接…" : "连接"}
-            </button>
-          </div>
-        </form>
-      </Modal>
-    </div>
+          <TextInput
+            id="ssh-password-input"
+            autoFocus
+            required
+            type="password"
+            autoComplete="off"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+          />
+        </Field>
+        {error && <NoticeBanner tone="danger">{error}</NoticeBanner>}
+      </form>
+    </Dialog>
   );
 }

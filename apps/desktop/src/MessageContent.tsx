@@ -3,12 +3,16 @@ import { WebLink } from "./LinkHandling";
 import { copyText } from "./clipboard";
 import {
   Children,
+  createContext,
   isValidElement,
+  useCallback,
   useContext,
   useEffect,
   useId,
   useRef,
   useState,
+  type ComponentPropsWithoutRef,
+  type CSSProperties,
   type ReactNode,
 } from "react";
 import ReactMarkdown, {
@@ -497,17 +501,289 @@ function MarkdownLink({
 function preserveLocalTargets(url: string): string {
   return /^file:\/\//i.test(url.trim()) ? url : defaultUrlTransform(url);
 }
+
+interface MdastNode {
+  type: string;
+  value?: string;
+  children?: MdastNode[];
+}
+
+const BR_TAG_ONLY_RE = /^(?:<br\s*\/?>\s*)+$/i;
+const BR_TAG_COUNT_RE = /<br\s*\/?>/gi;
+
+function replaceInlineBreakTags(node: MdastNode) {
+  if (!Array.isArray(node.children)) return;
+  for (let i = 0; i < node.children.length; i++) {
+    const child = node.children[i];
+    if (
+      child.type === "html" &&
+      typeof child.value === "string" &&
+      BR_TAG_ONLY_RE.test(child.value.trim())
+    ) {
+      const count = child.value.match(BR_TAG_COUNT_RE)?.length ?? 1;
+      const breaks: MdastNode[] = Array.from({ length: count }, () => ({
+        type: "break",
+      }));
+      node.children.splice(i, 1, ...breaks);
+      i += breaks.length - 1;
+      continue;
+    }
+    replaceInlineBreakTags(child);
+  }
+}
+
+/**
+ * Turn literal `<br>` / `<br/>` / `<br />` tags (commonly emitted by agents inside
+ * single-line GFM table cells) into real Markdown `break` nodes without enabling
+ * `rehype-raw` or allowing arbitrary HTML tags. `code` and `inlineCode` nodes have
+ * no `children` array and remain untouched.
+ */
+function remarkBreakTags() {
+  return (tree: MdastNode) => {
+    replaceInlineBreakTags(tree);
+  };
+}
+
+type HastNode = NonNullable<ExtraProps["node"]>;
+type HastChild = HastNode["children"][number];
+
+function lineVisualUnits(line: string): number {
+  const normalized = line.replace(/\s+/g, " ").trim();
+  let units = 0;
+  for (const ch of normalized) {
+    const code = ch.codePointAt(0) ?? 0;
+    units += code > 0xff ? 1.85 : 1;
+  }
+  return units;
+}
+
+function maxCellLineUnits(cell: HastNode | undefined): {
+  maxUnits: number;
+  hasWide: boolean;
+} {
+  if (!cell) return { maxUnits: 0, hasWide: false };
+  const lines = [""];
+  let hasWide = false;
+  const walk = (item: HastChild) => {
+    if (item.type === "text") {
+      for (const ch of item.value) {
+        if ((ch.codePointAt(0) ?? 0) > 0xff) {
+          hasWide = true;
+          break;
+        }
+      }
+      const parts = item.value.split("\n");
+      lines[lines.length - 1] += parts[0];
+      for (let i = 1; i < parts.length; i++) lines.push(parts[i]);
+      return;
+    }
+    if (item.type === "element") {
+      if (item.tagName === "br") {
+        lines.push("");
+        return;
+      }
+      for (const child of item.children) walk(child);
+    }
+  };
+  for (const child of cell.children) walk(child);
+  let maxUnits = 0;
+  for (const line of lines) {
+    const u = lineVisualUnits(line);
+    if (u > maxUnits) maxUnits = u;
+  }
+  return { maxUnits, hasWide };
+}
+
+function countTableColumns(tableNode: HastNode | undefined): number {
+  if (!tableNode) return 0;
+  for (const section of tableNode.children) {
+    if (section.type !== "element") continue;
+    for (const row of section.children) {
+      if (row.type === "element" && row.tagName === "tr") {
+        return row.children.filter(
+          (cell) =>
+            cell.type === "element" &&
+            (cell.tagName === "th" || cell.tagName === "td"),
+        ).length;
+      }
+    }
+  }
+  return 0;
+}
+
+const TableColCountContext = createContext<number>(3);
+
+function computeCellSizing(
+  node: HastNode | undefined,
+  isHeader: boolean,
+  colCount: number,
+): { minWidth?: string; nowrap?: boolean } {
+  const { maxUnits: units, hasWide } = maxCellLineUnits(node);
+  const dense = colCount >= 5;
+  if (isHeader) {
+    if (units === 0) return {};
+    // Keep short headers (`#`, `组别`, `门控`, `权重`, `Criterion ID`) on a single line
+    // at their natural compact width instead of inflating narrow metadata columns.
+    if (units <= (hasWide ? 9.5 : 16)) {
+      return { nowrap: true };
+    }
+    if (!hasWide) return { minWidth: "8rem" };
+    return { minWidth: dense ? "7.5rem" : "9.5rem" };
+  }
+  // Pure ASCII/numeric cells (`8`, `Blocker`, `classical`) already have natural word
+  // min-content width and never collapse into 1-char vertical strips.
+  if (!hasWide) return {};
+  if (units <= 8) return { minWidth: "4.5rem" };
+  if (units <= 22) return { minWidth: dense ? "6rem" : "8rem" };
+  if (units <= 40) return { minWidth: dense ? "8rem" : "9.5rem" };
+  if (units <= 90) return { minWidth: dense ? "11rem" : "12.5rem" };
+  return { minWidth: dense ? "13.5rem" : "15rem" };
+}
+
+function MarkdownTable({
+  children,
+  node,
+  ...props
+}: ComponentPropsWithoutRef<"table"> & ExtraProps) {
+  const colCount = countTableColumns(node);
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  const [scrollState, setScrollState] = useState<{
+    left: boolean;
+    right: boolean;
+  }>({ left: false, right: false });
+
+  const syncScrollState = useCallback(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const left = el.scrollLeft > 2;
+    const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 2;
+    setScrollState((prev) =>
+      prev.left === left && prev.right === right ? prev : { left, right },
+    );
+  }, []);
+
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return undefined;
+    syncScrollState();
+    if (typeof ResizeObserver === "undefined") return undefined;
+    const observer = new ResizeObserver(syncScrollState);
+    observer.observe(el);
+    const table = el.firstElementChild;
+    if (table) observer.observe(table);
+    return () => observer.disconnect();
+  }, [syncScrollState, colCount]);
+
+  return (
+    <TableColCountContext.Provider value={colCount}>
+      <div
+        className="markdown-table-wrap"
+        data-scroll-left={scrollState.left || undefined}
+        data-scroll-right={scrollState.right || undefined}
+      >
+        <div
+          ref={scrollerRef}
+          className="markdown-table-scroller"
+          onScroll={syncScrollState}
+        >
+          <table
+            {...props}
+            data-dense-cols={colCount >= 5 ? "true" : undefined}
+          >
+            {children}
+          </table>
+        </div>
+      </div>
+    </TableColCountContext.Provider>
+  );
+}
+
+function MarkdownTableHeaderCell({
+  children,
+  node,
+  style,
+  ...props
+}: ComponentPropsWithoutRef<"th"> & ExtraProps) {
+  const colCount = useContext(TableColCountContext);
+  const { minWidth, nowrap } = computeCellSizing(node, true, colCount);
+  const mergedStyle: CSSProperties | undefined =
+    minWidth || nowrap
+      ? {
+          ...style,
+          ...(minWidth ? { minWidth } : {}),
+          ...(nowrap ? { whiteSpace: "nowrap" } : {}),
+        }
+      : style;
+  return (
+    <th {...props} style={mergedStyle}>
+      {children}
+    </th>
+  );
+}
+
+function isBrElement(child: ReactNode): boolean {
+  return isValidElement(child) && child.type === "br";
+}
+
+function hasNonWhitespaceNode(segment: ReactNode[]): boolean {
+  return segment.some(
+    (item) => typeof item !== "string" || item.trim().length > 0,
+  );
+}
+
+function MarkdownTableCell({
+  children,
+  node,
+  style,
+  ...props
+}: ComponentPropsWithoutRef<"td"> & ExtraProps) {
+  const colCount = useContext(TableColCountContext);
+  const { minWidth } = computeCellSizing(node, false, colCount);
+  const mergedStyle: CSSProperties | undefined = minWidth
+    ? { ...style, minWidth }
+    : style;
+  const items = Children.toArray(children);
+  if (!items.some(isBrElement)) {
+    return (
+      <td {...props} style={mergedStyle}>
+        {children}
+      </td>
+    );
+  }
+  const segments: ReactNode[][] = [[]];
+  for (const item of items) {
+    if (isBrElement(item)) {
+      segments.push([]);
+    } else {
+      segments[segments.length - 1].push(item);
+    }
+  }
+  const nonEmpty = segments.filter(hasNonWhitespaceNode);
+  return (
+    <td {...props} style={mergedStyle}>
+      {nonEmpty.map((segment, index) => (
+        <div key={index} className="markdown-cell-block">
+          {segment}
+        </div>
+      ))}
+    </td>
+  );
+}
+
 export function MessageContent({ text }: { text: string }) {
   return (
     <ImageGalleryBoundary>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkBreakTags]}
         urlTransform={preserveLocalTargets}
         components={{
           pre: CodeBlock,
           a: MarkdownLink,
           code: InlineCodeRef,
           img: MarkdownImage,
+          table: MarkdownTable,
+          th: MarkdownTableHeaderCell,
+          td: MarkdownTableCell,
         }}
       >
         {text}

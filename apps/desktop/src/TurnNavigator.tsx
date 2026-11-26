@@ -5,9 +5,11 @@ import {
   useState,
   type RefObject,
 } from "react";
-import { ChevronUp, LoaderCircle } from "lucide-react";
+import { ChevronDown, ChevronUp, LoaderCircle } from "lucide-react";
 import type { TranscriptTurn } from "./TurnTranscript";
 import { userMessageContent } from "./annotations";
+
+export const TURN_PAGE_SIZE = 12;
 
 export function turnNavigationEntries(turns: TranscriptTurn[]) {
   return turns.flatMap((turn) => {
@@ -74,19 +76,40 @@ export function TurnNavigator({
   onNavigate: (top: number) => void;
   hasEarlierHistory: boolean;
   earlierHistoryLoading: boolean;
-  onLoadEarlier?: () => void;
+  onLoadEarlier?: (minTurns?: number) => void;
 }) {
   const rail = useRef<HTMLElement>(null);
   const list = useRef<HTMLDivElement>(null);
   const preview = useRef<HTMLDivElement>(null);
   const anchors = useRef<Anchor[]>([]);
   const navigation = useRef<{ key: string; top: number } | null>(null);
+  const prevActiveKey = useRef<string | undefined>(undefined);
+  const pendingLoadAnchor = useRef<number | null>(null);
+  const pendingPageFocus = useRef<"first" | "last" | null>(null);
   const [activeKey, setActiveKey] = useState<string>();
   const [focusKey, setFocusKey] = useState<string>();
   const [previewKey, setPreviewKey] = useState<string>();
   const [previewTop, setPreviewTop] = useState(0);
+  const [offset, setOffset] = useState(0);
   const tooltipId = useId();
-  const entry = entries.find((item) => item.key === previewKey);
+
+  const total = entries.length;
+  const maxOffset = Math.max(0, total - TURN_PAGE_SIZE);
+  const clampedOffset = Math.min(offset, maxOffset);
+  const end = total - clampedOffset;
+  const start = Math.max(0, end - TURN_PAGE_SIZE);
+  const visibleEntries = entries.slice(start, end);
+  const entry = visibleEntries.find((item) => item.key === previewKey);
+  const rovingKey =
+    focusKey && visibleEntries.some((item) => item.key === focusKey)
+      ? focusKey
+      : activeKey && visibleEntries.some((item) => item.key === activeKey)
+        ? activeKey
+        : visibleEntries.at(-1)?.key;
+  const showPagination =
+    total > TURN_PAGE_SIZE || (hasEarlierHistory && !!onLoadEarlier);
+  const canStepEarlierInMemory = start > 0;
+  const canLoadEarlierFromHost = hasEarlierHistory && !!onLoadEarlier;
 
   useLayoutEffect(() => {
     const el = scroller.current;
@@ -151,6 +174,7 @@ export function TurnNavigator({
     schedule();
     el.addEventListener("scroll", schedule, { passive: true });
     el.addEventListener("wheel", release, { passive: true });
+    el.addEventListener("toggle", measure, true);
     window.addEventListener("resize", measure);
     const observer =
       typeof ResizeObserver === "undefined"
@@ -163,10 +187,54 @@ export function TurnNavigator({
       cancelAnimationFrame(frame);
       el.removeEventListener("scroll", schedule);
       el.removeEventListener("wheel", release);
+      el.removeEventListener("toggle", measure, true);
       window.removeEventListener("resize", measure);
       observer?.disconnect();
     };
   }, [entries, scroller]);
+
+  useLayoutEffect(() => {
+    if (
+      pendingLoadAnchor.current !== null &&
+      total > pendingLoadAnchor.current
+    ) {
+      const added = total - pendingLoadAnchor.current;
+      pendingLoadAnchor.current = null;
+      const nextMax = Math.max(0, total - TURN_PAGE_SIZE);
+      setOffset((prev) =>
+        Math.min(nextMax, prev + Math.max(1, Math.min(TURN_PAGE_SIZE, added))),
+      );
+      setPreviewKey(undefined);
+    } else if (!hasEarlierHistory && !earlierHistoryLoading) {
+      pendingLoadAnchor.current = null;
+    }
+  }, [total, hasEarlierHistory, earlierHistoryLoading]);
+
+  useLayoutEffect(() => {
+    if (activeKey === prevActiveKey.current) return;
+    prevActiveKey.current = activeKey;
+    if (!activeKey) return;
+    const activeIndex = entries.findIndex((item) => item.key === activeKey);
+    if (activeIndex < 0) return;
+    if (activeIndex < start || activeIndex >= end) {
+      const nextOffset = Math.min(
+        maxOffset,
+        Math.floor((total - 1 - activeIndex) / TURN_PAGE_SIZE) * TURN_PAGE_SIZE,
+      );
+      setOffset(nextOffset);
+    }
+  }, [activeKey, entries, start, end, maxOffset, total]);
+
+  useLayoutEffect(() => {
+    if (!pendingPageFocus.current) return;
+    const direction = pendingPageFocus.current;
+    pendingPageFocus.current = null;
+    const buttons = list.current?.querySelectorAll<HTMLButtonElement>("button");
+    if (!buttons?.length) return;
+    const target =
+      direction === "first" ? buttons[0] : buttons[buttons.length - 1];
+    target?.focus();
+  }, [clampedOffset, visibleEntries.length]);
 
   useLayoutEffect(() => {
     // Keep the current marker visible in very long conversations without moving
@@ -184,7 +252,7 @@ export function TurnNavigator({
       el.scrollTop + el.clientHeight
     )
       el.scrollTop = button.offsetTop + button.offsetHeight - el.clientHeight;
-  }, [activeKey, focusKey, entries]);
+  }, [activeKey, focusKey, entries, clampedOffset]);
 
   useLayoutEffect(() => {
     if (!entry || !rail.current || !preview.current) return;
@@ -248,19 +316,49 @@ export function TurnNavigator({
     onNavigate(top);
   }
 
+  function stepEarlierPage() {
+    setPreviewKey(undefined);
+    if (canStepEarlierInMemory) {
+      setOffset(Math.min(maxOffset, clampedOffset + TURN_PAGE_SIZE));
+      return;
+    }
+    if (canLoadEarlierFromHost && !earlierHistoryLoading) {
+      pendingLoadAnchor.current = total;
+      onLoadEarlier(TURN_PAGE_SIZE);
+    }
+  }
+
+  function stepLaterPage() {
+    if (clampedOffset <= 0) return;
+    setPreviewKey(undefined);
+    setOffset(
+      clampedOffset > TURN_PAGE_SIZE
+        ? Math.floor((clampedOffset - 1) / TURN_PAGE_SIZE) * TURN_PAGE_SIZE
+        : 0,
+    );
+  }
+
   return (
     <nav className="turn-navigator" aria-label="对话轮次" ref={rail}>
-      {hasEarlierHistory && onLoadEarlier && (
+      {showPagination && (
         <button
+          type="button"
           className="turn-navigator-earlier"
           aria-label={
-            earlierHistoryLoading ? "正在加载更早的轮次" : "加载更早的轮次"
+            canStepEarlierInMemory
+              ? "上一页轮次"
+              : earlierHistoryLoading
+                ? "正在加载更早的轮次"
+                : "加载更早的轮次"
           }
-          title="加载更早的轮次"
-          disabled={earlierHistoryLoading}
-          onClick={onLoadEarlier}
+          title={canStepEarlierInMemory ? "上一页轮次" : "加载更早的轮次"}
+          disabled={
+            !canStepEarlierInMemory &&
+            (!canLoadEarlierFromHost || earlierHistoryLoading)
+          }
+          onClick={stepEarlierPage}
         >
-          {earlierHistoryLoading ? (
+          {!canStepEarlierInMemory && earlierHistoryLoading ? (
             <LoaderCircle size={14} className="spin" />
           ) : (
             <ChevronUp size={14} />
@@ -278,18 +376,15 @@ export function TurnNavigator({
           }
         }}
       >
-        {entries.map((item, index) => (
+        {visibleEntries.map((item, index) => (
           <button
+            type="button"
             key={item.key}
             data-jump-key={item.key}
             aria-label={`跳转到：${excerpt(item.prompt, 80)}`}
             aria-current={activeKey === item.key ? "location" : undefined}
             aria-describedby={previewKey === item.key ? tooltipId : undefined}
-            tabIndex={
-              (focusKey ?? activeKey ?? entries.at(-1)?.key) === item.key
-                ? 0
-                : -1
-            }
+            tabIndex={rovingKey === item.key ? 0 : -1}
             onMouseEnter={() => setPreviewKey(item.key)}
             onFocus={() => {
               setFocusKey(item.key);
@@ -301,27 +396,100 @@ export function TurnNavigator({
                 setPreviewKey(undefined);
                 return;
               }
-              const next =
-                event.key === "ArrowUp"
-                  ? Math.max(0, index - 1)
-                  : event.key === "ArrowDown"
-                    ? Math.min(entries.length - 1, index + 1)
-                    : event.key === "Home"
-                      ? 0
-                      : event.key === "End"
-                        ? entries.length - 1
-                        : null;
-              if (next === null) return;
-              event.preventDefault();
-              const buttons =
-                list.current?.querySelectorAll<HTMLButtonElement>("button");
-              buttons?.[next]?.focus();
+              if (event.key === "ArrowUp") {
+                event.preventDefault();
+                if (index > 0) {
+                  list.current
+                    ?.querySelectorAll<HTMLButtonElement>("button")
+                    ?.[index - 1]?.focus();
+                } else if (canStepEarlierInMemory) {
+                  pendingPageFocus.current = "last";
+                  stepEarlierPage();
+                }
+                return;
+              }
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                if (index < visibleEntries.length - 1) {
+                  list.current
+                    ?.querySelectorAll<HTMLButtonElement>("button")
+                    ?.[index + 1]?.focus();
+                } else if (clampedOffset > 0) {
+                  pendingPageFocus.current = "first";
+                  stepLaterPage();
+                }
+                return;
+              }
+              if (event.key === "PageUp") {
+                event.preventDefault();
+                if (canStepEarlierInMemory) {
+                  pendingPageFocus.current = "first";
+                  stepEarlierPage();
+                } else {
+                  list.current
+                    ?.querySelectorAll<HTMLButtonElement>("button")?.[0]
+                    ?.focus();
+                }
+                return;
+              }
+              if (event.key === "PageDown") {
+                event.preventDefault();
+                if (clampedOffset > 0) {
+                  pendingPageFocus.current = "last";
+                  stepLaterPage();
+                } else {
+                  const buttons =
+                    list.current?.querySelectorAll<HTMLButtonElement>("button");
+                  buttons?.[buttons.length - 1]?.focus();
+                }
+                return;
+              }
+              if (event.key === "Home") {
+                event.preventDefault();
+                if (canStepEarlierInMemory) {
+                  pendingPageFocus.current = "first";
+                  setPreviewKey(undefined);
+                  setOffset(maxOffset);
+                } else {
+                  list.current
+                    ?.querySelectorAll<HTMLButtonElement>("button")?.[0]
+                    ?.focus();
+                }
+                return;
+              }
+              if (event.key === "End") {
+                event.preventDefault();
+                if (clampedOffset > 0) {
+                  pendingPageFocus.current = "last";
+                  setPreviewKey(undefined);
+                  setOffset(0);
+                } else {
+                  const buttons =
+                    list.current?.querySelectorAll<HTMLButtonElement>("button");
+                  buttons?.[buttons.length - 1]?.focus();
+                }
+              }
             }}
           >
-            <span aria-hidden="true" />
+            <span
+              key={activeKey === item.key ? "active" : "idle"}
+              aria-hidden="true"
+            />
           </button>
         ))}
       </div>
+      {showPagination && (
+        <button
+          type="button"
+          className="turn-navigator-later"
+          aria-label="下一页轮次"
+          title="下一页轮次"
+          disabled={clampedOffset === 0}
+          onClick={stepLaterPage}
+        >
+          <ChevronDown size={14} />
+        </button>
+      )}
       {entry && (
         <div
           className="turn-navigator-preview"

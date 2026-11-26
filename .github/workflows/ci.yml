@@ -30,6 +30,7 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+      - run: node scripts/check-npm-lock.mjs
       - run: npm ci
       - run: make fmt-check
       - run: make types-check
@@ -169,6 +170,7 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+      - run: node scripts/check-npm-lock.mjs
       - run: npm ci
       - run: npm test
       - run: npm run web-build
@@ -194,8 +196,8 @@ jobs:
       - run: cargo build --release -p latte-work-server --locked
       - uses: actions/upload-artifact@v4
         with:
-          name: latte-work-server-${{ matrix.label }}-${{ runner.arch }}
-          path: target/release/latte-work-server
+          name: latte-continue-server-${{ matrix.label }}-${{ runner.arch }}
+          path: target/release/latte-continue-server
           if-no-files-found: error
 
   desktop-native:
@@ -212,6 +214,7 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+      - run: node scripts/check-npm-lock.mjs
       - run: npm ci
       - name: WebKit site-data, favicon transport and desktop command tests
         run: make test-native
@@ -222,7 +225,7 @@ jobs:
         timeout-minutes: 20
       - uses: actions/upload-artifact@v4
         with:
-          name: latte-work-dmg-${{ runner.arch }}
+          name: continue-dmg-${{ runner.arch }}
           path: |
             target/release/bundle/dmg/*.dmg
             target/release/bundle/dmg/*.sha256

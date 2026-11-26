@@ -235,6 +235,54 @@ it("preserves each user message's original send time through replay", () => {
     { key: 1, type: "user", text: "继续", at },
   ]);
 });
+it("deduplicates synthetic API error text right before a matching failed state while keeping genuine partial prose", () => {
+  const raw429 =
+    "API Error: Request rejected (429) · [1302][您的账户已达到速率限制，请您控制请求频率][20261125162645e418428b3b184a3a]";
+  const visibleChanges: TurnChanges = {
+    ...emptyChanges,
+    summary: {
+      ...emptyChanges.summary,
+      entries: [{ path: "src/lib.rs", status: "M", added: 3, removed: 1 }],
+    },
+  };
+  expect(
+    transcript([
+      e(1, { kind: "user", text: "review", request_id: "r1" }),
+      e(2, { kind: "text", text: "已完成前 3 个模块核查。" }),
+      e(3, { kind: "text", text: raw429 }),
+      e(4, { kind: "turn_changes", changes: visibleChanges }),
+      e(5, { kind: "state", status: "failed", message: raw429 }),
+    ]),
+  ).toEqual([
+    { key: 1, type: "user", text: "review", at: 0 },
+    { key: 2, type: "assistant", text: "已完成前 3 个模块核查。" },
+    {
+      key: 4,
+      type: "event",
+      value: { kind: "turn_changes", changes: visibleChanges },
+    },
+    {
+      key: 5,
+      type: "event",
+      value: { kind: "state", status: "failed", message: raw429 },
+    },
+  ]);
+
+  // Distinct partial diagnosis before a different failure message stays intact.
+  expect(
+    transcript([
+      e(1, { kind: "text", text: "登录诊断的部分结果" }),
+      e(2, { kind: "state", status: "failed", message: "登录失败" }),
+    ]),
+  ).toEqual([
+    { key: 1, type: "assistant", text: "登录诊断的部分结果" },
+    {
+      key: 2,
+      type: "event",
+      value: { kind: "state", status: "failed", message: "登录失败" },
+    },
+  ]);
+});
 it("pairs saved question answers and marks unanswered terminal questions expired without manufacturing an answer", () => {
   const question: Event = {
     seq: 1,

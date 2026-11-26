@@ -14,10 +14,20 @@ import {
   MoreHorizontal,
   Minus,
   Plus,
+  Search,
   X,
 } from "lucide-react";
 import { message, native } from "./api";
-import { Modal } from "./Modal";
+import {
+  Button,
+  CardList,
+  Checkbox,
+  Dialog,
+  EmptyState,
+  IconButton,
+  SearchInput,
+  TextInput,
+} from "./ui";
 import { openBrowser } from "./workspaceState";
 import {
   clearBrowserHistory,
@@ -274,8 +284,14 @@ export function BrowserTools({
               void findNext(false);
             }}
           >
-            <input
+            <Search
+              size={14}
+              className="browser-find-icon"
+              aria-hidden="true"
+            />
+            <TextInput
               ref={search}
+              size="sm"
               aria-label="在页面中查找"
               value={query}
               maxLength={512}
@@ -292,37 +308,35 @@ export function BrowserTools({
                 }
               }}
             />
-            <span role="status">
+            <span role="status" className="browser-find-status">
               {found === null ? "" : found ? "已找到" : "未找到"}
             </span>
-            <button
-              type="button"
-              className="icon-button"
-              aria-label="上一个匹配"
+            <IconButton
+              size="xs"
+              label="上一个匹配"
               disabled={busy || !query}
               onClick={() => void findNext(true)}
             >
-              <ChevronUp size={16} />
-            </button>
-            <button
+              <ChevronUp size={15} />
+            </IconButton>
+            <IconButton
               type="submit"
-              className="icon-button"
-              aria-label="下一个匹配"
+              size="xs"
+              label="下一个匹配"
               disabled={busy || !query}
             >
-              <ChevronDown size={16} />
-            </button>
-            <button
-              type="button"
-              className="icon-button"
-              aria-label="关闭查找"
+              <ChevronDown size={15} />
+            </IconButton>
+            <IconButton
+              size="xs"
+              label="关闭查找"
               onClick={() => {
                 setFind(false);
                 trigger.current?.focus();
               }}
             >
-              <X size={16} />
-            </button>
+              <X size={15} />
+            </IconButton>
           </form>,
           trigger.current!.closest(".browser-pane")!,
         )}
@@ -334,209 +348,205 @@ export function BrowserTools({
           </div>,
           trigger.current!.closest(".browser-pane")!,
         )}
-      {panel &&
-        active &&
-        createPortal(
-          <div
-            className="modal-backdrop"
-            onMouseDown={(event) => {
-              if (event.target === event.currentTarget && !busy) setPanel(null);
-            }}
-          >
-            <Modal
-              className="modal browser-library"
-              aria-label={
-                panel === "history"
-                  ? "浏览历史记录"
-                  : panel === "downloads"
-                    ? "浏览器下载"
-                    : "清除浏览数据"
-              }
-              onKeyDown={(event) => {
-                if (event.key === "Escape" && !busy) setPanel(null);
+      <Dialog
+        open={Boolean(panel && active)}
+        onClose={() => {
+          if (!busy) setPanel(null);
+        }}
+        busy={busy}
+        size={panel === "clear" ? "sm" : "lg"}
+        className="browser-library"
+        ariaLabel={
+          panel === "history"
+            ? "浏览历史记录"
+            : panel === "downloads"
+              ? "浏览器下载"
+              : "清除浏览数据"
+        }
+        title={
+          panel === "history"
+            ? "历史记录"
+            : panel === "downloads"
+              ? "下载"
+              : "清除浏览数据"
+        }
+        footer={
+          panel === "history" && visits.length > 0 ? (
+            <Button
+              variant="subtle"
+              size="sm"
+              onClick={() => {
+                setHistory(true);
+                setCookies(false);
+                setClearDownloads(false);
+                setPanel("clear");
               }}
             >
-              <button
-                className="modal-close icon-button"
-                aria-label="关闭"
+              清空浏览记录…
+            </Button>
+          ) : panel === "downloads" && downloads.length > 0 ? (
+            <Button
+              variant="subtle"
+              size="sm"
+              disabled={busy}
+              onClick={() =>
+                void perform(() => invoke("browser_clear_downloads"))
+              }
+            >
+              清除已结束的记录
+            </Button>
+          ) : panel === "clear" ? (
+            <>
+              <Button
+                variant="subtle"
+                size="md"
                 disabled={busy}
                 onClick={() => setPanel(null)}
               >
-                <X size={18} />
-              </button>
-              <h2>
-                {panel === "history"
-                  ? "历史记录"
-                  : panel === "downloads"
-                    ? "下载"
-                    : "清除浏览数据"}
-              </h2>
-              {panel === "history" && (
-                <>
-                  <input
-                    aria-label="搜索浏览记录"
-                    value={filter}
-                    placeholder="搜索标题或网址"
-                    onChange={(event) => setFilter(event.target.value)}
-                  />
-                  {visits.length === 0 && (
-                    <p className="muted">暂无浏览记录。</p>
-                  )}
-                  {visits.length > 0 &&
-                    !visits.some((item) =>
-                      (item.title + item.url)
-                        .toLowerCase()
-                        .includes(filter.toLowerCase()),
-                    ) && <p className="muted">没有匹配的记录。</p>}
-                  <div className="browser-records">
-                    {[...visits]
-                      .reverse()
-                      .filter((item) =>
-                        (item.title + item.url)
-                          .toLowerCase()
-                          .includes(filter.toLowerCase()),
-                      )
-                      .map((item) => (
-                        <div className="browser-record" key={item.id}>
-                          <button
-                            className="browser-record-open"
-                            onClick={() => {
-                              try {
-                                openBrowser(workspaceId, item.url, true);
-                                setPanel(null);
-                              } catch (error) {
-                                report(error);
-                              }
-                            }}
-                          >
-                            <strong>{item.title}</strong>
-                            <span>{item.url}</span>
-                            <small>{new Date(item.at).toLocaleString()}</small>
-                          </button>
-                          <button
-                            className="icon-button"
-                            aria-label={`删除记录 ${item.title}`}
-                            onClick={() => {
-                              try {
-                                removeBrowserVisit(item.id);
-                              } catch (error) {
-                                report(error);
-                              }
-                            }}
-                          >
-                            <X size={16} />
-                          </button>
-                        </div>
-                      ))}
-                  </div>
-                  {!!visits.length && (
-                    <button
-                      onClick={() => {
-                        setHistory(true);
-                        setCookies(false);
-                        setClearDownloads(false);
-                        setPanel("clear");
-                      }}
-                    >
-                      清空浏览记录…
-                    </button>
-                  )}
-                </>
-              )}
-              {panel === "downloads" && (
-                <>
-                  {!downloads.length && <p className="muted">暂无下载记录。</p>}
-                  <div className="browser-records">
-                    {[...downloads].reverse().map((item) => (
-                      <div className="browser-record" key={item.id}>
-                        <div>
-                          <strong>{item.name}</strong>
-                          <span>{item.path || item.url}</span>
-                          <small>
-                            {item.error || labels[item.status] || item.status}
-                          </small>
-                        </div>
-                        {item.status === "completed" && (
-                          <button
-                            disabled={busy}
-                            onClick={() =>
-                              void perform(() =>
-                                invoke("browser_reveal_download", {
-                                  id: item.id,
-                                }),
-                              )
-                            }
-                          >
-                            显示位置
-                          </button>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                  {!!downloads.length && (
-                    <button
-                      disabled={busy}
-                      onClick={() =>
-                        void perform(() => invoke("browser_clear_downloads"))
-                      }
-                    >
-                      清除已结束的记录
-                    </button>
-                  )}
-                </>
-              )}
-              {panel === "clear" && (
-                <>
-                  <p>网站数据清除后需要重新登录。工作台设置和对话会保留。</p>
-                  <label className="browser-check">
-                    <input
-                      type="checkbox"
-                      checked={cookies}
-                      onChange={(event) => setCookies(event.target.checked)}
-                      disabled={busy}
-                    />
-                    Cookie、缓存和网站存储
-                  </label>
-                  <label className="browser-check">
-                    <input
-                      type="checkbox"
-                      checked={history}
-                      onChange={(event) => setHistory(event.target.checked)}
-                      disabled={busy}
-                    />
-                    浏览历史记录
-                  </label>
-                  <label className="browser-check">
-                    <input
-                      type="checkbox"
-                      checked={clearDownloads}
-                      onChange={(event) =>
-                        setClearDownloads(event.target.checked)
-                      }
-                      disabled={busy}
-                    />
-                    已结束的下载记录（保留文件）
-                  </label>
-                  <div className="browser-dialog-actions">
-                    <button disabled={busy} onClick={() => setPanel(null)}>
-                      取消
-                    </button>
-                    <button
-                      className="primary"
-                      disabled={
-                        busy || (!cookies && !history && !clearDownloads)
-                      }
-                      onClick={() => void clearData()}
-                    >
-                      {busy ? "正在清除…" : "清除"}
-                    </button>
-                  </div>
-                </>
-              )}
-            </Modal>
-          </div>,
-          document.body,
+                取消
+              </Button>
+              <Button
+                variant="danger"
+                size="md"
+                busy={busy}
+                disabled={busy || (!cookies && !history && !clearDownloads)}
+                onClick={() => void clearData()}
+              >
+                {busy ? "正在清除…" : "清除"}
+              </Button>
+            </>
+          ) : undefined
+        }
+      >
+        {panel === "history" && (
+          <>
+            <SearchInput
+              size="md"
+              aria-label="搜索浏览记录"
+              value={filter}
+              placeholder="搜索标题或网址"
+              onClear={() => setFilter("")}
+              onChange={(event) => setFilter(event.target.value)}
+            />
+            {visits.length === 0 && <EmptyState title="暂无浏览记录。" />}
+            {visits.length > 0 &&
+              !visits.some((item) =>
+                (item.title + item.url)
+                  .toLowerCase()
+                  .includes(filter.toLowerCase()),
+              ) && <EmptyState title="没有匹配的记录。" />}
+            {visits.some((item) =>
+              (item.title + item.url)
+                .toLowerCase()
+                .includes(filter.toLowerCase()),
+            ) && (
+              <CardList className="browser-records">
+                {[...visits]
+                  .reverse()
+                  .filter((item) =>
+                    (item.title + item.url)
+                      .toLowerCase()
+                      .includes(filter.toLowerCase()),
+                  )
+                  .map((item) => (
+                    <div className="browser-record" key={item.id}>
+                      <button
+                        type="button"
+                        className="browser-record-open"
+                        onClick={() => {
+                          try {
+                            openBrowser(workspaceId, item.url, true);
+                            setPanel(null);
+                          } catch (error) {
+                            report(error);
+                          }
+                        }}
+                      >
+                        <strong>{item.title}</strong>
+                        <span>{item.url}</span>
+                        <small>{new Date(item.at).toLocaleString()}</small>
+                      </button>
+                      <IconButton
+                        size="sm"
+                        label={`删除记录 ${item.title}`}
+                        onClick={() => {
+                          try {
+                            removeBrowserVisit(item.id);
+                          } catch (error) {
+                            report(error);
+                          }
+                        }}
+                      >
+                        <X size={15} />
+                      </IconButton>
+                    </div>
+                  ))}
+              </CardList>
+            )}
+          </>
         )}
+        {panel === "downloads" && (
+          <>
+            {!downloads.length && <EmptyState title="暂无下载记录。" />}
+            {downloads.length > 0 && (
+              <CardList className="browser-records">
+                {[...downloads].reverse().map((item) => (
+                  <div className="browser-record" key={item.id}>
+                    <div className="browser-record-info">
+                      <strong>{item.name}</strong>
+                      <span>{item.path || item.url}</span>
+                      <small>
+                        {item.error || labels[item.status] || item.status}
+                      </small>
+                    </div>
+                    {item.status === "completed" && (
+                      <Button
+                        variant="subtle"
+                        size="xs"
+                        disabled={busy}
+                        onClick={() =>
+                          void perform(() =>
+                            invoke("browser_reveal_download", {
+                              id: item.id,
+                            }),
+                          )
+                        }
+                      >
+                        显示位置
+                      </Button>
+                    )}
+                  </div>
+                ))}
+              </CardList>
+            )}
+          </>
+        )}
+        {panel === "clear" && (
+          <div className="browser-clear-options">
+            <p className="ui-field-hint" style={{ margin: 0 }}>
+              网站数据清除后需要重新登录。工作台设置和对话会保留。
+            </p>
+            <Checkbox
+              checked={cookies}
+              onChange={setCookies}
+              disabled={busy}
+              label="Cookie、缓存和网站存储"
+            />
+            <Checkbox
+              checked={history}
+              onChange={setHistory}
+              disabled={busy}
+              label="浏览历史记录"
+            />
+            <Checkbox
+              checked={clearDownloads}
+              onChange={setClearDownloads}
+              disabled={busy}
+              label="已结束的下载记录（保留文件）"
+            />
+          </div>
+        )}
+      </Dialog>
     </>
   );
 }

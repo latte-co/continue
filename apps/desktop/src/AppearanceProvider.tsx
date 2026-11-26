@@ -38,6 +38,41 @@ export function AppearanceProvider({ children }: { children: ReactNode }) {
     () => applyAppearance(settings, systemDark),
     [settings, systemDark],
   );
+  useEffect(() => {
+    const timers = new Map<HTMLElement, ReturnType<typeof setTimeout>>();
+    const onScroll = (event: Event) => {
+      const raw = event.target;
+      const el =
+        raw instanceof HTMLElement
+          ? raw
+          : raw === document
+            ? document.documentElement
+            : null;
+      if (!el) return;
+      el.dataset.scrollActive = "true";
+      const prev = timers.get(el);
+      if (prev !== undefined) clearTimeout(prev);
+      timers.set(
+        el,
+        setTimeout(() => {
+          delete el.dataset.scrollActive;
+          timers.delete(el);
+        }, 750),
+      );
+    };
+    window.addEventListener("scroll", onScroll, {
+      capture: true,
+      passive: true,
+    });
+    return () => {
+      window.removeEventListener("scroll", onScroll, true);
+      for (const [el, timer] of timers) {
+        clearTimeout(timer);
+        delete el.dataset.scrollActive;
+      }
+      timers.clear();
+    };
+  }, []);
   function update(next: Appearance) {
     setSettings(next);
     setError(saveAppearance(next));

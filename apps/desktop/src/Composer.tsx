@@ -11,11 +11,16 @@ import {
   ArrowLeft,
   Box,
   ChevronRight,
+  Cpu,
   FileText,
   FileVideo,
   Folder,
+  GitFork,
+  MessageSquare,
   Plus,
   Search,
+  SlidersHorizontal,
+  Terminal,
   X,
 } from "lucide-react";
 import { chooseReferencePath, message, request } from "./api";
@@ -54,6 +59,11 @@ import {
   type InlineReferenceInputHandle,
   type InlineSelection,
 } from "./InlineReferenceInput";
+import { ComposerRichInput } from "./ComposerRichInput";
+import {
+  hasRichComposerMarkdown,
+  smartPasteTransform,
+} from "./composerMarkdown";
 
 export function composerReferenceScope(
   hostId: string,
@@ -139,6 +149,7 @@ type Option = {
   label: string;
   detail: string;
   icon: "file" | "folder" | "back" | "command";
+  uiAction?: AppCommandAction;
   choose: () => void;
 };
 export function Composer(props: Props) {
@@ -238,7 +249,11 @@ export function Composer(props: Props) {
   );
   const inlineAttached = attached.filter((entry) => !entry.attachmentKind);
   const separateAttached = attached.filter((entry) => !!entry.attachmentKind);
-  const inlineMode = !concealSubmitted && !!inlineAttached.length;
+  const richSyntax = hasRichComposerMarkdown(value);
+  const latchedRich = useRef(richSyntax);
+  if (!imeActive) latchedRich.current = richSyntax;
+  const richMode = !concealSubmitted && latchedRich.current;
+  const inlineMode = !concealSubmitted && (richMode || !!inlineAttached.length);
   // The native editor may be replaced after the last reference is removed.
   // Restore the caret only after React has mounted the destination editor.
   const editorContext = JSON.stringify([scope, sessionId]);
@@ -253,7 +268,7 @@ export function Composer(props: Props) {
   useLayoutEffect(() => {
     composing.current = false;
     setImeActive(false);
-  }, [editorContext, inlineMode, concealSubmitted]);
+  }, [editorContext, inlineMode, richMode, concealSubmitted]);
   function inputSelection(): InlineSelection | null {
     if (inlineMode && inlineInput.current)
       return inlineInput.current.selection();
@@ -623,6 +638,22 @@ export function Composer(props: Props) {
     setBrowse(next);
     setSearch("");
   }
+  function completeDirectory(entry: FileEntry) {
+    if (browse !== null) {
+      navigate(entry.path);
+      return;
+    }
+    const selection = inputSelection();
+    if (!selection) return;
+    const start = trigger?.start ?? selection.start;
+    const end = trigger?.end ?? selection.end;
+    const replacement = `@${entry.path}/`;
+    const next = value.slice(0, start) + replacement + value.slice(end);
+    const caret = start + replacement.length;
+    if (replaceTrigger(replacement)) {
+      setTrigger(composerTrigger(next, caret));
+    }
+  }
   function command(name: string) {
     replaceTrigger(`/${name} `);
     close();
@@ -660,15 +691,24 @@ export function Composer(props: Props) {
                 Number(a.name.toLowerCase() === query.toLowerCase()) ||
               Number(!!b.ui_action) - Number(!!a.ui_action),
           )
-          .map((item) => ({
-            id: item.name,
-            label: commandTitle(item, agent),
-            detail: `${item.argument_hint} ${item.description}`.trim(),
-            icon: "command",
-            choose: () => command(item.name),
-          }))
+          .map((item) => {
+            const title = commandTitle(item, agent);
+            const rawDetail =
+              `${item.argument_hint} ${item.description}`.trim();
+            return {
+              id: item.name,
+              label: title,
+              detail:
+                title !== item.name
+                  ? [title, rawDetail].filter(Boolean).join(" · ")
+                  : rawDetail,
+              icon: "command" as const,
+              uiAction: item.ui_action,
+              choose: () => command(item.name),
+            };
+          })
       : [
-          ...(path
+          ...(browse !== null && path
             ? [
                 {
                   id: "parent",
@@ -680,7 +720,7 @@ export function Composer(props: Props) {
                 },
               ]
             : []),
-          ...(!loading && !error && path
+          ...(browse !== null && !loading && !error && path
             ? [
                 {
                   id: "attach-folder",
@@ -702,16 +742,14 @@ export function Composer(props: Props) {
                 .map((item) => ({
                   id: `entry:${item.path}`,
                   label: item.name,
-                  detail: item.directory
-                    ? "Tab 引用"
-                    : item.path === item.name
-                      ? ""
-                      : item.path,
+                  detail: path || "",
                   icon: item.directory
                     ? ("folder" as const)
                     : ("file" as const),
                   choose: () =>
-                    item.directory ? navigate(item.path) : attach(item),
+                    item.directory && browse !== null
+                      ? navigate(item.path)
+                      : attach(item),
                 }))
             : []),
         ];
@@ -853,6 +891,10 @@ export function Composer(props: Props) {
       return;
     const files = Array.from(event.clipboardData.files);
     const text = event.clipboardData.getData("text/plain");
+    const hasHtmlType = Array.from(event.clipboardData.types ?? []).includes(
+      "text/html",
+    );
+    const html = hasHtmlType ? event.clipboardData.getData("text/html") : "";
     const selection = inputSelection();
     if (!selection) return;
     let restoresCaret = false;
@@ -886,13 +928,26 @@ export function Composer(props: Props) {
           ? nativePaths
           : [];
       if (!valid()) return;
-      const longText = !paths.length && !files.length && isLongPaste(text);
+      const transformed =
+        !paths.length && !files.length
+          ? smartPasteTransform({
+              clipboardText: text,
+              clipboardHtml: html,
+              hasHtmlType,
+              currentValue: value,
+              selectionStart: selection.start,
+              selectionEnd: selection.end,
+            })
+          : null;
+      const effectiveText = transformed ?? text;
+      const longText =
+        !paths.length && !files.length && isLongPaste(effectiveText);
       if (!paths.length && !files.length && !longText) {
-        if (!text) throw new Error("剪贴板中没有可粘贴的文本或文件");
+        if (!effectiveText) throw new Error("剪贴板中没有可粘贴的文本或文件");
         if (latestValue.current !== value)
           throw new Error("输入内容已变化，请重新粘贴");
         restoresCaret = replaceTrigger(
-          text.replace(/\r\n?/g, "\n"),
+          effectiveText.replace(/\r\n?/g, "\n"),
           undefined,
           selection,
         );
@@ -900,7 +955,7 @@ export function Composer(props: Props) {
       }
       const items = longText
         ? [
-            new File([text], `粘贴文本-${Date.now()}.txt`, {
+            new File([effectiveText], `粘贴文本-${Date.now()}.txt`, {
               type: "text/plain",
             }),
           ]
@@ -1112,8 +1167,15 @@ export function Composer(props: Props) {
         const entry = entries.find(
           (item) => `entry:${item.path}` === option?.id,
         );
-        if (event.key === "Tab" && entry?.directory) attach(entry);
-        else option?.choose();
+        if (event.key === "Tab") {
+          if (entry?.directory) completeDirectory(entry);
+          else if (entry) attach(entry);
+          else option?.choose();
+        } else if (entry) {
+          attach(entry);
+        } else {
+          option?.choose();
+        }
         return;
       }
     }
@@ -1283,16 +1345,6 @@ export function Composer(props: Props) {
           className={`composer-menu${mode === "commands" ? " composer-command-menu" : ""}`}
           onKeyDown={keys}
         >
-          <div className="composer-menu-heading">
-            <span>{mode === "commands" ? "命令" : "引用工作区文件"}</span>
-            <span>
-              {mode === "commands"
-                ? agent === "claude"
-                  ? "Claude Code"
-                  : agent
-                : "↑↓ 选择 · Enter 确认 · Esc 关闭"}
-            </span>
-          </div>
           {external && mode === "files" ? (
             <div
               className="composer-external-path"
@@ -1313,7 +1365,7 @@ export function Composer(props: Props) {
               }}
             >
               <label className="composer-menu-search">
-                <Folder size={16} aria-hidden="true" />
+                <Folder size={14} aria-hidden="true" />
                 <input
                   autoFocus
                   aria-label="引用绝对路径"
@@ -1327,10 +1379,6 @@ export function Composer(props: Props) {
                   disabled={externalBusy}
                 />
               </label>
-              <p className="composer-menu-path">
-                {hostId === "local" ? "本机" : "当前远程主机"}上的绝对路径 · 由
-                Agent 按当前权限读取
-              </p>
               <button
                 disabled={externalBusy || !externalPath.trim() || !connected}
                 onClick={() => void addExternal()}
@@ -1341,11 +1389,11 @@ export function Composer(props: Props) {
           ) : (
             browse !== null && (
               <label className="composer-menu-search">
-                <Search size={16} aria-hidden="true" />
+                <Search size={14} aria-hidden="true" />
                 <input
                   autoFocus
                   aria-label="搜索当前目录"
-                  placeholder="搜索当前目录…"
+                  placeholder={path ? `筛选 ${path}…` : "搜索当前目录…"}
                   value={search}
                   onChange={(event) => setSearch(event.target.value)}
                   aria-controls={listId}
@@ -1355,11 +1403,6 @@ export function Composer(props: Props) {
                 />
               </label>
             )
-          )}
-          {mode === "files" && !external && (
-            <div className="composer-menu-path">
-              {path || "项目根目录"} · 引用路径，供 Agent 按需读取
-            </div>
           )}
           <div
             hidden={external && mode === "files"}
@@ -1376,7 +1419,19 @@ export function Composer(props: Props) {
                     ? FileText
                     : option.icon === "back"
                       ? ArrowLeft
-                      : null;
+                      : option.uiAction === "model"
+                        ? Cpu
+                        : option.uiAction === "effort"
+                          ? SlidersHorizontal
+                          : option.uiAction === "subagents"
+                            ? GitFork
+                            : option.uiAction === "side"
+                              ? MessageSquare
+                              : Terminal;
+              const folderEntry =
+                option.icon === "folder" && option.id.startsWith("entry:")
+                  ? entries.find((item) => `entry:${item.path}` === option.id)
+                  : undefined;
               return (
                 <div
                   key={option.id}
@@ -1384,7 +1439,7 @@ export function Composer(props: Props) {
                   title={
                     option.id.startsWith("entry:")
                       ? option.id.slice(6)
-                      : `${option.label} ${option.detail}`
+                      : `${option.label} ${option.detail}`.trim()
                   }
                   role="option"
                   aria-selected={i === index}
@@ -1393,26 +1448,26 @@ export function Composer(props: Props) {
                   onClick={option.choose}
                   className="composer-menu-option"
                 >
-                  {Icon && <Icon size={17} />}
-                  <span>
-                    {option.icon === "command" ? (
-                      <>
-                        <span className="composer-command-title">
-                          {option.label}
-                        </span>
-                        <span className="composer-command-id">
-                          /{option.id}
-                        </span>
-                      </>
-                    ) : (
-                      option.label
-                    )}
+                  <Icon size={14.5} strokeWidth={1.7} aria-hidden="true" />
+                  <span className="composer-menu-option-primary">
+                    {option.icon === "command" ? `/${option.id}` : option.label}
                   </span>
-                  <small>{option.detail}</small>
-                  {option.icon === "folder" &&
-                    option.id.startsWith("entry:") && (
-                      <ChevronRight size={15} />
-                    )}
+                  {option.detail && <small>{option.detail}</small>}
+                  {folderEntry && (
+                    <span
+                      className="composer-menu-folder-drill"
+                      aria-hidden="true"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        completeDirectory(folderEntry);
+                      }}
+                    >
+                      {i === index && (
+                        <span className="composer-menu-hint">Tab</span>
+                      )}
+                      <ChevronRight size={13.5} />
+                    </span>
+                  )}
                 </div>
               );
             })}
@@ -1457,14 +1512,14 @@ export function Composer(props: Props) {
                     disabled={externalBusy || !connected}
                     onClick={() => void addExternal(false)}
                   >
-                    <FileText size={16} />
+                    <FileText size={14.5} />
                     选择文件并引用…
                   </button>
                   <button
                     disabled={externalBusy || !connected}
                     onClick={() => void addExternal(true)}
                   >
-                    <Folder size={16} />
+                    <Folder size={14.5} />
                     选择文件夹并引用…
                   </button>
                 </>
@@ -1476,19 +1531,13 @@ export function Composer(props: Props) {
                   setExternalError("");
                 }}
               >
+                <Folder size={14.5} aria-hidden="true" />
                 {external
                   ? "返回项目目录"
                   : hostId === "local"
                     ? "引用本机路径…"
                     : "引用远程路径…"}
               </button>
-            </div>
-          )}
-          {mode === "commands" && (
-            <div className="composer-menu-footer">
-              <span>↑↓ 选择</span>
-              <span>↵ 补全</span>
-              <span>esc 关闭</span>
             </div>
           )}
         </div>
@@ -1499,7 +1548,7 @@ export function Composer(props: Props) {
           role="group"
           aria-label="已选择技能"
         >
-          <span title="Latte Work 内置的技能创建指引；发送需求后创建全局技能">
+          <span title="Continue 内置的技能创建指引；发送需求后创建全局技能">
             <Box size={16} />
             Skill Creator
             <button
@@ -1571,68 +1620,138 @@ export function Composer(props: Props) {
         )}
         {!concealSubmitted && props.context}
         {inlineMode ? (
-          <InlineReferenceInput
-            key={editorContext}
-            ref={inlineInput}
-            value={value}
-            references={inlineAttached}
-            label={props.inputLabel ?? "任务输入"}
-            disabled={disabled || sending || pasting}
-            autocomplete={autocomplete}
-            onEdit={(text, entries, caret) => {
-              if (!entries.length && caret) restoreCaret(caret.start);
-              if (text !== value) onChange(text);
-              const paths = new Map(
-                entries.map((entry) => [entry.path, entry]),
-              );
-              const next = attached
-                .map((entry) =>
-                  entry.attachmentKind ? entry : paths.get(entry.path),
+          richMode ? (
+            <ComposerRichInput
+              key={`${editorContext}:rich`}
+              ref={inlineInput}
+              value={value}
+              references={inlineAttached}
+              label={props.inputLabel ?? "任务输入"}
+              placeholder={placeholder}
+              disabled={disabled || sending || pasting}
+              autocomplete={autocomplete}
+              onEdit={(text, entries, caret) => {
+                if (caret && !hasRichComposerMarkdown(text))
+                  restoreCaret(caret.start, caret.afterPath);
+                if (text !== value) onChange(text);
+                const paths = new Map(
+                  entries.map((entry) => [entry.path, entry]),
+                );
+                const next = attached
+                  .map((entry) =>
+                    entry.attachmentKind ? entry : paths.get(entry.path),
+                  )
+                  .filter((entry): entry is ComposerReference => !!entry);
+                if (
+                  next.length !== attached.length ||
+                  next.some(
+                    (entry, index) =>
+                      entry.inlineOffset !== attached[index].inlineOffset,
+                  )
                 )
-                .filter((entry): entry is ComposerReference => !!entry);
-              if (
-                next.length !== attached.length ||
-                next.some(
-                  (entry, index) =>
-                    entry.inlineOffset !== attached[index].inlineOffset,
+                  setReferences({ scope, entries: next });
+                setNotice("");
+              }}
+              onPaste={(event) => void paste(event)}
+              onKeyDown={keys}
+              onInputState={(text, offset) => {
+                setBrowse(null);
+                setAddMenu(false);
+                setTrigger(
+                  composing.current ? null : composerTrigger(text, offset),
+                );
+              }}
+              onCompositionStart={() => {
+                composing.current = true;
+                setImeActive(true);
+                close();
+              }}
+              onCompositionEnd={(text, offset) => {
+                composing.current = false;
+                setImeActive(false);
+                if (!hasRichComposerMarkdown(text)) restoreCaret(offset);
+                setTrigger(composerTrigger(text, offset));
+              }}
+              renderImage={(entry) => (
+                <AttachmentImage
+                  reference={entry}
+                  variant="chip"
+                  hostId={hostId}
+                  projectId={projectId}
+                  projectPath={projectPath}
+                  sessionId={sessionId}
+                  connected={connected}
+                  active={!hidden}
+                  onOpen={close}
+                />
+              )}
+            />
+          ) : (
+            <InlineReferenceInput
+              key={editorContext}
+              ref={inlineInput}
+              value={value}
+              references={inlineAttached}
+              label={props.inputLabel ?? "任务输入"}
+              disabled={disabled || sending || pasting}
+              autocomplete={autocomplete}
+              onEdit={(text, entries, caret) => {
+                if (caret && (!entries.length || hasRichComposerMarkdown(text)))
+                  restoreCaret(caret.start, caret.afterPath);
+                if (text !== value) onChange(text);
+                const paths = new Map(
+                  entries.map((entry) => [entry.path, entry]),
+                );
+                const next = attached
+                  .map((entry) =>
+                    entry.attachmentKind ? entry : paths.get(entry.path),
+                  )
+                  .filter((entry): entry is ComposerReference => !!entry);
+                if (
+                  next.length !== attached.length ||
+                  next.some(
+                    (entry, index) =>
+                      entry.inlineOffset !== attached[index].inlineOffset,
+                  )
                 )
-              )
-                setReferences({ scope, entries: next });
-              setNotice("");
-            }}
-            onPaste={(event) => void paste(event)}
-            onKeyDown={keys}
-            onInputState={(text, offset) => {
-              setBrowse(null);
-              setAddMenu(false);
-              setTrigger(
-                composing.current ? null : composerTrigger(text, offset),
-              );
-            }}
-            onCompositionStart={() => {
-              composing.current = true;
-              setImeActive(true);
-              close();
-            }}
-            onCompositionEnd={(text, offset) => {
-              composing.current = false;
-              setImeActive(false);
-              setTrigger(composerTrigger(text, offset));
-            }}
-            renderImage={(entry) => (
-              <AttachmentImage
-                reference={entry}
-                variant="chip"
-                hostId={hostId}
-                projectId={projectId}
-                projectPath={projectPath}
-                sessionId={sessionId}
-                connected={connected}
-                active={!hidden}
-                onOpen={close}
-              />
-            )}
-          />
+                  setReferences({ scope, entries: next });
+                setNotice("");
+              }}
+              onPaste={(event) => void paste(event)}
+              onKeyDown={keys}
+              onInputState={(text, offset) => {
+                setBrowse(null);
+                setAddMenu(false);
+                setTrigger(
+                  composing.current ? null : composerTrigger(text, offset),
+                );
+              }}
+              onCompositionStart={() => {
+                composing.current = true;
+                setImeActive(true);
+                close();
+              }}
+              onCompositionEnd={(text, offset) => {
+                composing.current = false;
+                setImeActive(false);
+                if (hasRichComposerMarkdown(text)) restoreCaret(offset);
+                setTrigger(composerTrigger(text, offset));
+              }}
+              renderImage={(entry) => (
+                <AttachmentImage
+                  reference={entry}
+                  variant="chip"
+                  hostId={hostId}
+                  projectId={projectId}
+                  projectPath={projectPath}
+                  sessionId={sessionId}
+                  connected={connected}
+                  active={!hidden}
+                  onOpen={close}
+                />
+              )}
+            />
+          )
         ) : (
           <div className="composer-editor">
             {visiblePrediction && (
@@ -1665,17 +1784,19 @@ export function Composer(props: Props) {
               disabled={disabled || sending || pasting}
               onPaste={(event) => void paste(event)}
               onChange={(event) => {
-                onChange(event.target.value);
+                const nextValue = event.target.value;
+                const caretOffset = event.target.selectionStart;
+                if (!composing.current && hasRichComposerMarkdown(nextValue)) {
+                  restoreCaret(caretOffset);
+                }
+                onChange(nextValue);
                 setNotice("");
                 setBrowse(null);
                 setAddMenu(false);
                 setTrigger(
                   composing.current
                     ? null
-                    : composerTrigger(
-                        event.target.value,
-                        event.target.selectionStart,
-                      ),
+                    : composerTrigger(nextValue, caretOffset),
                 );
               }}
               onClick={(event) => {
@@ -1765,7 +1886,7 @@ export function Composer(props: Props) {
             setAddMenu(open);
           }}
         >
-          <Plus size={19} />
+          <Plus size={16} />
         </button>
         {toolbar(
           () => void submit(),

@@ -7,7 +7,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { ArrowUp, MessageSquareText, Pencil, Trash2, X } from "lucide-react";
-import { Modal } from "./Modal";
+import { isHiddenOrInert, Modal } from "./Modal";
 import { MessageContent } from "./MessageContent";
 import {
   annotationRange,
@@ -141,7 +141,7 @@ export function AnnotationEditor({
     const el = input.current;
     if (!el) return;
     el.style.height = "0px";
-    el.style.height = `${Math.min(Math.max(el.scrollHeight, 24), 120)}px`;
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, 28), 120)}px`;
   }, [comment]);
   function save() {
     const result = onSave({ ...entry, comment: comment.trim() });
@@ -202,7 +202,7 @@ export function AnnotationEditor({
                 close();
               }}
             >
-              <Trash2 size={15} />
+              <Trash2 size={14} />
             </button>
           )}
           <button
@@ -212,7 +212,7 @@ export function AnnotationEditor({
             title="提交注释（Enter）"
             onClick={save}
           >
-            <ArrowUp size={17} />
+            <ArrowUp size={16} strokeWidth={2} />
           </button>
         </div>
         {error && (
@@ -312,7 +312,7 @@ function AnnotationInlineEditor({
           disabled={disabled}
           onClick={save}
         >
-          <ArrowUp size={15} />
+          <ArrowUp size={14} strokeWidth={2} />
         </button>
       </div>
       {error && (
@@ -360,7 +360,7 @@ export function AnnotationSummary({
     setAnchor(null);
     setEditingId(null);
     queueMicrotask(() => {
-      if (trigger.current?.isConnected && !trigger.current.closest("[inert]"))
+      if (trigger.current?.isConnected && !isHiddenOrInert(trigger.current))
         trigger.current.focus();
     });
   };
@@ -413,7 +413,7 @@ export function AnnotationSummary({
             setAnchor(trigger.current!.getBoundingClientRect());
           }}
         >
-          <MessageSquareText size={14} />
+          <MessageSquareText size={13} />
           <span>{entries.length} 条注释</span>
         </button>
         {onClear && (
@@ -428,7 +428,7 @@ export function AnnotationSummary({
               queueMicrotask(() => onFocusComposer?.());
             }}
           >
-            <X size={11} strokeWidth={2.4} />
+            <X size={13} />
           </button>
         )}
       </div>
@@ -487,7 +487,7 @@ export function AnnotationSummary({
                           disabled={disabled}
                           onClick={() => setEditingId(entry.id)}
                         >
-                          <Pencil size={15} />
+                          <Pencil size={14} />
                         </button>
                       )}
                       {onRemove && (
@@ -499,7 +499,7 @@ export function AnnotationSummary({
                           disabled={disabled}
                           onClick={() => removeItem(entry.id)}
                         >
-                          <Trash2 size={15} />
+                          <Trash2 size={14} />
                         </button>
                       )}
                     </div>
@@ -721,7 +721,7 @@ export function AnnotatedMessage({
       if (
         document.activeElement === document.body &&
         body.current?.isConnected &&
-        !body.current.closest("[inert]")
+        !isHiddenOrInert(body.current)
       )
         body.current.focus({ preventScroll: true });
     });
@@ -820,7 +820,7 @@ export function AnnotatedMessage({
               ? origin.bottom
               : Infinity,
       };
-      const maxLeft = Math.max(0, container.clientWidth - 28);
+      const maxLeft = Math.max(0, container.clientWidth - 24);
       const occupied: { left: number; top: number }[] = [];
       const buildMark = (
         entry: Annotation,
@@ -852,17 +852,17 @@ export function AnnotatedMessage({
         const anchorRect = rects.at(-1)!;
         const markerLeft = Math.max(
           0,
-          Math.min(anchorRect.left + anchorRect.width - 8, maxLeft),
+          Math.min(anchorRect.left + anchorRect.width - 6, maxLeft),
         );
-        let markerTop = anchorRect.top - 22;
+        let markerTop = anchorRect.top - 18;
         while (
           occupied.some(
             (pos) =>
-              Math.abs(pos.left - markerLeft) < 30 &&
-              Math.abs(pos.top - markerTop) < 30,
+              Math.abs(pos.left - markerLeft) < 26 &&
+              Math.abs(pos.top - markerTop) < 26,
           )
         )
-          markerTop += 30;
+          markerTop += 26;
         occupied.push({ left: markerLeft, top: markerTop });
         return [
           {
@@ -1064,7 +1064,7 @@ export function AnnotatedMessage({
           <AnnotationEditor
             entry={selection.entry}
             anchor={selection.anchor}
-            gap={pendingEntry ? 34 : 10}
+            gap={pendingEntry ? 28 : 8}
             onSave={(entry) => {
               const error = onSave(entry);
               if (!error) clearSelection();
@@ -1088,12 +1088,12 @@ export function AnnotatedMessage({
                   8,
                   Math.min(
                     selection.anchor.left,
-                    window.innerWidth - (askInSideChat ? 292 : 120),
+                    window.innerWidth - (askInSideChat ? 268 : 112),
                   ),
                 ),
                 top: Math.max(
                   8,
-                  Math.min(selection.anchor.top - 44, window.innerHeight - 48),
+                  Math.min(selection.anchor.top - 42, window.innerHeight - 44),
                 ),
                 maxWidth: "calc(100vw - 16px)",
               }}
@@ -1122,7 +1122,7 @@ export function AnnotatedMessage({
               }}
             >
               <button role="menuitem" onClick={() => setEditing(true)}>
-                <MessageSquareText size={15} />
+                <MessageSquareText size={14} />
                 添加注释
               </button>
               {askInSideChat && (

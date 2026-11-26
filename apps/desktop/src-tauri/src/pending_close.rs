@@ -11,7 +11,6 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
-use tauri::Manager;
 
 #[derive(PartialEq, Serialize, Deserialize)]
 struct Intent {
@@ -39,11 +38,7 @@ struct Adoption {
 const LIMIT: u64 = 1024 * 1024;
 const RECOVERY_PAGE_LIMIT: usize = 128;
 fn directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    Ok(app
-        .path()
-        .app_config_dir()
-        .map_err(|e| e.to_string())?
-        .join("pending-resources"))
+    Ok(crate::app_config_dir(app)?.join("pending-resources"))
 }
 fn prepare_directory(directory: &Path) -> Result<(), String> {
     if directory

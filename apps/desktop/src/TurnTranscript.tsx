@@ -102,6 +102,11 @@ export function turnTranscript(events: Event[]) {
 
 export type TranscriptTurn = ReturnType<typeof turnTranscript>[number];
 
+export interface TurnRenderContext {
+  turn: TranscriptTurn;
+  isLatestTurn: boolean;
+}
+
 export function TurnTranscript({
   events,
   turns: suppliedTurns,
@@ -111,69 +116,75 @@ export function TurnTranscript({
   events: Event[];
   turns?: TranscriptTurn[];
   askInSideChat?: (quote: string) => void;
-  children: (item: ActivityItem) => ReactNode;
+  children: (item: ActivityItem, context: TurnRenderContext) => ReactNode;
 }) {
   const processMemory = useRef(new Map<string, boolean>());
   const turns = useMemo(
     () => suppliedTurns ?? turnTranscript(events),
     [events, suppliedTurns],
   );
-  return turns.map((turn) => (
-    <div
-      className="conversation-turn"
-      key={turn.key}
-      data-turn-key={turn.user ? turn.key : undefined}
-    >
-      {turn.user && !turn.user.hidden && (
-        <ImageGalleryItem id={turn.user.key}>
-          {children(turn.user)}
-        </ImageGalleryItem>
-      )}
-      {turn.stopped && turn.processCount !== 1 && (
-        <div className="turn-stop-summary" title="已执行的文件改动不会撤销。">
-          {turn.elapsed}
-        </div>
-      )}
-      {turn.segments.map((segment) =>
-        segment.process ? (
-          <ProcessDisclosure
-            key={`process:${segment.items[0].key}`}
-            identity={`${turn.key}:${segment.items[0].key}`}
-            memory={processMemory.current}
-          >
-            <ProcessSummary
-              label={turn.processCount > 1 ? "执行过程" : turn.elapsed}
-              title={turn.stopped ? "已执行的文件改动不会撤销。" : undefined}
-            />
-            {() => (
-              <div className="turn-process-content">
-                {segment.items.map((item) => (
-                  <ImageGalleryItem key={item.key} id={item.key}>
-                    {children(item)}
-                  </ImageGalleryItem>
-                ))}
-              </div>
-            )}
-          </ProcessDisclosure>
-        ) : (
-          <Fragment key={segment.items[0].key}>
-            {segment.items.map((item) => (
-              <ImageGalleryItem key={item.key} id={item.key}>
-                {children(item)}
-                {item.key === turn.finalKey && item.type === "assistant" && (
-                  <ReplyActions
-                    text={turn.finalText!}
-                    at={turn.finalAt}
-                    askInSideChat={askInSideChat}
-                  />
-                )}
-              </ImageGalleryItem>
-            ))}
-          </Fragment>
-        ),
-      )}
-    </div>
-  ));
+  return turns.map((turn, turnIndex) => {
+    const context: TurnRenderContext = {
+      turn,
+      isLatestTurn: turnIndex === turns.length - 1,
+    };
+    return (
+      <div
+        className="conversation-turn"
+        key={turn.key}
+        data-turn-key={turn.user ? turn.key : undefined}
+      >
+        {turn.user && !turn.user.hidden && (
+          <ImageGalleryItem id={turn.user.key}>
+            {children(turn.user, context)}
+          </ImageGalleryItem>
+        )}
+        {turn.stopped && turn.processCount !== 1 && (
+          <div className="turn-stop-summary" title="已执行的文件改动不会撤销。">
+            {turn.elapsed}
+          </div>
+        )}
+        {turn.segments.map((segment) =>
+          segment.process ? (
+            <ProcessDisclosure
+              key={`process:${segment.items[0].key}`}
+              identity={`${turn.key}:${segment.items[0].key}`}
+              memory={processMemory.current}
+            >
+              <ProcessSummary
+                label={turn.processCount > 1 ? "执行过程" : turn.elapsed}
+                title={turn.stopped ? "已执行的文件改动不会撤销。" : undefined}
+              />
+              {() => (
+                <div className="turn-process-content">
+                  {segment.items.map((item) => (
+                    <ImageGalleryItem key={item.key} id={item.key}>
+                      {children(item, context)}
+                    </ImageGalleryItem>
+                  ))}
+                </div>
+              )}
+            </ProcessDisclosure>
+          ) : (
+            <Fragment key={segment.items[0].key}>
+              {segment.items.map((item) => (
+                <ImageGalleryItem key={item.key} id={item.key}>
+                  {children(item, context)}
+                  {item.key === turn.finalKey && item.type === "assistant" && (
+                    <ReplyActions
+                      text={turn.finalText!}
+                      at={turn.finalAt}
+                      askInSideChat={askInSideChat}
+                    />
+                  )}
+                </ImageGalleryItem>
+              ))}
+            </Fragment>
+          ),
+        )}
+      </div>
+    );
+  });
 }
 
 export function ProcessSummary({

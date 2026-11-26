@@ -6,13 +6,13 @@ import {
   render,
   screen,
   waitFor,
-  within,
 } from "@testing-library/react";
 import { AgentSettings } from "./AgentSettings";
 import type { Workbench } from "./useWorkbench";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+
 beforeEach(() => {
   HTMLElement.prototype.scrollIntoView = vi.fn();
 });
@@ -20,6 +20,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
 });
+
 const host = {
   id: "env-devbox",
   name: "Env Devbox",
@@ -27,6 +28,7 @@ const host = {
   server_path: null,
 };
 const state = { host, hosts: [host] } as Workbench;
+
 function setup(supported = true) {
   let saved = { claude: { HTTPS_PROXY: "http://saved.test:7890" } };
   invoke.mockImplementation(async (command, args) => {
@@ -61,33 +63,44 @@ function setup(supported = true) {
     throw new Error("Unexpected native command");
   });
 }
-function saveButton(field: HTMLElement) {
-  return within(field.closest(".agent-card") as HTMLElement).getByRole(
-    "button",
-    { name: "保存环境变量" },
-  ) as HTMLButtonElement;
+
+function saveButton() {
+  return screen.getByRole("button", { name: "保存" }) as HTMLButtonElement;
 }
 
-it("loads host and Agent settings, saves literal ENV independently and restores after reopening", async () => {
+it("starts as a collapsed summary list, saves literal ENV via subview, and restores after reopening", async () => {
   setup();
   const onBusy = vi.fn();
   const view = render(<AgentSettings state={state} active onBusy={onBusy} />);
-  const field = (await screen.findByLabelText(
-    "Claude Code 环境变量",
-  )) as HTMLTextAreaElement;
-  expect(field.value).toBe("HTTPS_PROXY=http://saved.test:7890");
+
+  await screen.findByRole("button", {
+    name: "编辑 Claude Code",
+  });
+  expect(screen.queryByRole("textbox")).toBeNull();
+  expect(screen.getByText("ENV · 1")).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "编辑 Codex" }));
   expect(
     (screen.getByLabelText("Codex 环境变量") as HTMLTextAreaElement).value,
   ).toBe("");
-  expect(saveButton(field).disabled).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "连接与 Agent" }));
+
+  fireEvent.click(screen.getByRole("button", { name: "编辑 Claude Code" }));
+  const field = screen.getByLabelText(
+    "Claude Code 环境变量",
+  ) as HTMLTextAreaElement;
+  expect(field.value).toBe("HTTPS_PROXY=http://saved.test:7890");
+  expect(saveButton().disabled).toBe(true);
+
   fireEvent.change(field, {
     target: {
       value:
         "HTTP_PROXY=http://proxy:7890\nEMPTY=\nLITERAL=$(do-not-run)=value",
     },
   });
-  fireEvent.click(saveButton(field));
+  fireEvent.click(saveButton());
   await screen.findByText(/环境变量已保存；下次启动/);
+  expect(screen.getByText("ENV · 3")).toBeTruthy();
   expect(invoke).toHaveBeenCalledWith("save_agent_environment", {
     hostId: host.id,
     agent: "claude",
@@ -98,15 +111,19 @@ it("loads host and Agent settings, saves literal ENV independently and restores 
     },
   });
   expect(onBusy.mock.calls).toEqual([[true], [false]]);
-  expect(saveButton(field).disabled).toBe(true);
+
   view.rerender(<AgentSettings state={state} active={false} onBusy={onBusy} />);
   view.rerender(<AgentSettings state={state} active onBusy={onBusy} />);
+  fireEvent.click(
+    await screen.findByRole("button", { name: "编辑 Claude Code" }),
+  );
   await waitFor(() =>
     expect(
       (screen.getByLabelText("Claude Code 环境变量") as HTMLTextAreaElement)
         .value,
     ).toContain("HTTP_PROXY=http://proxy:7890"),
   );
+  expect(saveButton().disabled).toBe(true);
   expect(
     invoke.mock.calls.some(
       ([command]) =>
@@ -145,67 +162,79 @@ it("keeps Cursor ENV host-isolated and disables unsupported App Provider binding
       onBusy={() => {}}
     />,
   );
-  const field = (await screen.findByLabelText(
+  fireEvent.click(
+    await screen.findByRole("button", { name: "编辑 Cursor Agent" }),
+  );
+  const field = screen.getByLabelText(
     "Cursor Agent 环境变量",
-  )) as HTMLTextAreaElement;
-  const card = within(field.closest(".agent-card") as HTMLElement);
+  ) as HTMLTextAreaElement;
   expect(
     (
-      card.getByRole("combobox", {
+      screen.getByRole("combobox", {
         name: "Cursor Agent 关联 Provider",
       }) as HTMLButtonElement
     ).disabled,
   ).toBe(true);
-  expect(card.getByText(/暂不支持 App Provider 关联/)).toBeTruthy();
-  expect(
-    (card.getByRole("button", { name: "保存关联" }) as HTMLButtonElement)
-      .disabled,
-  ).toBe(true);
+  expect(screen.getByText(/暂不支持 App Provider 关联/)).toBeTruthy();
+  expect(saveButton().disabled).toBe(true);
+
   fireEvent.change(field, { target: { value: "CURSOR_ENV=local-value" } });
-  fireEvent.click(saveButton(field));
+  fireEvent.click(saveButton());
   await screen.findByText(/环境变量已保存；下次启动/);
   expect(invoke).toHaveBeenCalledWith("save_agent_environment", {
     hostId: host.id,
     agent: "cursor",
     environment: { CURSOR_ENV: "local-value" },
   });
+
+  fireEvent.click(screen.getByRole("button", { name: "编辑 Claude Code" }));
   expect(
     (screen.getByLabelText("Claude Code 环境变量") as HTMLTextAreaElement)
       .value,
   ).toBe("HTTPS_PROXY=http://saved.test:7890");
+  fireEvent.click(screen.getByRole("button", { name: "连接与 Agent" }));
+
   fireEvent.click(screen.getByRole("combobox", { name: "运行主机" }));
   fireEvent.click(screen.getByRole("option", { name: other.name }));
-  await waitFor(() =>
-    expect(
-      (screen.getByLabelText("Cursor Agent 环境变量") as HTMLTextAreaElement)
-        .value,
-    ).toBe(""),
+  fireEvent.click(
+    await screen.findByRole("button", { name: "编辑 Cursor Agent" }),
   );
+  expect(
+    (screen.getByLabelText("Cursor Agent 环境变量") as HTMLTextAreaElement)
+      .value,
+  ).toBe("");
+  fireEvent.click(screen.getByRole("button", { name: "连接与 Agent" }));
+
   fireEvent.click(screen.getByRole("combobox", { name: "运行主机" }));
   fireEvent.click(screen.getByRole("option", { name: host.name }));
-  await waitFor(() =>
-    expect(
-      (screen.getByLabelText("Cursor Agent 环境变量") as HTMLTextAreaElement)
-        .value,
-    ).toBe("CURSOR_ENV=local-value"),
+  fireEvent.click(
+    await screen.findByRole("button", { name: "编辑 Cursor Agent" }),
   );
+  expect(
+    (screen.getByLabelText("Cursor Agent 环境变量") as HTMLTextAreaElement)
+      .value,
+  ).toBe("CURSOR_ENV=local-value");
   expect(
     invoke.mock.calls.some(([command]) => command === "bind_agent_provider"),
   ).toBe(false);
 });
 
-it("rejects invalid ENV and retains edits after a save failure", async () => {
+it("rejects invalid ENV, retains edits after a save failure, and discards draft on Cancel", async () => {
   setup();
   render(<AgentSettings state={state} active onBusy={() => {}} />);
-  const field = (await screen.findByLabelText(
+  fireEvent.click(
+    await screen.findByRole("button", { name: "编辑 Claude Code" }),
+  );
+  const field = screen.getByLabelText(
     "Claude Code 环境变量",
-  )) as HTMLTextAreaElement;
+  ) as HTMLTextAreaElement;
   fireEvent.change(field, {
     target: { value: "TOKEN=private-value\nTOKEN=another" },
   });
   expect(screen.getByRole("alert").textContent).toContain("变量名重复");
   expect(screen.getByRole("alert").textContent).not.toContain("private-value");
-  expect(saveButton(field).disabled).toBe(true);
+  expect(saveButton().disabled).toBe(true);
+
   fireEvent.change(field, {
     target: { value: "HTTP_PROXY=http://retry.test:7890" },
   });
@@ -215,21 +244,33 @@ it("rejects invalid ENV and retains edits after a save failure", async () => {
       ? Promise.reject(new Error("无法保存配置"))
       : original(command, args),
   );
-  fireEvent.click(saveButton(field));
+  fireEvent.click(saveButton());
   await screen.findByText("无法保存配置");
   expect(field.value).toBe("HTTP_PROXY=http://retry.test:7890");
-  expect(saveButton(field).disabled).toBe(false);
+  expect(saveButton().disabled).toBe(false);
+
+  // Clicking Cancel discards the unsaved draft and returns to the list.
+  fireEvent.click(screen.getByRole("button", { name: "取消" }));
+  expect(screen.queryByText("未保存修改")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "编辑 Claude Code" }));
+  expect(
+    (screen.getByLabelText("Claude Code 环境变量") as HTMLTextAreaElement)
+      .value,
+  ).toBe("HTTPS_PROXY=http://saved.test:7890");
 });
 
 it("disables ENV editing on an older Server and explains the required update", async () => {
   setup(false);
   render(<AgentSettings state={state} active onBusy={() => {}} />);
-  const field = (await screen.findByLabelText(
+  fireEvent.click(
+    await screen.findByRole("button", { name: "编辑 Claude Code" }),
+  );
+  const field = screen.getByLabelText(
     "Claude Code 环境变量",
-  )) as HTMLTextAreaElement;
+  ) as HTMLTextAreaElement;
   expect(field.disabled).toBe(true);
-  expect(saveButton(field).disabled).toBe(true);
-  expect(screen.getAllByText(/需要更新 Server 并重新连接/)).toHaveLength(2);
+  expect(saveButton().disabled).toBe(true);
+  expect(screen.getByText(/需要更新 Server 并重新连接/)).toBeTruthy();
 });
 
 it("keeps hosts isolated when switching the settings target", async () => {
@@ -242,29 +283,41 @@ it("keeps hosts isolated when switching the settings target", async () => {
       onBusy={() => {}}
     />,
   );
-  const field = (await screen.findByLabelText(
-    "Claude Code 环境变量",
-  )) as HTMLTextAreaElement;
-  fireEvent.change(field, { target: { value: "TOKEN=unsaved-private-value" } });
+  fireEvent.click(
+    await screen.findByRole("button", { name: "编辑 Claude Code" }),
+  );
+  fireEvent.change(screen.getByLabelText("Claude Code 环境变量"), {
+    target: { value: "TOKEN=unsaved-private-value" },
+  });
+  fireEvent.keyDown(screen.getByLabelText("Claude Code 环境变量"), {
+    key: "Escape",
+  });
+  expect(screen.getByText("未保存修改")).toBeTruthy();
+
   fireEvent.click(screen.getByRole("combobox", { name: "运行主机" }));
   fireEvent.click(screen.getByRole("option", { name: "Other Host" }));
-  await waitFor(() =>
-    expect(
-      (screen.getByLabelText("Claude Code 环境变量") as HTMLTextAreaElement)
-        .value,
-    ).toBe(""),
+  fireEvent.click(
+    await screen.findByRole("button", { name: "编辑 Claude Code" }),
   );
+  expect(
+    (screen.getByLabelText("Claude Code 环境变量") as HTMLTextAreaElement)
+      .value,
+  ).toBe("");
   expect(invoke).toHaveBeenCalledWith("agent_environments", {
     hostId: other.id,
   });
+  fireEvent.click(screen.getByRole("button", { name: "连接与 Agent" }));
+
   fireEvent.click(screen.getByRole("combobox", { name: "运行主机" }));
   fireEvent.click(screen.getByRole("option", { name: host.name }));
-  await waitFor(() =>
-    expect(
-      (screen.getByLabelText("Claude Code 环境变量") as HTMLTextAreaElement)
-        .value,
-    ).toBe("TOKEN=unsaved-private-value"),
-  );
+  expect(await screen.findByText("未保存修改")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "编辑 Claude Code" }));
+  expect(
+    (screen.getByLabelText("Claude Code 环境变量") as HTMLTextAreaElement)
+      .value,
+  ).toBe("TOKEN=unsaved-private-value");
+  fireEvent.click(screen.getByRole("button", { name: "连接与 Agent" }));
+  fireEvent.click(screen.getByRole("button", { name: "编辑 Codex" }));
   expect(
     (screen.getByLabelText("Codex 环境变量") as HTMLTextAreaElement).value,
   ).toBe("");
@@ -279,27 +332,44 @@ it.each(["", "TOKEN=first\nTOKEN=invalid-draft"])(
     setup();
     const onBusy = vi.fn();
     const view = render(<AgentSettings state={state} active onBusy={onBusy} />);
-    fireEvent.change(await screen.findByLabelText("Claude Code 环境变量"), {
+    fireEvent.click(
+      await screen.findByRole("button", { name: "编辑 Claude Code" }),
+    );
+    fireEvent.change(screen.getByLabelText("Claude Code 环境变量"), {
       target: { value: draft },
     });
+    fireEvent.click(screen.getByRole("button", { name: "连接与 Agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "编辑 Codex" }));
     fireEvent.change(screen.getByLabelText("Codex 环境变量"), {
       target: { value: "CODEX_TOKEN=independent-unsaved-value" },
     });
+    fireEvent.click(screen.getByRole("button", { name: "连接与 Agent" }));
+
     view.rerender(
       <AgentSettings state={state} active={false} onBusy={onBusy} />,
     );
     view.rerender(<AgentSettings state={state} active onBusy={onBusy} />);
-    const reopened = (await screen.findByLabelText(
+    fireEvent.click(
+      await screen.findByRole("button", { name: "编辑 Claude Code" }),
+    );
+    const reopened = screen.getByLabelText(
       "Claude Code 环境变量",
-    )) as HTMLTextAreaElement;
+    ) as HTMLTextAreaElement;
     await waitFor(() => expect(reopened.disabled).toBe(false));
     expect(reopened.value).toBe(draft);
+    fireEvent.click(screen.getByRole("button", { name: "连接与 Agent" }));
+
     fireEvent.click(screen.getByRole("button", { name: "重新连接" }));
-    const reconnected = (await screen.findByLabelText(
+    fireEvent.click(
+      await screen.findByRole("button", { name: "编辑 Claude Code" }),
+    );
+    const reconnected = screen.getByLabelText(
       "Claude Code 环境变量",
-    )) as HTMLTextAreaElement;
+    ) as HTMLTextAreaElement;
     await waitFor(() => expect(reconnected.disabled).toBe(false));
     expect(reconnected.value).toBe(draft);
+    fireEvent.click(screen.getByRole("button", { name: "连接与 Agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "编辑 Codex" }));
     expect(
       (screen.getByLabelText("Codex 环境变量") as HTMLTextAreaElement).value,
     ).toBe("CODEX_TOKEN=independent-unsaved-value");
@@ -314,7 +384,7 @@ it.each(["", "TOKEN=first\nTOKEN=invalid-draft"])(
 it("refreshes clean ENV while retaining dirty input against the latest saved baseline", async () => {
   setup();
   render(<AgentSettings state={state} active onBusy={() => {}} />);
-  await screen.findByLabelText("Claude Code 环境变量");
+  await screen.findByRole("button", { name: "编辑 Claude Code" });
   const original = invoke.getMockImplementation()!;
   let saved = { HTTPS_PROXY: "http://external.test:7890" };
   invoke.mockImplementation((command, args) =>
@@ -323,20 +393,26 @@ it("refreshes clean ENV while retaining dirty input against the latest saved bas
       : original(command, args),
   );
   fireEvent.click(screen.getByRole("button", { name: "重新连接" }));
-  let field = (await screen.findByLabelText(
+  fireEvent.click(
+    await screen.findByRole("button", { name: "编辑 Claude Code" }),
+  );
+  let field = screen.getByLabelText(
     "Claude Code 环境变量",
-  )) as HTMLTextAreaElement;
+  ) as HTMLTextAreaElement;
   await waitFor(() =>
     expect(field.value).toBe("HTTPS_PROXY=http://external.test:7890"),
   );
-  expect(saveButton(field).disabled).toBe(true);
+  expect(saveButton().disabled).toBe(true);
   fireEvent.change(field, { target: { value: "TOKEN=keep-this-draft" } });
+  fireEvent.click(screen.getByRole("button", { name: "连接与 Agent" }));
+
   saved = { HTTPS_PROXY: "http://newer.test:7890" };
   fireEvent.click(screen.getByRole("button", { name: "重新连接" }));
-  field = (await screen.findByLabelText(
-    "Claude Code 环境变量",
-  )) as HTMLTextAreaElement;
+  fireEvent.click(
+    await screen.findByRole("button", { name: "编辑 Claude Code" }),
+  );
+  field = screen.getByLabelText("Claude Code 环境变量") as HTMLTextAreaElement;
   await waitFor(() => expect(field.disabled).toBe(false));
   expect(field.value).toBe("TOKEN=keep-this-draft");
-  expect(saveButton(field).disabled).toBe(false);
+  expect(saveButton().disabled).toBe(false);
 });

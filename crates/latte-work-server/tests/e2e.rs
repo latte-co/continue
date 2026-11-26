@@ -50,7 +50,7 @@ impl Host {
         fixture_bridge::prepare(
             directory.path(),
             env,
-            Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+            Path::new(env!("CARGO_BIN_EXE_latte-continue-server")),
         );
         let process = Self::spawn(directory.path(), env);
         let host = Self { directory, process };
@@ -66,7 +66,7 @@ impl Host {
         removed: &[&str],
     ) -> Child {
         Self::spawn_binary(
-            Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+            Path::new(env!("CARGO_BIN_EXE_latte-continue-server")),
             directory,
             env,
             removed,
@@ -125,7 +125,7 @@ impl Host {
         let bridge = fixture_bridge::prepare(
             self.directory.path(),
             &[],
-            Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+            Path::new(env!("CARGO_BIN_EXE_latte-continue-server")),
         );
         Client::local(&bridge, Some(self.directory.path()))
             .await
@@ -400,7 +400,7 @@ async fn singleton_multi_client_reconnect_approval_dedup_and_resume() {
         hello(ask(&mut a, Request::Hello { version: VERSION }).await),
         hello(ask(&mut b, Request::Hello { version: VERSION }).await)
     );
-    let status = Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+    let status = Command::new(env!("CARGO_BIN_EXE_latte-continue-server"))
         .args(["serve", "--state-dir"])
         .arg(host.directory.path())
         .stdout(Stdio::null())
@@ -804,7 +804,7 @@ async fn provider_catalog_local_binding_and_remote_sync_use_host_protocol() {
     let remote = Host::start().await;
     let ssh_dir = tempfile::tempdir().unwrap();
     let ssh = ssh_dir.path().join("ssh");
-    let bin = serde_json::to_string(env!("CARGO_BIN_EXE_latte-work-server")).unwrap();
+    let bin = serde_json::to_string(env!("CARGO_BIN_EXE_latte-continue-server")).unwrap();
     let state = serde_json::to_string(&remote.directory.path().to_string_lossy()).unwrap();
     std::fs::write(&ssh,format!("#!/usr/bin/env python3\nimport os,sys\nif 'offline-fixture' in sys.argv: sys.exit(1)\nos.execv({bin},[{bin},'connect','--state-dir',{state}])\n")).unwrap();
     std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -812,7 +812,7 @@ async fn provider_catalog_local_binding_and_remote_sync_use_host_protocol() {
         .prefix("lw-")
         .tempdir_in("/tmp")
         .unwrap();
-    let process = Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+    let process = Command::new(env!("CARGO_BIN_EXE_latte-continue-server"))
         .args(["serve", "--state-dir"])
         .arg(directory.path())
         .env(
@@ -874,7 +874,7 @@ async fn provider_catalog_local_binding_and_remote_sync_use_host_protocol() {
     );
     let target = Some(ProviderTarget {
         ssh: "fixture-host".into(),
-        server_path: env!("CARGO_BIN_EXE_latte-work-server").into(),
+        server_path: env!("CARGO_BIN_EXE_latte-continue-server").into(),
     });
     let result = ask(
         &mut c,
@@ -2848,7 +2848,7 @@ async fn terminal_daemon_shutdown_cleans_up_and_restart_never_replays() {
         "PTY shell survived daemon shutdown"
     );
     drop(client);
-    host.process = Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+    host.process = Command::new(env!("CARGO_BIN_EXE_latte-continue-server"))
         .env("LATTE_WORK_AGENT_ENV", "inherit")
         .arg("serve")
         .arg("--state-dir")
@@ -3048,7 +3048,7 @@ async fn upgrade_local_coordinator_replaces_idle_build_once_for_concurrent_clien
     let bridge = fixture_bridge::prepare(
         &dir,
         &[],
-        Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+        Path::new(env!("CARGO_BIN_EXE_latte-continue-server")),
     );
     // Prepare once before concurrent clients, keeping every CLI deterministic on upgrade.
     async fn connect(binary: &Path, dir: &Path) -> (tokio::process::Child, serde_json::Value) {
@@ -3126,7 +3126,7 @@ async fn upgrade_legacy_daemon_returns_actionable_error_without_stopping_it() {
         listener
     });
     let result = Client::local(
-        Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+        Path::new(env!("CARGO_BIN_EXE_latte-continue-server")),
         Some(directory.path()),
     )
     .await;
@@ -3196,7 +3196,7 @@ async fn upgrade_busy_daemon_defers_replacement_and_still_requires_compatible_he
             }
         });
         let result = Client::local(
-            Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+            Path::new(env!("CARGO_BIN_EXE_latte-continue-server")),
             Some(directory.path()),
         )
         .await;
@@ -3282,7 +3282,7 @@ async fn quit_and_reconnect_keep_live_conversations_isolated_from_slow_or_unknow
     }
 
     let mut cleanup = Client::local_cleanup(
-        Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+        Path::new(env!("CARGO_BIN_EXE_latte-continue-server")),
         Some(host.directory.path()),
     )
     .await
@@ -3302,7 +3302,7 @@ async fn quit_and_reconnect_keep_live_conversations_isolated_from_slow_or_unknow
     }
     let mut another = tokio::time::timeout(Duration::from_millis(600), async {
         let mut client = Client::local_cleanup(
-            Path::new(env!("CARGO_BIN_EXE_latte-work-server")),
+            Path::new(env!("CARGO_BIN_EXE_latte-continue-server")),
             Some(host.directory.path()),
         )
         .await
@@ -3350,7 +3350,7 @@ async fn quit_and_reconnect_keep_live_conversations_isolated_from_slow_or_unknow
 #[tokio::test]
 async fn busy_server_with_one_pending_close_releases_other_owned_processes() {
     use latte_work_protocol::lifecycle::Resource;
-    let current = Path::new(env!("CARGO_BIN_EXE_latte-work-server"));
+    let current = Path::new(env!("CARGO_BIN_EXE_latte-continue-server"));
     let baseline = std::env::var_os("LATTE_WORK_TEST_LEGACY_SERVER").map(PathBuf::from);
     let binary = baseline.as_deref().unwrap_or(current);
     let directory = tempfile::Builder::new()
@@ -4763,7 +4763,7 @@ printf '%s' "$LATTE_TEST_VALUE"
     std::fs::write(
         &shell,
         format!(
-            "#!/bin/sh\nexport PATH='{}'\nexport LATTE_TEST_VALUE='shell-loaded'\necho startup-banner\nexec /bin/sh -c \"$2\"\n",
+            "#!/bin/sh\nexport PATH='{}'\nexport LATTE_TEST_VALUE='shell-loaded'\necho startup-banner\nwhile [ \"$#\" -gt 1 ]; do shift; done\nexec /bin/sh -c \"$1\"\n",
             shell_path.to_str().unwrap()
         ),
     )
@@ -7010,7 +7010,7 @@ async fn external_preview_scopes_are_canonical_project_scoped_and_revocable_afte
         assert!(Instant::now() < deadline, "server did not shut down");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    host.process = Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+    host.process = Command::new(env!("CARGO_BIN_EXE_latte-continue-server"))
         .arg("serve")
         .arg("--state-dir")
         .arg(host.directory.path())
@@ -7516,7 +7516,7 @@ async fn message_queue_stop_pauses_and_restart_requires_explicit_resume_without_
     drop(c);
     host.process.kill().unwrap();
     host.process.wait().unwrap();
-    host.process = Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+    host.process = Command::new(env!("CARGO_BIN_EXE_latte-continue-server"))
         .arg("serve")
         .arg("--state-dir")
         .arg(host.directory.path())
@@ -7829,7 +7829,7 @@ async fn message_queue_reorder_is_atomic_durable_and_controls_actual_execution()
     drop(c);
     host.process.kill().unwrap();
     host.process.wait().unwrap();
-    host.process = Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+    host.process = Command::new(env!("CARGO_BIN_EXE_latte-continue-server"))
         .arg("serve")
         .arg("--state-dir")
         .arg(host.directory.path())
@@ -10160,4 +10160,63 @@ async fn update_project_directory_guards_terminals_and_preserves_claude_resume_f
         transcript_text.contains("Updated In B"),
         "expected stale dir_a transcript to be overwritten with fresher dir_b history, got:\n{transcript_text}"
     );
+}
+
+#[tokio::test]
+async fn default_state_dir_uses_latte_continue_data_under_home() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::Builder::new()
+        .prefix("lw-home-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let project_dir = home.path().join("my-local-repo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let data_dir = home.path().join(".latte/continue/data");
+    let mut server_proc = Command::new(env!("CARGO_BIN_EXE_latte-continue-server"))
+        .arg("serve")
+        .env("HOME", home.path())
+        .env("LATTE_WORK_AGENT_ENV", "inherit")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !data_dir.join("control.sock").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "latte-continue-server readiness timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    for dir in [home.path().join(".latte/continue"), data_dir.clone()] {
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    let bridge = fixture_bridge::prepare(
+        &data_dir,
+        &[("HOME", home.path().as_os_str())],
+        Path::new(env!("CARGO_BIN_EXE_latte-continue-server")),
+    );
+    let mut client = Client::local(&bridge, Some(&data_dir)).await.unwrap();
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::AddProject {
+                path: project_dir.to_string_lossy().into_owned(),
+                name: Some("Clean Spec Project".into()),
+            },
+        )
+        .await,
+        Response::Project { .. }
+    ));
+    assert!(data_dir.join("state.sqlite").is_file());
+    drop(client);
+    let _ = server_proc.kill();
+    let _ = server_proc.wait();
 }

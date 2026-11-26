@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { message } from "./api";
 import { useStatusSnapshot, type StatusNotice } from "./statusNotices";
+import { Button, IconButton } from "./ui";
 
 const icons = {
   error: CircleAlert,
@@ -136,16 +137,16 @@ export function StatusCenter({
           >
             <header>
               <strong>状态提示</strong>
-              <button
-                className="icon-button"
-                aria-label="关闭状态提示"
+              <IconButton
+                size="xs"
+                label="关闭状态提示"
                 onClick={() => {
                   setOpen(false);
                   trigger.current?.focus();
                 }}
               >
                 <X size={14} />
-              </button>
+              </IconButton>
             </header>
             {total === 0 && (
               <p className="status-center-empty">当前没有状态提示</p>
@@ -156,20 +157,21 @@ export function StatusCenter({
                 return (
                   <li key={notice.id} data-level={notice.level}>
                     <div className="status-center-title">
-                      <Icon size={16} aria-label={labels[notice.level]} />
+                      <Icon size={15} aria-label={labels[notice.level]} />
                       <strong>{notice.title}</strong>
                     </div>
                     <p>{notice.detail}</p>
                     {notice.action && (
-                      <button
-                        className="text-button"
+                      <Button
+                        variant="subtle"
+                        size="xs"
                         disabled={!!busy || notice.pending}
                         onClick={() => void act(notice)}
                       >
                         {busy === notice.id || notice.pending
                           ? "处理中…"
                           : notice.action.label}
-                      </button>
+                      </Button>
                     )}
                   </li>
                 );

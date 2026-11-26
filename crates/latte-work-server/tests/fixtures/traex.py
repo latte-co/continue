@@ -80,7 +80,7 @@ for line in sys.stdin:
                       'sandbox': {'type': sandbox}, 'approvalPolicy': approval})
     elif method in ('thread/start', 'thread/resume'):
         if 'developerInstructions' in params:
-            assert params['developerInstructions'].startswith('FIXTURE_NATIVE_DEVELOPER_INSTRUCTIONS\n\nLatte Work'), params['developerInstructions']
+            assert params['developerInstructions'].startswith('FIXTURE_NATIVE_DEVELOPER_INSTRUCTIONS\n\nContinue'), params['developerInstructions']
         if method == 'thread/resume':
             assert params['threadId'] == thread
             if not pathlib.Path('traex-inputs').exists():

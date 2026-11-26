@@ -1123,7 +1123,7 @@ async fn traex_queue_metadata_survives_restart_without_an_installed_cli() {
         assert!(Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    host.process = Command::new(env!("CARGO_BIN_EXE_latte-work-server"))
+    host.process = Command::new(env!("CARGO_BIN_EXE_latte-continue-server"))
         .args(["serve", "--state-dir"])
         .arg(host.directory.path())
         .env("LATTE_WORK_AGENT_ENV", "inherit")
@@ -1543,7 +1543,7 @@ async fn traex_platform_instructions_preserve_native_text_on_start_resume_and_di
     assert!(opens.iter().any(|v| v["method"] == "thread/resume"));
     for open in &opens {
         let instructions = open["params"]["developerInstructions"].as_str().unwrap();
-        assert!(instructions.starts_with("FIXTURE_NATIVE_DEVELOPER_INSTRUCTIONS\n\nLatte Work"));
+        assert!(instructions.starts_with("FIXTURE_NATIVE_DEVELOPER_INSTRUCTIONS\n\nContinue"));
         assert!(!instructions.contains("description:"));
     }
     assert!(matches!(

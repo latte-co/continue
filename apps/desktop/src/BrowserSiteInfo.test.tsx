@@ -9,6 +9,7 @@ import {
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { renderWithStatus as render } from "./test/renderWithStatus";
 import { BrowserSiteInfo } from "./BrowserSiteInfo";
+import { SshPasswordDialog } from "./SshPasswordDialog";
 const invoke = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 const props = {
@@ -137,12 +138,23 @@ it("only clears the displayed site records after confirmation, and prevents doub
   );
   await openData();
   fireEvent.click(await screen.findByRole("button", { name: "清除网站数据…" }));
-  expect(screen.getByRole("dialog", { name: "清除网站数据" })).toBeTruthy();
+  const confirmDialog = screen.getByRole("dialog", { name: "清除网站数据" });
+  const siteInfoPanel =
+    document.querySelector<HTMLElement>(".browser-site-info")!;
+  const confirmBackdrop = confirmDialog.closest<HTMLElement>(
+    ".browser-site-confirm-backdrop",
+  )!;
+  expect(Number(confirmBackdrop.style.zIndex)).toBeGreaterThan(
+    Number(siteInfoPanel.style.zIndex),
+  );
+  expect(siteInfoPanel.inert).toBe(true);
+  expect(confirmDialog.contains(document.activeElement)).toBe(true);
   expect(invoke).not.toHaveBeenCalledWith(
     "browser_site_data",
     expect.objectContaining({ token: "one-use" }),
   );
   fireEvent.click(screen.getByRole("button", { name: "取消" }));
+  expect(siteInfoPanel.inert).toBe(false);
   expect(screen.getByRole("dialog", { name: "站点信息" })).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "清除网站数据…" }));
   const confirm = screen.getByRole("button", { name: "清除并刷新" });
@@ -197,4 +209,60 @@ it("ignores stale data responses and never offers a clear action for an empty st
   await act(async () => finish({ ...siteData, domains: [], types: [] }));
   expect(screen.getByText("此站点暂未保存网站数据")).toBeTruthy();
   expect(screen.queryByRole("button", { name: "清除网站数据…" })).toBeNull();
+});
+
+it("yields Tab and Escape to an async foreground SSH password modal while suspended", async () => {
+  function Harness() {
+    const [askPassword, setAskPassword] = useState(false);
+    return (
+      <>
+        <BrowserSiteInfo {...props} />
+        <button type="button" onClick={() => setAskPassword(true)}>
+          触发密码框
+        </button>
+        {askPassword && (
+          <SshPasswordDialog
+            host={{
+              id: "devbox",
+              name: "Devbox",
+              ssh: "dev@example.com",
+              server_path: null,
+            }}
+            submit={async () => {}}
+            cancel={() => setAskPassword(false)}
+          />
+        )}
+      </>
+    );
+  }
+  const { useState } = await import("react");
+  render(<Harness />);
+  const trigger = screen.getByRole("button", { name: "站点信息" });
+  fireEvent.click(trigger);
+  await screen.findByText("连接是安全的");
+
+  fireEvent.click(screen.getByRole("button", { name: "触发密码框" }));
+  const sshDialog = screen.getByRole("dialog", { name: "连接 Devbox" });
+  const siteInfoPanel =
+    document.querySelector<HTMLElement>(".browser-site-info")!;
+  expect(siteInfoPanel.inert).toBe(true);
+
+  const visited = new Set<Element | null>();
+  for (let i = 0; i < 4; i++) {
+    fireEvent.keyDown(document.activeElement!, { key: "Tab" });
+    visited.add(document.activeElement);
+  }
+  expect(visited.size).toBeGreaterThanOrEqual(3);
+  expect(sshDialog.contains(document.activeElement)).toBe(true);
+
+  // First Escape closes only the foreground SSH password modal, keeping BrowserSiteInfo open
+  fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+  expect(screen.queryByRole("dialog", { name: "连接 Devbox" })).toBeNull();
+  expect(screen.getByRole("dialog", { name: "站点信息" })).toBeTruthy();
+  expect(siteInfoPanel.inert).toBe(false);
+
+  // Second Escape closes BrowserSiteInfo and restores focus to its trigger
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(screen.queryByRole("dialog", { name: "站点信息" })).toBeNull();
+  expect(document.activeElement).toBe(trigger);
 });

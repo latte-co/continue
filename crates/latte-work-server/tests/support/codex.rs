@@ -241,7 +241,7 @@ async fn codex_catalog_prompt_free_open_stream_resume_and_reconnect_preserve_ide
     assert_eq!(inputs.lines().count(), 2);
     let opens = std::fs::read_to_string(root.path().join("codex-opens")).unwrap();
     assert!(opens.contains("thread/resume"));
-    assert!(opens.contains("NATIVE_CODEX_INSTRUCTIONS\\n\\nLatte Work"));
+    assert!(opens.contains("NATIVE_CODEX_INSTRUCTIONS\\n\\nContinue"));
 }
 
 #[tokio::test]

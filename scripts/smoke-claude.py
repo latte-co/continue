@@ -12,7 +12,7 @@ import tempfile
 import time
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--binary', default='target/debug/latte-work-server')
+parser.add_argument('--binary', default='target/debug/latte-continue-server')
 parser.add_argument('--approval', action='store_true')
 args = parser.parse_args()
 binary = str(Path(args.binary).resolve())

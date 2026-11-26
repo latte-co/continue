@@ -15,7 +15,9 @@ import {
   applyAppearance,
   contrastRatio,
   defaultAppearance,
+  minimumThemeContrast,
   parseAppearance,
+  presets,
   readAppearance,
   resolveTheme,
   saveAppearance,
@@ -383,4 +385,134 @@ it("uses the modern clipboard fallback and reports failure without claiming a su
   expect(screen.getByRole("alert").textContent).toContain("无法写入剪贴板");
   expect(screen.queryByText(/已复制完整主题 JSON/)).toBeNull();
   expect(document.querySelector("textarea:not([readonly])")).toBeNull();
+});
+
+it("checks contrast across elevated/card surfaces and boosts derived text when foreground barely clears canvas", () => {
+  for (const kind of ["light", "dark"] as const) {
+    for (const preset of Object.values(presets[kind])) {
+      expect(
+        minimumThemeContrast({
+          ...defaultAppearance()[kind],
+          ...preset,
+        }),
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+  }
+
+  const settings = defaultAppearance();
+  settings.dark.background = "#181818";
+  settings.dark.foreground = "#828282";
+  const tokens = themeTokens(settings.dark);
+  expect(
+    contrastRatio(tokens["--color-canvas"], tokens["--color-text"]),
+  ).toBeGreaterThanOrEqual(4.5);
+  expect(
+    contrastRatio(tokens["--color-text-secondary"], tokens["--color-elevated"]),
+  ).toBeGreaterThanOrEqual(4.5);
+  expect(
+    contrastRatio(tokens["--color-text-muted"], tokens["--color-elevated"]),
+  ).toBeGreaterThanOrEqual(4.5);
+  expect(minimumThemeContrast(settings.dark)).toBeLessThan(4.5);
+
+  saveAppearance(settings);
+  render(
+    <AppearanceProvider>
+      <AppearanceSettings />
+    </AppearanceProvider>,
+  );
+  expect(screen.getByText(/当前文字与界面层对比度较低/)).toBeTruthy();
+
+  const customTeal = {
+    ...defaultAppearance().dark,
+    background: "#00C090",
+    foreground: "#050505",
+    contrast: 50,
+  };
+  const tealTokens = themeTokens(customTeal);
+  expect(minimumThemeContrast(customTeal)).toBeGreaterThanOrEqual(4.5);
+  for (const surface of [
+    tealTokens["--color-canvas"],
+    tealTokens["--color-sidebar"].slice(0, 7),
+    tealTokens["--color-surface"],
+    tealTokens["--color-card"],
+    tealTokens["--color-elevated"],
+    tealTokens["--color-input"],
+    tealTokens["--color-composer"],
+  ]) {
+    expect(
+      contrastRatio(tealTokens["--color-text-secondary"], surface),
+    ).toBeGreaterThanOrEqual(4.5);
+    expect(
+      contrastRatio(tealTokens["--color-text-muted"], surface),
+    ).toBeGreaterThanOrEqual(4.5);
+  }
+});
+
+it("keeps tinted palette sidebars visibly aligned with the chosen background hue and reveals scrollbars only while scrolling", () => {
+  vi.useFakeTimers();
+  try {
+    const material = {
+      ...defaultAppearance().dark,
+      ...presets.dark.Material,
+    };
+    const tokens = themeTokens(material);
+    const sidebarHex = tokens["--color-sidebar"].slice(0, 7);
+    const [r, g, b] = [
+      parseInt(sidebarHex.slice(1, 3), 16),
+      parseInt(sidebarHex.slice(3, 5), 16),
+      parseInt(sidebarHex.slice(5, 7), 16),
+    ];
+    // Material (#1E272C) sidebar and elevated hover/popover surfaces stay in the same slate-blue family without a stark brightness cliff.
+    expect(b).toBeGreaterThan(g);
+    expect(g).toBeGreaterThan(r);
+    expect(r).toBeGreaterThanOrEqual(20);
+    expect(contrastRatio(tokens["--color-elevated"], sidebarHex)).toBeLessThan(
+      1.35,
+    );
+
+    const view = render(
+      <AppearanceProvider>
+        <div data-testid="scroller" style={{ overflow: "auto" }} />
+      </AppearanceProvider>,
+    );
+    const scroller = screen.getByTestId("scroller");
+    expect(scroller.dataset.scrollActive).toBeUndefined();
+    fireEvent.scroll(scroller);
+    expect(scroller.dataset.scrollActive).toBe("true");
+    act(() => {
+      vi.advanceTimersByTime(800);
+    });
+    expect(scroller.dataset.scrollActive).toBeUndefined();
+    view.unmount();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("derives a cohesive monotonic border and focus-ring ramp without stark white cliffs across all presets", () => {
+  for (const kind of ["dark", "light"] as const) {
+    for (const preset of Object.values(presets[kind])) {
+      for (const contrast of [0, 50, 100]) {
+        const tokens = themeTokens({
+          ...defaultAppearance()[kind],
+          ...preset,
+          contrast,
+        });
+        const canvas = tokens["--color-canvas"];
+        const rSubtle = contrastRatio(tokens["--color-border-subtle"], canvas);
+        const rBorder = contrastRatio(tokens["--color-border"], canvas);
+        const rStrong = contrastRatio(tokens["--color-border-strong"], canvas);
+        const rFocus = contrastRatio(tokens["--color-focus-ring"], canvas);
+        expect(rBorder).toBeGreaterThan(rSubtle);
+        expect(rStrong).toBeGreaterThan(rBorder);
+        expect(rFocus).toBeGreaterThan(rStrong);
+        // Focus ring stays calm and proportional instead of jumping to #FFFFFF / #000000.
+        expect(rFocus).toBeLessThan(4.5);
+        expect(tokens["--shadow-well"]).toContain(tokens["--color-border"]);
+        expect(tokens["--focus-ring-inset"]).toContain(
+          tokens["--color-focus-ring"],
+        );
+      }
+    }
+  }
 });

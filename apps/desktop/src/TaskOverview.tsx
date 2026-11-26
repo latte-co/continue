@@ -6,6 +6,7 @@ import type { Project } from "./protocol";
 import type { SubagentsState } from "./useSubagents";
 import { subagentCounts } from "./SubagentsPanel";
 import { useStatusIssues } from "./statusNotices";
+import { DiffStat, IconButton } from "./ui";
 import { SideChatHistory, type SideChatHistoryProps } from "./SideChatHistory";
 
 export function TaskOverview({
@@ -186,21 +187,22 @@ export function TaskOverview({
               <div className="task-overview-project">
                 {project?.name ?? "新任务"}
               </div>
-              <button
-                className="icon-button"
-                aria-label="固定到右侧栏"
+              <IconButton
+                size="xs"
+                label="固定到右侧栏"
                 title="固定到右侧栏 · 任务摘要"
                 onClick={() => choose(openInfo)}
               >
-                <Pin size={16} />
-              </button>
+                <Pin size={14} />
+              </IconButton>
             </div>
             <button
+              type="button"
               className="task-overview-row"
               disabled={!project}
               onClick={() => choose(openChanges)}
             >
-              <GitCompareArrows size={18} />
+              <GitCompareArrows size={15} />
               <strong>变更</strong>
               <span>
                 {!connected || changes.error
@@ -212,10 +214,10 @@ export function TaskOverview({
             </button>
             {changes.count !== undefined && !changes.error && (
               <div className="overview-change-stats">
-                <span className="change-totals">
-                  <b>+{changes.added}</b>
-                  <em>-{changes.removed}</em>
-                </span>
+                <DiffStat
+                  added={changes.added ?? 0}
+                  removed={changes.removed ?? 0}
+                />
                 <small>
                   分支
                   {changes.binary ? " · 含二进制变更" : ""}
@@ -225,11 +227,12 @@ export function TaskOverview({
             <section>
               <h2>子智能体</h2>
               <button
+                type="button"
                 className="task-overview-row"
                 disabled={!project}
                 onClick={() => choose(openSubagents)}
               >
-                <Bot size={18} />
+                <Bot size={15} />
                 <span>
                   {counts.active > 0 && `${counts.active} 个运行中 · `}
                   {counts.completed} 完成

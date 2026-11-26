@@ -14,6 +14,7 @@ import {
 } from "./sideWritePrompts";
 import { useStatusIssues } from "./statusNotices";
 import { hasTurnChangeFiles } from "./transcript";
+import { Button, DiffStat } from "./ui";
 import { openSideChatTab } from "./workspaceState";
 
 export function TurnChangesCard({
@@ -223,15 +224,14 @@ export function TurnChangesCard({
               : `已编辑 ${total} 个文件`}
           </strong>
           {!summary.unavailable && (
-            <span className="change-totals">
-              <b>+{summary.added}</b>
-              <em>-{summary.removed}</em>
-            </span>
+            <DiffStat added={summary.added} removed={summary.removed} />
           )}
         </div>
         {!summary.unavailable && (
           <div className="turn-changes-actions">
-            <button
+            <Button
+              variant="ghost"
+              size="xs"
               className="turn-changes-undo"
               aria-label={undoLabel}
               disabled={!undoable || busy}
@@ -247,21 +247,22 @@ export function TurnChangesCard({
               onClick={() => void undo()}
             >
               <span className="turn-changes-action-label">{undoLabel}</span>
-              <Undo2 size={14} aria-hidden="true" />
-            </button>
-            <button
-              className="secondary small"
+              <Undo2 size={13.5} aria-hidden="true" />
+            </Button>
+            <Button
+              variant="subtle"
+              size="xs"
               aria-label="查看变更"
               title="查看变更"
               onClick={() => open()}
             >
               <span className="turn-changes-action-label">查看变更</span>
               <FileDiff
-                size={14}
+                size={13.5}
                 className="turn-changes-view-icon"
                 aria-hidden="true"
               />
-            </button>
+            </Button>
           </div>
         )}
       </header>
@@ -276,6 +277,7 @@ export function TurnChangesCard({
           const split = entry.path.lastIndexOf("/") + 1;
           return (
             <button
+              type="button"
               className="turn-changes-file"
               key={entry.path}
               onClick={() => open(entry.path)}
@@ -295,10 +297,10 @@ export function TurnChangesCard({
                 {entry.added === null ? (
                   "二进制"
                 ) : (
-                  <>
-                    <b>+{entry.added}</b>
-                    <em>-{entry.removed}</em>
-                  </>
+                  <DiffStat
+                    added={entry.added ?? 0}
+                    removed={entry.removed ?? 0}
+                  />
                 )}
               </span>
             </button>
@@ -307,7 +309,9 @@ export function TurnChangesCard({
       </div>
       {expanded && (currentPage.next_offset != null || pageOffset > 0) && (
         <div className="turn-changes-pagination" aria-label="文件列表分页">
-          <button
+          <Button
+            variant="ghost"
+            size="xs"
             disabled={pageBusy === scope || !history.length}
             onClick={(event) => {
               pageTrigger.current = event.currentTarget;
@@ -315,11 +319,13 @@ export function TurnChangesCard({
             }}
           >
             上一页
-          </button>
+          </Button>
           <span>
             {pageOffset + 1}–{pageOffset + currentPage.entries.length} / {total}
           </span>
-          <button
+          <Button
+            variant="ghost"
+            size="xs"
             disabled={pageBusy === scope || currentPage.next_offset == null}
             onClick={(event) => {
               pageTrigger.current = event.currentTarget;
@@ -327,7 +333,7 @@ export function TurnChangesCard({
             }}
           >
             下一页
-          </button>
+          </Button>
         </div>
       )}
       {(total > 3 || firstPage.next_offset != null) && (

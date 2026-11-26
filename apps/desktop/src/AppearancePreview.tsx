@@ -2,27 +2,25 @@ import { useState } from "react";
 import { Shield, Plus, ChevronDown } from "lucide-react";
 import { ApprovalCard } from "./ApprovalCard";
 import { ComposerAction } from "./ComposerAction";
+import { Segmented } from "./ui";
+
 export function AppearancePreview() {
   const [mode, setMode] = useState<"empty" | "editing" | "running">("editing");
   const running = mode === "running";
   return (
     <div className="appearance-state-preview">
-      <div className="preview-states" role="group" aria-label="预览状态">
-        <button
-          aria-pressed={mode === "empty"}
-          onClick={() => setMode("empty")}
-        >
-          空输入
-        </button>
-        <button
-          aria-pressed={mode === "editing"}
-          onClick={() => setMode("editing")}
-        >
-          编辑
-        </button>
-        <button aria-pressed={running} onClick={() => setMode("running")}>
-          运行中
-        </button>
+      <div className="preview-states">
+        <Segmented
+          label="预览状态"
+          roleType="group"
+          value={mode}
+          onChange={setMode}
+          options={[
+            { value: "empty", label: "空输入" },
+            { value: "editing", label: "编辑" },
+            { value: "running", label: "运行中" },
+          ]}
+        />
         <span>仅预览外观</span>
       </div>
       <div className="composer">
@@ -34,20 +32,20 @@ export function AppearancePreview() {
           rows={1}
         />
         <div className="composer-toolbar">
-          <button disabled aria-label="添加引用预览">
-            <Plus size={17} />
+          <button className="composer-add" disabled aria-label="添加引用预览">
+            <Plus size={16} />
           </button>
           <div className="permission-picker">
             <Shield size={15} />
             <button className="select-trigger" disabled title="跟随 Agent">
               <span>跟随 Agent</span>
-              <ChevronDown size={15} />
+              <ChevronDown size={14} />
             </button>
           </div>
           <div className="model-picker">
             <button className="select-trigger" disabled>
               <span>default</span>
-              <ChevronDown size={15} />
+              <ChevronDown size={14} />
             </button>
           </div>
           <ComposerAction
@@ -62,7 +60,7 @@ export function AppearancePreview() {
           kind: "approval",
           request_id: "preview",
           tool: "Write",
-          input: { file_path: "README.md", content: "# Latte Work" },
+          input: { file_path: "README.md", content: "# Continue" },
         }}
         resolved={!running}
         decision={!running ? "allowed" : undefined}

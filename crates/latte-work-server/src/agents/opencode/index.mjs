@@ -355,7 +355,7 @@ export default {
           const { sessionID, agent, messageID, id: toolCallId } = context;
           // A native continuation can start with no foreground ACP subscriber.
           if (questions.size >= 32 || socket.destroyed)
-            throw new Error("Latte Work cannot show questions");
+            throw new Error("Continue cannot show questions");
           if (ctx.permission.assert) {
             await ctx.permission.assert({
               sessionID,

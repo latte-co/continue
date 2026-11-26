@@ -172,7 +172,7 @@ fn provider_settings(
         .into_iter()
         .collect::<Vec<_>>();
     Ok(jsonc_parser::json!({
-        "name": "Latte Work",
+        "name": "Continue",
         "package": (package),
         "settings": (settings),
         "headers": (headers),

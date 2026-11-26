@@ -12,7 +12,7 @@ import tempfile
 import time
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--binary', default='target/debug/latte-work-server')
+parser.add_argument('--binary', default='target/debug/latte-continue-server')
 parser.add_argument('--traex', default=str(Path.home() / '.local/bin/traex'))
 parser.add_argument('--output', default='target/traex-native-smoke.json')
 parser.add_argument('--live', action='store_true')
