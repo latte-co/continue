@@ -30,6 +30,7 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+      - run: node scripts/check-npm-lock.mjs
       - run: npm ci
       - run: make fmt-check
       - run: make types-check
@@ -169,6 +170,7 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+      - run: node scripts/check-npm-lock.mjs
       - run: npm ci
       - run: npm test
       - run: npm run web-build
@@ -212,6 +214,7 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+      - run: node scripts/check-npm-lock.mjs
       - run: npm ci
       - name: WebKit site-data, favicon transport and desktop command tests
         run: make test-native
