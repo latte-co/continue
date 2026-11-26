@@ -36,6 +36,7 @@ import {
   isAlwaysNativeCommand,
   isNativeSubagentCommand,
   leadingSlashCommand,
+  recognizedComposerCommands,
   supportsSideChatAgent,
   subagentPanelAliases,
   subagentPanelArgumentNotice,
@@ -255,7 +256,23 @@ export function Composer(props: Props) {
   );
   const inlineAttached = attached.filter((entry) => !entry.attachmentKind);
   const separateAttached = attached.filter((entry) => !!entry.attachmentKind);
-  const richSyntax = hasRichComposerMarkdown(value);
+  const [trigger, setTrigger] = useState<ComposerTrigger | null>(null);
+  const [commands, setCommands] = useState<AgentSlashCommand[]>([]);
+  const [commandsLoadedScope, setCommandsLoadedScope] = useState("");
+  const sideAgent = !sideChat && supportsSideChatAgent(agent);
+  const recognizedCommands = recognizedComposerCommands(
+    commands,
+    agent,
+    sideChat,
+    sideAgent,
+  );
+  const activeCommandTriggerStart =
+    trigger?.kind === "commands" ? trigger.start : null;
+  const richSyntax = hasRichComposerMarkdown(
+    value,
+    recognizedCommands,
+    activeCommandTriggerStart,
+  );
   const latchedRich = useRef(richSyntax);
   if (!imeActive) latchedRich.current = richSyntax;
   const richMode = !concealSubmitted && latchedRich.current;
@@ -340,12 +357,9 @@ export function Composer(props: Props) {
       pasteOperation.current++;
     };
   }, [scope, sessionId, hidden, disabled, sending, connected]);
-  const [trigger, setTrigger] = useState<ComposerTrigger | null>(null);
   const [browse, setBrowse] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState(0);
-  const [commands, setCommands] = useState<AgentSlashCommand[]>([]);
-  const [commandsLoadedScope, setCommandsLoadedScope] = useState("");
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -443,6 +457,14 @@ export function Composer(props: Props) {
     browse !== null ? search : slash < 0 ? query : query.slice(slash + 1)
   ).toLowerCase();
   function close() {
+    if (
+      !inlineMode &&
+      input.current &&
+      trigger?.kind === "commands" &&
+      hasRichComposerMarkdown(value, recognizedCommands, null)
+    ) {
+      restoreCaret(input.current.selectionStart);
+    }
     setAddMenu(false);
     referenceOperation.current++;
     setExternal(false);
@@ -676,7 +698,6 @@ export function Composer(props: Props) {
     ...subagentPanelAliases,
     ...commands.filter(isNativeSubagentCommand).map((command) => command.name),
   ];
-  const sideAgent = !sideChat && supportsSideChatAgent(agent);
   const nativeCommands = sideChat ? [] : commands;
   const action = appCommandAction(value, nativeCommands, sideAgent);
   const localNavigation =
@@ -1542,7 +1563,9 @@ export function Composer(props: Props) {
                   title={
                     option.id.startsWith("entry:")
                       ? option.id.slice(6)
-                      : `${option.label} ${option.detail}`.trim()
+                      : option.icon === "command"
+                        ? [option.id, option.detail].filter(Boolean).join(" · ")
+                        : `${option.label} ${option.detail}`.trim()
                   }
                   role="option"
                   aria-selected={i === index}
@@ -1553,7 +1576,7 @@ export function Composer(props: Props) {
                 >
                   <Icon size={14.5} strokeWidth={1.7} aria-hidden="true" />
                   <span className="composer-menu-option-primary">
-                    {option.icon === "command" ? `/${option.id}` : option.label}
+                    {option.icon === "command" ? option.id : option.label}
                   </span>
                   {option.badge && (
                     <Badge className="composer-command-badge">
@@ -1734,12 +1757,17 @@ export function Composer(props: Props) {
               ref={inlineInput}
               value={value}
               references={inlineAttached}
+              recognizedCommands={recognizedCommands}
+              activeCommandTriggerStart={activeCommandTriggerStart}
               label={props.inputLabel ?? "任务输入"}
               placeholder={placeholder}
               disabled={disabled || sending || pasting}
               autocomplete={autocomplete}
               onEdit={(text, entries, caret) => {
-                if (caret && !hasRichComposerMarkdown(text))
+                if (
+                  caret &&
+                  !hasRichComposerMarkdown(text, recognizedCommands, null)
+                )
                   restoreCaret(caret.start, caret.afterPath);
                 if (text !== value) onChange(text);
                 const paths = new Map(
@@ -1777,8 +1805,18 @@ export function Composer(props: Props) {
               onCompositionEnd={(text, offset) => {
                 composing.current = false;
                 setImeActive(false);
-                if (!hasRichComposerMarkdown(text)) restoreCaret(offset);
-                setTrigger(composerTrigger(text, offset));
+                const nextTrigger = composerTrigger(text, offset);
+                const nextCmdStart =
+                  nextTrigger?.kind === "commands" ? nextTrigger.start : null;
+                if (
+                  !hasRichComposerMarkdown(
+                    text,
+                    recognizedCommands,
+                    nextCmdStart,
+                  )
+                )
+                  restoreCaret(Math.max(0, offset));
+                setTrigger(nextTrigger);
               }}
               renderImage={(entry) => (
                 <AttachmentImage
@@ -1804,7 +1842,21 @@ export function Composer(props: Props) {
               disabled={disabled || sending || pasting}
               autocomplete={autocomplete}
               onEdit={(text, entries, caret) => {
-                if (caret && (!entries.length || hasRichComposerMarkdown(text)))
+                const nextTrigger =
+                  caret && !composing.current
+                    ? composerTrigger(text, caret.start)
+                    : null;
+                const nextCmdStart =
+                  nextTrigger?.kind === "commands" ? nextTrigger.start : null;
+                if (
+                  caret &&
+                  (!entries.length ||
+                    hasRichComposerMarkdown(
+                      text,
+                      recognizedCommands,
+                      nextCmdStart,
+                    ))
+                )
                   restoreCaret(caret.start, caret.afterPath);
                 if (text !== value) onChange(text);
                 const paths = new Map(
@@ -1842,8 +1894,18 @@ export function Composer(props: Props) {
               onCompositionEnd={(text, offset) => {
                 composing.current = false;
                 setImeActive(false);
-                if (hasRichComposerMarkdown(text)) restoreCaret(offset);
-                setTrigger(composerTrigger(text, offset));
+                const nextTrigger = composerTrigger(text, offset);
+                const nextCmdStart =
+                  nextTrigger?.kind === "commands" ? nextTrigger.start : null;
+                if (
+                  hasRichComposerMarkdown(
+                    text,
+                    recognizedCommands,
+                    nextCmdStart,
+                  )
+                )
+                  restoreCaret(offset);
+                setTrigger(nextTrigger);
               }}
               renderImage={(entry) => (
                 <AttachmentImage
@@ -1894,18 +1956,26 @@ export function Composer(props: Props) {
               onChange={(event) => {
                 const nextValue = event.target.value;
                 const caretOffset = event.target.selectionStart;
-                if (!composing.current && hasRichComposerMarkdown(nextValue)) {
+                const nextTrigger = composing.current
+                  ? null
+                  : composerTrigger(nextValue, caretOffset);
+                const nextCmdStart =
+                  nextTrigger?.kind === "commands" ? nextTrigger.start : null;
+                if (
+                  !composing.current &&
+                  hasRichComposerMarkdown(
+                    nextValue,
+                    recognizedCommands,
+                    nextCmdStart,
+                  )
+                ) {
                   restoreCaret(caretOffset);
                 }
                 onChange(nextValue);
                 setNotice("");
                 setBrowse(null);
                 setAddMenu(false);
-                setTrigger(
-                  composing.current
-                    ? null
-                    : composerTrigger(nextValue, caretOffset),
-                );
+                setTrigger(nextTrigger);
               }}
               onClick={(event) => {
                 const el = event.currentTarget;

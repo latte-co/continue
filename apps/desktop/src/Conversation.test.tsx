@@ -1123,7 +1123,9 @@ it("blocks native slash commands with annotations and leaves context intact", as
   fireEvent.click(screen.getByRole("button", { name: "发送任务" }));
   await screen.findByText("请先移除注释，再使用 Agent 原生命令。");
   expect(p.send).not.toHaveBeenCalled();
-  expect(input().value).toBe("/compact");
+  expect(
+    input().querySelector('[data-command-name="compact"]')?.textContent,
+  ).toBe("compact");
 });
 
 it("keeps the reading anchor when older history is prepended without concealing the current transcript", async () => {
@@ -2760,7 +2762,8 @@ it("displays, removes, guards slash commands, and submits side-chat quotes added
   expect(p.send).not.toHaveBeenCalled();
 
   // Submitting with empty prose uses the main-conversation quote prompt and clears quotes.
-  fireEvent.change(input(), { target: { value: "" } });
+  fireEvent.keyDown(input(), { key: "Backspace" });
+  expect(input().value).toBe("");
   fireEvent.click(screen.getByRole("button", { name: "发送任务" }));
   await waitFor(() =>
     expect(p.send).toHaveBeenCalledWith(

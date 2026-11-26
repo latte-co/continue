@@ -37,12 +37,7 @@ export function StatusSignal({
   const tip = title ?? text;
   if (status === "running") {
     return (
-      <span
-        className="ui-signal-dots"
-        role="img"
-        aria-label={text}
-        title={tip}
-      >
+      <span className="ui-signal-dots" role="img" aria-label={text} title={tip}>
         <i />
         <i />
         <i />

@@ -36,6 +36,7 @@ vi.mock("./api", () => ({
   chooseReferencePath: mocks.choose,
   message: (e: unknown) => String(e),
 }));
+let resetHarnessDraft: (() => void) | null = null;
 function Harness({
   hostId = "remote",
   projectId = "p",
@@ -44,6 +45,7 @@ function Harness({
   ...props
 }: Partial<ComponentProps<typeof Composer>>) {
   const [text, setText] = useState("");
+  resetHarnessDraft = () => setText("");
   return (
     <Composer
       agent={agent}
@@ -73,7 +75,11 @@ function Harness({
   );
 }
 function type(value: string, cursor = value.length) {
-  const input = screen.getByRole("textbox", { name: "任务输入" });
+  let input = screen.getByRole("textbox", { name: "任务输入" });
+  if (input.classList.contains("composer-rich-input") && resetHarnessDraft) {
+    act(() => resetHarnessDraft?.());
+    input = screen.getByRole("textbox", { name: "任务输入" });
+  }
   if (input instanceof HTMLTextAreaElement) {
     fireEvent.change(input, {
       target: { value, selectionStart: cursor, selectionEnd: cursor },
@@ -96,6 +102,21 @@ function type(value: string, cursor = value.length) {
 function inputText() {
   const input = screen.getByRole("textbox", { name: "任务输入" });
   if (input instanceof HTMLTextAreaElement) return input.value;
+  if (input.classList.contains("composer-rich-input")) {
+    return Array.from(input.children)
+      .map((block) =>
+        Array.from(block.childNodes)
+          .map((node) => {
+            if (node instanceof HTMLElement && node.dataset.commandName)
+              return `/${node.dataset.commandName}`;
+            if (node instanceof HTMLElement && node.dataset.referencePath)
+              return "";
+            return node.textContent ?? "";
+          })
+          .join(""),
+      )
+      .join("\n");
+  }
   return Array.from(input.childNodes)
     .filter((node) => node.nodeType === Node.TEXT_NODE)
     .map((node) => node.textContent ?? "")
@@ -464,7 +485,11 @@ it.each([
     });
     fireEvent.keyDown(screen.getByRole("textbox"), { key });
     const completed = draft.replace(/\/comp$/, "/compact ");
-    expect(screen.getByRole("textbox")).toHaveProperty("value", completed);
+    expect(inputText()).toBe(completed);
+    expect(
+      screen.getByRole("textbox").querySelector('[data-command-name="compact"]')
+        ?.textContent,
+    ).toBe("compact");
     expect(mocks.send).not.toHaveBeenCalled();
     expect(screen.queryByRole("listbox")).toBeNull();
     fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
@@ -482,16 +507,11 @@ it("completes a command at the caret without replacing surrounding text", async 
   const after = " 后文";
   type(`${before}/comp${after}`, before.length + "/comp".length);
   fireEvent.click(await screen.findByRole("option", { name: /compact/ }));
-  expect(screen.getByRole("textbox")).toHaveProperty(
-    "value",
-    `${before}/compact ${after}`,
-  );
-  await waitFor(() =>
-    expect(screen.getByRole("textbox")).toHaveProperty(
-      "selectionStart",
-      before.length + "/compact ".length,
-    ),
-  );
+  expect(inputText()).toBe(`${before}/compact ${after}`);
+  expect(
+    screen.getByRole("textbox").querySelector('[data-command-name="compact"]')
+      ?.textContent,
+  ).toBe("compact");
   expect(mocks.send).not.toHaveBeenCalled();
 });
 it("loads native commands from the selected host and inserts without running; sends exact arguments", async () => {
@@ -504,9 +524,7 @@ it("loads native commands from the selected host and inserts without running; se
     agent: "claude",
   });
   fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
-  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-    "/compact ",
-  );
+  expect(inputText()).toBe("/compact ");
   expect(mocks.send).not.toHaveBeenCalled();
   type("/compact 保留结论");
   fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
@@ -752,17 +770,16 @@ it("keeps adjacent chips on the left of command completion and successive deleti
   fireEvent.input(editor);
   fireEvent.click(await screen.findByRole("option", { name: /compact/ }));
   expect(inputText()).toBe("前文 /compact ");
-  expect(editor.lastChild?.textContent).toBe("/compact ");
+  const richEditor = screen.getByRole("textbox", { name: "任务输入" });
+  expect(
+    richEditor.querySelector('[data-command-name="compact"]')?.textContent,
+  ).toBe("compact");
 
-  const afterChips = document.createRange();
-  afterChips.setStartAfter(
-    editor.querySelector('[data-reference-path="src/中文 file.ts"]')!,
+  fireEvent.click(
+    screen.getByRole("button", { name: "移除引用 src/中文 file.ts" }),
   );
-  afterChips.collapse(true);
-  selectComposerRange(afterChips);
-  fireEvent.keyDown(editor, { key: "Backspace" });
-  expect(editor.querySelectorAll("[data-reference-path]")).toHaveLength(1);
-  fireEvent.keyDown(editor, { key: "Backspace" });
+  expect(richEditor.querySelectorAll("[data-reference-path]")).toHaveLength(1);
+  fireEvent.click(screen.getByRole("button", { name: "移除引用 README.md" }));
   expect(screen.queryByRole("button", { name: /移除引用/ })).toBeNull();
   expect(inputText()).toBe("前文 /compact ");
 });
@@ -1005,9 +1022,7 @@ it("searches friendly titles but inserts the original agent command", async () =
   render(<Harness />);
   type("/压缩");
   fireEvent.click(await screen.findByRole("option", { name: /压缩上下文/ }));
-  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-    "/compact ",
-  );
+  expect(inputText()).toBe("/compact ");
   expect(mocks.send).not.toHaveBeenCalled();
 });
 
@@ -1293,9 +1308,11 @@ it("shows one local subagent entry and hides native listing variants", async () 
   await waitFor(() => expect(mocks.request).toHaveBeenCalled());
   await screen.findByRole("option", { name: /压缩上下文/ });
   expect(screen.getAllByRole("option")).toHaveLength(4);
+  const subagentOption = screen.getByRole("option", { name: /子智能体/ });
   expect(
-    screen.getByRole("option", { name: /子智能体/ }).textContent,
-  ).toContain("/agents");
+    subagentOption.querySelector(".composer-menu-option-primary")?.textContent,
+  ).toBe("agents");
+  expect(subagentOption.textContent).not.toContain("/agents");
   expect(
     screen.queryByRole("option", {
       name: /list-agents|Native wizard|Native list|Native tasks/,
@@ -1413,9 +1430,7 @@ it.each([
     expect(mocks.openSubagents).toHaveBeenCalledOnce();
     expect(mocks.send).not.toHaveBeenCalled();
     expect(mocks.request).not.toHaveBeenCalled();
-    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-      command,
-    );
+    expect(inputText()).toBe(command);
     expect(screen.getByText(/此命令不接受参数/)).toBeTruthy();
   },
 );
@@ -1437,9 +1452,7 @@ it("prioritizes the exact native command over matches in other command descripti
   type("/agents");
   await screen.findAllByRole("option");
   fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
-  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-    "/agents ",
-  );
+  expect(inputText()).toBe("/agents ");
   expect(mocks.send).not.toHaveBeenCalled();
 });
 
@@ -1518,9 +1531,7 @@ it.each(["/model opus", "/effort high", "/model\n检查项目"])(
     fireEvent.click(screen.getByText("发送"));
     expect(mocks.send).not.toHaveBeenCalled();
     expect(mocks.request).not.toHaveBeenCalled();
-    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-      command,
-    );
+    expect(inputText()).toBe(command);
     expect(screen.getByText(/请在菜单中选择/)).toBeTruthy();
   },
 );
@@ -1531,9 +1542,7 @@ it("preserves the draft when the App model settings are unavailable", () => {
   type("/effort ");
   fireEvent.click(screen.getByText("发送"));
   expect(screen.getByText(/不支持调整思考强度/)).toBeTruthy();
-  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-    "/effort ",
-  );
+  expect(inputText()).toBe("/effort ");
   expect(mocks.send).not.toHaveBeenCalled();
 });
 
@@ -2132,9 +2141,17 @@ it.each([
     render(<Harness agent={agent} />);
     type("/");
     await screen.findByRole("option", { name: /修复 CI/ });
-    expect(screen.getByRole("option", { name: /压缩上下文/ })).toBeTruthy();
+    const compactOption = screen.getByRole("option", { name: /压缩上下文/ });
+    expect(
+      compactOption.querySelector(".composer-menu-option-primary")?.textContent,
+    ).toBe("compact");
+    expect(compactOption.textContent).not.toContain("/compact");
     expect(screen.getByRole("option", { name: /代码审查/ })).toBeTruthy();
     const skillOption = screen.getByRole("option", { name: /修复 CI/ });
+    expect(
+      skillOption.querySelector(".composer-menu-option-primary")?.textContent,
+    ).toBe("fix-ci");
+    expect(skillOption.textContent).not.toContain("/fix-ci");
     expect(
       skillOption.querySelector(".composer-command-badge")?.textContent,
     ).toBe("技能");
@@ -2273,4 +2290,71 @@ it("permits a catalog skill named init with @ references, quotes, and annotation
   expect(submitted).toContain("README.md");
   expect(submitted).toContain("补充失败分支检查");
   view.unmount();
+});
+
+it("renders selected skills and commands as inline icon pills without leading slash and supports multiple tokens", async () => {
+  mocks.request.mockImplementation(async (_host, req) =>
+    req.method === "agent_commands"
+      ? {
+          kind: "agent_commands",
+          commands: [
+            {
+              name: "doc-coauthoring",
+              display_name: "Doc Coauthoring",
+              description: "Guide users through co-authoring documentation",
+              argument_hint: "",
+              kind: "skill",
+            },
+            {
+              name: "fix-ci",
+              display_name: "修复 CI",
+              description: "诊断并修复流水线失败",
+              argument_hint: "",
+              kind: "skill",
+            },
+          ],
+        }
+      : { kind: "files", entries: [] },
+  );
+  mocks.send.mockResolvedValue(true);
+  render(<Harness agent="codex" />);
+  type("/doc");
+  fireEvent.click(
+    await screen.findByRole("option", { name: /Doc Coauthoring/ }),
+  );
+  const rich = screen.getByRole("textbox", { name: "任务输入" });
+  expect(rich.classList.contains("composer-rich-input")).toBe(true);
+  const firstPill = rich.querySelector<HTMLElement>(
+    '.composer-command-pill[data-command-name="doc-coauthoring"]',
+  );
+  expect(firstPill).not.toBeNull();
+  expect(firstPill?.dataset.commandIcon).toBe("skill");
+  expect(firstPill?.textContent).toBe("doc-coauthoring");
+  expect(firstPill?.querySelector("svg")).not.toBeNull();
+
+  // Select a second skill inline alongside the first pill
+  fireEvent.paste(rich, {
+    clipboardData: {
+      files: [],
+      types: ["text/plain"],
+      getData: (mime: string) => (mime === "text/plain" ? "/fix" : ""),
+    },
+  });
+  await waitFor(() => expect(inputText()).toBe("/doc-coauthoring /fix"));
+  rich.click();
+  type("/doc-coauthoring /fix");
+  fireEvent.click(await screen.findByRole("option", { name: /修复 CI/ }));
+  const pills = Array.from(
+    screen
+      .getByRole("textbox")
+      .querySelectorAll<HTMLElement>(".composer-command-pill"),
+  );
+  expect(pills.map((p) => p.textContent)).toEqual([
+    "doc-coauthoring",
+    "fix-ci",
+  ]);
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() =>
+    expect(mocks.send).toHaveBeenCalledWith("/doc-coauthoring /fix-ci"),
+  );
 });

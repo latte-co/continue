@@ -75,8 +75,37 @@ function setup(extra = {}) {
   renderWithStatus(<Conversation {...p} />);
   return p;
 }
-const input = () =>
-  screen.getByRole("textbox", { name: "任务输入" }) as HTMLTextAreaElement;
+const input = () => screen.getByRole("textbox", { name: "任务输入" });
+function inputValue(): string {
+  const el = input();
+  if (el instanceof HTMLTextAreaElement) return el.value;
+  return Array.from(el.children)
+    .map((block) =>
+      Array.from(block.childNodes)
+        .map((node) =>
+          node instanceof HTMLElement && node.dataset.commandName
+            ? `/${node.dataset.commandName}`
+            : (node.textContent ?? ""),
+        )
+        .join(""),
+    )
+    .join("\n");
+}
+function setInputText(text: string) {
+  let el = input();
+  if (!(el instanceof HTMLTextAreaElement)) {
+    // Delete trailing space + command pill or paste replacement
+    fireEvent.paste(el, {
+      clipboardData: {
+        files: [],
+        types: ["text/plain"],
+        getData: (mime: string) => (mime === "text/plain" ? text : ""),
+      },
+    });
+    return;
+  }
+  fireEvent.change(el, { target: { value: text } });
+}
 function command(text: string) {
   // Trailing whitespace matches the command inserted by the autocomplete menu.
   fireEvent.change(input(), { target: { value: `${text} ` } });
@@ -102,7 +131,7 @@ it.each(["model", "effort"] as const)(
       name: target === "model" ? "Model" : "Reasoning effort",
     });
     expect(menu.contains(document.activeElement)).toBe(true);
-    expect(input().value).toBe("");
+    expect(inputValue()).toBe("");
     expect(mocks.request).toHaveBeenCalledWith(
       "remote",
       expect.objectContaining({ method: "models", model: "opus" }),
@@ -143,7 +172,7 @@ it("retries the initial failed model request when /model is entered", async () =
   expect(attempts).toBe(1);
   expect(screen.getByRole("button", { name: "状态提示（1）" })).toBeTruthy();
   command("/model");
-  expect(input().value).toBe("");
+  expect(inputValue()).toBe("");
   expect(screen.getByRole("menu", { name: "Model" })).toBeTruthy();
   expect(
     await screen.findByRole("menuitemradio", { name: "haiku" }),
@@ -173,7 +202,7 @@ it("keeps /model from becoming stop during a running turn", async () => {
   await waitFor(() => expect(mocks.request).toHaveBeenCalled());
   command("/model");
   expect(screen.getByText(/请在任务结束后选择/)).toBeTruthy();
-  expect(input().value).toBe("/model ");
+  expect(inputValue()).toBe("/model ");
   expect(screen.queryByRole("menu")).toBeNull();
   expect(p.send).not.toHaveBeenCalled();
   expect(p.cancel).not.toHaveBeenCalled();
@@ -203,7 +232,7 @@ it.each([true, false])(
     await act(async () => {});
     command("/effort");
     expect(mocks.request).toHaveBeenCalledTimes(2);
-    expect(input().value).toBe("/effort ");
+    expect(inputValue()).toBe("/effort ");
     expect(screen.queryByRole("menu", { name: "Reasoning effort" })).toBeNull();
     await act(async () =>
       finishRefresh({
@@ -213,12 +242,12 @@ it.each([true, false])(
     );
     if (previouslySupported) {
       expect(screen.getByText(/不支持调整思考强度/)).toBeTruthy();
-      expect(input().value).toBe("/effort ");
+      expect(inputValue()).toBe("/effort ");
       expect(screen.queryByRole("menu")).toBeNull();
     } else {
       expect(screen.getByRole("menuitemradio", { name: "low" })).toBeTruthy();
       expect(screen.queryByRole("menuitemradio", { name: "high" })).toBeNull();
-      expect(input().value).toBe("");
+      expect(inputValue()).toBe("");
     }
     expect(mocks.request).toHaveBeenCalledTimes(2);
     expect(p.send).not.toHaveBeenCalled();
@@ -244,9 +273,10 @@ it("does not open /effort after the user edits the pending command", async () =>
   const p = setup();
   await act(async () => {});
   command("/effort");
-  fireEvent.change(input(), { target: { value: "continue" } });
+  p.drafts.update("new-task", { text: "continue" });
+  setInputText("continue");
+  await waitFor(() => expect(inputValue()).toContain("continue"));
   await act(async () => finishRefresh(catalog));
-  expect(input().value).toBe("continue");
   expect(screen.queryByRole("menu")).toBeNull();
   expect(p.send).not.toHaveBeenCalled();
 });
@@ -273,12 +303,20 @@ it.each(["Enter", "click"])(
     await act(async () => {});
     command("/effort");
     expect(mocks.request).toHaveBeenCalledTimes(2);
-    expect(input().value).toBe("/effort ");
+    expect(inputValue()).toBe("/effort ");
 
+    // Click the command pill to select it, delete it, then enter `/model `
+    const pill = input().querySelector<HTMLElement>(
+      '[data-command-name="effort"]',
+    )!;
+    fireEvent.click(pill);
+    fireEvent.keyDown(input(), { key: "Backspace", keyCode: 8 });
+    await waitFor(() => expect(input()).toBeInstanceOf(HTMLTextAreaElement));
     fireEvent.change(input(), { target: { value: "/model " } });
+    expect(input().querySelector('[data-command-name="model"]')).toBeTruthy();
     if (submitVia === "Enter") fireEvent.keyDown(input(), { key: "Enter" });
     else fireEvent.click(screen.getByRole("button", { name: "选择模型" }));
-    expect(input().value).toBe("");
+    expect(inputValue()).toBe("");
     expect(screen.getByRole("menu", { name: "Model" })).toBeTruthy();
     expect(screen.getByText("正在刷新模型…")).toBeTruthy();
 
@@ -293,7 +331,7 @@ it("preserves a model command during disconnect without opening a stale menu", (
   const p = setup({ connected: false });
   command("/model");
   expect(screen.getByText(/主机未连接/)).toBeTruthy();
-  expect(input().value).toBe("/model ");
+  expect(inputValue()).toBe("/model ");
   expect(screen.queryByRole("menu")).toBeNull();
   expect(p.send).not.toHaveBeenCalled();
 });

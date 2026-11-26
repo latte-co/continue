@@ -1813,6 +1813,38 @@ button.recent-notice {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.composer-command-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 1px;
+  padding: 0 4px;
+  border-radius: var(--radius-badge);
+  color: color-mix(in oklab, var(--color-unread) 86%, var(--color-text));
+  font-weight: 500;
+  line-height: 1.45;
+  vertical-align: baseline;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color var(--duration-fast) ease;
+}
+.composer-command-pill:hover {
+  background: var(--color-hover);
+}
+.composer-command-pill.is-selected {
+  background: var(--color-focus-background);
+  outline: 1px solid var(--color-unread);
+}
+.composer-command-pill > svg {
+  flex: none;
+  opacity: 0.92;
+}
+.composer-command-pill-label {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .composer-inline-input[aria-disabled="true"] {
   color: var(--color-text-muted);
 }
@@ -3572,10 +3604,8 @@ button.recent-notice {
 }
 .workspace-reference-content > p,
 .workspace-reference-content > button {
-  margin: var(--space-2) var(--space-3);
-}
-.workspace-reference-content > button {
   align-self: flex-start;
+  margin: var(--space-2) var(--space-3);
 }
 .workspace-file-tree {
   flex: 0 0 240px;

@@ -12,6 +12,7 @@ export function composerTrigger(
   text: string,
   cursor: number,
 ): ComposerTrigger | null {
+  if (cursor < 0) return null;
   const prefix = text.slice(0, cursor);
   const command = /(?:^|\s)\/([^\s/]*)$/.exec(prefix);
   if (command)
@@ -59,6 +60,13 @@ export type AppCommandAction = "subagents" | "model" | "effort" | "side";
 export type ComposerCommand = Omit<AgentSlashCommand, "ui_action"> & {
   ui_action?: AppCommandAction;
 };
+export type CommandPillIconKind =
+  "skill" | "command" | "model" | "effort" | "subagents" | "side";
+export interface ComposerCommandTokenMeta {
+  name: string;
+  icon: CommandPillIconKind;
+  title?: string;
+}
 export const supportsSideChatAgent = (agent: string) =>
   agent === "claude" || agent === "codex" || agent === "traex";
 
@@ -224,4 +232,52 @@ export function commandTitle(
     .filter(Boolean)
     .map((word) => word[0].toUpperCase() + word.slice(1))
     .join(" ");
+}
+
+export function recognizedComposerCommands(
+  commands: AgentSlashCommand[],
+  agent: string,
+  sideChat: boolean,
+  sideAgent: boolean,
+): Map<string, ComposerCommandTokenMeta> {
+  const map = new Map<string, ComposerCommandTokenMeta>();
+  map.set("model", { name: "model", icon: "model", title: "选择模型" });
+  map.set("effort", { name: "effort", icon: "effort", title: "思考强度" });
+  if (sideChat) return map;
+
+  for (const alias of subagentPanelAliases) {
+    map.set(alias, { name: alias, icon: "subagents", title: "子智能体" });
+  }
+  if (sideAgent) {
+    map.set("side", { name: "side", icon: "side", title: "侧边聊天" });
+    map.set("btw", { name: "btw", icon: "side", title: "侧边聊天" });
+  }
+  if (agent !== "opencode") {
+    for (const name of alwaysCommandNames) {
+      map.set(name, {
+        name,
+        icon: "command",
+        title: builtinCommandTitles[name] ?? name,
+      });
+    }
+  }
+  for (const cmd of commands) {
+    const icon: CommandPillIconKind = isNativeSubagentCommand(cmd)
+      ? "subagents"
+      : sideAgent && (cmd.name === "side" || cmd.name === "btw")
+        ? "side"
+        : cmd.name === "model"
+          ? "model"
+          : cmd.name === "effort"
+            ? "effort"
+            : cmd.kind === "skill"
+              ? "skill"
+              : "command";
+    map.set(cmd.name, {
+      name: cmd.name,
+      icon,
+      title: commandTitle(cmd, agent),
+    });
+  }
+  return map;
 }

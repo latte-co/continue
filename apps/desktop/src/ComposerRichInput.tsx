@@ -29,8 +29,11 @@ import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { invoke } from "@tauri-apps/api/core";
 import { native } from "./api";
+import { composerTrigger } from "./composerActions";
 import { dragHasFiles } from "./fileDrag";
 import {
+  type CommandPillIconKind,
+  type ComposerCommandTokenMeta,
   isTableHeaderPair,
   parseInlineMarkdown,
   parseMarkdownToDoc,
@@ -113,6 +116,78 @@ function createReferenceSvg(directory: boolean): SVGSVGElement {
   return svg;
 }
 
+function createCommandSvg(kind: CommandPillIconKind): SVGSVGElement {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("width", "14");
+  svg.setAttribute("height", "14");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.75");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+
+  const addPath = (d: string) => {
+    const p = document.createElementNS(ns, "path");
+    p.setAttribute("d", d);
+    svg.append(p);
+  };
+  const addRect = (x: string, y: string, w: string, h: string, rx: string) => {
+    const r = document.createElementNS(ns, "rect");
+    r.setAttribute("x", x);
+    r.setAttribute("y", y);
+    r.setAttribute("width", w);
+    r.setAttribute("height", h);
+    r.setAttribute("rx", rx);
+    svg.append(r);
+  };
+  const addCircle = (cx: string, cy: string, rad: string) => {
+    const c = document.createElementNS(ns, "circle");
+    c.setAttribute("cx", cx);
+    c.setAttribute("cy", cy);
+    c.setAttribute("r", rad);
+    svg.append(c);
+  };
+
+  switch (kind) {
+    case "skill":
+      addPath(
+        "M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z",
+      );
+      addPath("m3.3 7 8.7 5 8.7-5");
+      addPath("M12 22V12");
+      break;
+    case "subagents":
+      addCircle("12", "18", "3");
+      addCircle("6", "6", "3");
+      addCircle("18", "6", "3");
+      addPath("M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9");
+      addPath("M12 12v3");
+      break;
+    case "model":
+      addRect("4", "4", "16", "16", "2");
+      addRect("9", "9", "6", "6", "1");
+      addPath("M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2");
+      break;
+    case "effort":
+      addPath(
+        "M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3M14 2v4M8 10v4M16 18v4",
+      );
+      break;
+    case "side":
+      addPath("M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z");
+      break;
+    default:
+      addRect("3", "3", "18", "18", "3");
+      addPath("m7 15 3-3-3-3");
+      addPath("M13 15h4");
+      break;
+  }
+  return svg;
+}
+
 interface RichComposerContext {
   disabled: boolean;
   references: ComposerReference[];
@@ -192,6 +267,91 @@ const LinkPill = TiptapNode.create({
           if (updatedNode.type !== currentNode.type) return false;
           currentNode = updatedNode;
           syncAttrs(currentNode);
+          return true;
+        },
+        selectNode() {
+          dom.classList.add("is-selected");
+        },
+        deselectNode() {
+          dom.classList.remove("is-selected");
+        },
+        ignoreMutation() {
+          return true;
+        },
+      };
+    };
+  },
+});
+
+const CommandPill = TiptapNode.create({
+  name: "commandPill",
+  group: "inline",
+  inline: true,
+  atom: true,
+  selectable: true,
+
+  addAttributes() {
+    return {
+      name: { default: "" },
+      icon: { default: "command" },
+      title: { default: "" },
+    };
+  },
+
+  parseHTML() {
+    return [{ tag: "span[data-command-name]" }];
+  },
+
+  renderText({ node }) {
+    return `/${String(node.attrs.name ?? "")}`;
+  },
+
+  renderHTML({ HTMLAttributes }) {
+    const name = String(HTMLAttributes.name ?? "");
+    const icon = String(HTMLAttributes.icon ?? "command");
+    return [
+      "span",
+      mergeAttributes(HTMLAttributes, {
+        class: "composer-command-pill",
+        "data-command-name": name,
+        "data-command-icon": icon,
+      }),
+      `/${name}`,
+    ];
+  },
+
+  addNodeView() {
+    return ({ node }) => {
+      let currentNode = node;
+      const dom = document.createElement("span");
+      dom.className = "composer-command-pill";
+      dom.contentEditable = "false";
+
+      const renderPillDom = (target: typeof node) => {
+        dom.replaceChildren();
+        const name = String(target.attrs.name ?? "");
+        const iconKind = (target.attrs.icon ??
+          "command") as CommandPillIconKind;
+        const title = String(target.attrs.title ?? "");
+        dom.dataset.commandName = name;
+        dom.dataset.commandIcon = iconKind;
+        dom.title =
+          title && title !== name ? `${title} (/${name})` : `/${name}`;
+
+        const iconEl = createCommandSvg(iconKind);
+        const textSpan = document.createElement("span");
+        textSpan.className = "composer-command-pill-label";
+        textSpan.textContent = name;
+        dom.append(iconEl, textSpan);
+      };
+      renderPillDom(currentNode);
+
+      return {
+        dom,
+        update(updatedNode) {
+          if (updatedNode.type !== currentNode.type) return false;
+          currentNode = updatedNode;
+          renderPillDom(currentNode);
           return true;
         },
         selectNode() {
@@ -354,6 +514,8 @@ const ConfiguredStarterKit = StarterKit.configure({
 interface Props {
   value: string;
   references: ComposerReference[];
+  recognizedCommands?: ReadonlyMap<string, ComposerCommandTokenMeta>;
+  activeCommandTriggerStart?: number | null;
   label: string;
   placeholder: string;
   disabled: boolean;
@@ -376,7 +538,29 @@ interface Props {
   renderImage: (entry: ComposerReference) => ReactNode;
 }
 
-function signature(text: string, references: ComposerReference[]): string {
+function signature(
+  text: string,
+  references: ComposerReference[],
+  recognizedCommands?: ReadonlyMap<string, ComposerCommandTokenMeta>,
+  activeCommandTriggerStart?: number | null,
+): string {
+  const matchedCommands: [string, string, string][] = [];
+  if (recognizedCommands && recognizedCommands.size > 0 && text.includes("/")) {
+    const regex = /(?:^|[ \t\n])\/([^\s/]+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = regex.exec(text)) !== null) {
+      const meta = recognizedCommands.get(m[1]);
+      if (meta) matchedCommands.push([meta.name, meta.icon, meta.title ?? ""]);
+    }
+  }
+  const normalizedTriggerStart =
+    activeCommandTriggerStart !== null &&
+    activeCommandTriggerStart !== undefined &&
+    activeCommandTriggerStart >= 0 &&
+    activeCommandTriggerStart < text.length &&
+    text[activeCommandTriggerStart] === "/"
+      ? activeCommandTriggerStart
+      : null;
   return JSON.stringify([
     text,
     references.map((entry) => [
@@ -386,6 +570,8 @@ function signature(text: string, references: ComposerReference[]): string {
       entry.mimeType,
       Math.max(0, Math.min(text.length, entry.inlineOffset ?? text.length)),
     ]),
+    matchedCommands,
+    normalizedTriggerStart,
   ]);
 }
 
@@ -397,7 +583,14 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
 
     const composingRef = useRef(false);
     const syncingExternalRef = useRef(false);
-    const lastSerializedSig = useRef(signature(props.value, props.references));
+    const lastSerializedSig = useRef(
+      signature(
+        props.value,
+        props.references,
+        props.recognizedCommands,
+        props.activeCommandTriggerStart,
+      ),
+    );
     const lastSelectionRef = useRef<InlineSelection>({
       start: props.value.length,
       end: props.value.length,
@@ -448,6 +641,66 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
         priority: 1000,
         addKeyboardShortcuts() {
           return {
+            Backspace: ({ editor }) => {
+              const { selection } = editor.state;
+              if (
+                selection instanceof NodeSelection &&
+                (selection.node.type.name === "commandPill" ||
+                  selection.node.type.name === "referenceChip" ||
+                  selection.node.type.name === "linkPill")
+              ) {
+                editor.view.dispatch(
+                  editor.state.tr.delete(selection.from, selection.to),
+                );
+                return true;
+              }
+              if (!selection.empty) return false;
+              const before = selection.$from.nodeBefore;
+              if (
+                before &&
+                (before.type.name === "commandPill" ||
+                  before.type.name === "referenceChip")
+              ) {
+                editor.view.dispatch(
+                  editor.state.tr.delete(
+                    selection.from - before.nodeSize,
+                    selection.from,
+                  ),
+                );
+                return true;
+              }
+              return false;
+            },
+            Delete: ({ editor }) => {
+              const { selection } = editor.state;
+              if (
+                selection instanceof NodeSelection &&
+                (selection.node.type.name === "commandPill" ||
+                  selection.node.type.name === "referenceChip" ||
+                  selection.node.type.name === "linkPill")
+              ) {
+                editor.view.dispatch(
+                  editor.state.tr.delete(selection.from, selection.to),
+                );
+                return true;
+              }
+              if (!selection.empty) return false;
+              const after = selection.$from.nodeAfter;
+              if (
+                after &&
+                (after.type.name === "commandPill" ||
+                  after.type.name === "referenceChip")
+              ) {
+                editor.view.dispatch(
+                  editor.state.tr.delete(
+                    selection.from,
+                    selection.from + after.nodeSize,
+                  ),
+                );
+                return true;
+              }
+              return false;
+            },
             Enter: () => {
               // Plain Enter is strictly owned by Composer (submit or autocomplete menu)
               return true;
@@ -588,6 +841,7 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
                                   content: parseInlineMarkdown(
                                     h,
                                     propsRef.current.references,
+                                    propsRef.current.recognizedCommands,
                                   ),
                                 },
                               ],
@@ -729,10 +983,16 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
         TableHeader,
         TableCell,
         LinkPill,
+        CommandPill,
         ReferenceChip,
         ComposerKeyboard,
       ],
-      content: parseMarkdownToDoc(props.value, props.references),
+      content: parseMarkdownToDoc(
+        props.value,
+        props.references,
+        props.recognizedCommands,
+        props.activeCommandTriggerStart,
+      ),
       editorProps: {
         attributes: {
           class: "composer-inline-input composer-rich-input",
@@ -760,10 +1020,20 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
           afterPath: serialized.afterPath,
           selectedPaths: serialized.selectedPaths,
         };
+        const afterCommandPill =
+          instance.state.selection.empty &&
+          instance.state.selection.$from.nodeBefore?.type.name ===
+            "commandPill";
+        const triggerOffset = afterCommandPill ? -1 : caret.start;
+        const nextTrigger = composerTrigger(serialized.text, triggerOffset);
+        const nextActiveCmdStart =
+          nextTrigger?.kind === "commands" ? nextTrigger.start : null;
         lastSelectionRef.current = caret;
         lastSerializedSig.current = signature(
           serialized.text,
           serialized.references,
+          propsRef.current.recognizedCommands,
+          nextActiveCmdStart,
         );
         collectImageTargets();
         if (!propsRef.current.disabled) {
@@ -772,7 +1042,7 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
             serialized.references,
             caret,
           );
-          propsRef.current.onInputState(serialized.text, caret.start);
+          propsRef.current.onInputState(serialized.text, triggerOffset);
         }
       },
       onSelectionUpdate: ({ editor: instance }) => {
@@ -801,7 +1071,12 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
       });
     }
 
-    const incomingSig = signature(props.value, props.references);
+    const incomingSig = signature(
+      props.value,
+      props.references,
+      props.recognizedCommands,
+      props.activeCommandTriggerStart,
+    );
 
     useLayoutEffect(() => {
       collectImageTargets();
@@ -855,7 +1130,12 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
       syncingExternalRef.current = true;
       try {
         const focused = editor.isFocused;
-        const nextDoc = parseMarkdownToDoc(props.value, props.references);
+        const nextDoc = parseMarkdownToDoc(
+          props.value,
+          props.references,
+          props.recognizedCommands,
+          props.activeCommandTriggerStart,
+        );
         editor.commands.setContent(nextDoc, { emitUpdate: false });
         lastSerializedSig.current = incomingSig;
         collectImageTargets();
@@ -997,12 +1277,36 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
                 afterPath: serialized.afterPath,
                 selectedPaths: serialized.selectedPaths,
               };
-              props.onInputState(serialized.text, serialized.selectionStart);
+              const afterCommandPill =
+                editor.state.selection.empty &&
+                editor.state.selection.$from.nodeBefore?.type.name ===
+                  "commandPill";
+              props.onInputState(
+                serialized.text,
+                afterCommandPill ? -1 : serialized.selectionStart,
+              );
             }
           }}
           onClick={(event) => {
             if (!editor || composingRef.current) return;
             const target = event.target as Element | null;
+            const cmdPill = target?.closest<HTMLElement>("[data-command-name]");
+            if (cmdPill) {
+              event.preventDefault();
+              const pos = editor.view.posAtDOM(cmdPill, 0);
+              if (pos >= 0 && pos < editor.state.doc.content.size) {
+                const node = editor.state.doc.nodeAt(pos);
+                if (node?.type.name === "commandPill") {
+                  editor.view.dispatch(
+                    editor.state.tr.setSelection(
+                      NodeSelection.create(editor.state.doc, pos),
+                    ),
+                  );
+                  editor.commands.focus();
+                  return;
+                }
+              }
+            }
             const pill = target?.closest<HTMLElement>("[data-link-href]");
             if (pill) {
               event.preventDefault();
@@ -1044,7 +1348,14 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
               afterPath: serialized.afterPath,
               selectedPaths: serialized.selectedPaths,
             };
-            props.onInputState(serialized.text, serialized.selectionStart);
+            const afterCommandPill =
+              editor.state.selection.empty &&
+              editor.state.selection.$from.nodeBefore?.type.name ===
+                "commandPill";
+            props.onInputState(
+              serialized.text,
+              afterCommandPill ? -1 : serialized.selectionStart,
+            );
           }}
           onCompositionStart={() => {
             composingRef.current = true;
@@ -1066,12 +1377,22 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
               afterPath: serialized.afterPath,
               selectedPaths: serialized.selectedPaths,
             };
+            const afterCommandPill =
+              editor.state.selection.empty &&
+              editor.state.selection.$from.nodeBefore?.type.name ===
+                "commandPill";
+            const triggerOffset = afterCommandPill ? -1 : caret.start;
+            const nextTrigger = composerTrigger(serialized.text, triggerOffset);
+            const nextActiveCmdStart =
+              nextTrigger?.kind === "commands" ? nextTrigger.start : null;
             lastSelectionRef.current = caret;
             lastSerializedSig.current = signature(
               serialized.text,
               serialized.references,
+              props.recognizedCommands,
+              nextActiveCmdStart,
             );
-            props.onCompositionEnd(serialized.text, caret.start);
+            props.onCompositionEnd(serialized.text, triggerOffset);
             if (!props.disabled) {
               props.onEdit(serialized.text, serialized.references, caret);
             }
