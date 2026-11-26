@@ -163,14 +163,21 @@ pub(crate) fn mime(bytes: &[u8], path: &Path) -> &'static str {
     } else if bytes.starts_with(b"%PDF-") {
         "application/pdf"
     } else if bytes.get(4..8) == Some(b"ftyp")
-        && !matches!(
-            path.extension().and_then(|s| s.to_str()),
-            Some("heic" | "heif" | "avif")
-        )
+        && !path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("heic")
+                    || ext.eq_ignore_ascii_case("heif")
+                    || ext.eq_ignore_ascii_case("avif")
+            })
     {
         "video/mp4"
     } else if bytes.starts_with(b"\x1a\x45\xdf\xa3")
-        && path.extension().and_then(|s| s.to_str()) == Some("webm")
+        && path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("webm"))
     {
         "video/webm"
     } else if !bytes.contains(&0)
@@ -254,5 +261,17 @@ mod tests {
         );
         assert_eq!(mime(b"%PDF-1.7", Path::new("binary")), "application/pdf");
         assert_eq!(mime(b"\x89PNG\r\n\x1a\n", Path::new("text")), "image/png");
+        assert_eq!(
+            mime(b"\x1a\x45\xdf\xa3\x9f", Path::new("clip.webm")),
+            "video/webm"
+        );
+        assert_eq!(
+            mime(b"\x1a\x45\xdf\xa3\x9f", Path::new("upper.WEBM")),
+            "video/webm"
+        );
+        assert_eq!(
+            mime(b"\x00\x00\x00\x18ftypheic", Path::new("IMG.HEIC")),
+            "application/octet-stream"
+        );
     }
 }

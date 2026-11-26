@@ -360,7 +360,16 @@ fn traex_skill_info(
 ) -> Result<Option<latte_work_protocol::SkillInfo>> {
     let home = crate::agent_environment::configured_variable("HOME", environment)
         .map(std::path::PathBuf::from);
+    let traex_home = crate::agent_environment::configured_variable("TRAEX_HOME", environment)
+        .map(std::path::PathBuf::from);
+    let codex_home = crate::agent_environment::configured_variable("CODEX_HOME", environment)
+        .map(std::path::PathBuf::from);
     if name.contains(':') {
+        if let Some(traex_home) = &traex_home
+            && let Some(found) = claude_skills::find_in(project, traex_home, name)?
+        {
+            return Ok(Some(found));
+        }
         let Some(home) = home else {
             return Ok(None);
         };
@@ -377,6 +386,12 @@ fn traex_skill_info(
         if parent.join(".git").exists() {
             break;
         }
+    }
+    if let Some(traex_home) = traex_home {
+        roots.push(traex_home.join("skills"));
+    }
+    if let Some(codex_home) = codex_home {
+        roots.push(codex_home.join("skills"));
     }
     if let Some(home) = home {
         roots.extend([".trae/skills", ".traex/skills", ".agents/skills"].map(|r| home.join(r)));

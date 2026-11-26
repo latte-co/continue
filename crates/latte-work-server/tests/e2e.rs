@@ -10880,6 +10880,97 @@ async fn terminal_opens_in_active_agent_worktree_across_all_agents_and_falls_bac
     )
     .await;
 
+    // Failed or pending `ExitWorktree` and >64 read-only tool calls must not lose the worktree;
+    // only a confirmed successful `ExitWorktree` resets back to the project root.
+    let db = rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
+    let insert_event = |sid: &str, event: EventKind| {
+        db.execute(
+            "INSERT INTO events(session_id, at, data) VALUES (?1, 1.0, ?2)",
+            rusqlite::params![sid, serde_json::to_string(&event).unwrap()],
+        )
+        .unwrap();
+    };
+    insert_event(
+        &claude_sid,
+        EventKind::Tool {
+            id: "exit-failed".into(),
+            name: "ExitWorktree".into(),
+            input: json!({}),
+        },
+    );
+    insert_event(
+        &claude_sid,
+        EventKind::ToolResult {
+            id: "exit-failed".into(),
+            content: json!("exit cancelled"),
+            is_error: true,
+        },
+    );
+    for idx in 0..80 {
+        insert_event(
+            &claude_sid,
+            EventKind::Tool {
+                id: format!("read-{idx}"),
+                name: "Read".into(),
+                input: json!({ "file_path": internal_wt.join("README.md") }),
+            },
+        );
+    }
+    drop(db);
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&claude_sid),
+        None,
+        &canonical_internal_wt,
+    )
+    .await;
+
+    let db = rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
+    for event in [
+        EventKind::Tool {
+            id: "exit-ok".into(),
+            name: "ExitWorktree".into(),
+            input: json!({}),
+        },
+        EventKind::ToolResult {
+            id: "exit-ok".into(),
+            content: json!("exited"),
+            is_error: false,
+        },
+    ] {
+        db.execute(
+            "INSERT INTO events(session_id, at, data) VALUES (?1, 1.0, ?2)",
+            rusqlite::params![&claude_sid, serde_json::to_string(&event).unwrap()],
+        )
+        .unwrap();
+    }
+    drop(db);
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&claude_sid),
+        None,
+        &canonical_workspace,
+    )
+    .await;
+
+    // Case-insensitive `.WEBM` project preview resolves as `video/webm`.
+    std::fs::write(workspace.path().join("upper.WEBM"), b"\x1a\x45\xdf\xa3\x9f").unwrap();
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::PreviewSource {
+                project_id: project_id.clone(),
+                session_id: None,
+                path: "upper.WEBM".into(),
+                offset: 0,
+            },
+        )
+        .await,
+        Response::SourcePreview { ref mime_type, .. } if mime_type == "video/webm"
+    ));
+
     // Removing the worktree falls back cleanly to `workspace` root instead of failing.
     run_git(
         &repo_continue,

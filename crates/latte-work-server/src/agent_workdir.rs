@@ -84,7 +84,7 @@ async fn resolve_for_session(
     };
 
     let events = db(&service.database, |d| {
-        d.recent_tool_events(&session.id, RECENT_TOOL_EVENT_LIMIT)
+        d.recent_workdir_tool_events(&session.id, RECENT_TOOL_EVENT_LIMIT)
     })
     .unwrap_or_default();
 
@@ -131,16 +131,25 @@ async fn resolve_for_session(
     None
 }
 
+pub(crate) fn may_emit_directory_signal(
+    raw_name: &str,
+    raw_input: &Value,
+    outcome: Option<bool>,
+) -> bool {
+    let probe_root = Path::new("/");
+    !extract_tool_signals(raw_name, raw_input, outcome, probe_root, probe_root).is_empty()
+}
+
 async fn resolve_from_tool_events(
     canonical_project: &Path,
     base_cwd: &Path,
-    events: &[EventKind],
+    events: &[(EventKind, Option<bool>)],
 ) -> Option<PathBuf> {
-    for event in events {
+    for (event, outcome) in events {
         let EventKind::Tool { name, input, .. } = event else {
             continue;
         };
-        for signal in extract_tool_signals(name, input, canonical_project, base_cwd) {
+        for signal in extract_tool_signals(name, input, *outcome, canonical_project, base_cwd) {
             match signal {
                 DirectorySignal::ResetToProjectRoot => {
                     return Some(canonical_project.to_path_buf());
@@ -193,6 +202,7 @@ fn normalized_input_object(input: &Value) -> Option<serde_json::Map<String, Valu
 fn extract_tool_signals(
     raw_name: &str,
     raw_input: &Value,
+    outcome: Option<bool>,
     canonical_project: &Path,
     base_cwd: &Path,
 ) -> Vec<DirectorySignal> {
@@ -203,7 +213,13 @@ fn extract_tool_signals(
     let lower = stripped.to_ascii_lowercase();
 
     if matches!(lower.as_str(), "exitworktree" | "exit_worktree") {
-        return vec![DirectorySignal::ResetToProjectRoot];
+        // Only a confirmed successful `ExitWorktree` leaves the active worktree.
+        // Failed (`Some(true)`) or unconfirmed/pending (`None`) exits keep the worktree.
+        return if outcome == Some(false) {
+            vec![DirectorySignal::ResetToProjectRoot]
+        } else {
+            Vec::new()
+        };
     }
 
     let Some(map) = normalized_input_object(raw_input) else {
@@ -211,6 +227,9 @@ fn extract_tool_signals(
     };
 
     if matches!(lower.as_str(), "enterworktree" | "enter_worktree") {
+        if outcome == Some(true) {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         for key in ["path", "worktree_path", "worktreePath", "directory", "cwd"] {
             if let Some(raw) = map.get(key).and_then(Value::as_str)
@@ -291,6 +310,9 @@ fn extract_tool_signals(
             | "editfiletoolcall"
     );
     if is_mutating_file_tool {
+        if outcome == Some(true) {
+            return Vec::new();
+        }
         let mut signals = Vec::new();
         for key in [
             "file_path",
@@ -725,30 +747,39 @@ mod tests {
         // 1. Codex/Traex `commandExecution` with external linked worktree `cwd`, followed by
         //    a default-cwd command (`gh auth status` at `project.path`) and `/tmp` escape attempt.
         let codex_events = vec![
-            EventKind::Tool {
-                id: "t3".into(),
-                name: "Bash".into(),
-                input: json!({
-                    "command": "ls -la",
-                    "cwd": "/tmp",
-                }),
-            },
-            EventKind::Tool {
-                id: "t2".into(),
-                name: "Bash".into(),
-                input: json!({
-                    "command": "gh auth status",
-                    "cwd": canonical_project,
-                }),
-            },
-            EventKind::Tool {
-                id: "t1".into(),
-                name: "Bash".into(),
-                input: json!({
-                    "command": ["/bin/zsh", "-lc", "cargo test"],
-                    "cwd": external_wt,
-                }),
-            },
+            (
+                EventKind::Tool {
+                    id: "t3".into(),
+                    name: "Bash".into(),
+                    input: json!({
+                        "command": "ls -la",
+                        "cwd": "/tmp",
+                    }),
+                },
+                Some(false),
+            ),
+            (
+                EventKind::Tool {
+                    id: "t2".into(),
+                    name: "Bash".into(),
+                    input: json!({
+                        "command": "gh auth status",
+                        "cwd": canonical_project,
+                    }),
+                },
+                Some(false),
+            ),
+            (
+                EventKind::Tool {
+                    id: "t1".into(),
+                    name: "Bash".into(),
+                    input: json!({
+                        "command": ["/bin/zsh", "-lc", "cargo test"],
+                        "cwd": external_wt,
+                    }),
+                },
+                Some(false),
+            ),
         ];
         assert_eq!(
             resolve_from_tool_events(&canonical_project, &canonical_project, &codex_events).await,
@@ -756,14 +787,17 @@ mod tests {
         );
 
         // Unrelated external Git repositories must never be accepted.
-        let foreign_events = vec![EventKind::Tool {
-            id: "f1".into(),
-            name: "Bash".into(),
-            input: json!({
-                "command": "git status",
-                "cwd": unrelated.path(),
-            }),
-        }];
+        let foreign_events = vec![(
+            EventKind::Tool {
+                id: "f1".into(),
+                name: "Bash".into(),
+                input: json!({
+                    "command": "git status",
+                    "cwd": unrelated.path(),
+                }),
+            },
+            Some(false),
+        )];
         assert_eq!(
             resolve_from_tool_events(&canonical_project, &canonical_project, &foreign_events).await,
             None
@@ -774,39 +808,75 @@ mod tests {
         let deep_src = internal_wt.join("apps/desktop/src");
         std::fs::create_dir_all(&deep_src).unwrap();
         let claude_events = vec![
-            EventKind::Tool {
-                id: "c2".into(),
-                name: "Read".into(),
-                input: json!({ "file_path": repo.join("README.md") }),
-            },
-            EventKind::Tool {
-                id: "c1".into(),
-                name: "Edit".into(),
-                input: json!({ "file_path": deep_src.join("App.tsx") }),
-            },
+            (
+                EventKind::Tool {
+                    id: "c2".into(),
+                    name: "Read".into(),
+                    input: json!({ "file_path": repo.join("README.md") }),
+                },
+                Some(false),
+            ),
+            (
+                EventKind::Tool {
+                    id: "c1".into(),
+                    name: "Edit".into(),
+                    input: json!({ "file_path": deep_src.join("App.tsx") }),
+                },
+                Some(false),
+            ),
         ];
         assert_eq!(
             resolve_from_tool_events(&canonical_project, &canonical_project, &claude_events).await,
             Some(canonical_internal_wt.clone())
         );
 
-        // 3. Claude Code `EnterWorktree` (by name) and `ExitWorktree` reset.
-        let enter_events = vec![EventKind::Tool {
-            id: "cw1".into(),
-            name: "EnterWorktree".into(),
-            input: json!({ "name": "claude-feat" }),
-        }];
+        // 3. Claude Code `EnterWorktree` (by name) and `ExitWorktree` reset:
+        //    failed (`Some(true)`) or pending (`None`) `ExitWorktree` keeps the worktree.
+        let enter_events = vec![(
+            EventKind::Tool {
+                id: "cw1".into(),
+                name: "EnterWorktree".into(),
+                input: json!({ "name": "claude-feat" }),
+            },
+            Some(false),
+        )];
         let canonical_repo = repo.canonicalize().unwrap();
         assert_eq!(
             resolve_from_tool_events(&canonical_repo, &canonical_repo, &enter_events).await,
+            Some(canonical_claude_wt.clone())
+        );
+        let failed_exit_events = vec![
+            (
+                EventKind::Tool {
+                    id: "cw_pending".into(),
+                    name: "ExitWorktree".into(),
+                    input: json!({}),
+                },
+                None,
+            ),
+            (
+                EventKind::Tool {
+                    id: "cw_failed".into(),
+                    name: "ExitWorktree".into(),
+                    input: json!({}),
+                },
+                Some(true),
+            ),
+            enter_events[0].clone(),
+        ];
+        assert_eq!(
+            resolve_from_tool_events(&canonical_repo, &canonical_repo, &failed_exit_events).await,
             Some(canonical_claude_wt)
         );
         let exit_events = vec![
-            EventKind::Tool {
-                id: "cw2".into(),
-                name: "ExitWorktree".into(),
-                input: json!({}),
-            },
+            (
+                EventKind::Tool {
+                    id: "cw2".into(),
+                    name: "ExitWorktree".into(),
+                    input: json!({}),
+                },
+                Some(false),
+            ),
             enter_events[0].clone(),
         ];
         assert_eq!(
@@ -815,11 +885,14 @@ mod tests {
         );
 
         // 4. OpenCode `workdir` and camelCase `filePath`.
-        let opencode_events = vec![EventKind::Tool {
-            id: "o1".into(),
-            name: "Edit".into(),
-            input: json!({ "filePath": deep_src.join("main.tsx") }),
-        }];
+        let opencode_events = vec![(
+            EventKind::Tool {
+                id: "o1".into(),
+                name: "Edit".into(),
+                input: json!({ "filePath": deep_src.join("main.tsx") }),
+            },
+            Some(false),
+        )];
         assert_eq!(
             resolve_from_tool_events(&canonical_project, &canonical_project, &opencode_events)
                 .await,
@@ -827,23 +900,31 @@ mod tests {
         );
 
         // 5. Cursor `shellToolCall` (`workingDirectory`) and generic `function` string JSON.
-        let cursor_events = vec![EventKind::Tool {
-            id: "cu1".into(),
-            name: "shellToolCall".into(),
-            input: json!({
-                "command": "npm test",
-                "workingDirectory": internal_wt,
-            }),
-        }];
+        let cursor_events = vec![(
+            EventKind::Tool {
+                id: "cu1".into(),
+                name: "shellToolCall".into(),
+                input: json!({
+                    "command": "npm test",
+                    "workingDirectory": internal_wt,
+                }),
+            },
+            Some(false),
+        )];
         assert_eq!(
             resolve_from_tool_events(&canonical_project, &canonical_project, &cursor_events).await,
             Some(canonical_internal_wt.clone())
         );
-        let cursor_fn_events = vec![EventKind::Tool {
-            id: "cu2".into(),
-            name: "edit_file".into(),
-            input: Value::String(json!({ "target_file": deep_src.join("index.ts") }).to_string()),
-        }];
+        let cursor_fn_events = vec![(
+            EventKind::Tool {
+                id: "cu2".into(),
+                name: "edit_file".into(),
+                input: Value::String(
+                    json!({ "target_file": deep_src.join("index.ts") }).to_string(),
+                ),
+            },
+            Some(false),
+        )];
         assert_eq!(
             resolve_from_tool_events(&canonical_project, &canonical_project, &cursor_fn_events)
                 .await,

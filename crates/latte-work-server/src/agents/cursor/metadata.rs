@@ -591,6 +591,23 @@ fn skill_roots(project: &std::path::Path, environment: &AgentEnvironment) -> Vec
             break;
         }
     }
+    if let Some(cursor_config) =
+        crate::agent_environment::configured_variable("CURSOR_CONFIG_DIR", environment)
+            .map(PathBuf::from)
+    {
+        roots.extend(["skills", "skills-cursor"].map(|relative| cursor_config.join(relative)));
+    }
+    if let Some(claude_config) =
+        crate::agent_environment::configured_variable("CLAUDE_CONFIG_DIR", environment)
+            .map(PathBuf::from)
+    {
+        roots.push(claude_config.join("skills"));
+    }
+    if let Some(codex_home) =
+        crate::agent_environment::configured_variable("CODEX_HOME", environment).map(PathBuf::from)
+    {
+        roots.push(codex_home.join("skills"));
+    }
     if let Some(home) =
         crate::agent_environment::configured_variable("HOME", environment).map(PathBuf::from)
     {
@@ -615,6 +632,18 @@ fn command_roots(project: &std::path::Path, environment: &AgentEnvironment) -> V
         if parent.join(".git").exists() {
             break;
         }
+    }
+    if let Some(cursor_config) =
+        crate::agent_environment::configured_variable("CURSOR_CONFIG_DIR", environment)
+            .map(PathBuf::from)
+    {
+        roots.push(cursor_config.join("commands"));
+    }
+    if let Some(claude_config) =
+        crate::agent_environment::configured_variable("CLAUDE_CONFIG_DIR", environment)
+            .map(PathBuf::from)
+    {
+        roots.push(claude_config.join("commands"));
     }
     if let Some(home) =
         crate::agent_environment::configured_variable("HOME", environment).map(PathBuf::from)

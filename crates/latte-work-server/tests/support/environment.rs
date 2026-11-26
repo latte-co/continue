@@ -1098,14 +1098,14 @@ async fn custom_agent_environment_resolves_agent_commands_and_skill_info_for_col
         ),
         (
             "cursor",
-            "HOME",
-            ".cursor/skills/configured-demo",
+            "CURSOR_CONFIG_DIR",
+            "skills/configured-demo",
             "expected cursor instance file",
         ),
         (
             "traex",
-            "HOME",
-            ".trae/skills/configured-demo",
+            "TRAEX_HOME",
+            "skills/configured-demo",
             "expected traex instance file",
         ),
     ] {
@@ -1202,7 +1202,7 @@ async fn custom_agent_environment_resolves_agent_commands_and_skill_info_for_col
 
         // 3. Once the session is opened with the configured environment, direct RPC `SkillInfo`
         //    with `provider: None` also uses the active session's environment.
-        if matches!(agent, "codex" | "claude") {
+        if matches!(agent, "codex" | "claude" | "traex") {
             assert!(matches!(
                 request_with_app_agent_config(
                     &target,

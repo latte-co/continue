@@ -26,6 +26,7 @@ import type { Event, GitReview, Project } from "./protocol";
 import {
   isEmptyRepositoryReviewError,
   isNotGitRepositoryError,
+  isRemovedGitRepositoryError,
   normalizeGitRepoPath,
   readGitRepositories,
   useSelectedGitRepository,
@@ -216,11 +217,17 @@ export function TaskInfo({
         throw isNotGitRepositoryError(error) ? scanError : error;
       }
       const { repositories, truncated } = discovered;
-      if (repoArg && repositories.some((repo) => repo.path === repoArg)) {
+      if (
+        repoArg &&
+        (truncated ||
+          !isRemovedGitRepositoryError(error) ||
+          repositories.some((repo) => repo.path === repoArg))
+      ) {
         throw error;
       }
       if (!repositories.length) {
-        if (repoArg) setSelectedRepo(undefined);
+        if (repoArg && !truncated && isRemovedGitRepositoryError(error))
+          setSelectedRepo(undefined);
         if (truncated) throw new Error("子目录过多，未能完成 Git 仓库扫描");
         return null;
       }

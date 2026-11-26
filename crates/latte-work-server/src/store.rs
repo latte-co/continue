@@ -681,22 +681,62 @@ impl Store {
             .map(|row| Ok(serde_json::from_str(&row?)?))
             .collect()
     }
-    pub fn recent_tool_events(&self, session_id: &str, limit: usize) -> Result<Vec<EventKind>> {
+    pub(crate) fn recent_workdir_tool_events(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(EventKind, Option<bool>)>> {
+        const SCAN_ROW_LIMIT: i64 = 16_384;
         let mut query = self.db.prepare(
-            "SELECT data FROM events
-             WHERE session_id=?1 AND length(data) <= 262144
-               AND json_extract(data,'$.kind')='tool'
-             ORDER BY seq DESC LIMIT ?2",
+            "SELECT
+                 json_extract(data,'$.kind'),
+                 json_extract(data,'$.id'),
+                 json_extract(data,'$.is_error'),
+                 CASE WHEN json_extract(data,'$.kind')='tool' AND length(data) <= 262144
+                      THEN data
+                 END
+             FROM events
+             WHERE session_id=?1
+               AND json_extract(data,'$.kind') IN ('tool','tool_result')
+             ORDER BY seq DESC
+             LIMIT ?2",
         )?;
-        let rows = query
-            .query_map(params![session_id, limit as i64], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|raw| serde_json::from_str::<EventKind>(&raw).ok())
-            .collect())
+        let mut rows = query.query(params![session_id, SCAN_ROW_LIMIT])?;
+        let mut outcomes = std::collections::HashMap::<String, bool>::new();
+        let mut collected = Vec::new();
+        while let Some(row) = rows.next()? {
+            let kind: Option<String> = row.get(0)?;
+            let id: Option<String> = row.get(1)?;
+            match kind.as_deref() {
+                Some("tool_result") => {
+                    if let Some(id) = id {
+                        let is_error = row.get::<_, Option<bool>>(2)?.unwrap_or(false);
+                        outcomes.entry(id).or_insert(is_error);
+                    }
+                }
+                Some("tool") => {
+                    let Some(raw) = row.get::<_, Option<String>>(3)? else {
+                        continue;
+                    };
+                    let Ok(event) = serde_json::from_str::<EventKind>(&raw) else {
+                        continue;
+                    };
+                    let EventKind::Tool { id, name, input } = &event else {
+                        continue;
+                    };
+                    let outcome = outcomes.get(id).copied();
+                    if !crate::agent_workdir::may_emit_directory_signal(name, input, outcome) {
+                        continue;
+                    }
+                    collected.push((event, outcome));
+                    if collected.len() >= limit {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(collected)
     }
     pub fn recent_sessions(
         &self,

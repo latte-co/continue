@@ -1211,3 +1211,78 @@ it("keeps the repository switcher rendered when git_info fails on an existing ch
     ),
   );
 });
+
+it("preserves the selected child repository and avoids silent fallback when discovery is truncated", async () => {
+  const { setSelectedGitRepository, getSelectedGitRepository } =
+    await import("./gitRepositories");
+  setSelectedGitRepository("local", project, "still-valid");
+  const list = [
+    { path: ".", name: "root", kind: "root" as const },
+    { path: "other", name: "other", kind: "repository" as const },
+  ];
+  mocks.request.mockImplementation(async (_host: string, req: Request) => {
+    if (req.method === "git_info" && req.repo_path === "still-valid") {
+      throw Object.assign(new Error("Git 元数据超出读取上限，请缩小项目范围"), {
+        code: "request_failed",
+      });
+    }
+    if (req.method === "git_info") {
+      return { kind: "git_info", info: { ...info, repositories: list } };
+    }
+    if (req.method === "git_repositories") {
+      return { kind: "git_repositories", repositories: list, truncated: true };
+    }
+    if (req.method === "git_review") {
+      return { kind: "git_review", review: { ...review, entries: [] } };
+    }
+    throw new Error(`unexpected ${req.method}`);
+  });
+  render(<ChangesView {...props} />);
+  expect(
+    await screen.findByText(/Git 元数据超出读取上限，请缩小项目范围/),
+  ).toBeTruthy();
+  const switcher = await screen.findByRole("combobox", { name: "Git 仓库" });
+  expect(getSelectedGitRepository("local", project)).toBe("still-valid");
+  expect(mocks.request).not.toHaveBeenCalledWith(
+    "local",
+    expect.objectContaining({ method: "git_review" }),
+  );
+
+  // User can still explicitly switch to another discovered repository.
+  fireEvent.click(switcher);
+  fireEvent.click(screen.getByRole("option", { name: /root/ }));
+  await waitFor(() =>
+    expect(mocks.request).toHaveBeenCalledWith(
+      "local",
+      expect.objectContaining({ method: "git_review" }),
+    ),
+  );
+  expect(getSelectedGitRepository("local", project)).toBe(".");
+});
+
+it("does not silently switch to a partial-scan repository even when the selected child is missing under truncated discovery", async () => {
+  const { setSelectedGitRepository, getSelectedGitRepository } =
+    await import("./gitRepositories");
+  setSelectedGitRepository("local", project, "removed-wt");
+  const list = [
+    { path: ".", name: "root", kind: "root" as const },
+    { path: "other", name: "other", kind: "repository" as const },
+  ];
+  mocks.request.mockImplementation(async (_host: string, req: Request) => {
+    if (req.method === "git_info" && req.repo_path === "removed-wt") {
+      throw Object.assign(new Error("子仓库目录不存在"), {
+        code: "request_failed",
+      });
+    }
+    if (req.method === "git_repositories") {
+      return { kind: "git_repositories", repositories: list, truncated: true };
+    }
+    throw new Error(`unexpected ${req.method}`);
+  });
+  render(<ChangesView {...props} />);
+  expect(await screen.findByText(/子仓库目录不存在/)).toBeTruthy();
+  expect(
+    await screen.findByRole("combobox", { name: "Git 仓库" }),
+  ).toBeTruthy();
+  expect(getSelectedGitRepository("local", project)).toBe("removed-wt");
+});

@@ -14,6 +14,7 @@ import { ChangeScopePicker, type ReviewScope } from "./ChangeScopePicker";
 import {
   formatGitRepositoryOption,
   isNotGitRepositoryError,
+  isRemovedGitRepositoryError,
   matchRepositoryForPath,
   normalizeGitRepoPath,
   readGitRepositories,
@@ -304,11 +305,25 @@ export function ChangesView({
         if (discovered.repositories.length > 0) {
           if (
             repoArg &&
-            discovered.repositories.some((repo) => repo.path === repoArg)
+            (discovered.truncated ||
+              !isRemovedGitRepositoryError(cause) ||
+              discovered.repositories.some((repo) => repo.path === repoArg))
           ) {
+            const list = discovered.repositories.some(
+              (repo) => repo.path === repoArg,
+            )
+              ? discovered.repositories
+              : [
+                  ...discovered.repositories,
+                  {
+                    path: repoArg,
+                    name: repoArg,
+                    kind: "repository" as const,
+                  },
+                ];
             setDiscoveredRepos({
               scopeKey: projectKey,
-              list: discovered.repositories,
+              list,
               truncated: discovered.truncated,
               noGit: false,
             });
@@ -343,7 +358,11 @@ export function ChangesView({
           setSelectedRepo(chosen.path);
           return;
         }
-        if (repoArg) {
+        if (
+          repoArg &&
+          !discovered.truncated &&
+          isRemovedGitRepositoryError(cause)
+        ) {
           setSelectedRepo(undefined);
         }
         if (discovered.truncated) {

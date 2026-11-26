@@ -11,6 +11,7 @@ import { SideChatHistory, type SideChatHistoryProps } from "./SideChatHistory";
 import {
   isEmptyRepositoryReviewError,
   isNotGitRepositoryError,
+  isRemovedGitRepositoryError,
   normalizeGitRepoPath,
   readGitRepositories,
   useSelectedGitRepository,
@@ -126,12 +127,18 @@ export function TaskOverview({
           }
           if (disposed) return;
           const { repositories, truncated } = discovered;
-          if (repoArg && repositories.some((repo) => repo.path === repoArg)) {
+          if (
+            repoArg &&
+            (truncated ||
+              !isRemovedGitRepositoryError(cause) ||
+              repositories.some((repo) => repo.path === repoArg))
+          ) {
             setChanges({ error: message(cause) });
             return;
           }
           if (!repositories.length) {
-            if (repoArg) setSelectedRepo(undefined);
+            if (repoArg && !truncated && isRemovedGitRepositoryError(cause))
+              setSelectedRepo(undefined);
             setChanges(
               truncated
                 ? { error: "子目录过多，未能完成 Git 仓库扫描" }
