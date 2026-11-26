@@ -143,8 +143,8 @@ import {
 | `--radius-window` | `16px` | Native macOS window frame |
 | `--radius-dialog` | `14px` | Modal dialogs (`Dialog`, `SettingsPage` `.settings-modal`) |
 | `--radius-island` | `12px` | `StageIsland`, `.sidebar-preview`, `Composer`, user message bubble |
-| `--radius-card` / `--radius-track` | `10px` | `Card`, `CardList`, `DataTable`, `EmptyState`, `ApprovalCard`, `.activity-well`, `Popover`, `.composer-menu`, `Segmented` track |
-| `--radius-control` | `8px` | **All** buttons, icon buttons, inputs, `SearchInput`, `Select`, `NoticeBanner`, `NavRow`, `MenuRow`, `FloatingPill`, workspace tabs, segmented thumbs |
+| `--radius-card` / `--radius-track` | `10px` | `Card`, `CardList`, `DataTable`, `EmptyState`, `ApprovalCard`, `Popover`, `.composer-menu`, `Segmented` track |
+| `--radius-control` | `8px` | **All** buttons, icon buttons, inputs, `SearchInput`, `Select`, `NoticeBanner`, `NavRow`, `MenuRow`, `FloatingPill`, `.activity-well`, workspace tabs, segmented thumbs |
 | `--radius-badge` | `5px` | `<Kbd>`, `<Badge>`, inline `<code>`, `.composer-link-pill`, tool status tags |
 | `--radius-pill` | `999px` | Reserved strictly for `Switch` tracks, status dots, and circular swatches |
 
@@ -333,8 +333,10 @@ To keep every page visually calm, dense, and cohesive:
   Session Process Stream (`阶段簇 → 工具行 → 展开卡`). Vertical bars are allowed
   only for: ① `2.5px` `+ / -` bars inside inline code diffs, ② `2px`
   Markdown/SideChat blockquotes, and ③ `WorkspaceFiles` directory trees at depth
-  `>= 3`. Level-2 tool children and expanded `.activity-output` wells align on a
-  pure **`22px` whitespace indent axis** (`.activity-children`, `.activity-output`).
+  `>= 3`. Level-2 tool children (`.activity-children`) indent on a pure **`22px`
+  whitespace axis**, while expanded `.activity-output` wells align **flush with
+  their own parent row's left edge** (`0px` at top level alongside prose/code
+  blocks; `22px` inside `.activity-children`).
 
 ### Graded Tool Failure Folding (`ToolGroup` + `activity.ts`)
 
@@ -359,7 +361,8 @@ To keep every page visually calm, dense, and cohesive:
 
 Both regular `<ToolRow>` items and `<ApprovalCard>` items (`presentation="request"`
 in the live approval dock and `presentation="record"` in the transcript) share the
-exact same `<ToolDetailBody>` semantic `10px` `.activity-well` containers:
+exact same `<ToolDetailBody>` semantic `8px` (`--radius-control`, `1px solid
+var(--color-border)`) `.activity-well` containers:
 
 - **Terminal Well (`.activity-well--terminal`)**:
   - **Conditional `cwd` Header**: Renders `.activity-well-header` with folder icon
@@ -377,8 +380,8 @@ exact same `<ToolDetailBody>` semantic `10px` `.activity-well` containers:
 - **Approval Alignment Contract**: Resolved `<ApprovalCard presentation="record">`
   renders `<details class="approval-result activity-row">` with `ShieldCheck`
   (`14px`), two-tone verb + monospace target, status pill (`已完成` / `执行失败` /
-  `已拒绝`), and `.activity-output` at the exact `22px` left axis housing
-  `<ToolDetailBody>` + collapsible `操作参数`.
+  `已拒绝`), and `.activity-output` flush with its own row's left edge (`0px` top-
+  level) housing `<ToolDetailBody>` + collapsible `操作参数`.
 
 ### Borderless Stream Error Row & Dual-Layer Deduplication (`TurnErrorRow`)
 
@@ -408,10 +411,10 @@ exact same `<ToolDetailBody>` semantic `10px` `.activity-well` containers:
     already ran in the turn; `重试` when zero progress ran before failure;
     omitted for context-window overflow or once retired by a newer turn), using
     `preserveDraft: true` so unsent Composer drafts are never cleared.
-  - **Uniform `22px` Neutral Raw Drawer**: Clicking the row in either active or
-    historical turns expands `.activity-output` (`margin: 5px 0 12px 22px`)
-    housing a neutral `.activity-well.turn-error-well` (`<pre>` full raw error
-    message + `复制` / `已复制` ghost micro-button).
+  - **Row-Edge Flush Neutral Raw Drawer**: Clicking the row in either active or
+    historical turns expands `.activity-output` (`margin: 5px 0 12px`) flush with
+    the `0px` row start, housing a neutral `.activity-well.turn-error-well` (`<pre>`
+    full raw error message + `复制` / `已复制` ghost micro-button).
 
 ---
 

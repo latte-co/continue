@@ -2816,25 +2816,22 @@ button.recent-notice {
 .activity-group[open] > summary > .activity-chevron {
   transform: rotate(90deg);
 }
-/* Pure 22px whitespace indent axis — no vertical scaffold rail (DESIGN.md §6). */
+/* Pure 22px child-row indent axis; expanded .activity-output aligns flush with its own row's left edge (0px top-level, 22px in .activity-children). */
 .activity-children {
   padding-left: 22px;
   margin: 2px 0 8px;
 }
 .activity-output {
-  margin: 5px 0 12px 22px;
+  margin: 5px 0 12px;
   outline: none;
-}
-.activity-children .activity-output {
-  margin-left: 0;
 }
 .activity-output:focus-visible .activity-well {
   box-shadow: var(--focus-ring);
 }
 .activity-well {
   background: var(--color-input);
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
   max-height: 300px;
   overflow: auto;
   /* Keep boundary and momentum scrolling inside the tool output. */
@@ -3058,7 +3055,7 @@ button.recent-notice {
 .approval-operation pre,
 .approval-parameters pre {
   background: var(--color-input);
-  border: 1px solid var(--color-border-subtle);
+  border: 1px solid var(--color-border);
   border-radius: var(--radius-control);
   padding: 8px 12px;
   max-height: 180px;
@@ -3092,16 +3089,26 @@ button.recent-notice {
   font-size: var(--text-xs);
 }
 .activity-output > .approval-parameters {
-  margin-top: 6px;
+  margin-top: 5px;
 }
 .approval-parameters summary {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  min-height: 26px;
+  min-height: 24px;
+  padding: 1px 5px;
+  margin-left: -5px;
+  border-radius: var(--radius-badge);
   cursor: pointer;
   list-style: none;
   user-select: none;
+  transition:
+    color var(--duration-fast) ease,
+    background var(--duration-fast) ease;
+}
+.approval-parameters summary:hover {
+  color: var(--color-text-secondary);
+  background: var(--color-hover);
 }
 .approval-parameters summary::-webkit-details-marker {
   display: none;
