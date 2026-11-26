@@ -367,19 +367,23 @@ export default function App() {
               <div className="topbar-actions">
                 {!merged && conversationActions}
                 {overview}
-                <span className="titlebar-divider" aria-hidden="true" />
-                <IconButton
-                  size="sm"
-                  active={panel}
-                  className="panel-toggle"
-                  title={panel ? "收起工作区" : "展开工作区"}
-                  label={panel ? "收起工作区" : "展开工作区"}
-                  aria-expanded={panel}
-                  aria-controls="project-workspace"
-                  onClick={() => setPanel((v) => !v)}
-                >
-                  <PanelRight size={15.5} />
-                </IconButton>
+                {!panel && (
+                  <>
+                    <span className="titlebar-divider" aria-hidden="true" />
+                    <IconButton
+                      size="sm"
+                      data-workspace-toggle
+                      className="panel-toggle"
+                      title="展开工作区"
+                      label="展开工作区"
+                      aria-expanded={false}
+                      aria-controls="project-workspace"
+                      onClick={() => setPanel(true)}
+                    >
+                      <PanelRight size={15.5} />
+                    </IconButton>
+                  </>
+                )}
               </div>
             </Topbar>
             <Conversation
@@ -614,9 +618,23 @@ export default function App() {
             project={project}
             visible={panel && workbench.modal !== "settings" && !skillsOpen}
             connected={connected}
-            close={() =>
-              merged ? workbench.restoreWorkspace() : setPanel(false)
-            }
+            close={() => {
+              if (merged) {
+                workbench.restoreWorkspace();
+                return;
+              }
+              const restoreFocus = document
+                .getElementById("project-workspace")
+                ?.contains(document.activeElement);
+              setPanel(false);
+              if (restoreFocus) {
+                requestAnimationFrame(() => {
+                  document
+                    .querySelector<HTMLElement>("[data-workspace-toggle]")
+                    ?.focus();
+                });
+              }
+            }}
           />
           <SkillsPage
             state={workbench}

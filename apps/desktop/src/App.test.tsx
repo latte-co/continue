@@ -369,3 +369,25 @@ it("requests Markdown preview mode only when opening Markdown files from the con
     codeTab?.kind === "files" ? codeTab.markdownPreviewRequest : undefined,
   ).toBeUndefined();
 });
+
+it("hides the main topbar workspace toggle when the right workspace panel is open", () => {
+  const view = render(<App />);
+  const expandBtn = screen.getByRole("button", { name: "展开工作区" });
+  expect(expandBtn.closest(".topbar-actions")).toBeTruthy();
+  expect(document.querySelectorAll(".topbar .titlebar-divider")).toHaveLength(
+    1,
+  );
+  fireEvent.click(expandBtn);
+  expect(mocks.state.setPanel).toHaveBeenCalledWith(true);
+
+  mocks.state = { ...mocks.state, panel: true };
+  view.rerender(<App />);
+  expect(
+    within(document.querySelector(".topbar-actions")!).queryByRole("button", {
+      name: /工作区/,
+    }),
+  ).toBeNull();
+  expect(document.querySelectorAll(".topbar .titlebar-divider")).toHaveLength(
+    0,
+  );
+});
