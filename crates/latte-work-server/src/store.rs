@@ -684,8 +684,11 @@ impl Store {
     pub(crate) fn recent_workdir_tool_events(
         &self,
         session_id: &str,
+        project_root: &std::path::Path,
+        canonical_project: &std::path::Path,
+        base_cwd: &std::path::Path,
         limit: usize,
-    ) -> Result<Vec<(EventKind, Option<bool>)>> {
+    ) -> Result<Vec<crate::agent_workdir::DirectorySignal>> {
         const SCAN_ROW_LIMIT: i64 = 16_384;
         let mut query = self.db.prepare(
             "SELECT
@@ -703,8 +706,9 @@ impl Store {
         )?;
         let mut rows = query.query(params![session_id, SCAN_ROW_LIMIT])?;
         let mut outcomes = std::collections::HashMap::<String, bool>::new();
+        let mut seen = std::collections::HashSet::new();
         let mut collected = Vec::new();
-        while let Some(row) = rows.next()? {
+        'rows: while let Some(row) = rows.next()? {
             let kind: Option<String> = row.get(0)?;
             let id: Option<String> = row.get(1)?;
             match kind.as_deref() {
@@ -718,19 +722,28 @@ impl Store {
                     let Some(raw) = row.get::<_, Option<String>>(3)? else {
                         continue;
                     };
-                    let Ok(event) = serde_json::from_str::<EventKind>(&raw) else {
+                    let Ok(EventKind::Tool { id, name, input }) =
+                        serde_json::from_str::<EventKind>(&raw)
+                    else {
                         continue;
                     };
-                    let EventKind::Tool { id, name, input } = &event else {
-                        continue;
-                    };
-                    let outcome = outcomes.get(id).copied();
-                    if !crate::agent_workdir::may_emit_directory_signal(name, input, outcome) {
-                        continue;
-                    }
-                    collected.push((event, outcome));
-                    if collected.len() >= limit {
-                        break;
+                    let outcome = outcomes.get(&id).copied();
+                    for signal in crate::agent_workdir::extract_tool_signals(
+                        &name,
+                        &input,
+                        outcome,
+                        project_root,
+                        canonical_project,
+                        base_cwd,
+                    ) {
+                        let is_reset =
+                            signal == crate::agent_workdir::DirectorySignal::ResetToProjectRoot;
+                        if seen.insert(signal.clone()) {
+                            collected.push(signal);
+                            if is_reset || collected.len() >= limit {
+                                break 'rows;
+                            }
+                        }
                     }
                 }
                 _ => {}

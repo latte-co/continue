@@ -106,9 +106,11 @@ pub(crate) fn find_with_env(
     environment: &latte_work_protocol::AgentEnvironment,
 ) -> Result<Option<SkillInfo>> {
     let config = crate::agent_environment::configured_variable("CLAUDE_CONFIG_DIR", environment)
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             crate::agent_environment::configured_variable("HOME", environment)
+                .filter(|v| !v.is_empty())
                 .map(|home| PathBuf::from(home).join(".claude"))
         })
         .context("无法确定 Agent 配置目录")?;
@@ -119,19 +121,12 @@ pub(crate) fn find_in_roots(roots: &[PathBuf], name: &str) -> Result<Option<Skil
     if !crate::skills::component(name) {
         bail!("Skill 名称无效");
     }
-    let mut match_info: Option<SkillInfo> = None;
     for root in roots {
         if let Some(found) = inspect(&root.join(name), name)? {
-            if match_info
-                .as_ref()
-                .is_some_and(|existing| existing.directory != found.directory)
-            {
-                bail!("此 Skill 有多个安装位置，无法确认当前目录");
-            }
-            match_info = Some(found);
+            return Ok(Some(found));
         }
     }
-    Ok(match_info)
+    Ok(None)
 }
 
 pub(crate) fn scan_roots(roots: &[PathBuf]) -> Vec<(String, SkillInfo)> {

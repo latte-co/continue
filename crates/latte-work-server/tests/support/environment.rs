@@ -1059,7 +1059,18 @@ async fn custom_agent_environment_reaches_all_adapters_and_reconfigures_without_
 #[tokio::test]
 async fn custom_agent_environment_resolves_agent_commands_and_skill_info_for_cold_and_open_sessions()
  {
-    let host = Host::start().await;
+    let fake_home = tempfile::tempdir().unwrap();
+    let fake_xdg = fake_home.path().join(".config");
+    let empty = std::ffi::OsStr::new("");
+    let host = Host::start_with_environment(&[
+        ("HOME", fake_home.path().as_os_str()),
+        ("XDG_CONFIG_HOME", fake_xdg.as_os_str()),
+        ("CODEX_HOME", empty),
+        ("OPENCODE_CONFIG_DIR", empty),
+        ("CURSOR_CONFIG_DIR", empty),
+        ("TRAEX_HOME", empty),
+    ])
+    .await;
     let app = tempfile::tempdir().unwrap();
     let app_path = app.path();
     let target = Mutex::new(host.client().await);
@@ -1076,6 +1087,26 @@ async fn custom_agent_environment_resolves_agent_commands_and_skill_info_for_col
     else {
         panic!("project")
     };
+
+    let write_skill = |dir: &std::path::Path, name: &str, desc: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {desc}\n---\nbody\n"),
+        )
+        .unwrap();
+    };
+    // Seed a default copy of `dual-demo` in each agent's unconfigured default root so
+    // configured overrides prove they replace (not duplicate) the default home root.
+    for default_skill_dir in [
+        fake_home.path().join(".codex/skills/dual-demo"),
+        host.directory.path().join("claude-config/skills/dual-demo"),
+        fake_home.path().join(".config/opencode/skills/dual-demo"),
+        fake_home.path().join(".cursor/skills/dual-demo"),
+        fake_home.path().join(".traex/skills/dual-demo"),
+    ] {
+        write_skill(&default_skill_dir, "Dual Demo", "default home copy");
+    }
 
     for (agent, env_key, rel_skill_dir, expected_desc) in [
         (
@@ -1111,12 +1142,13 @@ async fn custom_agent_environment_resolves_agent_commands_and_skill_info_for_col
     ] {
         let instance_dir = tempfile::tempdir().unwrap();
         let skill_dir = instance_dir.path().join(rel_skill_dir);
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            format!("---\nname: Configured Demo\ndescription: {expected_desc}\n---\nbody\n"),
-        )
-        .unwrap();
+        write_skill(&skill_dir, "Configured Demo", expected_desc);
+        let custom_dual_desc = format!("custom {agent} override copy");
+        write_skill(
+            &instance_dir.path().join("skills/dual-demo"),
+            "Dual Demo",
+            &custom_dual_desc,
+        );
 
         let env = AgentEnvironment(BTreeMap::from([(
             env_key.into(),
@@ -1144,13 +1176,15 @@ async fn custom_agent_environment_resolves_agent_commands_and_skill_info_for_col
         .unwrap();
         match catalog {
             Response::AgentCommands { commands } => {
-                assert!(
-                    commands.iter().any(|c| {
-                        c.name == "configured-demo"
-                            && c.kind == Some(latte_work_protocol::AgentCommandKind::Skill)
-                    }),
-                    "{agent} missing configured-demo in commands: {commands:?}"
-                );
+                for expected_slug in ["configured-demo", "dual-demo"] {
+                    assert!(
+                        commands.iter().any(|c| {
+                            c.name == expected_slug
+                                && c.kind == Some(latte_work_protocol::AgentCommandKind::Skill)
+                        }),
+                        "{agent} missing {expected_slug} in commands: {commands:?}"
+                    );
+                }
             }
             other => panic!("expected {agent} commands, got {other:?}"),
         }
@@ -1167,8 +1201,9 @@ async fn custom_agent_environment_resolves_agent_commands_and_skill_info_for_col
             panic!("session")
         };
 
-        // 2. Cold session without `provider` sees default host environment (`None`), while
-        //    `request_with_app_agent_config` attaches the configured environment and resolves it.
+        // 2. Cold session without `provider` sees default host environment (`None` for
+        //    `configured-demo`, `"default home copy"` for `dual-demo`), while
+        //    `request_with_app_agent_config` attaches the configured override without ambiguity.
         assert!(matches!(
             ask(
                 &mut observer,
@@ -1181,24 +1216,41 @@ async fn custom_agent_environment_resolves_agent_commands_and_skill_info_for_col
             .await,
             Response::SkillInfo { skill: None }
         ));
-        let cold_info = request_with_app_agent_config(
-            &target,
-            Request::SkillInfo {
-                provider: None,
-                session_id: session.id.clone(),
-                name: "configured-demo".into(),
-            },
-            resolve,
-        )
-        .await
-        .unwrap();
-        assert!(
-            matches!(
-                &cold_info,
-                Response::SkillInfo { skill: Some(info) } if info.description == expected_desc
-            ),
-            "{agent} cold SkillInfo mismatch: {cold_info:?}"
-        );
+        assert!(matches!(
+            ask(
+                &mut observer,
+                Request::SkillInfo {
+                    provider: None,
+                    session_id: session.id.clone(),
+                    name: "dual-demo".into(),
+                },
+            )
+            .await,
+            Response::SkillInfo { skill: Some(info) } if info.description == "default home copy"
+        ));
+        for (slug, desc) in [
+            ("configured-demo", expected_desc),
+            ("dual-demo", custom_dual_desc.as_str()),
+        ] {
+            let cold_info = request_with_app_agent_config(
+                &target,
+                Request::SkillInfo {
+                    provider: None,
+                    session_id: session.id.clone(),
+                    name: slug.into(),
+                },
+                resolve,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    &cold_info,
+                    Response::SkillInfo { skill: Some(info) } if info.description == desc
+                ),
+                "{agent} cold SkillInfo({slug}) mismatch: {cold_info:?}"
+            );
+        }
 
         // 3. Once the session is opened with the configured environment, direct RPC `SkillInfo`
         //    with `provider: None` also uses the active session's environment.
@@ -1216,22 +1268,27 @@ async fn custom_agent_environment_resolves_agent_commands_and_skill_info_for_col
                 .unwrap(),
                 Response::Ok
             ));
-            let open_info = ask(
-                &mut observer,
-                Request::SkillInfo {
-                    provider: None,
-                    session_id: session.id.clone(),
-                    name: "configured-demo".into(),
-                },
-            )
-            .await;
-            assert!(
-                matches!(
-                    &open_info,
-                    Response::SkillInfo { skill: Some(info) } if info.description == expected_desc
-                ),
-                "{agent} open-session SkillInfo mismatch: {open_info:?}"
-            );
+            for (slug, desc) in [
+                ("configured-demo", expected_desc),
+                ("dual-demo", custom_dual_desc.as_str()),
+            ] {
+                let open_info = ask(
+                    &mut observer,
+                    Request::SkillInfo {
+                        provider: None,
+                        session_id: session.id.clone(),
+                        name: slug.into(),
+                    },
+                )
+                .await;
+                assert!(
+                    matches!(
+                        &open_info,
+                        Response::SkillInfo { skill: Some(info) } if info.description == desc
+                    ),
+                    "{agent} open-session SkillInfo({slug}) mismatch: {open_info:?}"
+                );
+            }
             ask(
                 &mut observer,
                 Request::CloseAgentSession {

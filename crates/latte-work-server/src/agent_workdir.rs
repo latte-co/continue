@@ -11,15 +11,15 @@ use crate::{
     agents, files, git_review,
     runtime::{self, db},
 };
-use latte_work_protocol::{EventKind, Project, Session};
+use latte_work_protocol::{Project, Session};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 const RECENT_TOOL_EVENT_LIMIT: usize = 64;
 const PATCH_PATH_LIMIT: usize = 8;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DirectorySignal {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum DirectorySignal {
     /// Explicit exit back to the project's primary root (e.g. `ExitWorktree`).
     ResetToProjectRoot,
     /// Explicit working directory from a command tool, `cd` prefix, or `EnterWorktree`.
@@ -41,7 +41,9 @@ pub(crate) async fn resolve_terminal_cwd(
         && let Ok(session) = db(&service.database, |d| d.session(id))
         && session.project_id == project.id
     {
-        if let Some(found) = resolve_for_session(service, &canonical_project, &session).await {
+        if let Some(found) =
+            resolve_for_session(service, project_root, &canonical_project, &session).await
+        {
             return Some(found);
         }
         // If a side chat has not established its own working directory yet,
@@ -49,7 +51,8 @@ pub(crate) async fn resolve_terminal_cwd(
         if let Ok(Some((parent_id, _))) = db(&service.database, |d| d.side_parent(&session.id))
             && let Ok(parent) = db(&service.database, |d| d.session(&parent_id))
             && parent.project_id == project.id
-            && let Some(found) = resolve_for_session(service, &canonical_project, &parent).await
+            && let Some(found) =
+                resolve_for_session(service, project_root, &canonical_project, &parent).await
         {
             return Some(found);
         }
@@ -67,6 +70,7 @@ pub(crate) async fn resolve_terminal_cwd(
 
 async fn resolve_for_session(
     service: &crate::Service,
+    project_root: &Path,
     canonical_project: &Path,
     session: &Session,
 ) -> Option<PathBuf> {
@@ -83,12 +87,18 @@ async fn resolve_for_session(
         None => canonical_project.to_path_buf(),
     };
 
-    let events = db(&service.database, |d| {
-        d.recent_workdir_tool_events(&session.id, RECENT_TOOL_EVENT_LIMIT)
+    let signals = db(&service.database, |d| {
+        d.recent_workdir_tool_events(
+            &session.id,
+            project_root,
+            canonical_project,
+            &base_cwd,
+            RECENT_TOOL_EVENT_LIMIT,
+        )
     })
     .unwrap_or_default();
 
-    if let Some(resolved) = resolve_from_tool_events(canonical_project, &base_cwd, &events).await {
+    if let Some(resolved) = resolve_from_signals(canonical_project, &signals).await {
         return Some(resolved);
     }
 
@@ -131,47 +141,64 @@ async fn resolve_for_session(
     None
 }
 
-pub(crate) fn may_emit_directory_signal(
-    raw_name: &str,
-    raw_input: &Value,
-    outcome: Option<bool>,
-) -> bool {
-    let probe_root = Path::new("/");
-    !extract_tool_signals(raw_name, raw_input, outcome, probe_root, probe_root).is_empty()
-}
-
-async fn resolve_from_tool_events(
+async fn resolve_from_signals(
     canonical_project: &Path,
-    base_cwd: &Path,
-    events: &[(EventKind, Option<bool>)],
+    signals: &[DirectorySignal],
 ) -> Option<PathBuf> {
-    for (event, outcome) in events {
-        let EventKind::Tool { name, input, .. } = event else {
-            continue;
-        };
-        for signal in extract_tool_signals(name, input, *outcome, canonical_project, base_cwd) {
-            match signal {
-                DirectorySignal::ResetToProjectRoot => {
-                    return Some(canonical_project.to_path_buf());
+    for signal in signals {
+        match signal {
+            DirectorySignal::ResetToProjectRoot => {
+                return Some(canonical_project.to_path_buf());
+            }
+            DirectorySignal::ExplicitDirectory(candidate) => {
+                if let Some(valid) = validate_explicit_directory(canonical_project, candidate).await
+                {
+                    return Some(valid);
                 }
-                DirectorySignal::ExplicitDirectory(candidate) => {
-                    if let Some(valid) =
-                        validate_explicit_directory(canonical_project, &candidate).await
-                    {
-                        return Some(valid);
-                    }
-                }
-                DirectorySignal::MutatedFile(candidate) => {
-                    if let Some(valid) =
-                        validate_mutated_file_worktree(canonical_project, &candidate).await
-                    {
-                        return Some(valid);
-                    }
+            }
+            DirectorySignal::MutatedFile(candidate) => {
+                if let Some(valid) =
+                    validate_mutated_file_worktree(canonical_project, candidate).await
+                {
+                    return Some(valid);
                 }
             }
         }
     }
     None
+}
+
+#[cfg(test)]
+async fn resolve_from_tool_events(
+    project_root: &Path,
+    canonical_project: &Path,
+    base_cwd: &Path,
+    events: &[(latte_work_protocol::EventKind, Option<bool>)],
+) -> Option<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut signals = Vec::new();
+    'events: for (event, outcome) in events {
+        let latte_work_protocol::EventKind::Tool { name, input, .. } = event else {
+            continue;
+        };
+        for signal in extract_tool_signals(
+            name,
+            input,
+            *outcome,
+            project_root,
+            canonical_project,
+            base_cwd,
+        ) {
+            let is_reset = signal == DirectorySignal::ResetToProjectRoot;
+            if seen.insert(signal.clone()) {
+                signals.push(signal);
+                if is_reset || signals.len() >= RECENT_TOOL_EVENT_LIMIT {
+                    break 'events;
+                }
+            }
+        }
+    }
+    resolve_from_signals(canonical_project, &signals).await
 }
 
 fn resolve_against(base: &Path, raw: &str) -> Option<PathBuf> {
@@ -199,13 +226,22 @@ fn normalized_input_object(input: &Value) -> Option<serde_json::Map<String, Valu
     }
 }
 
-fn extract_tool_signals(
+pub(crate) fn extract_tool_signals(
     raw_name: &str,
     raw_input: &Value,
     outcome: Option<bool>,
+    project_root: &Path,
     canonical_project: &Path,
     base_cwd: &Path,
 ) -> Vec<DirectorySignal> {
+    // Only a confirmed, non-error tool execution (`ToolResult { is_error: false }`)
+    // may establish or reset the session's active working directory. Pending (`None`),
+    // interrupted (`None`), or rejected/failed (`Some(true)`) tool calls never move
+    // new terminals into an unconfirmed or failed directory.
+    if outcome != Some(false) {
+        return Vec::new();
+    }
+
     let stripped = raw_name
         .strip_prefix("mcp__")
         .and_then(|s| s.split_once("__").map(|(_, tool)| tool))
@@ -213,13 +249,7 @@ fn extract_tool_signals(
     let lower = stripped.to_ascii_lowercase();
 
     if matches!(lower.as_str(), "exitworktree" | "exit_worktree") {
-        // Only a confirmed successful `ExitWorktree` leaves the active worktree.
-        // Failed (`Some(true)`) or unconfirmed/pending (`None`) exits keep the worktree.
-        return if outcome == Some(false) {
-            vec![DirectorySignal::ResetToProjectRoot]
-        } else {
-            Vec::new()
-        };
+        return vec![DirectorySignal::ResetToProjectRoot];
     }
 
     let Some(map) = normalized_input_object(raw_input) else {
@@ -227,9 +257,6 @@ fn extract_tool_signals(
     };
 
     if matches!(lower.as_str(), "enterworktree" | "enter_worktree") {
-        if outcome == Some(true) {
-            return Vec::new();
-        }
         let mut out = Vec::new();
         for key in ["path", "worktree_path", "worktreePath", "directory", "cwd"] {
             if let Some(raw) = map.get(key).and_then(Value::as_str)
@@ -280,6 +307,7 @@ fn extract_tool_signals(
         // choice when it differs from the default project root; commands without
         // `workdir` default `cwd` to `project.path` even while operating on a worktree.
         if let Some(dir) = explicit_cwd
+            && dir != project_root
             && dir != canonical_project
             && dir.canonicalize().ok().as_deref() != Some(canonical_project)
         {
@@ -310,9 +338,6 @@ fn extract_tool_signals(
             | "editfiletoolcall"
     );
     if is_mutating_file_tool {
-        if outcome == Some(true) {
-            return Vec::new();
-        }
         let mut signals = Vec::new();
         for key in [
             "file_path",
@@ -511,7 +536,7 @@ fn parse_cd_clause(clause: &str) -> Option<String> {
         rest = after_dashdash.trim_start();
     }
     let token = parse_shell_path_token(rest)?;
-    if token.is_empty() || token == "-" || token.starts_with('~') {
+    if token.is_empty() || token == "." || token == "-" || token.starts_with('~') {
         return None;
     }
     Some(token)
@@ -634,6 +659,7 @@ async fn validate_mutated_file_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use latte_work_protocol::EventKind;
     use serde_json::json;
     use std::process::Command;
 
@@ -782,7 +808,52 @@ mod tests {
             ),
         ];
         assert_eq!(
-            resolve_from_tool_events(&canonical_project, &canonical_project, &codex_events).await,
+            resolve_from_tool_events(
+                workspace.path(),
+                &canonical_project,
+                &canonical_project,
+                &codex_events
+            )
+            .await,
+            Some(canonical_external_wt.clone())
+        );
+
+        // >64 default-cwd `git status` calls and repeated `/tmp` commands must not
+        // evict an earlier active worktree.
+        let mut noisy_events = Vec::new();
+        for idx in 0..80 {
+            noisy_events.push((
+                EventKind::Tool {
+                    id: format!("gs-{idx}"),
+                    name: "Bash".into(),
+                    input: json!({
+                        "command": "git status",
+                        "cwd": workspace.path(),
+                    }),
+                },
+                Some(false),
+            ));
+            noisy_events.push((
+                EventKind::Tool {
+                    id: format!("tmp-{idx}"),
+                    name: "Bash".into(),
+                    input: json!({
+                        "command": "ls -la",
+                        "cwd": "/tmp",
+                    }),
+                },
+                Some(false),
+            ));
+        }
+        noisy_events.push(codex_events[2].clone());
+        assert_eq!(
+            resolve_from_tool_events(
+                workspace.path(),
+                &canonical_project,
+                &canonical_project,
+                &noisy_events
+            )
+            .await,
             Some(canonical_external_wt.clone())
         );
 
@@ -799,7 +870,13 @@ mod tests {
             Some(false),
         )];
         assert_eq!(
-            resolve_from_tool_events(&canonical_project, &canonical_project, &foreign_events).await,
+            resolve_from_tool_events(
+                workspace.path(),
+                &canonical_project,
+                &canonical_project,
+                &foreign_events
+            )
+            .await,
             None
         );
 
@@ -826,12 +903,32 @@ mod tests {
             ),
         ];
         assert_eq!(
-            resolve_from_tool_events(&canonical_project, &canonical_project, &claude_events).await,
+            resolve_from_tool_events(
+                workspace.path(),
+                &canonical_project,
+                &canonical_project,
+                &claude_events
+            )
+            .await,
             Some(canonical_internal_wt.clone())
         );
 
-        // 3. Claude Code `EnterWorktree` (by name) and `ExitWorktree` reset:
-        //    failed (`Some(true)`) or pending (`None`) `ExitWorktree` keeps the worktree.
+        // 3. Claude Code `EnterWorktree` (by name), pending/rejected tools, and `ExitWorktree`:
+        //    pending (`None`) or failed/rejected (`Some(true)`) `EnterWorktree`, `Bash`, `Edit`,
+        //    or `ExitWorktree` must never change the active worktree.
+        let claude_wt_next = repo.join(".claude/worktrees/claude-next");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/claude-next",
+                claude_wt_next.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
         let enter_events = vec![(
             EventKind::Tool {
                 id: "cw1".into(),
@@ -842,10 +939,50 @@ mod tests {
         )];
         let canonical_repo = repo.canonicalize().unwrap();
         assert_eq!(
-            resolve_from_tool_events(&canonical_repo, &canonical_repo, &enter_events).await,
+            resolve_from_tool_events(&repo, &canonical_repo, &canonical_repo, &enter_events).await,
             Some(canonical_claude_wt.clone())
         );
-        let failed_exit_events = vec![
+        let unconfirmed_or_rejected_events = vec![
+            (
+                EventKind::Tool {
+                    id: "enter_pending".into(),
+                    name: "EnterWorktree".into(),
+                    input: json!({ "name": "claude-next" }),
+                },
+                None,
+            ),
+            (
+                EventKind::Tool {
+                    id: "enter_rejected".into(),
+                    name: "EnterWorktree".into(),
+                    input: json!({ "name": "claude-next" }),
+                },
+                Some(true),
+            ),
+            (
+                EventKind::Tool {
+                    id: "bash_pending".into(),
+                    name: "Bash".into(),
+                    input: json!({ "command": "cd .claude/worktrees/claude-next && pwd" }),
+                },
+                None,
+            ),
+            (
+                EventKind::Tool {
+                    id: "bash_rejected".into(),
+                    name: "Bash".into(),
+                    input: json!({ "command": "cd .claude/worktrees/claude-next && pwd" }),
+                },
+                Some(true),
+            ),
+            (
+                EventKind::Tool {
+                    id: "edit_pending".into(),
+                    name: "Edit".into(),
+                    input: json!({ "file_path": claude_wt_next.join("README.md") }),
+                },
+                None,
+            ),
             (
                 EventKind::Tool {
                     id: "cw_pending".into(),
@@ -865,7 +1002,13 @@ mod tests {
             enter_events[0].clone(),
         ];
         assert_eq!(
-            resolve_from_tool_events(&canonical_repo, &canonical_repo, &failed_exit_events).await,
+            resolve_from_tool_events(
+                &repo,
+                &canonical_repo,
+                &canonical_repo,
+                &unconfirmed_or_rejected_events
+            )
+            .await,
             Some(canonical_claude_wt)
         );
         let exit_events = vec![
@@ -880,7 +1023,7 @@ mod tests {
             enter_events[0].clone(),
         ];
         assert_eq!(
-            resolve_from_tool_events(&canonical_repo, &canonical_repo, &exit_events).await,
+            resolve_from_tool_events(&repo, &canonical_repo, &canonical_repo, &exit_events).await,
             Some(canonical_repo)
         );
 
@@ -894,8 +1037,13 @@ mod tests {
             Some(false),
         )];
         assert_eq!(
-            resolve_from_tool_events(&canonical_project, &canonical_project, &opencode_events)
-                .await,
+            resolve_from_tool_events(
+                workspace.path(),
+                &canonical_project,
+                &canonical_project,
+                &opencode_events
+            )
+            .await,
             Some(canonical_internal_wt.clone())
         );
 
@@ -912,7 +1060,13 @@ mod tests {
             Some(false),
         )];
         assert_eq!(
-            resolve_from_tool_events(&canonical_project, &canonical_project, &cursor_events).await,
+            resolve_from_tool_events(
+                workspace.path(),
+                &canonical_project,
+                &canonical_project,
+                &cursor_events
+            )
+            .await,
             Some(canonical_internal_wt.clone())
         );
         let cursor_fn_events = vec![(
@@ -926,8 +1080,13 @@ mod tests {
             Some(false),
         )];
         assert_eq!(
-            resolve_from_tool_events(&canonical_project, &canonical_project, &cursor_fn_events)
-                .await,
+            resolve_from_tool_events(
+                workspace.path(),
+                &canonical_project,
+                &canonical_project,
+                &cursor_fn_events
+            )
+            .await,
             Some(canonical_internal_wt)
         );
 
@@ -942,7 +1101,13 @@ mod tests {
             ],
         );
         assert_eq!(
-            resolve_from_tool_events(&canonical_project, &canonical_project, &cursor_events).await,
+            resolve_from_tool_events(
+                workspace.path(),
+                &canonical_project,
+                &canonical_project,
+                &cursor_events
+            )
+            .await,
             None
         );
     }

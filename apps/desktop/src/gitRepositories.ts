@@ -37,6 +37,7 @@ export function isNotGitRepositoryError(error: unknown): boolean {
 export function isRemovedGitRepositoryError(error: unknown): boolean {
   if (isNotGitRepositoryError(error)) return true;
   const text = error instanceof Error ? error.message : String(error);
+  if (/无权访问|无法访问|Permission denied/i.test(text)) return false;
   return /子仓库目录不存在|子仓库路径不是目录|不是独立的 Git 仓库|无法解析 Git (?:共享)?元数据路径/.test(
     text,
   );

@@ -75,14 +75,18 @@ for line in sys.stdin:
             },
         ]
         skill_roots = [cwd_path / '.traex/skills', cwd_path / '.trae/skills', cwd_path / '.agents/skills']
-        for env_name in ('TRAEX_HOME', 'CODEX_HOME'):
-            env_dir = os.environ.get(env_name)
-            if env_dir:
-                skill_roots.append(pathlib.Path(env_dir) / 'skills')
+        traex_home = os.environ.get('TRAEX_HOME')
+        codex_home = os.environ.get('CODEX_HOME')
         home_dir = os.environ.get('HOME')
-        if home_dir:
-            for rel in ('.trae/skills', '.traex/skills', '.agents/skills'):
+        if traex_home:
+            skill_roots.append(pathlib.Path(traex_home) / 'skills')
+        elif home_dir:
+            for rel in ('.trae/skills', '.traex/skills'):
                 skill_roots.append(pathlib.Path(home_dir) / rel)
+        if codex_home:
+            skill_roots.append(pathlib.Path(codex_home) / 'skills')
+        if home_dir:
+            skill_roots.append(pathlib.Path(home_dir) / '.agents/skills')
         for skills_root in skill_roots:
             if skills_root.is_dir():
                 for child in sorted(skills_root.iterdir()):

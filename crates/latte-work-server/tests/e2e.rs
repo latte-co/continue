@@ -10662,17 +10662,25 @@ async fn terminal_opens_in_active_agent_worktree_across_all_agents_and_falls_bac
     // Seed realistic recorded tool events and native session state across all 5 agents.
     let db = rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
     let append_tool = |sid: &str, name: &str, input: serde_json::Value| {
-        let data = serde_json::to_string(&EventKind::Tool {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: name.into(),
-            input,
-        })
-        .unwrap();
-        db.execute(
-            "INSERT INTO events(session_id, at, data) VALUES (?1, 1.0, ?2)",
-            rusqlite::params![sid, data],
-        )
-        .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        for event in [
+            EventKind::Tool {
+                id: id.clone(),
+                name: name.into(),
+                input,
+            },
+            EventKind::ToolResult {
+                id,
+                content: json!("ok"),
+                is_error: false,
+            },
+        ] {
+            db.execute(
+                "INSERT INTO events(session_id, at, data) VALUES (?1, 1.0, ?2)",
+                rusqlite::params![sid, serde_json::to_string(&event).unwrap()],
+            )
+            .unwrap();
+        }
     };
 
     // Codex: external worktree commandExecution, followed by default-cwd `gh auth status` & `/tmp`.
@@ -10915,7 +10923,63 @@ async fn terminal_opens_in_active_agent_worktree_across_all_agents_and_falls_bac
                 input: json!({ "file_path": internal_wt.join("README.md") }),
             },
         );
+        insert_event(
+            &claude_sid,
+            EventKind::ToolResult {
+                id: format!("read-{idx}"),
+                content: json!("ok"),
+                is_error: false,
+            },
+        );
+        // >64 default-cwd `git status` commands must not evict `internal_wt` either.
+        insert_event(
+            &claude_sid,
+            EventKind::Tool {
+                id: format!("root-status-{idx}"),
+                name: "Bash".into(),
+                input: json!({
+                    "command": "git status",
+                    "cwd": workspace.path(),
+                }),
+            },
+        );
+        insert_event(
+            &claude_sid,
+            EventKind::ToolResult {
+                id: format!("root-status-{idx}"),
+                content: json!("clean"),
+                is_error: false,
+            },
+        );
     }
+    // Pending (`EnterWorktree` without `ToolResult`) or rejected (`is_error: true`) directory
+    // transitions must never switch new terminals before user approval.
+    insert_event(
+        &claude_sid,
+        EventKind::Tool {
+            id: "enter-pending".into(),
+            name: "EnterWorktree".into(),
+            input: json!({ "path": external_wt }),
+        },
+    );
+    insert_event(
+        &claude_sid,
+        EventKind::Tool {
+            id: "cd-rejected".into(),
+            name: "Bash".into(),
+            input: json!({
+                "command": format!("cd '{}' && pwd", external_wt.display()),
+            }),
+        },
+    );
+    insert_event(
+        &claude_sid,
+        EventKind::ToolResult {
+            id: "cd-rejected".into(),
+            content: json!("permission denied by user"),
+            is_error: true,
+        },
+    );
     drop(db);
     assert_terminal_pwd(
         &mut client,

@@ -81,12 +81,15 @@ fn skill_roots(
     environment: &AgentEnvironment,
 ) -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
-    let home =
-        crate::agent_environment::configured_variable("HOME", environment).map(PathBuf::from);
+    let home = crate::agent_environment::configured_variable("HOME", environment)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
     let config = crate::agent_environment::configured_variable("OPENCODE_CONFIG_DIR", environment)
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             crate::agent_environment::configured_variable("XDG_CONFIG_HOME", environment)
+                .filter(|v| !v.is_empty())
                 .map(PathBuf::from)
                 .map(|path| path.join("opencode"))
         })

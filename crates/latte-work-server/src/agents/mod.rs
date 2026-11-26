@@ -340,8 +340,10 @@ fn codex_skill_info(
         }
     }
     let home = crate::agent_environment::configured_variable("HOME", environment)
+        .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from);
     let codex_home = crate::agent_environment::configured_variable("CODEX_HOME", environment)
+        .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
         .or_else(|| home.as_ref().map(|h| h.join(".codex")));
     if let Some(codex_home) = codex_home {
@@ -353,22 +355,23 @@ fn codex_skill_info(
     claude_skills::find_in_roots(&roots, name)
 }
 
-fn traex_skill_info(
+pub(crate) fn traex_skill_info(
     project: &std::path::Path,
     name: &str,
     environment: &latte_work_protocol::AgentEnvironment,
 ) -> Result<Option<latte_work_protocol::SkillInfo>> {
     let home = crate::agent_environment::configured_variable("HOME", environment)
+        .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from);
     let traex_home = crate::agent_environment::configured_variable("TRAEX_HOME", environment)
+        .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from);
     let codex_home = crate::agent_environment::configured_variable("CODEX_HOME", environment)
+        .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from);
     if name.contains(':') {
-        if let Some(traex_home) = &traex_home
-            && let Some(found) = claude_skills::find_in(project, traex_home, name)?
-        {
-            return Ok(Some(found));
+        if let Some(traex_home) = &traex_home {
+            return claude_skills::find_in(project, traex_home, name);
         }
         let Some(home) = home else {
             return Ok(None);
@@ -389,12 +392,14 @@ fn traex_skill_info(
     }
     if let Some(traex_home) = traex_home {
         roots.push(traex_home.join("skills"));
+    } else if let Some(home) = &home {
+        roots.extend([".trae/skills", ".traex/skills"].map(|r| home.join(r)));
     }
     if let Some(codex_home) = codex_home {
         roots.push(codex_home.join("skills"));
     }
     if let Some(home) = home {
-        roots.extend([".trae/skills", ".traex/skills", ".agents/skills"].map(|r| home.join(r)));
+        roots.push(home.join(".agents/skills"));
     }
     claude_skills::find_in_roots(&roots, name)
 }

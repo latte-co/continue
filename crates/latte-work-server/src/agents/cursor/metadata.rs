@@ -591,36 +591,35 @@ fn skill_roots(project: &std::path::Path, environment: &AgentEnvironment) -> Vec
             break;
         }
     }
+    let home = crate::agent_environment::configured_variable("HOME", environment)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
     if let Some(cursor_config) =
         crate::agent_environment::configured_variable("CURSOR_CONFIG_DIR", environment)
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".cursor")))
     {
         roots.extend(["skills", "skills-cursor"].map(|relative| cursor_config.join(relative)));
     }
     if let Some(claude_config) =
         crate::agent_environment::configured_variable("CLAUDE_CONFIG_DIR", environment)
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".claude")))
     {
         roots.push(claude_config.join("skills"));
     }
     if let Some(codex_home) =
-        crate::agent_environment::configured_variable("CODEX_HOME", environment).map(PathBuf::from)
+        crate::agent_environment::configured_variable("CODEX_HOME", environment)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".codex")))
     {
         roots.push(codex_home.join("skills"));
     }
-    if let Some(home) =
-        crate::agent_environment::configured_variable("HOME", environment).map(PathBuf::from)
-    {
-        roots.extend(
-            [
-                ".cursor/skills",
-                ".cursor/skills-cursor",
-                ".claude/skills",
-                ".codex/skills",
-                ".agents/skills",
-            ]
-            .map(|relative| home.join(relative)),
-        );
+    if let Some(home) = home {
+        roots.push(home.join(".agents/skills"));
     }
     roots
 }
@@ -633,22 +632,24 @@ fn command_roots(project: &std::path::Path, environment: &AgentEnvironment) -> V
             break;
         }
     }
+    let home = crate::agent_environment::configured_variable("HOME", environment)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
     if let Some(cursor_config) =
         crate::agent_environment::configured_variable("CURSOR_CONFIG_DIR", environment)
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".cursor")))
     {
         roots.push(cursor_config.join("commands"));
     }
     if let Some(claude_config) =
         crate::agent_environment::configured_variable("CLAUDE_CONFIG_DIR", environment)
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".claude")))
     {
         roots.push(claude_config.join("commands"));
-    }
-    if let Some(home) =
-        crate::agent_environment::configured_variable("HOME", environment).map(PathBuf::from)
-    {
-        roots.extend([".cursor/commands", ".claude/commands"].map(|r| home.join(r)));
     }
     roots
 }
