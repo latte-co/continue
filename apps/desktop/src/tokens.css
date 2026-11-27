@@ -4,11 +4,14 @@
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC",
     sans-serif;
   --font-content: var(--font-ui);
-  --font-code: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --font-code:
+    ui-monospace, "SF Mono", "SFMono-Regular", "JetBrains Mono", "Fira Code",
+    Menlo, Consolas, monospace;
   --weight-ui: 400;
   --weight-content: 400;
   --weight-content-emphasis: 500;
   --weight-code: 400;
+  --tracking-mono: -0.01em;
 
   /* 5-Step Typography Scale + Compatibility Aliases */
   --text-xs: 11px;
@@ -58,45 +61,48 @@
   --icon-hit-size: var(--control-height-sm);
   --icon-size: 15.5px;
 
-  /* Soft Obsidian Neutral Defaults (Overridden dynamically by appearance.ts) */
-  --color-shell: #131313;
-  --color-canvas: #181818;
-  --color-sidebar: #131313;
-  --color-surface: #1f1f1f;
-  --color-card: #1f1f1f;
-  --color-elevated: #232323;
-  --color-well: #f2f2f20c;
-  --color-input: #1c1c1c;
-  --color-composer: #202020;
-  --color-text: #f2f2f2;
-  --color-text-secondary: #c8c8c8;
-  --color-text-muted: #a1a1a1;
-  --color-placeholder: #a1a1a1;
-  --color-border-subtle: #262626;
-  --color-border: #2f2f2f;
-  --color-border-strong: #383838;
-  --color-hover: #f2f2f20d;
-  --color-row-selected: #f2f2f214;
-  --color-selected: #f2f2f21a;
-  --color-focus-background: #f2f2f21f;
-  --color-focus-ring: #4f4f4f;
-  --color-primary: #f2f2f2;
-  --color-primary-hover: #ffffff;
+  /* Pure Achromatic Zinc + Latte Crema Amber Defaults (Overridden dynamically by appearance.ts) */
+  --color-shell: #111111;
+  --color-canvas: #161616;
+  --color-sidebar: #111111;
+  --color-surface: #1c1c1c;
+  --color-card: #1c1c1c;
+  --color-elevated: #202020;
+  --color-well: #f0f0f00b;
+  --color-control-bg: #f0f0f00a;
+  --color-input: #131313;
+  --color-composer: #1d1d1d;
+  --color-text: #f0f0f0;
+  --color-text-secondary: #a2a2a2;
+  --color-text-muted: #7c7c7c;
+  --color-text-faint: #626262;
+  --color-placeholder: #7c7c7c;
+  --color-border-subtle: #232323;
+  --color-border: #2b2b2b;
+  --color-border-strong: #343434;
+  --color-hover: #f0f0f00c;
+  --color-row-selected: #f0f0f014;
+  --color-selected: #f0f0f01b;
+  --color-focus-background: #f0f0f020;
+  --color-focus-ring: #4a4a4a;
+  --color-primary: #e0a458;
+  --color-primary-hover: #e4af6e;
   --color-on-primary: #121212;
-  --color-action: #dfdfdf;
-  --color-action-hover: #f2f2f2;
+  --color-brand: #e0a458;
+  --color-brand-soft: #e0a45824;
+  --color-action: #e6e6e6;
+  --color-action-hover: #f0f0f0;
   --color-on-action: #141414;
-  --color-btn-bg: #222222;
-  --color-btn-hover: #292929;
-  --color-btn-elevated: #282828;
-  --color-btn-elevated-hover: #303030;
+  --color-btn-bg: #1f1f1f;
+  --color-btn-hover: #262626;
+  --color-btn-elevated: #242424;
+  --color-btn-elevated-hover: #2b2b2b;
   --color-btn-rim: #ffffff12;
-  --color-disabled-bg: #222222;
-  --color-disabled-text: #787878;
-  --color-stop: #3a3a3a;
-  --color-stop-hover: #484848;
-  --color-on-stop: #f2f2f2;
-  --color-brand: #f2f2f2;
+  --color-disabled-bg: #202020;
+  --color-disabled-text: #7c7c7c;
+  --color-stop: #373737;
+  --color-stop-hover: #464646;
+  --color-on-stop: #f0f0f0;
   --color-code-keyword: #cda4d7;
   --color-code-string: #c4c998;
   --color-code-number: #a7c6be;
@@ -110,23 +116,27 @@
   --color-danger-text: #ff9497;
   --color-unread: #6ea4ff;
   --color-backdrop: #0000008c;
-  --color-selection: #f2f2f23d;
+  --color-selection: #e0a45838;
 
   /* 3-Tier Optical Shadows — Bound to theme border tokens for uniform contrast */
   --shadow-island:
-    0 0 0 1px var(--color-border-subtle), 0 4px 16px -4px rgba(0, 0, 0, 0.24);
+    0 0 0 1px var(--color-border-subtle), 0 6px 20px -6px rgba(0, 0, 0, 0.3);
   --shadow-well: inset 0 0 0 1px var(--color-border);
-  --shadow-card: 0 0 0 1px var(--color-border-subtle);
+  --shadow-card:
+    0 0 0 1px var(--color-border-subtle),
+    inset 0 1px 0 rgba(255, 255, 255, 0.03);
   --shadow-elevated:
-    0 0 0 1px var(--color-border), 0 2px 6px rgba(0, 0, 0, 0.18);
+    0 0 0 1px var(--color-border), 0 4px 12px -2px rgba(0, 0, 0, 0.24);
   --shadow-composer:
-    0 0 0 1px var(--color-border), 0 2px 8px rgba(0, 0, 0, 0.16);
+    0 0 0 1px var(--color-border), inset 0 1px 0 rgba(255, 255, 255, 0.035),
+    0 6px 20px -6px rgba(0, 0, 0, 0.24);
   --shadow-composer-focus:
-    0 0 0 1px var(--color-focus-ring), 0 2px 8px rgba(0, 0, 0, 0.18);
+    0 0 0 1px var(--color-focus-ring), inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 8px 24px -6px rgba(0, 0, 0, 0.3);
   --shadow-dialog:
-    0 16px 40px -8px rgba(0, 0, 0, 0.42), 0 0 0 1px var(--color-border);
+    0 20px 48px -12px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--color-border);
   --shadow-popover:
-    0 12px 28px -6px rgba(0, 0, 0, 0.36), 0 0 0 1px var(--color-border-strong);
+    0 12px 32px -8px rgba(0, 0, 0, 0.42), 0 0 0 1px var(--color-border-strong);
   --focus-ring: 0 0 0 1px var(--color-focus-ring);
   --focus-ring-inset: inset 0 0 0 1px var(--color-focus-ring);
 

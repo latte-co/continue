@@ -106,9 +106,10 @@ import {
 ### Multi-Plane Spatial Hierarchy
 
 1. **`L1` Window Shell & Sidebar (`--color-shell` / `--color-sidebar`)**: Outer
-   ambient shell (`#131313` in default dark, `#EFEFEF` in default light) with
-   optional macOS vibrancy (`backdrop-filter: blur(28px) saturate(150%)`) and a
-   floating `12px` `.sidebar-preview` hover-peek drawer when collapsed.
+   ambient shell (`#111111` in default dark, `#F7F7F7` in default light — pure
+   achromatic `R = G = B`) with optional macOS vibrancy
+   (`backdrop-filter: blur(28px) saturate(150%)`) and a floating `12px`
+   `.sidebar-preview` hover-peek drawer when collapsed.
 2. **`L2` Clipped Single Stage Island (`StageIsland`, `--color-canvas`)**: Houses
    both the primary conversation canvas and the collapsible right workspace
    inside **one** `12px` rounded container (`--island-inset: 6px`) with
@@ -211,9 +212,18 @@ the subpixel:
   lists, tool rows, composer editor) · `14px` (`--text-lg` Markdown prose & user
   bubbles) · `18px` (`--text-heading` page titles; `15px` `--text-subheading` for
   modal/pane headers; `20px` `--text-page-title` for welcome hero).
-- **Tabular Numerals**: Apply `font-variant-numeric: tabular-nums` to all counts,
-  durations, slider readouts, token metrics, ordered list markers, line numbers,
-  and `+add / -del` stats.
+- **Editorial Sans + Monospace Micro-Typography (`--font-code` + `--tracking-mono`)**:
+  Establish structural hierarchy through font-personality contrast rather than
+  wrapping auxiliary metadata in small background boxes:
+  - **Sans-Serif (`--font-ui` / `--font-content`)**: Narrative prose, headings,
+    session titles, primary labels, and button captions.
+  - **Monospace Micro-Typography (`--font-code` + `letter-spacing: var(--tracking-mono)`
+    + `font-variant-numeric: tabular-nums`)**: Turn elapsed times (`用时 12秒`),
+    phase step counts (`· 71 步`), message timestamps, token/context telemetry
+    readouts, reasoning effort tags (`high`), keyboard shortcuts (`⌘N`, `Tab 插入`),
+    micro-badges, and file/reference paths (`@file`, `TurnChangesCard`,
+    `WorkspaceFiles`, `GitReview`). Neutral tool-row statuses render as clean
+    borderless monospace micro-labels rather than boxed pills.
 - **Markdown GFM Table Readability (`.markdown-table-wrap` + `MessageContent.tsx`)**:
   - **Framed `10px` Scroll Container**: Wrap Markdown `<table>` inside
     `.markdown-table-wrap` (`border-radius: var(--radius-card); border: 1px solid
@@ -277,31 +287,56 @@ To keep every page visually calm, dense, and cohesive:
 
 ## 5. Perceptual OKLCH Palette, Optical Surfaces & Signals
 
-- **OKLCH Derivation (`appearance.ts`)**:
-  - Built-in presets: Dark (`Latte` `#181818`, `Material` `#1E272C`, `Graphite`
-    `#202024`) and Light (`Latte` `#FFFFFF`, `Paper` `#FAF7F2`, `Mint` `#F4F8F6`).
-  - Interpolates surfaces in OKLab/OKLCH perceptual lightness while serializing
-    `--color-*` tokens to `#RRGGBB` / `#RRGGBBAA` for `Appearance` JSON
-    `version: 1` compatibility, enforcing WCAG AA `>= 4.5:1` (`4.75:1` muted,
-    `7.0:1` secondary) across all seven surface planes (`canvas`, `sidebar`,
-    `surface`, `card`, `elevated`, `input`, `composer`).
+- **OKLCH Derivation, Pure Achromatic Base & Latte Amber Point Accent (`appearance.ts`)**:
+  - **Built-in Presets**:
+    - Dark: `Latte` (pure obsidian `#161616` canvas / `#111111` shell, `#F0F0F0`
+      chalk ink, `#E0A458` Latte Crema Amber 3%–5% point accent), `Material`
+      (`#1E272C`), `Graphite` (`#202024`) with damped surface/border chroma so
+      tinted dark themes stay crisp rather than muddy.
+    - Light: `Latte` (pure paper `#FFFFFF` canvas / `#F7F7F7` shell, `#111111`
+      jet ink, `#A66022` Roasted Latte Amber point accent), `Paper` (`#FAF7F2`),
+      `Mint` (`#F4F8F6`).
+  - **4-Step Editorial Luminosity Ladder**: Interpolates in OKLab/OKLCH while
+    preserving dramatic figure-ground contrast between primary content and
+    auxiliary chrome across all seven surface planes (`canvas`, `sidebar`,
+    `surface`, `card`, `elevated`, `input`, `composer`):
+    1. `--color-text`: High-polarity primary ink (`#F0F0F0` `15.9:1` dark /
+       `#111111` `18.9:1` light).
+    2. `--color-text-secondary`: Calm reading support (`>= 5.4:1` across all
+       surfaces; `#A2A2A2` `~7.1:1` dark / `#5B5B5B` `~6.8:1` light).
+    3. `--color-text-muted`: Quiet metadata, timestamps, step counts, and
+       placeholders (`>= 3.65:1` across all surfaces; `#7C7C7C` `~4.3:1` dark /
+       `#7F7F7F` `~4.0:1` light) so timestamps and telemetry never compete with
+       headings or code.
+    4. `--color-text-faint`: Non-textual decorative chrome (`$` prompt sigils,
+       `/` separators, resting chevrons, diff line-number gutters; `>= 2.65:1`).
+  - **Light-Mode White-on-White & Ink Polarity**: In light themes, `StageIsland`,
+    `Card`, `CardList`, `Disclosure`, `Composer`, and form controls
+    (`--color-control-bg`) remain crisp canvas white (`#FFFFFF` in default light)
+    separated purely by `1px` `--color-border-subtle` / `--color-border`
+    hairlines (`#ECECEC` / `#E6E6E6`) and pure achromatic diffusion shadows,
+    paired with solid `#111111` primary commit CTAs (`--color-action`) and a
+    subtle `--color-brand-soft` hover halo.
   - **Placeholder Contrast Invariant**: `--color-placeholder` equals the contrast-
     verified `--color-text-muted` token directly (`opacity: 1`), never diluted
     with background `color-mix`, so empty composer and search prompts remain
-    legible (`>= 4.75:1`) in Material and custom dark themes.
+    calmly legible (`>= 3.65:1`) in Material and custom dark themes.
 - **Three Optical Surface Tiers & Cohesive 4-Step Border Ramp**:
   All container rings, control borders, popover frames, and focus rings derive from
   one OKLCH-interpolated, `contrast`-scaled ramp (`--color-border-subtle` ->
   `--color-border` -> `--color-border-strong` -> `--color-focus-ring`) — never
   disconnected `rgba(255, 255, 255, ...)` outer rings that vanish over dark
   backdrops or stark `#FFFFFF` focus outlines:
-  1. `Well` (`--color-well` + `--shadow-well`): `8px` recessed `1px` inner
-     hairline (`inset 0 0 0 1px var(--color-border)`) for inputs, selects, subtle
-     buttons, code blocks, and `Segmented` tracks; focuses in-place via `1px`
-     `--focus-ring-inset` (`inset 0 0 0 1px var(--color-focus-ring)`) without
-     outer geometry expansion.
-  2. `Card` (`--color-card` + `--shadow-card`): `10px` grouped surface with `1px`
-     `--color-border-subtle` (dark) / `--color-border` (light) perimeter ring.
+  1. `Well` & Form Controls (`--color-well` / `--color-control-bg` + `--shadow-well`):
+     `8px` `1px` inner hairline (`inset 0 0 0 1px var(--color-border)`) — crisp
+     canvas-white fill in light mode (`--color-control-bg`) for inputs, selects,
+     and color fields, and subtle recessed track fill (`--color-well`) for
+     `Segmented` tracks; focuses in-place via `1px` `--focus-ring-inset` without
+     outer geometry expansion. Code and terminal output wells use `--color-input`
+     (`#131313` deep obsidian in dark / `#F8F8F8` soft paper-zinc in light).
+  2. `Card` (`--color-card` + `--shadow-card`): `10px` grouped surface (`#FFFFFF`
+     white-on-white + `1px` `--color-border` in light; `#1C1C1C` + `1px`
+     `--color-border-subtle` + `3%` top specular inner rim in dark).
   3. `Elevated` (`--color-elevated` + `--shadow-elevated` / `--shadow-popover`):
      `8px`/`10px` raised surface with opaque `1px` `--color-border` /
      `--color-border-strong` perimeter. Menu and listbox rows (`MenuRow`,

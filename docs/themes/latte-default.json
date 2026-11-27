@@ -2,9 +2,9 @@
   "version": 1,
   "mode": "system",
   "light": {
-    "accent": "#2563EB",
+    "accent": "#A66022",
     "background": "#FFFFFF",
-    "foreground": "#181818",
+    "foreground": "#111111",
     "contrast": 50,
     "translucentSidebar": false,
     "uiFont": "system",
@@ -15,9 +15,9 @@
     "codeWeight": "400"
   },
   "dark": {
-    "accent": "#F2F2F2",
-    "background": "#181818",
-    "foreground": "#F2F2F2",
+    "accent": "#E0A458",
+    "background": "#161616",
+    "foreground": "#F0F0F0",
     "contrast": 50,
     "translucentSidebar": false,
     "uiFont": "system",

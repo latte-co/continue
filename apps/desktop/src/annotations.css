@@ -42,7 +42,7 @@ button.annotation-marker {
   background-image: none;
   color: #ffffff;
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.28);
-  font-family: var(--font-ui);
+  font-family: var(--font-code);
   font-size: var(--text-xs);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
@@ -290,7 +290,9 @@ button.annotation-marker:hover:not(:disabled) {
 .annotation-index {
   color: var(--color-text-muted);
   min-width: 16px;
-  font-size: var(--text-sm);
+  font-family: var(--font-code);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-mono);
   line-height: 20px;
   font-variant-numeric: tabular-nums;
 }
@@ -337,7 +339,7 @@ button.annotation-marker:hover:not(:disabled) {
   padding: 4px 4px 4px 10px;
   border: 0;
   border-radius: var(--radius-control);
-  background: var(--color-input);
+  background: var(--color-control-bg, var(--color-input));
   box-shadow: var(--shadow-well);
 }
 .annotation-inline-editor textarea {
