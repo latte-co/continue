@@ -48,4 +48,22 @@ describe("TurnErrorRow", () => {
     expect(onRecover).toHaveBeenCalledTimes(1);
     expect(screen.queryByText(raw429)).toBeNull();
   });
+
+  it("sanitizes ANSI escape sequences in both collapsed summary and expanded raw drawer", () => {
+    render(
+      <TurnErrorRow
+        message={
+          "\x1b[32;1mInfo:\x1b[0m doas check\n\x1b[31mError:\x1b[0m exit status 1"
+        }
+      />,
+    );
+    const toggle = screen.getByRole("button", { expanded: false });
+    expect(toggle.textContent).not.toContain("\x1b");
+    fireEvent.click(toggle);
+    const pre = document.querySelector(".turn-error-well pre");
+    expect(pre?.textContent).toBe("Info: doas check\nError: exit status 1");
+    expect(pre?.querySelector(".ansi-bold.ansi-fg-green")?.textContent).toBe(
+      "Info:",
+    );
+  });
 });

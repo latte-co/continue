@@ -106,7 +106,7 @@ import {
 ### Multi-Plane Spatial Hierarchy
 
 1. **`L1` Window Shell & Sidebar (`--color-shell` / `--color-sidebar`)**: Outer
-   ambient shell (`#111111` in default dark, `#F7F7F7` in default light — pure
+   ambient shell (`#0D0D0D` in default dark, `#F8F8F8` in default light — pure
    achromatic `R = G = B`) with optional macOS vibrancy
    (`backdrop-filter: blur(28px) saturate(150%)`) and a floating `12px`
    `.sidebar-preview` hover-peek drawer when collapsed.
@@ -212,18 +212,12 @@ the subpixel:
   lists, tool rows, composer editor) · `14px` (`--text-lg` Markdown prose & user
   bubbles) · `18px` (`--text-heading` page titles; `15px` `--text-subheading` for
   modal/pane headers; `20px` `--text-page-title` for welcome hero).
-- **Editorial Sans + Monospace Micro-Typography (`--font-code` + `--tracking-mono`)**:
-  Establish structural hierarchy through font-personality contrast rather than
-  wrapping auxiliary metadata in small background boxes:
-  - **Sans-Serif (`--font-ui` / `--font-content`)**: Narrative prose, headings,
-    session titles, primary labels, and button captions.
-  - **Monospace Micro-Typography (`--font-code` + `letter-spacing: var(--tracking-mono)`
-    + `font-variant-numeric: tabular-nums`)**: Turn elapsed times (`用时 12秒`),
-    phase step counts (`· 71 步`), message timestamps, token/context telemetry
-    readouts, reasoning effort tags (`high`), keyboard shortcuts (`⌘N`, `Tab 插入`),
-    micro-badges, and file/reference paths (`@file`, `TurnChangesCard`,
-    `WorkspaceFiles`, `GitReview`). Neutral tool-row statuses render as clean
-    borderless monospace micro-labels rather than boxed pills.
+- **Editorial Three-Tier Font Architecture (`fonts.css` + `tokens.css` + `appearance.ts`)**:
+  Bundled offline SIL OFL variable webfonts (`apps/desktop/src/fonts/*.woff2`) pair seamlessly with macOS CJK typefaces across three distinct roles:
+  - **UI Chrome (`--font-ui` = `"Inter Variable"` + `"PingFang SC"`, default `--weight-ui: 500`)**: Follows the **"Dim the Ink, Keep the Weight" (`减色不减骨`)** principle — navigation rows (`14px` top actions, `13.5px` section headers and project rows, `13px` session rows) and controls maintain full-bodied `500` Medium strokes paired with `1.75–1.85px` icons, establishing hierarchy through ink contrast (`88%` primary ink on top actions vs calm muted grey on section headers) rather than thin `400` hairlines, with polarity-aware smoothing (`antialiased` in dark mode; native macOS optical rendering in light mode).
+  - **Editorial Reader Content (`--font-content` = `"Newsreader Variable"` + `"New York"` / `Georgia` + `"Songti SC"` by default)**: Used for the Welcome hero (`24px`), Topbar active session title (`13.5px`), and Assistant/SideChat Markdown headings (`18.5px / 16px / 14.5px`) and long-form prose (`14.5px`, `line-height: 1.82`). Users can switch `内容字体` to `与界面字体相同` / `无衬线` in `AppearanceSettings`.
+  - **Monospace Micro-Typography & Zero-Ligature Code (`--font-code` = `"JetBrains Mono Variable"` + `"SF Mono"` + `"PingFang SC"` fallback before `monospace`)**: Topbar project segments, model & agent selectors (`ModelPicker`, `.agent-badge`, `.agent-picker`), welcome eyebrow badge, turn elapsed times (`用时 12秒`), phase step counts (`· 71 步`), message timestamps, token/context telemetry readouts, reasoning effort tags (`high`), keyboard shortcuts (`⌘N`), micro-badges, and file/reference paths (`@file`, `TurnChangesCard`, `WorkspaceFiles`, `GitReview`). Explicit `"PingFang SC"` fallback prevents CJK glyphs from degrading to `STHeiti`, and `font-variant-ligatures: none` on `code`/`pre`/diffs keeps `--flag` and `---` unambiguous.
+  - **Terminal ANSI SGR Sanitization (`ansi.tsx`)**: `FullToolOutput` and `TurnErrorRow` parse SGR ANSI color/weight sequences into theme-aware `.ansi-*` spans while stripping non-SGR CSI/OSC/control bytes (`0x1B`) so CLI tools never leak missing-glyph tofu boxes.
 - **Markdown GFM Table Readability (`.markdown-table-wrap` + `MessageContent.tsx`)**:
   - **Framed `10px` Scroll Container**: Wrap Markdown `<table>` inside
     `.markdown-table-wrap` (`border-radius: var(--radius-card); border: 1px solid
@@ -289,33 +283,43 @@ To keep every page visually calm, dense, and cohesive:
 
 - **OKLCH Derivation, Pure Achromatic Base & Latte Amber Point Accent (`appearance.ts`)**:
   - **Built-in Presets**:
-    - Dark: `Latte` (pure obsidian `#161616` canvas / `#111111` shell, `#F0F0F0`
-      chalk ink, `#E0A458` Latte Crema Amber 3%–5% point accent), `Material`
+    - Dark: `Latte` (deep obsidian `#121212` canvas / `#0D0D0D` shell, `#F2F2F2`
+      chalk ink, `#E5A454` Latte Crema Amber 3%–5% point accent), `Material`
       (`#1E272C`), `Graphite` (`#202024`) with damped surface/border chroma so
       tinted dark themes stay crisp rather than muddy.
-    - Light: `Latte` (pure paper `#FFFFFF` canvas / `#F7F7F7` shell, `#111111`
+    - Light: `Latte` (pure paper `#FFFFFF` canvas / `#F8F8F8` shell, `#0F0F0F`
       jet ink, `#A66022` Roasted Latte Amber point accent), `Paper` (`#FAF7F2`),
       `Mint` (`#F4F8F6`).
+    - **Legacy Default Migration**: `readAppearance()` seamlessly upgrades
+      untouched legacy `Latte` color triples in `localStorage` to the current
+      `Latte` preset while preserving custom palettes, contrast, vibrancy, and
+      font preferences.
   - **4-Step Editorial Luminosity Ladder**: Interpolates in OKLab/OKLCH while
-    preserving dramatic figure-ground contrast between primary content and
-    auxiliary chrome across all seven surface planes (`canvas`, `sidebar`,
-    `surface`, `card`, `elevated`, `input`, `composer`):
-    1. `--color-text`: High-polarity primary ink (`#F0F0F0` `15.9:1` dark /
-       `#111111` `18.9:1` light).
-    2. `--color-text-secondary`: Calm reading support (`>= 5.4:1` across all
-       surfaces; `#A2A2A2` `~7.1:1` dark / `#5B5B5B` `~6.8:1` light).
+    preserving dramatic figure-ground contrast (`> 10:1` contrast drop between
+    primary and secondary ink) across all seven surface planes (`canvas`,
+    `sidebar`, `surface`, `card`, `elevated`, `input`, `composer`):
+    1. `--color-text`: High-polarity primary ink (`#F2F2F2` `16.7:1` dark /
+       `#0F0F0F` `19.2:1` light).
+    2. `--color-text-secondary`: Calm reading support (`>= 4.8:1` across all
+       surfaces; `#8D8D8D` `~5.6:1` dark / `#666666` `~5.7:1` light).
     3. `--color-text-muted`: Quiet metadata, timestamps, step counts, and
-       placeholders (`>= 3.65:1` across all surfaces; `#7C7C7C` `~4.3:1` dark /
-       `#7F7F7F` `~4.0:1` light) so timestamps and telemetry never compete with
+       placeholders (`>= 3.6:1` across all surfaces; `#757575` `~4.1:1` dark /
+       `#808080` `~4.0:1` light) so timestamps and telemetry never compete with
        headings or code.
     4. `--color-text-faint`: Non-textual decorative chrome (`$` prompt sigils,
-       `/` separators, resting chevrons, diff line-number gutters; `>= 2.65:1`).
+       `/` separators, resting chevrons, diff line-number gutters; `>= 2.55:1`).
+  - **5% Latte Amber Point Anchors**: Reserved for high-signal focal points
+    rather than heavy button fills: Composer `:focus-within` warm halo
+    (`--shadow-composer-focus`) + `caret-color`, active sidebar session/nav
+    capsule (`2.5px × 14px`), selected project folder icon, `TurnNavigator`
+    `aria-current="location"` bar, `BrandLogo` working pupil glint, and the
+    Welcome empty-state ambient spotlight + eyebrow badge.
   - **Light-Mode White-on-White & Ink Polarity**: In light themes, `StageIsland`,
     `Card`, `CardList`, `Disclosure`, `Composer`, and form controls
     (`--color-control-bg`) remain crisp canvas white (`#FFFFFF` in default light)
     separated purely by `1px` `--color-border-subtle` / `--color-border`
-    hairlines (`#ECECEC` / `#E6E6E6`) and pure achromatic diffusion shadows,
-    paired with solid `#111111` primary commit CTAs (`--color-action`) and a
+    hairlines (`#F0F0F0` / `#E6E6E6`) and pure achromatic diffusion shadows,
+    paired with solid `#0F0F0F` primary commit CTAs (`--color-action`) and a
     subtle `--color-brand-soft` hover halo.
   - **Placeholder Contrast Invariant**: `--color-placeholder` equals the contrast-
     verified `--color-text-muted` token directly (`opacity: 1`), never diluted
@@ -457,7 +461,7 @@ exact same `<ToolDetailBody>` semantic `10px` `.activity-well` containers:
 - **`TurnNavigator` (`TURN_PAGE_SIZE = 12`)**:
   - Anchored along the left conversation gutter (`width: 28px`), rendering up to
     **12** compact horizontal turn bars (`6px` resting, `16px` hover, `24px` solid
-    `--color-text` for `aria-current="location"`).
+    `--color-primary` for `aria-current="location"`).
   - When a session exceeds 12 turns (or `hasEarlierHistory` on host), renders `^`
     (`上一页对话轮次`) and `v` (`下一页对话轮次`) pagination buttons that page the
     12-bar preview window (fetching earlier turns on demand with `LoaderCircle`)

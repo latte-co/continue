@@ -8,9 +8,11 @@ import {
 } from "react";
 import {
   applyAppearance,
+  migrateLegacyAppearance,
   readAppearance,
   resolveTheme,
   saveAppearance,
+  TYPOGRAPHY_MIGRATION_KEY,
   type Appearance,
   type ThemeKind,
 } from "./appearance";
@@ -22,7 +24,14 @@ const AppearanceContext = createContext<{
 } | null>(null);
 export function AppearanceProvider({ children }: { children: ReactNode }) {
   const [initial] = useState(readAppearance);
-  const [settings, setSettings] = useState(initial.settings);
+  const [rawSettings, setSettings] = useState(initial.settings);
+  let migrateTypography = false;
+  try {
+    migrateTypography = !localStorage.getItem(TYPOGRAPHY_MIGRATION_KEY);
+  } catch {
+    /* Ignore restricted storage in embedded contexts. */
+  }
+  const settings = migrateLegacyAppearance(rawSettings, migrateTypography);
   const [error, setError] = useState(initial.error);
   const [systemDark, setSystemDark] = useState(
     () => window.matchMedia("(prefers-color-scheme: dark)").matches,

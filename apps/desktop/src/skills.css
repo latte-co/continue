@@ -343,8 +343,21 @@
   padding: 32px var(--content-gutter) 64px;
 }
 .sidebar-skills[aria-current="page"] {
-  background: var(--color-selected);
+  position: relative;
+  background: var(--color-row-selected);
   color: var(--color-text);
+  font-weight: 500;
+}
+.sidebar-skills[aria-current="page"]::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 2.5px;
+  height: 14px;
+  border-radius: var(--radius-pill);
+  background: var(--color-primary);
 }
 
 .skill-import-drop {

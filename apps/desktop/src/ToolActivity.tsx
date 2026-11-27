@@ -21,6 +21,7 @@ import {
   toolLabel,
   type ToolActivity,
 } from "./activity";
+import { renderAnsiText } from "./ansi";
 import { reassembleFullContent, streamEventContent } from "./eventContent";
 import type { ContentEncoding, JsonValue } from "./protocol";
 import { Badge, Button, DiffStat } from "./ui";
@@ -203,18 +204,20 @@ export function FullToolOutput({
           )}
           {stream.encoding === "text" || stream.done ? (
             <pre>
-              {stream.done
-                ? stream.encoding === "text"
-                  ? stream.text
-                  : reassembleFullContent("json", stream.text)
-                : stream.text}
+              {renderAnsiText(
+                stream.done
+                  ? stream.encoding === "text"
+                    ? stream.text
+                    : reassembleFullContent("json", stream.text)
+                  : stream.text,
+              )}
             </pre>
           ) : (
             <p>结构化内容接收中…</p>
           )}
         </>
       ) : output !== undefined ? (
-        <pre>{outputText(output)}</pre>
+        <pre>{renderAnsiText(outputText(output))}</pre>
       ) : (
         <p className="activity-empty-note">
           {pending ? "等待工具返回结果…" : "未收到工具结果。"}

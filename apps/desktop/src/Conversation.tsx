@@ -804,6 +804,10 @@ export function Conversation({
         >
           {events.length === 0 ? (
             <div className="welcome" aria-hidden={preparingHistory}>
+              <div className="welcome-eyebrow" aria-hidden="true">
+                <span className="welcome-eyebrow-dot" />
+                <span>CONTINUE · WORKBENCH</span>
+              </div>
               <h1>{projectName ? "从一个想法开始" : "开始一项新任务"}</h1>
               <p>
                 {projectName

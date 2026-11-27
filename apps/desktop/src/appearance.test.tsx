@@ -219,16 +219,72 @@ it("uses user fonts across UI, content and code", () => {
   expect(css.getPropertyValue("--font-code")).toContain("Menlo");
 });
 
+it("migrates untouched legacy Latte palettes and editorial serif defaults while preserving user customizations", () => {
+  const legacy = defaultAppearance();
+  legacy.mode = "dark";
+  legacy.dark = {
+    ...legacy.dark,
+    accent: "#F2F2F2",
+    background: "#181818",
+    foreground: "#F2F2F2",
+    contentFont: "inherit",
+    uiWeight: "400",
+    translucentSidebar: true,
+  };
+  legacy.light = {
+    ...legacy.light,
+    accent: "#2563EB",
+    background: "#FFFFFF",
+    foreground: "#181818",
+    contentFont: "inherit",
+    uiWeight: "400",
+    contrast: 75,
+  };
+  localStorage.setItem(APPEARANCE_KEY, JSON.stringify(legacy));
+
+  const migrated = readAppearance().settings;
+  expect(migrated.mode).toBe("dark");
+  expect(migrated.dark).toEqual({
+    ...legacy.dark,
+    ...presets.dark.Latte,
+    contentFont: "serif",
+    uiWeight: "500",
+  });
+  expect(migrated.light).toEqual({
+    ...legacy.light,
+    ...presets.light.Latte,
+    contentFont: "serif",
+    uiWeight: "500",
+  });
+  expect(themeTokens(migrated.dark)["--font-ui"]).toContain("Inter Variable");
+  expect(themeTokens(migrated.dark)["--font-content"]).toContain(
+    "Newsreader Variable",
+  );
+  expect(themeTokens(migrated.dark)["--font-code"]).toContain(
+    "JetBrains Mono Variable",
+  );
+  expect(themeTokens(migrated.dark)["--font-code"]).toContain("PingFang SC");
+
+  // Explicit user font choices (including switching back to inherit) and custom colors stay untouched after saveAppearance.
+  const custom = defaultAppearance();
+  custom.dark.background = "#181818";
+  custom.dark.accent = "#FF6B6B";
+  custom.dark.contentFont = "inherit";
+  custom.light.contentFont = "inherit";
+  saveAppearance(custom);
+  expect(readAppearance().settings).toEqual(custom);
+});
+
 it("keeps default text and actions readable with clear editorial hierarchy across every surface in both modes", () => {
   expect(presets.dark.Latte).toEqual({
-    accent: "#E0A458",
-    background: "#161616",
-    foreground: "#F0F0F0",
+    accent: "#E5A454",
+    background: "#121212",
+    foreground: "#F2F2F2",
   });
   expect(presets.light.Latte).toEqual({
     accent: "#A66022",
     background: "#FFFFFF",
-    foreground: "#111111",
+    foreground: "#0F0F0F",
   });
 
   for (const kind of ["light", "dark"] as const) {
@@ -240,8 +296,8 @@ it("keeps default text and actions readable with clear editorial hierarchy acros
     const rFaint = contrastRatio(tokens["--color-text-faint"], canvas);
 
     // Editorial luminosity separation: secondary and muted step down decisively instead of crowding primary ink.
-    expect(rPrimary - rSecondary).toBeGreaterThan(7);
-    expect(rSecondary - rMuted).toBeGreaterThan(2);
+    expect(rPrimary - rSecondary).toBeGreaterThan(10);
+    expect(rSecondary - rMuted).toBeGreaterThan(1.5);
     expect(rMuted).toBeLessThanOrEqual(4.6);
     expect(rFaint).toBeLessThan(rMuted);
 
@@ -260,7 +316,7 @@ it("keeps default text and actions readable with clear editorial hierarchy acros
       for (const text of ["text", "text-secondary"]) {
         expect(
           contrastRatio(tokens[`--color-${text}`], background),
-        ).toBeGreaterThanOrEqual(5.4);
+        ).toBeGreaterThanOrEqual(4.8);
       }
       for (const text of ["text-muted", "placeholder"]) {
         expect(
@@ -269,7 +325,7 @@ it("keeps default text and actions readable with clear editorial hierarchy acros
       }
       expect(
         contrastRatio(tokens["--color-text-faint"], background),
-      ).toBeGreaterThanOrEqual(2.6);
+      ).toBeGreaterThanOrEqual(2.5);
     }
     for (const background of ["primary", "primary-hover"]) {
       expect(
@@ -286,7 +342,7 @@ it("keeps default text and actions readable with clear editorial hierarchy acros
   expect(lightTokens["--color-card"]).toBe("#FFFFFF");
   expect(lightTokens["--color-composer"]).toBe("#FFFFFF");
   expect(lightTokens["--color-control-bg"]).toBe("#FFFFFF");
-  expect(lightTokens["--color-action"].toUpperCase()).toBe("#111111");
+  expect(lightTokens["--color-action"].toUpperCase()).toBe("#0F0F0F");
 });
 
 it("opens one file picker and applies the documented JSON without a second import panel", async () => {

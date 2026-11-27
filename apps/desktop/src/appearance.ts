@@ -22,26 +22,28 @@ export interface Appearance {
   dark: ThemeConfig;
 }
 export const APPEARANCE_KEY = "latte-work.appearance.v1";
+export const TYPOGRAPHY_MIGRATION_KEY = "latte-work.appearance.editorial-v2";
 export const APPEARANCE_EVENT = "latte-work:appearance";
 export const MAX_THEME_BYTES = 32 * 1024;
 export const fonts = {
   system:
-    '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC", sans-serif',
-  sans: 'Arial, "PingFang SC", sans-serif',
-  serif: 'Georgia, "Songti SC", serif',
-  mono: 'ui-monospace, "SF Mono", "SFMono-Regular", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace',
+    '"Inter Variable", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", sans-serif',
+  sans: '"Inter Variable", Arial, "PingFang SC", "Hiragino Sans GB", sans-serif',
+  serif:
+    '"Newsreader Variable", "New York", Georgia, "Songti SC", "STSong", "Noto Serif CJK SC", serif',
+  mono: '"JetBrains Mono Variable", ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, "PingFang SC", "Hiragino Sans GB", monospace',
 };
 export const codeFonts = {
   system: fonts.mono,
-  menlo: 'Menlo, Monaco, "Courier New", monospace',
-  consolas: 'Consolas, "Courier New", monospace',
+  menlo: 'Menlo, Monaco, "PingFang SC", "Courier New", monospace',
+  consolas: 'Consolas, "PingFang SC", "Courier New", monospace',
 };
 export const presets: Record<
   ThemeKind,
   Record<string, Pick<ThemeConfig, "accent" | "background" | "foreground">>
 > = {
   dark: {
-    Latte: { accent: "#E0A458", background: "#161616", foreground: "#F0F0F0" },
+    Latte: { accent: "#E5A454", background: "#121212", foreground: "#F2F2F2" },
     Material: {
       accent: "#82AAFF",
       background: "#1E272C",
@@ -54,20 +56,72 @@ export const presets: Record<
     },
   },
   light: {
-    Latte: { accent: "#A66022", background: "#FFFFFF", foreground: "#111111" },
+    Latte: { accent: "#A66022", background: "#FFFFFF", foreground: "#0F0F0F" },
     Paper: { accent: "#806044", background: "#FAF7F2", foreground: "#2C2824" },
     Mint: { accent: "#247564", background: "#F4F8F6", foreground: "#1D312B" },
   },
 };
+
+const LEGACY_LATTE_DEFAULTS: Record<
+  ThemeKind,
+  ReadonlyArray<Pick<ThemeConfig, "accent" | "background" | "foreground">>
+> = {
+  dark: [
+    { accent: "#F2F2F2", background: "#181818", foreground: "#F2F2F2" },
+    { accent: "#E0A458", background: "#161616", foreground: "#F0F0F0" },
+  ],
+  light: [
+    { accent: "#2563EB", background: "#FFFFFF", foreground: "#181818" },
+    { accent: "#A66022", background: "#FFFFFF", foreground: "#111111" },
+  ],
+};
+
+function migrateLegacyDefaultTheme(
+  kind: ThemeKind,
+  theme: ThemeConfig,
+): ThemeConfig {
+  const isLegacyDefault = LEGACY_LATTE_DEFAULTS[kind].some(
+    (legacy) =>
+      theme.accent === legacy.accent &&
+      theme.background === legacy.background &&
+      theme.foreground === legacy.foreground,
+  );
+  return isLegacyDefault ? { ...theme, ...presets[kind].Latte } : theme;
+}
+
+export function migrateLegacyAppearance(
+  settings: Appearance,
+  migrateTypography = false,
+): Appearance {
+  let light = migrateLegacyDefaultTheme("light", settings.light);
+  let dark = migrateLegacyDefaultTheme("dark", settings.dark);
+  if (
+    migrateTypography &&
+    light.uiFont === "system" &&
+    dark.uiFont === "system"
+  ) {
+    if (light.contentFont === "inherit" && dark.contentFont === "inherit") {
+      light = { ...light, contentFont: "serif" };
+      dark = { ...dark, contentFont: "serif" };
+    }
+    if (light.uiWeight === "400" && dark.uiWeight === "400") {
+      light = { ...light, uiWeight: "500" };
+      dark = { ...dark, uiWeight: "500" };
+    }
+  }
+  return light === settings.light && dark === settings.dark
+    ? settings
+    : { ...settings, light, dark };
+}
 export function defaultTheme(kind: ThemeKind): ThemeConfig {
   return {
     ...presets[kind].Latte,
     contrast: 50,
     translucentSidebar: false,
     uiFont: "system",
-    contentFont: "inherit",
+    contentFont: "serif",
     codeFont: "system",
-    uiWeight: "400",
+    uiWeight: "500",
     contentWeight: "400",
     codeWeight: "400",
   };
@@ -154,8 +208,15 @@ export function parseAppearance(text: string): Appearance {
 export function readAppearance(): { settings: Appearance; error: string } {
   try {
     const raw = localStorage.getItem(APPEARANCE_KEY);
+    if (!raw) {
+      return { settings: defaultAppearance(), error: "" };
+    }
+    const migrateTypography = !localStorage.getItem(TYPOGRAPHY_MIGRATION_KEY);
     return {
-      settings: raw ? parseAppearance(raw) : defaultAppearance(),
+      settings: migrateLegacyAppearance(
+        parseAppearance(raw),
+        migrateTypography,
+      ),
       error: "",
     };
   } catch {
@@ -168,6 +229,7 @@ export function readAppearance(): { settings: Appearance; error: string } {
 export function saveAppearance(settings: Appearance): string {
   try {
     localStorage.setItem(APPEARANCE_KEY, JSON.stringify(settings));
+    localStorage.setItem(TYPOGRAPHY_MIGRATION_KEY, "1");
     return "";
   } catch {
     return "外观已应用，但无法保存到本机。重启后可能丢失。";
@@ -360,8 +422,8 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
   const scale = 0.65 + (theme.contrast / 100) * 0.7;
   const step = (n: number) => mix(bg, fg, n);
   const shell = dark
-    ? shiftLightness(bg, -0.022 * scale, 0.96)
-    : shiftLightness(bg, -0.021 * scale, 0.96);
+    ? shiftLightness(bg, -0.024 * scale, 0.96)
+    : shiftLightness(bg, -0.025 * scale, 0.96);
   const sidebarBase = shell;
   const surface = dark
     ? shiftLightness(bg, 0.026 * scale, 0.72)
@@ -369,29 +431,24 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
   const card = dark ? shiftLightness(bg, 0.026 * scale, 0.72) : bg;
   const elevated = dark ? shiftLightness(bg, 0.044 * scale, 0.72) : bg;
   const input = dark
-    ? shiftLightness(bg, -0.012 * scale, 0.88)
+    ? shiftLightness(bg, -0.014 * scale, 0.88)
     : shiftLightness(bg, -0.018 * scale, 0.88);
   const composer = dark ? shiftLightness(bg, 0.032 * scale, 0.72) : bg;
   const controlBg = dark ? fg + "0a" : bg;
 
   const surfaces = [bg, sidebarBase, surface, card, elevated, input, composer];
   const textSecondary = ensureContrast(
-    step(dark ? 0.68 : 0.64),
+    step(dark ? 0.59 : 0.59),
     surfaces,
     fg,
-    5.4,
+    4.8,
   );
-  const textMuted = ensureContrast(
-    step(dark ? 0.51 : 0.49),
-    surfaces,
-    fg,
-    3.65,
-  );
+  const textMuted = ensureContrast(step(dark ? 0.46 : 0.48), surfaces, fg, 3.6);
   const textFaint = ensureContrast(
-    step(dark ? 0.39 : 0.37),
+    step(dark ? 0.36 : 0.36),
     surfaces,
     fg,
-    2.65,
+    2.55,
   );
 
   const borderSubtle = dark
@@ -406,6 +463,7 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
   const focusRing = dark
     ? shiftLightness(bg, 0.21 * scale, 0.72)
     : shiftLightness(bg, -0.24 * scale, 0.72);
+  const composerFocusRing = mix(focusRing, accent, dark ? 0.52 : 0.45);
   const action = dark ? mix(fg, bg, 0.06) : fg;
   const actionHover = dark ? fg : mix(fg, bg, 0.14);
   const btnBg = dark ? shiftLightness(bg, 0.04 * scale, 0.72) : "#ffffff";
@@ -495,8 +553,8 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
       ? `0 0 0 1px ${border}, inset 0 1px 0 rgba(255, 255, 255, 0.035), 0 6px 20px -6px rgba(0, 0, 0, 0.24)`
       : `0 0 0 1px ${border}, 0 6px 20px -8px rgba(0, 0, 0, 0.06)`,
     "--shadow-composer-focus": dark
-      ? `0 0 0 1px ${focusRing}, inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 8px 24px -6px rgba(0, 0, 0, 0.3)`
-      : `0 0 0 1px ${focusRing}, 0 8px 24px -8px rgba(0, 0, 0, 0.08)`,
+      ? `0 0 0 1px ${composerFocusRing}, 0 0 0 3.5px ${accent}22, inset 0 1px 0 rgba(255, 255, 255, 0.045), 0 10px 28px -6px rgba(0, 0, 0, 0.36)`
+      : `0 0 0 1px ${composerFocusRing}, 0 0 0 3.5px ${accent}1c, 0 10px 28px -8px rgba(0, 0, 0, 0.09)`,
     "--shadow-dialog": dark
       ? `0 20px 48px -12px rgba(0, 0, 0, 0.5), 0 0 0 1px ${border}`
       : `0 20px 48px -12px rgba(0, 0, 0, 0.14), 0 0 0 1px ${border}`,
