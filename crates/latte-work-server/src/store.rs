@@ -205,7 +205,9 @@ impl Store {
         }
         migration.execute_batch("CREATE INDEX IF NOT EXISTS side_chats_parent ON side_chats(parent_id);
         CREATE INDEX IF NOT EXISTS events_recent_activity_v2 ON events(session_id,seq DESC) WHERE json_extract(data,'$.kind') IN ('user','queued_message_sent','text','tool','tool_result','approval','approval_resolved','subagent');
-        CREATE INDEX IF NOT EXISTS events_workdir_tools ON events(session_id,seq DESC) WHERE json_extract(data,'$.kind') IN ('tool','tool_result');
+        CREATE INDEX IF NOT EXISTS events_workdir_tool_calls ON events(session_id,seq DESC) WHERE json_extract(data,'$.kind')='tool' AND lower(COALESCE(json_extract(data,'$.name'),'')) NOT IN ('read','glob','grep','ls','webfetch','websearch','todowrite','todoread','skill','askuserquestion','taskoutput','taskstop');
+        CREATE INDEX IF NOT EXISTS events_workdir_tool_results ON events(session_id,json_extract(data,'$.id'),seq ASC,COALESCE(json_extract(data,'$.is_error'),0)) WHERE json_extract(data,'$.kind')='tool_result';
+        DROP INDEX IF EXISTS events_workdir_tools;
         DROP INDEX IF EXISTS events_recent_activity;")?;
         let columns = migration
             .prepare("PRAGMA table_info(requests)")?
@@ -688,30 +690,45 @@ impl Store {
         before_seq: Option<i64>,
         page_limit: usize,
     ) -> Result<Vec<crate::agent_workdir::RawWorkdirEventRow>> {
-        let clamped = i64::try_from(page_limit.min(512)).unwrap_or(256);
+        let clamped = i64::try_from(page_limit.min(512)).unwrap_or(512);
         let mut query = self.db.prepare_cached(
             "SELECT
-                 seq,
-                 json_extract(data,'$.kind'),
-                 json_extract(data,'$.id'),
-                 json_extract(data,'$.is_error'),
-                 CASE WHEN json_extract(data,'$.kind')='tool' AND length(data) <= 262144
-                      THEN data
-                 END
-             FROM events
-             WHERE session_id=?1
-               AND (?2 IS NULL OR seq < ?2)
-               AND json_extract(data,'$.kind') IN ('tool','tool_result')
-             ORDER BY seq DESC
+                 t.seq,
+                 (SELECT r.seq
+                  FROM events r
+                  WHERE r.session_id=t.session_id
+                    AND json_extract(r.data,'$.kind')='tool_result'
+                    AND json_extract(r.data,'$.id')=json_extract(t.data,'$.id')
+                    AND r.seq>t.seq
+                  ORDER BY r.seq ASC
+                  LIMIT 1),
+                 (SELECT COALESCE(json_extract(r.data,'$.is_error'),0)
+                  FROM events r
+                  WHERE r.session_id=t.session_id
+                    AND json_extract(r.data,'$.kind')='tool_result'
+                    AND json_extract(r.data,'$.id')=json_extract(t.data,'$.id')
+                    AND r.seq>t.seq
+                  ORDER BY r.seq ASC
+                  LIMIT 1),
+                 CASE WHEN length(t.data) <= 262144 THEN t.data END
+             FROM events t
+             WHERE t.session_id=?1
+               AND (?2 IS NULL OR t.seq<?2)
+               AND json_extract(t.data,'$.kind')='tool'
+               AND lower(COALESCE(json_extract(t.data,'$.name'),'')) NOT IN (
+                   'read','glob','grep','ls','webfetch','websearch',
+                   'todowrite','todoread','skill','askuserquestion',
+                   'taskoutput','taskstop'
+               )
+             ORDER BY t.seq DESC
              LIMIT ?3",
         )?;
         let rows = query.query_map(params![session_id, before_seq, clamped], |row| {
             Ok(crate::agent_workdir::RawWorkdirEventRow {
                 seq: row.get(0)?,
-                kind: row.get(1)?,
-                id: row.get(2)?,
-                is_error: row.get::<_, Option<bool>>(3)?.unwrap_or(false),
-                raw_tool: row.get(4)?,
+                result_seq: row.get(1)?,
+                result_is_error: row.get::<_, Option<i64>>(2)?.map(|v| v != 0),
+                raw_tool: row.get(3)?,
             })
         })?;
         rows.map(|r| Ok(r?)).collect()

@@ -515,12 +515,16 @@ export function Composer(props: Props) {
   useEffect(() => {
     if (!menu || mode === "add") return;
     let disposed = false;
-    setEntries([]);
-    setCommands([]);
-    setCommandsLoadedScope("");
+    if (mode === "files") {
+      setEntries([]);
+    }
     setError("");
     setLoading(true);
     if (!connected || !projectId) {
+      if (mode === "commands") {
+        setCommands([]);
+        setCommandsLoadedScope("");
+      }
       setError("请先连接项目所在主机");
       setLoading(false);
       return;
@@ -543,7 +547,13 @@ export function Composer(props: Props) {
           else throw new Error("响应格式不匹配，请更新项目所在主机的 Server");
         })
         .catch((cause) => {
-          if (!disposed) setError(message(cause));
+          if (!disposed) {
+            if (mode === "commands") {
+              setCommands([]);
+              setCommandsLoadedScope("");
+            }
+            setError(message(cause));
+          }
         })
         .finally(() => {
           if (!disposed) setLoading(false);

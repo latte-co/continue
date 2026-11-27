@@ -396,15 +396,10 @@ pub(crate) fn traex_skill_info(
         bail!("Skill 名称无效");
     }
     for root in &roots {
-        if let Some(found) = claude_skills::inspect(&root.join(name), name)? {
-            let enabled = std::path::Path::new(&found.directory)
-                .join("SKILL.md")
-                .canonicalize()
-                .map(|md| codex_skills::is_skill_enabled(&rules, &md, &found.name, name))
-                .unwrap_or(true);
-            if enabled {
-                return Ok(Some(found));
-            }
+        if let Some(found) =
+            codex_skills::find_enabled_in_roots(&[(root.clone(), false)], name, &rules)?
+        {
+            return Ok(Some(found));
         }
     }
     Ok(None)

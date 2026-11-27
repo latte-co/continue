@@ -2402,3 +2402,96 @@ it("renders selected skills and commands as inline icon pills without leading sl
     expect(mocks.send).toHaveBeenCalledWith("/doc-coauthoring /fix-ci"),
   );
 });
+
+it("converts character-by-character typed commands in rich input into inline pills upon completion", async () => {
+  mocks.request.mockImplementation(async (_host, req) =>
+    req.method === "agent_commands"
+      ? {
+          kind: "agent_commands",
+          commands: [
+            {
+              name: "doc-coauthoring",
+              display_name: "Doc Coauthoring",
+              description: "Guide users through co-authoring documentation",
+              argument_hint: "",
+              kind: "skill",
+            },
+            {
+              name: "fix-ci",
+              display_name: "修复 CI",
+              description: "诊断并修复流水线失败",
+              argument_hint: "",
+              kind: "skill",
+            },
+          ],
+        }
+      : { kind: "files", entries: [] },
+  );
+  mocks.send.mockResolvedValue(true);
+  render(<Harness agent="codex" />);
+
+  // Enter rich mode via a first command pill (`/doc-coauthoring `)
+  type("/doc");
+  fireEvent.click(
+    await screen.findByRole("option", { name: /Doc Coauthoring/ }),
+  );
+  const rich = screen.getByRole("textbox", { name: "任务输入" });
+  expect(rich.classList.contains("composer-rich-input")).toBe(true);
+
+  const pmView = (
+    rich as unknown as {
+      editor: {
+        view: {
+          state: { tr: { insertText: (text: string) => unknown } };
+          dispatch: (tr: unknown) => void;
+        };
+      };
+    }
+  ).editor.view;
+
+  // Type `/fix-ci` character-by-character inside `ComposerRichInput`: while the
+  // slash trigger is still active (no trailing space yet), `/fix-ci` stays plain text.
+  for (const ch of "/fix-ci") {
+    act(() => {
+      pmView.dispatch(pmView.state.tr.insertText(ch));
+    });
+  }
+  expect(
+    Array.from(rich.querySelectorAll(".composer-command-pill")).map(
+      (el) => el.textContent,
+    ),
+  ).toEqual(["doc-coauthoring"]);
+  expect(rich.querySelector(".composer-command-pill svg")).not.toBeNull();
+  expect(await screen.findByRole("option", { name: /修复 CI/ })).toBeTruthy();
+
+  // Completing the command with a space immediately converts `/fix-ci` into a pill
+  // on the same live rich-editor instance and keeps the caret positioned after the space.
+  expect(screen.getByRole("textbox", { name: "任务输入" })).toBe(rich);
+  act(() => {
+    pmView.dispatch(pmView.state.tr.insertText(" "));
+  });
+  await waitFor(() =>
+    expect(
+      Array.from(rich.querySelectorAll(".composer-command-pill")).map(
+        (el) => el.textContent,
+      ),
+    ).toEqual(["doc-coauthoring", "fix-ci"]),
+  );
+
+  for (const ch of "检查构建") {
+    act(() => {
+      pmView.dispatch(pmView.state.tr.insertText(ch));
+    });
+  }
+  expect(
+    Array.from(rich.querySelectorAll(".composer-command-pill")).every(
+      (el) => el.querySelector("svg") !== null,
+    ),
+  ).toBe(true);
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() =>
+    expect(mocks.send).toHaveBeenCalledWith(
+      "/doc-coauthoring /fix-ci 检查构建",
+    ),
+  );
+});

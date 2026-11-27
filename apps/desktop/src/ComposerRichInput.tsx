@@ -12,6 +12,7 @@ import {
 import { createPortal } from "react-dom";
 import {
   Extension,
+  type JSONContent,
   Node as TiptapNode,
   mergeAttributes,
   nodeInputRule,
@@ -24,6 +25,7 @@ import {
   TableHeader,
   TableRow,
 } from "@tiptap/extension-table";
+import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { NodeSelection, TextSelection } from "@tiptap/pm/state";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
@@ -316,7 +318,7 @@ const CommandPill = TiptapNode.create({
         "data-command-name": name,
         "data-command-icon": icon,
       }),
-      `/${name}`,
+      name,
     ];
   },
 
@@ -510,6 +512,8 @@ const ConfiguredStarterKit = StarterKit.configure({
   dropcursor: false,
   codeBlock: false,
 });
+const ConfiguredTaskItem = TaskItem.configure({ nested: true });
+const ConfiguredTable = Table.configure({ resizable: false });
 
 interface Props {
   value: string;
@@ -536,6 +540,22 @@ interface Props {
   onCompositionStart: () => void;
   onCompositionEnd: (text: string, offset: number) => void;
   renderImage: (entry: ComposerReference) => ReactNode;
+}
+
+function countDocCommandPills(doc: ProseMirrorNode): number {
+  let count = 0;
+  doc.descendants((node) => {
+    if (node.type.name === "commandPill") count++;
+  });
+  return count;
+}
+
+function countJsonCommandPills(node: JSONContent): number {
+  let count = node.type === "commandPill" ? 1 : 0;
+  if (node.content) {
+    for (const child of node.content) count += countJsonCommandPills(child);
+  }
+  return count;
 }
 
 function signature(
@@ -969,99 +989,110 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
       }),
     ).current;
 
-    const editor = useEditor({
-      immediatelyRender: true,
-      editable: !props.disabled,
-      extensions: [
-        ConfiguredStarterKit,
-        ComposerCodeBlock,
-        BulletListPreservingMarker,
-        TaskList,
-        TaskItem.configure({ nested: true }),
-        Table.configure({ resizable: false }),
-        TableRow,
-        TableHeader,
-        TableCell,
-        LinkPill,
-        CommandPill,
-        ReferenceChip,
-        ComposerKeyboard,
-      ],
-      content: parseMarkdownToDoc(
+    const extensionsRef = useRef([
+      ConfiguredStarterKit,
+      ComposerCodeBlock,
+      BulletListPreservingMarker,
+      TaskList,
+      ConfiguredTaskItem,
+      ConfiguredTable,
+      TableRow,
+      TableHeader,
+      TableCell,
+      LinkPill,
+      CommandPill,
+      ReferenceChip,
+      ComposerKeyboard,
+    ]);
+    const initialContentRef = useRef<JSONContent | null>(null);
+    if (initialContentRef.current === null) {
+      initialContentRef.current = parseMarkdownToDoc(
         props.value,
         props.references,
         props.recognizedCommands,
         props.activeCommandTriggerStart,
-      ),
-      editorProps: {
-        attributes: {
-          class: "composer-inline-input composer-rich-input",
-          role: "textbox",
-          "aria-label": props.label,
-          "aria-multiline": "true",
-          "aria-disabled": String(props.disabled),
-          "aria-autocomplete": "list",
-          "aria-expanded": String(props.autocomplete["aria-expanded"]),
-          "data-placeholder": props.placeholder,
-        },
-      },
-      onUpdate: ({ editor: instance }) => {
-        if (syncingExternalRef.current || composingRef.current) return;
-        const { from, to } = instance.state.selection;
-        const serialized = serializeDocWithSelection(
-          instance.state.doc,
-          propsRef.current.references,
-          from,
-          to,
-        );
-        const caret: InlineSelection = {
-          start: serialized.selectionStart,
-          end: serialized.selectionEnd,
-          afterPath: serialized.afterPath,
-          selectedPaths: serialized.selectedPaths,
-        };
-        const afterCommandPill =
-          instance.state.selection.empty &&
-          instance.state.selection.$from.nodeBefore?.type.name ===
-            "commandPill";
-        const triggerOffset = afterCommandPill ? -1 : caret.start;
-        const nextTrigger = composerTrigger(serialized.text, triggerOffset);
-        const nextActiveCmdStart =
-          nextTrigger?.kind === "commands" ? nextTrigger.start : null;
-        lastSelectionRef.current = caret;
-        lastSerializedSig.current = signature(
-          serialized.text,
-          serialized.references,
-          propsRef.current.recognizedCommands,
-          nextActiveCmdStart,
-        );
-        collectImageTargets();
-        if (!propsRef.current.disabled) {
-          propsRef.current.onEdit(
+      );
+    }
+    const editor = useEditor(
+      {
+        immediatelyRender: true,
+        editable: !props.disabled,
+        extensions: extensionsRef.current,
+        content: initialContentRef.current,
+        onUpdate: ({ editor: instance }) => {
+          if (syncingExternalRef.current || composingRef.current) return;
+          const { from, to } = instance.state.selection;
+          const serialized = serializeDocWithSelection(
+            instance.state.doc,
+            propsRef.current.references,
+            from,
+            to,
+          );
+          const caret: InlineSelection = {
+            start: serialized.selectionStart,
+            end: serialized.selectionEnd,
+            afterPath: serialized.afterPath,
+            selectedPaths: serialized.selectedPaths,
+          };
+          const afterCommandPill =
+            instance.state.selection.empty &&
+            instance.state.selection.$from.nodeBefore?.type.name ===
+              "commandPill";
+          const triggerOffset = afterCommandPill ? -1 : caret.start;
+          const nextTrigger = composerTrigger(serialized.text, triggerOffset);
+          const nextActiveCmdStart =
+            nextTrigger?.kind === "commands" ? nextTrigger.start : null;
+          lastSelectionRef.current = caret;
+          const nextSig = signature(
             serialized.text,
             serialized.references,
-            caret,
+            propsRef.current.recognizedCommands,
+            nextActiveCmdStart,
           );
-          propsRef.current.onInputState(serialized.text, triggerOffset);
-        }
+          const hasPendingCommandConversion =
+            !!propsRef.current.recognizedCommands?.size &&
+            serialized.text.includes("/") &&
+            countDocCommandPills(instance.state.doc) !==
+              countJsonCommandPills(
+                parseMarkdownToDoc(
+                  serialized.text,
+                  serialized.references,
+                  propsRef.current.recognizedCommands,
+                  nextActiveCmdStart,
+                ),
+              );
+          lastSerializedSig.current = hasPendingCommandConversion
+            ? ""
+            : nextSig;
+          collectImageTargets();
+          if (!propsRef.current.disabled) {
+            propsRef.current.onEdit(
+              serialized.text,
+              serialized.references,
+              caret,
+            );
+            propsRef.current.onInputState(serialized.text, triggerOffset);
+          }
+        },
+        onSelectionUpdate: ({ editor: instance }) => {
+          if (syncingExternalRef.current || composingRef.current) return;
+          const { from, to } = instance.state.selection;
+          const serialized = serializeDocWithSelection(
+            instance.state.doc,
+            propsRef.current.references,
+            from,
+            to,
+          );
+          lastSelectionRef.current = {
+            start: serialized.selectionStart,
+            end: serialized.selectionEnd,
+            afterPath: serialized.afterPath,
+            selectedPaths: serialized.selectedPaths,
+          };
+        },
       },
-      onSelectionUpdate: ({ editor: instance }) => {
-        if (syncingExternalRef.current || composingRef.current) return;
-        const { from, to } = instance.state.selection;
-        const serialized = serializeDocWithSelection(
-          instance.state.doc,
-          propsRef.current.references,
-          from,
-          to,
-        );
-        lastSelectionRef.current = {
-          start: serialized.selectionStart,
-          end: serialized.selectionEnd,
-          afterPath: serialized.afterPath,
-          selectedPaths: serialized.selectedPaths,
-        };
-      },
-    });
+      [extensionsRef.current],
+    );
 
     if (editor) {
       richContextMap.set(editor, {
@@ -1100,9 +1131,10 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
       }
     }, [editor, props.disabled]);
 
-    useEffect(() => {
+    useLayoutEffect(() => {
       if (!editor) return;
       const dom = editor.view.dom;
+      dom.classList.add("composer-inline-input", "composer-rich-input");
       const syncAttr = (name: string, val: string | undefined) => {
         if (val === undefined) {
           if (dom.hasAttribute(name)) dom.removeAttribute(name);
@@ -1110,15 +1142,20 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
           dom.setAttribute(name, val);
         }
       };
+      syncAttr("role", "textbox");
+      syncAttr("aria-multiline", "true");
+      syncAttr("aria-autocomplete", "list");
       syncAttr("aria-label", props.label);
       syncAttr("aria-disabled", String(props.disabled));
       syncAttr("aria-expanded", String(ariaExpanded));
       syncAttr("aria-controls", ariaControls);
       syncAttr("aria-activedescendant", ariaActiveDescendant);
+      syncAttr("data-placeholder", props.placeholder);
     }, [
       editor,
       props.disabled,
       props.label,
+      props.placeholder,
       ariaExpanded,
       ariaControls,
       ariaActiveDescendant,
@@ -1386,12 +1423,27 @@ export const ComposerRichInput = forwardRef<InlineReferenceInputHandle, Props>(
             const nextActiveCmdStart =
               nextTrigger?.kind === "commands" ? nextTrigger.start : null;
             lastSelectionRef.current = caret;
-            lastSerializedSig.current = signature(
+            const nextSig = signature(
               serialized.text,
               serialized.references,
               props.recognizedCommands,
               nextActiveCmdStart,
             );
+            const hasPendingCommandConversion =
+              !!props.recognizedCommands?.size &&
+              serialized.text.includes("/") &&
+              countDocCommandPills(editor.state.doc) !==
+                countJsonCommandPills(
+                  parseMarkdownToDoc(
+                    serialized.text,
+                    serialized.references,
+                    props.recognizedCommands,
+                    nextActiveCmdStart,
+                  ),
+                );
+            lastSerializedSig.current = hasPendingCommandConversion
+              ? ""
+              : nextSig;
             props.onCompositionEnd(serialized.text, triggerOffset);
             if (!props.disabled) {
               props.onEdit(serialized.text, serialized.references, caret);

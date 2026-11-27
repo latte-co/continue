@@ -8,9 +8,10 @@ use std::{
 };
 
 const CONFIG_FILE_LIMIT: u64 = 256 * 1024;
-const DIR_ENTRY_LIMIT: usize = 256;
-const WALK_DIR_LIMIT: usize = 64;
-const WALK_DEPTH_LIMIT: usize = 3;
+const DIR_SCAN_CEILING: usize = 4096;
+const DIR_ENTRY_LIMIT: usize = 512;
+const WALK_DIR_LIMIT: usize = 2048;
+const WALK_DEPTH_LIMIT: usize = 6;
 
 #[derive(Debug, Clone)]
 pub(super) struct SkillConfigRule {
@@ -99,17 +100,28 @@ pub(crate) fn find(
     }
 
     for scope_roots in [&repo_roots, &user_roots, &system_roots] {
-        let mut candidates = collect_scope_candidates(scope_roots, name)?;
-        candidates.sort_by(|a, b| a.skill_md.cmp(&b.skill_md));
-        for candidate in candidates {
-            if is_skill_enabled(
-                &rules,
-                &candidate.skill_md,
-                &candidate.info.name,
-                &candidate.folder_slug,
-            ) {
-                return Ok(Some(candidate.info));
-            }
+        if let Some(info) = find_enabled_in_roots(scope_roots, name, &rules)? {
+            return Ok(Some(info));
+        }
+    }
+    Ok(None)
+}
+
+pub(super) fn find_enabled_in_roots(
+    scope_roots: &[(PathBuf, bool)],
+    name: &str,
+    rules: &[SkillConfigRule],
+) -> Result<Option<SkillInfo>> {
+    let mut candidates = collect_scope_candidates(scope_roots, name)?;
+    candidates.sort_by(|a, b| a.skill_md.cmp(&b.skill_md));
+    for candidate in candidates {
+        if is_skill_enabled(
+            rules,
+            &candidate.skill_md,
+            &candidate.info.name,
+            &candidate.folder_slug,
+        ) {
+            return Ok(Some(candidate.info));
         }
     }
     Ok(None)
@@ -167,6 +179,10 @@ fn collect_scope_candidates(roots: &[(PathBuf, bool)], requested: &str) -> Resul
             });
         }
 
+        let mut visited_dirs = HashSet::new();
+        if let Ok(canon_root) = root.canonicalize() {
+            visited_dirs.insert(canon_root);
+        }
         let mut queue = VecDeque::from([(root.clone(), 0_usize)]);
         let mut walked = 0_usize;
         while let Some((dir, depth)) = queue.pop_front() {
@@ -178,10 +194,11 @@ fn collect_scope_candidates(roots: &[(PathBuf, bool)], requested: &str) -> Resul
                 continue;
             };
             let mut entries: Vec<_> = listing
-                .take(DIR_ENTRY_LIMIT)
+                .take(DIR_SCAN_CEILING)
                 .filter_map(Result::ok)
                 .collect();
             entries.sort_by_key(std::fs::DirEntry::file_name);
+            entries.truncate(DIR_ENTRY_LIMIT);
             for entry in entries {
                 let Some(entry_name) = entry.file_name().to_str().map(str::to_owned) else {
                     continue;
@@ -192,21 +209,22 @@ fn collect_scope_candidates(roots: &[(PathBuf, bool)], requested: &str) -> Resul
                     continue;
                 }
                 let entry_path = entry.path();
-                if let Ok(Some(info)) = super::claude_skills::inspect(&entry_path, &entry_name) {
-                    if (info.name == requested || entry_name == requested)
-                        && let Ok(skill_md) =
-                            Path::new(&info.directory).join("SKILL.md").canonicalize()
-                        && seen_skill_md.insert(skill_md.clone())
-                    {
-                        out.push(Candidate {
-                            skill_md,
-                            folder_slug: entry_name,
-                            info,
-                        });
-                    }
-                    continue;
+                if let Ok(Some(info)) = super::claude_skills::inspect(&entry_path, &entry_name)
+                    && (info.name == requested || entry_name == requested)
+                    && let Ok(skill_md) = Path::new(&info.directory).join("SKILL.md").canonicalize()
+                    && seen_skill_md.insert(skill_md.clone())
+                {
+                    out.push(Candidate {
+                        skill_md,
+                        folder_slug: entry_name.clone(),
+                        info,
+                    });
                 }
-                if depth + 1 < WALK_DEPTH_LIMIT && entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                if depth + 1 < WALK_DEPTH_LIMIT
+                    && std::fs::metadata(&entry_path).is_ok_and(|meta| meta.is_dir())
+                    && let Ok(canon_dir) = entry_path.canonicalize()
+                    && visited_dirs.insert(canon_dir)
+                {
                     queue.push_back((entry_path, depth + 1));
                 }
             }
@@ -879,6 +897,108 @@ mod tests {
                 .unwrap()
                 .description,
             "repo .codex"
+        );
+    }
+
+    #[test]
+    fn discovers_multi_level_symlinked_and_nested_codex_skills_before_user_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let codex_home = home.join(".codex");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        // Depth 4, 5, and 6 (up to Codex CLI's `MAX_SCAN_DEPTH = 6`) in project `.codex/skills`
+        // must beat top-level user copies in `$CODEX_HOME/skills`.
+        for (rel, name, desc) in [
+            ("a/b/c/deep3", "deep3", "repo-depth3"),
+            ("a/b/c/d/deep4", "deep4", "repo-depth4"),
+            ("a/b/c/d/e/deep5", "deep5", "repo-depth5"),
+            ("a/b/c/d/e/f/deep6", "deep6", "repo-depth6"),
+        ] {
+            write_skill(&repo.join(".codex/skills").join(rel), name, desc);
+            write_skill(
+                &codex_home.join("skills").join(name),
+                name,
+                &format!("user-{name}"),
+            );
+        }
+
+        // Symlinked category directory + self-cycle protection inside `.codex/skills`.
+        let shared_skill = repo.join("shared-catalog/cat/sym-skill");
+        write_skill(&shared_skill, "sym-skill", "repo-sym");
+        write_skill(
+            &codex_home.join("skills/sym-skill"),
+            "sym-skill",
+            "user-sym",
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                repo.join("shared-catalog/cat"),
+                repo.join(".codex/skills/linked-cat"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                repo.join(".codex/skills"),
+                repo.join("shared-catalog/cat/loop-back"),
+            )
+            .unwrap();
+        }
+
+        // Child skill nested beneath a directory that already has its own `SKILL.md`.
+        write_skill(
+            &repo.join(".codex/skills/parent-skill"),
+            "parent-skill",
+            "repo-parent",
+        );
+        write_skill(
+            &repo.join(".codex/skills/parent-skill/sub/nested-child"),
+            "nested-child",
+            "repo-nested-child",
+        );
+        write_skill(
+            &codex_home.join("skills/nested-child"),
+            "nested-child",
+            "user-nested-child",
+        );
+
+        let env = AgentEnvironment(BTreeMap::from([
+            ("HOME".into(), home.to_string_lossy().into_owned()),
+            (
+                "CODEX_HOME".into(),
+                codex_home.to_string_lossy().into_owned(),
+            ),
+        ]));
+
+        assert_eq!(
+            find(&repo, "deep3", &env).unwrap().unwrap().description,
+            "repo-depth3"
+        );
+        assert_eq!(
+            find(&repo, "deep4", &env).unwrap().unwrap().description,
+            "repo-depth4"
+        );
+        assert_eq!(
+            find(&repo, "deep5", &env).unwrap().unwrap().description,
+            "repo-depth5"
+        );
+        // Beyond depth 6 (7 components), Codex CLI skips the repo entry and falls back to user.
+        assert_eq!(
+            find(&repo, "deep6", &env).unwrap().unwrap().description,
+            "user-deep6"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            find(&repo, "sym-skill", &env).unwrap().unwrap().description,
+            "repo-sym"
+        );
+        assert_eq!(
+            find(&repo, "nested-child", &env)
+                .unwrap()
+                .unwrap()
+                .description,
+            "repo-nested-child"
         );
     }
 }

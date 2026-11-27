@@ -15,16 +15,15 @@ use latte_work_protocol::{Project, Session};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-const RECENT_TOOL_EVENT_LIMIT: usize = 64;
-const WORKDIR_SCAN_PAGE_SIZE: usize = 256;
-const WORKDIR_SCAN_MAX_PAGES: usize = 16;
+const MAX_VALIDATED_CANDIDATES: usize = 64;
+const WORKDIR_SCAN_PAGE_SIZE: usize = 512;
+const WORKDIR_SCAN_MAX_PAGES: usize = 2_048;
 const PATCH_PATH_LIMIT: usize = 8;
 
 pub(crate) struct RawWorkdirEventRow {
     pub seq: i64,
-    pub kind: Option<String>,
-    pub id: Option<String>,
-    pub is_error: bool,
+    pub result_seq: Option<i64>,
+    pub result_is_error: Option<bool>,
     pub raw_tool: Option<String>,
 }
 
@@ -100,17 +99,15 @@ async fn resolve_for_session(
         None => canonical_project.to_path_buf(),
     };
 
-    let signals = collect_recent_workdir_signals(
+    if let Some(resolved) = resolve_from_session_history(
         &service.database,
         &session.id,
         project_root,
         canonical_project,
         &base_cwd,
-        RECENT_TOOL_EVENT_LIMIT,
     )
-    .await;
-
-    if let Some(resolved) = resolve_from_signals(canonical_project, &signals).await {
+    .await
+    {
         return Some(resolved);
     }
 
@@ -153,19 +150,20 @@ async fn resolve_for_session(
     None
 }
 
-async fn collect_recent_workdir_signals(
+async fn resolve_from_session_history(
     database: &runtime::Database,
     session_id: &str,
     project_root: &Path,
     canonical_project: &Path,
     base_cwd: &Path,
-    limit: usize,
-) -> Vec<DirectorySignal> {
+) -> Option<PathBuf> {
     let mut before_seq: Option<i64> = None;
-    let mut outcomes = std::collections::HashMap::<String, bool>::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut collected = Vec::new();
-    'pages: for page_idx in 0..WORKDIR_SCAN_MAX_PAGES {
+    let mut claimed_results = std::collections::HashSet::<i64>::new();
+    let mut seen = std::collections::HashSet::<DirectorySignal>::new();
+    let mut checked_mutated_parents = std::collections::HashSet::<PathBuf>::new();
+    let mut validated_candidates = 0_usize;
+
+    for page_idx in 0..WORKDIR_SCAN_MAX_PAGES {
         if page_idx > 0 {
             tokio::task::yield_now().await;
         }
@@ -179,50 +177,87 @@ async fn collect_recent_workdir_signals(
         }
         before_seq = rows.last().map(|r| r.seq);
         let exhausted = rows.len() < WORKDIR_SCAN_PAGE_SIZE;
+
+        let mut page_signals = Vec::new();
         for row in rows {
-            match row.kind.as_deref() {
-                Some("tool_result") => {
-                    if let Some(id) = row.id {
-                        outcomes.entry(id).or_insert(row.is_error);
+            let outcome = match row.result_seq {
+                Some(rseq) if claimed_results.insert(rseq) => row.result_is_error,
+                _ => None,
+            };
+            let Some(raw) = row.raw_tool else {
+                continue;
+            };
+            let Ok(latte_work_protocol::EventKind::Tool { name, input, .. }) =
+                serde_json::from_str::<latte_work_protocol::EventKind>(&raw)
+            else {
+                continue;
+            };
+            for signal in extract_tool_signals(
+                &name,
+                &input,
+                outcome,
+                project_root,
+                canonical_project,
+                base_cwd,
+            ) {
+                let is_reset = signal == DirectorySignal::ResetToProjectRoot;
+                if seen.insert(signal.clone()) {
+                    page_signals.push(signal);
+                    if is_reset {
+                        break;
                     }
                 }
-                Some("tool") => {
-                    let Some(raw) = row.raw_tool else {
-                        continue;
-                    };
-                    let Ok(latte_work_protocol::EventKind::Tool { id, name, input }) =
-                        serde_json::from_str::<latte_work_protocol::EventKind>(&raw)
-                    else {
-                        continue;
-                    };
-                    let outcome = outcomes.get(&id).copied();
-                    for signal in extract_tool_signals(
-                        &name,
-                        &input,
-                        outcome,
-                        project_root,
-                        canonical_project,
-                        base_cwd,
-                    ) {
-                        let is_reset = signal == DirectorySignal::ResetToProjectRoot;
-                        if seen.insert(signal.clone()) {
-                            collected.push(signal);
-                            if is_reset || collected.len() >= limit {
-                                break 'pages;
-                            }
-                        }
-                    }
-                }
-                _ => {}
             }
         }
+
+        for signal in page_signals {
+            match signal {
+                DirectorySignal::ResetToProjectRoot => {
+                    return Some(canonical_project.to_path_buf());
+                }
+                DirectorySignal::ExplicitDirectory {
+                    path: candidate,
+                    allow_project_root,
+                } => {
+                    validated_candidates += 1;
+                    if let Some(valid) =
+                        validate_explicit_directory(canonical_project, &candidate).await
+                        && (allow_project_root || valid != canonical_project)
+                    {
+                        return Some(valid);
+                    }
+                    if validated_candidates >= MAX_VALIDATED_CANDIDATES {
+                        return None;
+                    }
+                }
+                DirectorySignal::MutatedFile(candidate) => {
+                    let Some(parent) = candidate.parent() else {
+                        continue;
+                    };
+                    if !checked_mutated_parents.insert(parent.to_path_buf()) {
+                        continue;
+                    }
+                    validated_candidates += 1;
+                    if let Some(valid) =
+                        validate_mutated_file_worktree(canonical_project, &candidate).await
+                    {
+                        return Some(valid);
+                    }
+                    if validated_candidates >= MAX_VALIDATED_CANDIDATES {
+                        return None;
+                    }
+                }
+            }
+        }
+
         if exhausted {
             break;
         }
     }
-    collected
+    None
 }
 
+#[cfg(test)]
 async fn resolve_from_signals(
     canonical_project: &Path,
     signals: &[DirectorySignal],
@@ -278,7 +313,7 @@ async fn resolve_from_tool_events(
             let is_reset = signal == DirectorySignal::ResetToProjectRoot;
             if seen.insert(signal.clone()) {
                 signals.push(signal);
-                if is_reset || signals.len() >= RECENT_TOOL_EVENT_LIMIT {
+                if is_reset || signals.len() >= MAX_VALIDATED_CANDIDATES {
                     break 'events;
                 }
             }
@@ -1206,6 +1241,140 @@ mod tests {
             )
             .await,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_active_worktree_and_exit_across_long_session_histories() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        init_repo(&repo);
+        let wt = repo.join(".claude/worktrees/long-feat");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/long",
+                wt.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let canonical_repo = tokio::fs::canonicalize(&repo).await.unwrap();
+        let canonical_wt = tokio::fs::canonicalize(&wt).await.unwrap();
+
+        let store = crate::store::Store::open(&temp.path().join("state.sqlite")).unwrap();
+        let project = store.add_project(&canonical_repo).unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO sessions VALUES (?1,?2,'{}')",
+                rusqlite::params!["s-long", project.id],
+            )
+            .unwrap();
+
+        let append_tool_pair = |conn: &rusqlite::Connection, id: &str, name: &str, input: Value| {
+            let tool_json = serde_json::to_string(&EventKind::Tool {
+                id: id.into(),
+                name: name.into(),
+                input,
+            })
+            .unwrap();
+            let res_json = serde_json::to_string(&EventKind::ToolResult {
+                id: id.into(),
+                content: Value::String("ok".into()),
+                is_error: false,
+            })
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events(session_id, at, data) VALUES (?1, 1.0, ?2)",
+                rusqlite::params!["s-long", tool_json],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events(session_id, at, data) VALUES (?1, 1.0, ?2)",
+                rusqlite::params!["s-long", res_json],
+            )
+            .unwrap();
+        };
+
+        // Turn 1 enters `long-feat`, followed by 6,000 tool calls (12,000 rows: 3,000 Read +
+        // 3,000 relative Bash calls without `cwd` or `cd`) in a single SQLite transaction.
+        {
+            let tx = store.db.unchecked_transaction().unwrap();
+            append_tool_pair(
+                &tx,
+                "enter-1",
+                "EnterWorktree",
+                json!({ "name": "long-feat" }),
+            );
+            for i in 0..3_000 {
+                append_tool_pair(
+                    &tx,
+                    &format!("r-{i}"),
+                    "Read",
+                    json!({ "file_path": "README.md" }),
+                );
+                append_tool_pair(
+                    &tx,
+                    &format!("b-{i}"),
+                    "Bash",
+                    json!({ "command": "cargo test --quiet" }),
+                );
+            }
+            tx.commit().unwrap();
+        }
+
+        let database: runtime::Database = std::sync::Arc::new(std::sync::Mutex::new(store));
+        assert_eq!(
+            resolve_from_session_history(
+                &database,
+                "s-long",
+                &repo,
+                &canonical_repo,
+                &canonical_repo,
+            )
+            .await,
+            Some(canonical_wt.clone()),
+            "long sessions must still open new terminals in the active worktree"
+        );
+
+        // Now exit the worktree and run another 5,000 tool calls (10,000 rows); even if
+        // `base_cwd` was still pointing at `canonical_wt`, `ExitWorktree` resets to root.
+        {
+            let guard = database.lock().unwrap();
+            let tx = guard.db.unchecked_transaction().unwrap();
+            append_tool_pair(&tx, "exit-1", "ExitWorktree", json!({}));
+            for i in 0..2_500 {
+                append_tool_pair(
+                    &tx,
+                    &format!("r2-{i}"),
+                    "Grep",
+                    json!({ "pattern": "fn main" }),
+                );
+                append_tool_pair(
+                    &tx,
+                    &format!("b2-{i}"),
+                    "Bash",
+                    json!({ "command": "git status --short" }),
+                );
+            }
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            resolve_from_session_history(
+                &database,
+                "s-long",
+                &repo,
+                &canonical_repo,
+                &canonical_wt,
+            )
+            .await,
+            Some(canonical_repo),
+            "long sessions after ExitWorktree must reset terminals back to project root"
         );
     }
 }
