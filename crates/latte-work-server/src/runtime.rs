@@ -88,6 +88,18 @@ impl ForwardedInputs {
     fn deadline(&self) -> Option<tokio::time::Instant> {
         self.0.values().copied().min()
     }
+    fn drain_unawaited(&mut self, mut is_awaited: impl FnMut(&str) -> bool) -> Vec<String> {
+        let settled: Vec<String> = self
+            .0
+            .keys()
+            .filter(|id| !is_awaited(id))
+            .cloned()
+            .collect();
+        for id in &settled {
+            self.0.remove(id);
+        }
+        settled
+    }
 }
 #[derive(Default)]
 pub struct TitleRefreshCache {
@@ -382,12 +394,18 @@ pub async fn queue_action(
     path: String,
     action: QueueAction,
 ) -> Result<Response> {
+    let wait_budget = match &action {
+        QueueAction::Dispatch {
+            interrupt: true, ..
+        } => Duration::from_secs(20),
+        _ => Duration::from_secs(10),
+    };
     let control = control_for(database, runs, binary, session, path)?;
     let (reply, receive) = oneshot::channel();
     control
         .try_send(Control::Queue { action, reply })
         .context("会话请求过多，请核对队列后重试")?;
-    tokio::time::timeout(Duration::from_secs(10), receive)
+    tokio::time::timeout(wait_budget, receive)
         .await
         .context("队列操作结果待确认，请刷新后核对")??
         .map_err(anyhow::Error::msg)
@@ -1859,6 +1877,9 @@ impl Process {
             self.interrupt_sent = true;
             self.interrupt_ack_pending = true;
             let actions = self.adapter.advance(Input::Interrupt)?;
+            if actions.iter().any(|a| matches!(a, Action::Interrupted)) {
+                self.interrupt_ack_pending = false;
+            }
             self.apply_state(actions, database, id).await?;
         }
         self.session_open.store(self.state.ready, Ordering::SeqCst);
@@ -2047,7 +2068,7 @@ impl Process {
         let background_confirmed = if requires_drain {
             matches!(
                 tokio::time::timeout(
-                    Duration::from_secs(2),
+                    Duration::from_secs(3),
                     transport.drain_native_close(self.adapter.as_mut()),
                 )
                 .await,
@@ -2074,10 +2095,13 @@ impl Process {
             }
             true
         };
+        let adapter = self.adapter.as_mut();
+        let per_turn = adapter.transport_lifetime() == agents::TransportLifetime::PerTurn;
         let confirmed = transport
             .terminate_with_auxiliary(
-                self.adapter.transport_lifetime() == agents::TransportLifetime::PerTurn,
+                per_turn,
                 requires_drain && background_confirmed,
+                move |status| adapter.close_exit_confirmed(status),
                 deadline,
                 auxiliary,
             )
@@ -2093,6 +2117,7 @@ async fn close_group(
     group: &mut Group,
     deadline: tokio::time::Instant,
     expect_clean_exit: bool,
+    exit_confirmed: impl FnOnce(std::process::ExitStatus) -> bool,
     auxiliary: impl std::future::Future<Output = bool>,
 ) -> bool {
     let pid = Pid::from_raw(group.pid);
@@ -2123,7 +2148,7 @@ async fn close_group(
         Err(_) => false,
     };
     let native_confirmed = match exit {
-        Ok(Ok(status)) => !expect_clean_exit || status.success(),
+        Ok(Ok(status)) => !expect_clean_exit || exit_confirmed(status),
         _ => {
             let reaped = matches!(
                 tokio::time::timeout_at(
@@ -2535,7 +2560,6 @@ async fn actor(
 ) {
     struct Immediate {
         turn: SendTurn,
-        restore_reason: Option<String>,
         reply: oneshot::Sender<Result<Response, String>>,
         deadline: tokio::time::Instant,
     }
@@ -2626,38 +2650,98 @@ async fn actor(
                     Ok(())
                 }
                 Some(Control::Interrupt { reply }) => async {
-                    if let Some(p) = process.as_mut().filter(|p| p.adapter.transport_lifetime() == agents::TransportLifetime::PerTurn && p.turn_active) {
-                        db(&database, |d| d.pause_queue(&session.id, Some("当前执行已停止，队列已暂停")))?;
+                    if let Some(pending) = immediate.take() {
+                        let _ = db(&database, |d| {
+                            if !d.queue_state(&session.id)?.0 {
+                                d.pause_queue(&session.id, Some("当前执行已停止，队列已暂停"))?;
+                            }
+                            Ok(())
+                        });
+                        let _ = pending
+                            .reply
+                            .send(Err("发送已取消，消息保留在队列".into()));
+                    }
+                    if let Some(p) = process.as_mut().filter(|p| {
+                        p.adapter.transport_lifetime() == agents::TransportLifetime::PerTurn
+                            && p.turn_active
+                    }) {
+                        db(&database, |d| {
+                            d.pause_queue(&session.id, Some("当前执行已停止，队列已暂停"))
+                        })?;
                         let result = p.stop_per_turn(&database, &session.id).await;
                         let _ = reply.send(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
                         return result;
                     }
-                    if let Some(pending) = immediate.take() { let _ = pending.reply.send(Err("发送已取消，消息保留在队列".into())); }
-                    if !forwarded.is_empty() {
-                        let background_pending=process.as_ref().is_some_and(|p|p.turn_active&&p.background_at_start);
-                        if let Some(p)=process.as_mut(){p.close_confirmed(&database, &session.id).await?;}
-                        process=None;
+                    let must_reset_for_forwarded = !forwarded.is_empty()
+                        && process.as_ref().is_none_or(|p| {
+                            !p.turn_active || p.adapter.interrupt_requires_process_reset()
+                        });
+                    if must_reset_for_forwarded {
+                        let background_pending = process
+                            .as_ref()
+                            .is_some_and(|p| p.turn_active && p.background_at_start);
+                        if let Some(p) = process.as_mut()
+                            && let Err(error) = p.close_confirmed(&database, &session.id).await
+                        {
+                            let _ = reply.send(Err(error.to_string()));
+                            return Err(error);
+                        }
+                        process = None;
                         forwarded.clear();
-                        db(&database,|d|{d.uncertain_forwarded(&session.id)?;d.end_subagents(&session.id,latte_work_protocol::SubagentStatus::Unknown)?;d.pause_queue(&session.id,Some("当前执行已停止，队列已暂停"))})?;
-                        finish_turn(&database,&session.id,&path,true,background_pending).await?;
-                        db(&database,|d|d.state(&session.id,Status::Stopped,Some("已停止；已发送消息的处理状态请核对 Agent 记录".into())))?;
-                        let _=reply.send(Ok(()));
+                        db(&database, |d| {
+                            d.uncertain_forwarded(&session.id)?;
+                            d.end_subagents(
+                                &session.id,
+                                latte_work_protocol::SubagentStatus::Unknown,
+                            )?;
+                            d.pause_queue(&session.id, Some("当前执行已停止，队列已暂停"))
+                        })?;
+                        finish_turn(&database, &session.id, &path, true, background_pending)
+                            .await?;
+                        db(&database, |d| {
+                            d.state(
+                                &session.id,
+                                Status::Stopped,
+                                Some("已停止；已发送消息的处理状态请核对 Agent 记录".into()),
+                            )
+                        })?;
+                        let _ = reply.send(Ok(()));
                         Ok(())
-                    } else if process.as_ref().is_some_and(|p| !p.turn_active && !p.state.pending.is_empty()) {
-                        if let Some(p) = process.as_mut() {
-                            p.close_confirmed(&database, &session.id).await?;
+                    } else if process
+                        .as_ref()
+                        .is_some_and(|p| !p.turn_active && !p.state.pending.is_empty())
+                    {
+                        if let Some(p) = process.as_mut()
+                            && let Err(error) = p.close_confirmed(&database, &session.id).await
+                        {
+                            let _ = reply.send(Err(error.to_string()));
+                            return Err(error);
                         }
                         process = None;
                         db(&database, |d| {
                             d.pause_queue(&session.id, Some("当前执行已停止，队列已暂停"))?;
-                            d.end_subagents(&session.id, latte_work_protocol::SubagentStatus::Stopped)?;
-                            d.state(&session.id, Status::Stopped, Some("已停止后台任务；已执行的文件改动不会撤销。".into()))
+                            d.end_subagents(
+                                &session.id,
+                                latte_work_protocol::SubagentStatus::Stopped,
+                            )?;
+                            d.state(
+                                &session.id,
+                                Status::Stopped,
+                                Some("已停止后台任务；已执行的文件改动不会撤销。".into()),
+                            )
                         })?;
                         let _ = reply.send(Ok(()));
                         Ok(())
                     } else if let Some(p) = process.as_mut().filter(|p| p.turn_active) {
                         if p.stopping {
-                            let _ = reply.send(Err("任务正在停止".into()));
+                            if p.stop_reply.is_none() {
+                                p.stop_reply = Some(reply);
+                                p.turn_deadline = p
+                                    .turn_deadline
+                                    .min(tokio::time::Instant::now() + Duration::from_secs(10));
+                            } else {
+                                let _ = reply.send(Err("任务正在停止".into()));
+                            }
                             Ok(())
                         } else {
                             p.stopping = true;
@@ -2678,7 +2762,8 @@ async fn actor(
                         let _ = reply.send(Ok(()));
                         Ok(())
                     }
-                }.await,
+                }
+                .await,
                 Some(Control::SubagentHistory { task_id, permit, reply }) => {
                     let source=db(&database,|d|Ok((d.subagent(&session.id,&task_id)?,d.session(&session.id)?.native_id,d.child_history_cursor(&session.id,&task_id)?,d.project_former_paths(&session.project_id)?))).map(|(child,parent,cursor,former_paths)|{
                         let process=process.as_ref().filter(|p|p.adapter.knows_subagent(&child.native_id));
@@ -2760,34 +2845,69 @@ async fn actor(
                         }
                         db(&database, |d| {
                             let (entry,fingerprint) = d.queued(&session.id)?.into_iter().find(|(e,_)|e.request_id==request_id && e.revision==revision).context("消息已开始执行、移除或更新，请刷新队列")?;
-                            let (paused,reason) = d.queue_state(&session.id)?;
-                            d.pause_queue(&session.id,Some("正在发送消息"))?;
-                            Ok((SendTurn { request_id: entry.request_id, text: entry.text, model: entry.model, fingerprint, config }, if paused {Some(reason.unwrap_or_else(||"队列已暂停".into()))} else {None}))
+                            Ok(SendTurn { request_id: entry.request_id, text: entry.text, model: entry.model, fingerprint, config })
                         })
                     })();
                     match prepared {
                         Err(error) => { let _=reply.send(Err(error.to_string())); Ok(()) },
-                        Ok((turn,restore_reason)) => {
-                            immediate=Some(Immediate {turn,restore_reason,reply,deadline:tokio::time::Instant::now()+Duration::from_secs(8)});
-                            if interrupt && !forwarded.is_empty() {
-                                let background_pending=process.as_ref().is_some_and(|p|p.turn_active&&p.background_at_start);
-                                if let Some(p)=process.as_mut() {p.close_confirmed(&database, &session.id).await?;}
-                                process=None;
+                        Ok(turn) => {
+                            immediate=Some(Immediate {turn,reply,deadline:tokio::time::Instant::now()+Duration::from_secs(8)});
+                            let must_reset_for_forwarded = interrupt
+                                && !forwarded.is_empty()
+                                && process.as_ref().is_none_or(|p| {
+                                    !p.turn_active || p.adapter.interrupt_requires_process_reset()
+                                });
+                            if must_reset_for_forwarded {
+                                let background_pending = process
+                                    .as_ref()
+                                    .is_some_and(|p| p.turn_active && p.background_at_start);
+                                if let Some(p) = process.as_mut() {
+                                    p.close_confirmed(&database, &session.id).await?;
+                                }
+                                process = None;
                                 forwarded.clear();
-                                db(&database,|d|{d.uncertain_forwarded(&session.id)?;d.end_subagents(&session.id,latte_work_protocol::SubagentStatus::Unknown)})?;
-                                finish_turn(&database,&session.id,&path,true,background_pending).await?;
-                                db(&database,|d|d.state(&session.id,Status::Stopped,Some("已停止当前任务".into())))?;
+                                db(&database, |d| {
+                                    d.uncertain_forwarded(&session.id)?;
+                                    d.end_subagents(
+                                        &session.id,
+                                        latte_work_protocol::SubagentStatus::Unknown,
+                                    )
+                                })?;
+                                finish_turn(
+                                    &database,
+                                    &session.id,
+                                    &path,
+                                    true,
+                                    background_pending,
+                                )
+                                .await?;
+                                db(&database, |d| {
+                                    d.state(
+                                        &session.id,
+                                        Status::Stopped,
+                                        Some("已停止当前任务".into()),
+                                    )
+                                })?;
                                 Ok(())
-                            } else if let Some(p)=process.as_mut().filter(|p|p.turn_active && interrupt) {
-                                if p.adapter.transport_lifetime() == agents::TransportLifetime::PerTurn {
+                            } else if let Some(p) =
+                                process.as_mut().filter(|p| p.turn_active && interrupt)
+                            {
+                                if p.adapter.transport_lifetime()
+                                    == agents::TransportLifetime::PerTurn
+                                {
                                     return p.stop_per_turn(&database, &session.id).await;
                                 }
-                                p.stopping=true;
-                                p.interrupt_sent=true;
-                                p.interrupt_ack_pending=true;
-                                let actions=p.adapter.advance(Input::Interrupt);
-                                match actions {Ok(actions)=>p.apply(actions,&database,&session.id).await,Err(error)=>Err(error)}
-                            } else {Ok(())}
+                                p.stopping = true;
+                                p.interrupt_sent = true;
+                                p.interrupt_ack_pending = true;
+                                let actions = p.adapter.advance(Input::Interrupt);
+                                match actions {
+                                    Ok(actions) => p.apply(actions, &database, &session.id).await,
+                                    Err(error) => Err(error),
+                                }
+                            } else {
+                                Ok(())
+                            }
                         }
                     }
                 }.await,
@@ -2831,7 +2951,7 @@ async fn actor(
                 Some(Control::Send { turn, allow_queue, admission, reply }) => {
                     safe_to_close.store(false, Ordering::SeqCst);
                     let mut reply = Some(reply);
-                    let result = receive_turn(&mut process, &database, &binary, &session, &path, turn, &session_open, allow_queue, !forwarded.is_empty(), &mut queued_configs, &admission, || {
+                    let result = receive_turn(&mut process, &database, &binary, &session, &path, turn, &session_open, allow_queue, !forwarded.is_empty() || immediate.is_some(), &mut queued_configs, &admission, || {
                         if let Some(reply) = reply.take() {
                             let _ = reply.send(Ok(Response::Accepted { duplicate: false }));
                         }
@@ -2984,7 +3104,12 @@ async fn actor(
                 // current turn under normal supervision, without replaying input.
                 if let Some(pending) = immediate.take() {
                     let _ = pending.reply.send(Err("发送确认超时，消息保留在队列，请核对后重试".into()));
-                    db(&database, |d| d.pause_queue(&session.id, pending.restore_reason.as_deref().or(Some("发送确认超时，队列已暂停，请核对后继续"))))
+                    db(&database, |d| {
+                        if !d.queue_state(&session.id)?.0 {
+                            d.pause_queue(&session.id, Some("发送确认超时，队列已暂停，请核对后继续"))?;
+                        }
+                        Ok(())
+                    })
                 } else { Ok(()) }
             },
             _ = deadline(init_deadline) => Err(anyhow::anyhow!("Agent 初始化超时（18 秒）")),
@@ -3000,7 +3125,13 @@ async fn actor(
                 }
                 Ok(())
             },
-            _ = deadline(turn_deadline) => Err(anyhow::anyhow!("任务超过 24 小时上限")),
+            _ = deadline(turn_deadline) => Err(anyhow::anyhow!(
+                if process.as_ref().is_some_and(|p| p.stopping) {
+                    "停止任务超时，未在 10 秒内收到 Agent 结束确认"
+                } else {
+                    "任务超过 24 小时上限"
+                }
+            )),
             _ = deadline(handoff_deadline) => Err(anyhow::anyhow!("Agent 未在 24 小时内确认已交付的消息，处理结果待确认；不会自动重发")),
         };
         if let Err(error) = result {
@@ -3026,15 +3157,17 @@ async fn actor(
                 if let Some(reply) = p.stop_reply.take() {
                     let _ = reply.send(Err(text.clone()));
                 }
-                let closed = p.close_confirmed(&database, &session.id).await;
-                if let Err(error) = closed
-                    && !p.close_started
-                {
-                    safe_to_close.store(false, Ordering::SeqCst);
-                    for reply in opening.drain(..) {
-                        let _ = reply.send(Err(error.to_string()));
+                if !p.close_started {
+                    let closed = p.close_confirmed(&database, &session.id).await;
+                    if let Err(error) = closed
+                        && !p.close_started
+                    {
+                        safe_to_close.store(false, Ordering::SeqCst);
+                        for reply in opening.drain(..) {
+                            let _ = reply.send(Err(error.to_string()));
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 text
             } else {
@@ -3046,15 +3179,18 @@ async fn actor(
             {
                 eprintln!("cannot freeze failed turn: {error}");
             }
-            if let Err(e) = db(&database, |s| {
-                s.end_subagents(&session.id, latte_work_protocol::SubagentStatus::Unknown)?;
-                s.state(&session.id, Status::Failed, Some(message))
-            }) {
+            let close_pending = db(&database, |s| s.unconfirmed_agent_close(&session.id))
+                .is_ok_and(|pending| pending.is_some());
+            if !(close_pending && message == CLOSE_PENDING)
+                && let Err(e) = db(&database, |s| {
+                    s.end_subagents(&session.id, latte_work_protocol::SubagentStatus::Unknown)?;
+                    s.state(&session.id, Status::Failed, Some(message))
+                })
+            {
                 eprintln!("cannot persist terminal state: {e}");
             }
             if let Some(config) = recovery
-                && db(&database, |s| s.unconfirmed_agent_close(&session.id))
-                    .is_ok_and(|pending| pending.is_none())
+                && !close_pending
             {
                 let restore = async {
                     let current = db(&database, |s| s.session(&session.id))?;
@@ -3112,63 +3248,99 @@ async fn actor(
                 .is_some_and(|s| s.active() || *s != status)
                 && !status.active()
                 && status != Status::Completed
+                && !(status == Status::Stopped && immediate.is_some())
             {
                 db(&database, |d| {
-                    d.pause_queue(&session.id, Some("当前执行未完成，队列已暂停"))
+                    if !d.queue_state(&session.id)?.0 {
+                        d.pause_queue(&session.id, Some("当前执行未完成，队列已暂停"))?;
+                    }
+                    Ok(())
                 })?;
             }
             // Native completions can consume zero, one or several delivered
             // inputs. Never invent another turn or replay them at this boundary.
+            // Keep inputs whose live native process is still awaiting an
+            // explicit accept/reject RPC reply so a late rejection can still
+            // return them to the paused queue.
             if !status.active() && status != Status::Completed && !forwarded.is_empty() {
-                forwarded.clear();
-                db(&database, |d| d.uncertain_forwarded(&session.id))?;
+                let unawaited = forwarded.drain_unawaited(|request_id| {
+                    process
+                        .as_ref()
+                        .is_some_and(|p| p.adapter.awaits_forwarded_reply(request_id))
+                });
+                if !unawaited.is_empty() {
+                    db(&database, |d| {
+                        d.uncertain_forwarded_ids(&session.id, &unawaited)
+                    })?;
+                }
             }
             let status = db(&database, |d| Ok(d.session(&session.id)?.status))?;
             if immediate.is_some()
                 && !status.active()
-                && process
-                    .as_ref()
-                    .is_none_or(|p| p.host_prepared() && !p.turn_active && !p.interrupt_ack_pending)
+                && process.as_ref().is_none_or(Process::can_start_turn)
             {
                 let pending = immediate.take().expect("checked immediate");
-                let result = async {
-                    if matches!(status, Status::Failed | Status::Unknown)
-                        && previous_status.as_ref().is_some_and(|s| s.active())
-                    {
-                        bail!("当前执行异常，发送消息保留在队列");
-                    }
-                    accept_turn(
-                        &mut process,
-                        &database,
-                        &binary,
-                        &session,
-                        &path,
-                        pending.turn,
-                        &session_open,
-                        None,
-                        || {},
-                    )
-                    .await?;
-                    queued_configs.retain(|id, _| {
-                        db(&database, |d| {
-                            Ok(d.queued(&session.id)?
-                                .iter()
-                                .any(|(e, _)| &e.request_id == id))
-                        })
-                        .unwrap_or(false)
-                    });
-                    if db(&database, |d| {
-                        Ok(d.session(&session.id)?.status == Status::Failed)
-                    })? {
-                        bail!("消息发送失败，请检查 Agent 状态");
-                    }
+                if pending.reply.is_closed() {
                     db(&database, |d| {
-                        d.pause_queue(&session.id, pending.restore_reason.as_deref())?;
-                        d.queue_snapshot(&session.id)
-                    })
+                        if !d.queue_state(&session.id)?.0 {
+                            d.pause_queue(
+                                &session.id,
+                                Some("发送确认超时，队列已暂停，请核对后继续"),
+                            )?;
+                        }
+                        Ok(())
+                    })?;
+                } else {
+                    let mut reply = Some(pending.reply);
+                    let result = async {
+                        if matches!(status, Status::Failed | Status::Unknown)
+                            && previous_status.as_ref().is_some_and(|s| s.active())
+                        {
+                            bail!("当前执行异常，发送消息保留在队列");
+                        }
+                        accept_turn(
+                            &mut process,
+                            &database,
+                            &binary,
+                            &session,
+                            &path,
+                            pending.turn,
+                            &session_open,
+                            None,
+                            || {
+                                // Confirm durable admission immediately before slow workspace
+                                // snapshots or process launch can exceed queue_action's budget.
+                                // Preserve the current pause state (including any rejection
+                                // pause written while waiting for the previous turn to stop).
+                                let snapshot = db(&database, |d| d.queue_snapshot(&session.id));
+                                if let Some(reply) = reply.take() {
+                                    let _ = reply.send(snapshot.map_err(|e| e.to_string()));
+                                }
+                            },
+                        )
+                        .await?;
+                        queued_configs.retain(|id, _| {
+                            db(&database, |d| {
+                                Ok(d.queued(&session.id)?
+                                    .iter()
+                                    .any(|(e, _)| &e.request_id == id))
+                            })
+                            .unwrap_or(false)
+                        });
+                        if db(&database, |d| {
+                            Ok(d.session(&session.id)?.status == Status::Failed)
+                        })? {
+                            bail!("消息发送失败，请检查 Agent 状态");
+                        }
+                        db(&database, |d| d.queue_snapshot(&session.id))
+                    }
+                    .await;
+                    if let Some(reply) = reply {
+                        let _ = reply.send(result.map_err(|e| e.to_string()));
+                    } else {
+                        result?;
+                    }
                 }
-                .await;
-                let _ = pending.reply.send(result.map_err(|e| e.to_string()));
             }
             let (status, paused) = db(&database, |d| {
                 Ok((
@@ -3177,6 +3349,7 @@ async fn actor(
                 ))
             })?;
             if !paused
+                && immediate.is_none()
                 && forwarded.is_empty()
                 && !status.active()
                 && process.as_ref().is_none_or(Process::can_start_turn)
@@ -3314,10 +3487,13 @@ mod tests {
 
     #[tokio::test]
     async fn auxiliary_close_barrier_runs_before_native_pid_is_reaped() {
-        for (command, expect_clean_exit, expected) in [
-            ("exec sleep 60", false, true),
-            ("exit 0", true, true),
-            ("exit 17", true, false),
+        for (command, expect_clean_exit, allow_exit_one, expected) in [
+            ("exec sleep 60", false, false, true),
+            ("exit 0", true, false, true),
+            ("exit 1", true, false, false),
+            ("exit 1", true, true, true),
+            ("exit 17", true, false, false),
+            ("exit 17", true, true, false),
         ] {
             let child = tokio::process::Command::new("/bin/sh")
                 .args(["-c", command])
@@ -3336,6 +3512,7 @@ mod tests {
                 &mut group,
                 tokio::time::Instant::now() + Duration::from_secs(5),
                 expect_clean_exit,
+                |status| status.success() || (allow_exit_one && status.code() == Some(1)),
                 async move {
                     observed.store(
                         nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok(),
@@ -3373,7 +3550,16 @@ mod tests {
             assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("init"));
             let mut group = Group { child, pid };
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            assert!(close_group(&mut group, deadline, false, std::future::ready(true)).await);
+            assert!(
+                close_group(
+                    &mut group,
+                    deadline,
+                    false,
+                    |status| status.success(),
+                    std::future::ready(true),
+                )
+                .await
+            );
             assert!(observe_group_retirement(Pid::from_raw(pid), deadline).await);
         }
     }

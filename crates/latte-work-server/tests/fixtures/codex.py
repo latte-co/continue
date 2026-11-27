@@ -339,6 +339,9 @@ for line in sys.stdin:
         else:
             reply(value, {'turnId': turn})
             text('STEER:' + extra)
+            if extra == 'hold-steer-interruptible':
+                pathlib.Path('steer-completion-held').touch()
+                continue
             if extra == 'hold-steer':
                 # The flushed ack/text precede completion, so tests can observe
                 # a real native handoff without inferring it from elapsed time.
@@ -349,6 +352,7 @@ for line in sys.stdin:
                     time.sleep(.01)
             complete()
     elif method == 'turn/interrupt':
+        pathlib.Path('codex-interrupted').write_text('interrupt')
         assert params['turnId'] == turn
         if turn_prompt == 'subtask':
             notify('item/completed', {'item': {'id': 'agent-activity', 'type': 'subAgentActivity',

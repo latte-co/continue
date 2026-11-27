@@ -778,3 +778,178 @@ it("collapses and expands multi-item queues while previewing the next queued pro
   fireEvent.click(screen.getByRole("button", { name: "展开待发送队列" }));
   expect(screen.getAllByRole("listitem")).toHaveLength(3);
 });
+
+it("keeps stop-and-send compact on one row without a synthetic paused header", async () => {
+  let finish!: (response: unknown) => void;
+  let sending = false;
+  mocks.request.mockImplementation(async (_, command) => {
+    if (command.method === "dispatch_queued_message") {
+      sending = true;
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    }
+    return {
+      kind: "message_queue",
+      entries: [entry],
+      // Even if an older server reports the legacy transient sending pause,
+      // the queue must not pop open a paused header or disabled resume button.
+      paused: sending,
+      reason: sending ? "正在发送消息" : null,
+    };
+  });
+  const view = render(<MessageQueue {...props} onEdit={vi.fn()} />);
+  const trigger = await screen.findByRole("button", {
+    name: "排队消息更多操作：Original message",
+  });
+  fireEvent.click(trigger);
+  fireEvent.click(screen.getByRole("menuitem", { name: "停止当前并发送" }));
+  // Force a poll while dispatch is still pending to simulate a live refresh.
+  view.rerender(<MessageQueue {...props} onEdit={vi.fn()} revision="1" />);
+  await waitFor(() =>
+    expect(screen.getByText("正在停止当前任务并发送…")).toBeTruthy(),
+  );
+  const region = screen.getByRole("region", { name: "待发送消息" });
+  expect(region.querySelector(".message-queue-heading")).toBeNull();
+  expect(screen.queryByRole("button", { name: "继续排队" })).toBeNull();
+  expect(screen.queryByText("正在发送消息")).toBeNull();
+  expect(region.querySelector(".message-queue-feedback")).toBeNull();
+  const row = within(region).getByRole("listitem");
+  expect(within(row).getByText("正在停止当前任务并发送…")).toBeTruthy();
+  await act(async () =>
+    finish({ kind: "message_queue", entries: [], paused: false, reason: null }),
+  );
+});
+
+it("never claims an ambiguous dispatch timeout was unsent and clears once conversation confirms delivery", async () => {
+  let rejectDispatch!: (cause: Error) => void;
+  let entries: QueuedMessage[] = [entry];
+  mocks.request.mockImplementation(async (_, command) => {
+    if (command.method === "dispatch_queued_message") {
+      return new Promise((_, reject) => {
+        rejectDispatch = reject;
+      });
+    }
+    return {
+      kind: "message_queue",
+      entries,
+      paused: false,
+      reason: null,
+    };
+  });
+  const view = render(
+    <MessageQueue {...props} onEdit={vi.fn()} dispatchedReceipts={new Map()} />,
+  );
+  const trigger = await screen.findByRole("button", {
+    name: "排队消息更多操作：Original message",
+  });
+  fireEvent.click(trigger);
+  fireEvent.click(screen.getByRole("menuitem", { name: "停止当前并发送" }));
+  entries = [];
+  await act(async () =>
+    rejectDispatch(new Error("队列操作结果待确认，请刷新后核对")),
+  );
+  const alert = await screen.findByRole("alert");
+  expect(alert.textContent).toContain("队列操作结果待确认，请刷新后核对");
+  expect(alert.textContent).not.toContain("未发送");
+
+  // Once the conversation timeline contains a newer User event for this
+  // request_id, both the stale alert and status issue must clear.
+  view.rerender(
+    <MessageQueue
+      {...props}
+      onEdit={vi.fn()}
+      dispatchedReceipts={new Map([["q", { userSeq: 20 }]])}
+    />,
+  );
+  await waitFor(() =>
+    expect(screen.queryByRole("region", { name: "待发送消息" })).toBeNull(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "状态提示" }));
+  expect(screen.queryByText(/队列操作结果待确认/)).toBeNull();
+});
+
+it.each([false, true])(
+  "does not clear a retry timeout alert using a stale receipt from an earlier rejected attempt (interrupt=%s)",
+  async (interrupt) => {
+    let rejectDispatch!: (cause: Error) => void;
+    let entries: QueuedMessage[] = [{ ...entry, revision: 4 }];
+    mocks.request.mockImplementation(async (_, command) => {
+      if (command.method === "dispatch_queued_message") {
+        return new Promise((_, reject) => {
+          rejectDispatch = reject;
+        });
+      }
+      return {
+        kind: "message_queue",
+        entries,
+        paused: true,
+        reason: "消息未被 Agent 接收，已退回队列：steering rejected",
+      };
+    });
+    const staleReceipts = new Map([["q", { forwardedSeq: 10 }]]);
+    const view = render(
+      <MessageQueue
+        {...props}
+        onEdit={vi.fn()}
+        dispatchedReceipts={staleReceipts}
+      />,
+    );
+    if (interrupt) {
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: "排队消息更多操作：Original message",
+        }),
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "停止当前并发送" }));
+    } else {
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: "发送排队消息：Original message",
+        }),
+      );
+    }
+    await act(async () =>
+      rejectDispatch(new Error("队列操作结果待确认，请刷新后核对")),
+    );
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("队列操作结果待确认，请刷新后核对");
+    expect(screen.getByText("Original message")).toBeTruthy();
+
+    if (interrupt) {
+      // Even a late queued_message_sent cannot clear a stop-and-send timeout.
+      view.rerender(
+        <MessageQueue
+          {...props}
+          onEdit={vi.fn()}
+          dispatchedReceipts={new Map([["q", { forwardedSeq: 12 }]])}
+        />,
+      );
+      expect(screen.getByRole("alert").textContent).toContain(
+        "队列操作结果待确认，请刷新后核对",
+      );
+    }
+
+    // Only a strictly newer matching receipt clears the timeout alert.
+    entries = [];
+    view.rerender(
+      <MessageQueue
+        {...props}
+        onEdit={vi.fn()}
+        dispatchedReceipts={
+          new Map([
+            [
+              "q",
+              interrupt
+                ? { forwardedSeq: 10, userSeq: 15 }
+                : { forwardedSeq: 15 },
+            ],
+          ])
+        }
+      />,
+    );
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "状态提示" }));
+    expect(screen.queryByText(/队列操作结果待确认/)).toBeNull();
+  },
+);

@@ -316,6 +316,31 @@ impl Store {
         }
         Ok(())
     }
+    pub fn uncertain_forwarded_ids(&self, id: &str, requests: &[String]) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.unchecked_transaction()?;
+        let mut count = 0usize;
+        for request in requests {
+            count += tx.execute(
+                "UPDATE message_queue SET status='uncertain' WHERE session_id=?1 AND request_id=?2 AND status='forwarded'",
+                params![id, request],
+            )?;
+        }
+        tx.commit()?;
+        if count > 0 {
+            self.event(
+                id,
+                latte_work_protocol::EventKind::Notice {
+                    text: format!(
+                        "{count} 条已发送给 Agent 的消息处理状态待确认，请核对原生会话记录；不会自动重发。"
+                    ),
+                },
+            )?;
+        }
+        Ok(())
+    }
     pub fn take_queued(&self, id: &str, request_id: &str, revision: u32) -> Result<Response> {
         self.session(id)?;
         let tx = self.db.unchecked_transaction()?;

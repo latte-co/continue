@@ -446,10 +446,12 @@ local daemon's durable unknown-close state retains the quit journal while allowi
 the connection to open for manual verification; transport failures remain errors.
 Before reaping Claude, the host sends the native `end_session` request to stop
 new work and let the CLI clean up its background tasks. Close confirmation
-requires the matching acknowledgement, clean exit, and a full drain of task
-lifecycle events through EOF. This includes task starts that had not reached
-the actor when the close began. A crash before the acknowledgement leaves the
-close pending even when the process has exited and the observed task set is empty.
+requires the matching acknowledgement, expected exit (code `0`, or code `1`
+after an observed error/interrupted parent `result`, matching Claude CLI `-p`
+teardown), and a full drain of task lifecycle events through EOF. This includes
+task starts that had not reached the actor when the close began. A crash before
+the acknowledgement or an unexpected exit leaves the close pending even when
+the process has exited and the observed task set is empty.
 The host still reaps the Agent process group within a deadline. An App
 reclaim fences stale closes from an earlier App instance. New requests are blocked
 while quitting; admitted requests cannot send new work after claiming a resource
@@ -1658,13 +1660,18 @@ Server. CLI version, binary/source hashes and the observed UUID fields are saved
 separately from Python-CLI E2E evidence. This smoke is optional and outside CI.
 
 The extra menu's “停止当前并发送” explicitly requests `interrupt: true`. With no
-native backlog, it waits for both the native result and interrupt acknowledgement
-before starting the selected message. If native inputs were already handed off,
-stopping closes that process and marks their processing state uncertain; they are
-never replayed automatically. The selected host-held item then starts in the saved
-session. Stop, close, failure and restart also quarantine unconfirmed native inputs
-and preserve their original prompt receipts. Remaining host-held messages retain
-their order and the queue's original paused/running choice.
+unconsumed native backlog that would auto-start another turn after `interrupt`
+(including Codex/Traex `turn/steer` and Claude once all forwarded inputs are
+replayed into the active turn), Stop and “停止当前并发送” interrupt in place
+while keeping the native process open, and wait for the native result and
+interrupt acknowledgement before starting the selected message. Only when
+unconsumed native backlog could still start after `interrupt` (for example,
+unreplayed Claude stdin messages or undelivered OpenCode steering) does
+stopping reset that process and mark those inputs uncertain; they are never
+replayed automatically. The selected host-held item then starts in the saved
+session. Stop, close, failure and restart also quarantine unconfirmed native
+inputs and preserve their original prompt receipts. Remaining host-held
+messages retain their order and the queue's original paused/running choice.
 
 Editing uses revision-bound `take_queued_message`: atomically retire the pending
 item and return its exact content. A repeated take reconciles a lost response.

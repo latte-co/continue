@@ -545,5 +545,129 @@ async fn codex_background_command_survives_the_turn_and_releases_on_native_exit(
     );
 }
 
+#[tokio::test]
+async fn codex_stop_during_steered_turn_keeps_native_process_and_marks_steer_uncertain() {
+    let host = Host::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut client = host.client().await;
+    let id = session(&mut client, root.path()).await;
+    send(&mut client, &id, "head", "wait").await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let Response::Events { events, .. } = ask(
+            &mut client,
+            Request::Poll {
+                session_id: id.clone(),
+                after: 0.0,
+            },
+        )
+        .await
+        else {
+            panic!("poll")
+        };
+        if events
+            .iter()
+            .any(|e| matches!(&e.event, EventKind::Text { text } if text == "WAITING"))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "wait turn did not start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    send(&mut client, &id, "steer", "hold-steer-interruptible").await;
+    let Response::MessageQueue { entries, .. } = ask(
+        &mut client,
+        Request::MessageQueue {
+            session_id: id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("queue")
+    };
+    let entry = entries.iter().find(|e| e.request_id == "steer").unwrap();
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::DispatchQueuedMessage {
+                session_id: id.clone(),
+                request_id: entry.request_id.clone(),
+                revision: entry.revision,
+                interrupt: false,
+                provider: Some(TurnProvider::Cli),
+            }
+        )
+        .await,
+        Response::MessageQueue { .. }
+    ));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let Response::Events { events, .. } = ask(
+            &mut client,
+            Request::Poll {
+                session_id: id.clone(),
+                after: 0.0,
+            },
+        )
+        .await
+        else {
+            panic!("poll")
+        };
+        if events.iter().any(
+            |e| matches!(&e.event, EventKind::Text { text } if text == "STEER:hold-steer-interruptible"),
+        ) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "codex steer not observed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::Cancel {
+                session_id: id.clone(),
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    let events = wait(&mut client, &id, Status::Stopped).await;
+    assert!(
+        events.iter().any(
+            |e| matches!(&e.event, EventKind::Notice { text } if text.contains("不会自动重发"))
+        )
+    );
+    assert!(root.path().join("codex-interrupted").exists());
+    let Response::Session { session: current } = ask(
+        &mut client,
+        Request::Session {
+            session_id: id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("session")
+    };
+    assert_eq!(current.agent_session_open, Some(true));
+    assert_eq!(current.agent_close_pending, None);
+    send(&mut client, &id, "next", "after-stop").await;
+    let events = wait(&mut client, &id, Status::Completed).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(&e.event, EventKind::Text { text } if text == "CODEX:after-stop"))
+    );
+    let inputs: Vec<serde_json::Value> = std::fs::read_to_string(root.path().join("codex-inputs"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(inputs.len(), 2);
+    assert_eq!(
+        inputs[0]["pid"], inputs[1]["pid"],
+        "stopping a steered Codex turn must keep the native app-server process"
+    );
+}
+
 #[path = "app_provider_admission.rs"]
 mod app_provider_admission;

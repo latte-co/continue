@@ -214,6 +214,23 @@ pub trait AgentAdapter: Send {
     fn background_close_complete(&self) -> bool {
         true
     }
+    /// Whether the child's natural exit status after a drained native close
+    /// confirms teardown. Defaults to exit code 0 (`status.success()`).
+    fn close_exit_confirmed(&self, status: std::process::ExitStatus) -> bool {
+        status.success()
+    }
+    /// Whether stopping the active turn cannot safely cancel already-handed-off
+    /// native inputs (for example, an unconsumed stdin backlog that would start
+    /// a follow-up turn after `interrupt`), requiring a process reset.
+    fn interrupt_requires_process_reset(&self) -> bool {
+        false
+    }
+    /// Whether this live process is still waiting for a native accept/reject
+    /// reply for a forwarded queued input, so a late definitive rejection can
+    /// still return it to the paused queue after the turn ends.
+    fn awaits_forwarded_reply(&self, _request_id: &str) -> bool {
+        false
+    }
     /// Whether this adapter can cancel a pending prompt before startup completes.
     fn can_interrupt_startup(&self) -> bool {
         false

@@ -8133,8 +8133,14 @@ async fn closing_a_session_cancels_pending_immediate_confirmation_without_losing
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // A result can precede interrupt acknowledgement: the session is stopped,
-    // but a pending send still makes an idle-only close unsafe.
+    // but a pending send still makes an idle-only close unsafe. Meanwhile the
+    // queue must not synthesize a misleading paused state ("正在发送消息").
     wait(&mut c, &id, Status::Stopped).await;
+    assert!(matches!(
+        ask(&mut c, Request::MessageQueue { session_id: id.clone() }).await,
+        Response::MessageQueue { entries, paused: false, reason: None }
+            if entries.len() == 1 && entries[0].request_id == "pending"
+    ));
     assert!(matches!(ask(&mut c, Request::CloseAgentSession {
         session_id: id.clone(), only_if_idle: Some(true)
     }).await, Response::Error {message,..} if message.contains("确认后关闭")));
@@ -8643,6 +8649,304 @@ async fn message_queue_desktop_provider_bridge_accepts_both_dispatch_responses()
         })
         .collect::<Vec<_>>();
     assert_eq!(ids, ["bridge-head", "bridge-b"]);
+}
+
+#[tokio::test]
+async fn claude_stop_after_replayed_followup_interrupts_turn_without_closing_session() {
+    let host = Host::start_with_environment(&[(
+        "LATTE_FIXTURE_REALISTIC_EXIT_CODE",
+        std::ffi::OsStr::new("1"),
+    )])
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let mut c = host.client().await;
+    let id = session(&mut c, root.path()).await;
+    queue_send(&mut c, &id, "head", "native-queue-head").await;
+    native_queue_ready(&mut c, &id).await;
+    let initial_pid = agent_pid(root.path());
+    queue_send(&mut c, &id, "replayed", "native-message-replay-1").await;
+    assert!(matches!(
+        dispatch_queue(&mut c, &id, "replayed", false).await,
+        Response::MessageQueue { .. }
+    ));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let Response::Events { events, .. } = ask(
+            &mut c,
+            Request::Poll {
+                session_id: id.clone(),
+                after: 0.0,
+            },
+        )
+        .await
+        else {
+            panic!("poll")
+        };
+        if events.iter().any(
+            |e| matches!(&e.event, EventKind::Text { text } if text == "NATIVE_REPLAYED:native-message-replay-1"),
+        ) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "replayed follow-up not observed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::Cancel {
+                session_id: id.clone(),
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    let events = wait(&mut c, &id, Status::Stopped).await;
+    assert!(
+        events.iter().any(
+            |e| matches!(&e.event, EventKind::Notice { text } if text.contains("不会自动重发"))
+        ),
+        "interrupted turn with a forwarded follow-up must record uncertainty"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e.event,
+            EventKind::State {
+                status: Status::Failed | Status::Unknown,
+                ..
+            }
+        )),
+        "stopping a turn must not emit Failed or Unknown: {events:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("native-interrupts")).unwrap(),
+        "interrupt\n"
+    );
+    let Response::Session { session: current } = ask(
+        &mut c,
+        Request::Session {
+            session_id: id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("session")
+    };
+    assert_eq!(current.agent_session_open, Some(true));
+    assert_eq!(current.agent_close_pending, None);
+    // The next turn must continue on the exact same native process.
+    send(&mut c, &id, "after-stop", "identity").await;
+    let events = wait(&mut c, &id, Status::Completed).await;
+    let identity: serde_json::Value = events
+        .iter()
+        .rev()
+        .find_map(|e| match &e.event {
+            EventKind::Text { text } => serde_json::from_str(text).ok(),
+            _ => None,
+        })
+        .expect("identity response");
+    assert_eq!(identity["pid"].as_i64(), Some(i64::from(initial_pid)));
+}
+
+#[tokio::test]
+async fn claude_stop_with_unconsumed_followup_and_realistic_exit_one_does_not_mark_close_pending() {
+    let host = Host::start_with_environment(&[(
+        "LATTE_FIXTURE_REALISTIC_EXIT_CODE",
+        std::ffi::OsStr::new("1"),
+    )])
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let mut c = host.client().await;
+    let id = session(&mut c, root.path()).await;
+    queue_send(&mut c, &id, "head", "native-queue-head").await;
+    native_queue_ready(&mut c, &id).await;
+    queue_send(&mut c, &id, "buffered", "native-message-buffered").await;
+    assert!(matches!(
+        dispatch_queue(&mut c, &id, "buffered", false).await,
+        Response::MessageQueue { .. }
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !std::fs::read_to_string(root.path().join("native-inputs"))
+        .unwrap_or_default()
+        .contains("native-message-buffered")
+    {
+        assert!(Instant::now() < deadline, "buffered input not read");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::Cancel {
+                session_id: id.clone(),
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    let events = wait(&mut c, &id, Status::Stopped).await;
+    assert!(
+        events.iter().any(
+            |e| matches!(&e.event, EventKind::Notice { text } if text.contains("不会自动重发"))
+        )
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e.event,
+            EventKind::State {
+                status: Status::Failed | Status::Unknown,
+                ..
+            }
+        )),
+        "exit code 1 after end_session error result must confirm cleanly: {events:?}"
+    );
+    let Response::Session { session: current } = ask(
+        &mut c,
+        Request::Session {
+            session_id: id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("session")
+    };
+    assert_eq!(current.agent_close_pending, None);
+    // Subsequent turns remain usable without manual close confirmation.
+    send(&mut c, &id, "next", "hello").await;
+    wait(&mut c, &id, Status::Completed).await;
+}
+
+#[tokio::test]
+async fn claude_close_accepts_exit_one_only_after_interrupted_turn_not_healthy_turn() {
+    // 1. After an interrupted turn (is_error: true), Claude exits with status 1 on end_session.
+    let host = Host::start_with_environment(&[(
+        "LATTE_FIXTURE_REALISTIC_EXIT_CODE",
+        std::ffi::OsStr::new("1"),
+    )])
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let mut c = host.client().await;
+    let id = session(&mut c, root.path()).await;
+    queue_send(&mut c, &id, "head", "native-queue-head").await;
+    native_queue_ready(&mut c, &id).await;
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::Cancel {
+                session_id: id.clone(),
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    wait(&mut c, &id, Status::Stopped).await;
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::CloseAgentSession {
+                session_id: id.clone(),
+                only_if_idle: Some(true),
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    assert!(matches!(
+        ask(&mut c, Request::Session { session_id: id }).await,
+        Response::Session { session }
+            if session.agent_session_open == Some(false) && session.agent_close_pending.is_none()
+    ));
+
+    // 2. After a healthy turn (is_error: false), an unexpected exit code 1 must still stay unconfirmed.
+    let host = Host::start_with_environment(&[(
+        "LATTE_FIXTURE_CLOSE_EXIT_CODE",
+        std::ffi::OsStr::new("1"),
+    )])
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let mut c = host.client().await;
+    let id = session(&mut c, root.path()).await;
+    send(&mut c, &id, "ok", "hello").await;
+    wait(&mut c, &id, Status::Completed).await;
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::CloseAgentSession {
+                session_id: id.clone(),
+                only_if_idle: Some(true),
+            }
+        )
+        .await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        ask(&mut c, Request::Session { session_id: id }).await,
+        Response::Session { session }
+            if session.agent_session_open == Some(false) && session.agent_close_pending.is_some()
+    ));
+
+    // 3. Turn 1 interrupted with error result, then Turn 2 starts on the same
+    // process and closes with exit 1 without emitting a Turn 2 error result:
+    // Turn 1's stale error must NEVER confirm Turn 2's abnormal exit.
+    let host = Host::start_with_environment(&[(
+        "LATTE_FIXTURE_REALISTIC_EXIT_CODE",
+        std::ffi::OsStr::new("1"),
+    )])
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let mut c = host.client().await;
+    let id = session(&mut c, root.path()).await;
+    queue_send(&mut c, &id, "turn-1", "native-queue-head").await;
+    native_queue_ready(&mut c, &id).await;
+    let initial_pid = agent_pid(root.path());
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::Cancel {
+                session_id: id.clone(),
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    wait(&mut c, &id, Status::Stopped).await;
+    send(&mut c, &id, "turn-2", "hang-exit-one-without-result").await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let Response::Events { events, .. } = ask(
+            &mut c,
+            Request::Poll {
+                session_id: id.clone(),
+                after: 0.0,
+            },
+        )
+        .await
+        else {
+            panic!("poll")
+        };
+        if events.iter().any(
+            |e| matches!(&e.event, EventKind::Text { text } if text == "HANG_NO_RESULT_STARTED"),
+        ) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "turn 2 did not start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(agent_pid(root.path()), initial_pid);
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::CloseAgentSession {
+                session_id: id.clone(),
+                only_if_idle: Some(false),
+            }
+        )
+        .await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        ask(&mut c, Request::Session { session_id: id }).await,
+        Response::Session { session }
+            if session.agent_session_open == Some(false) && session.agent_close_pending.is_some()
+    ));
 }
 
 #[tokio::test]

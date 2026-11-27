@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { createPortal } from "react-dom";
 import { request, message } from "./api";
+import { HostConnectionError } from "./connectionErrors";
 import type { Request, QueuedMessage } from "./protocol";
 import { usePollingSnapshot, LIVE_POLL_MS } from "./usePollingSnapshot";
 import { useStatusIssues } from "./statusNotices";
@@ -30,6 +31,48 @@ const initial = {
   reason: null as string | null,
 };
 
+function formatDispatchError(cause: unknown): {
+  text: string;
+  ambiguous: boolean;
+} {
+  const detail = message(cause);
+  const ambiguous =
+    cause instanceof HostConnectionError ||
+    /待确认|未确认|已发送|已执行|已开始执行|请刷新后核对/.test(detail);
+  if (ambiguous) return { text: detail, ambiguous: true };
+  return {
+    text: detail.startsWith("未发送") ? detail : `未发送：${detail}`,
+    ambiguous: false,
+  };
+}
+
+export interface DispatchedReceipt {
+  userSeq?: number;
+  forwardedSeq?: number;
+}
+
+interface ReceiptBaseline {
+  interrupt: boolean;
+  sinceUserSeq: number;
+  sinceForwardedSeq: number;
+}
+
+function hasNewerReceipt(
+  receipts: ReadonlyMap<string, DispatchedReceipt> | undefined,
+  requestId: string,
+  baseline: ReceiptBaseline,
+): boolean {
+  const current = receipts?.get(requestId);
+  if (!current) return false;
+  if ((current.userSeq ?? -Infinity) > baseline.sinceUserSeq) return true;
+  if (
+    !baseline.interrupt &&
+    (current.forwardedSeq ?? -Infinity) > baseline.sinceForwardedSeq
+  )
+    return true;
+  return false;
+}
+
 export function MessageQueue({
   hostId,
   sessionId,
@@ -40,6 +83,7 @@ export function MessageQueue({
   onEdit,
   editingBlocked = false,
   onEditPending,
+  dispatchedReceipts,
   captureQueuedPredictionRetirement,
 }: {
   hostId: string;
@@ -51,6 +95,7 @@ export function MessageQueue({
   onEdit?: (entry: QueuedMessage) => void;
   editingBlocked?: boolean;
   onEditPending?: (pending: boolean) => void;
+  dispatchedReceipts?: ReadonlyMap<string, DispatchedReceipt>;
   captureQueuedPredictionRetirement?: (requestId: string) => () => void;
 }) {
   const scope = JSON.stringify([hostId, sessionId]);
@@ -80,8 +125,17 @@ export function MessageQueue({
     revision: number;
     kind: "pending" | "success" | "error";
     text: string;
+    ambiguous?: boolean;
+    snapshot?: unknown;
+    baseline?: ReceiptBaseline;
   }>();
   const [error, setError] = useState("");
+  const errorDispatch = useRef<{
+    id: string;
+    baseline: ReceiptBaseline;
+  } | null>(null);
+  const latestReceipts = useRef(dispatchedReceipts);
+  latestReceipts.current = dispatchedReceipts;
   const [recover, setRecover] =
     useState<Extract<Request, { method: "take_queued_message" }>>();
   const drag = useRef<
@@ -114,6 +168,7 @@ export function MessageQueue({
   useEffect(() => {
     setBusy(false);
     acting.current = null;
+    errorDispatch.current = null;
     setFeedback(undefined);
     setError("");
     setCollapsed(false);
@@ -146,15 +201,51 @@ export function MessageQueue({
   );
   useEffect(() => {
     if (
-      feedback?.kind === "success" &&
+      errorDispatch.current &&
+      hasNewerReceipt(
+        dispatchedReceipts,
+        errorDispatch.current.id,
+        errorDispatch.current.baseline,
+      )
+    ) {
+      errorDispatch.current = null;
+      setError("");
+    }
+    if (!feedback) return;
+    if (
+      feedback.baseline &&
+      hasNewerReceipt(dispatchedReceipts, feedback.id, feedback.baseline)
+    ) {
+      setFeedback(undefined);
+      if (state.data.entries.some((entry) => entry.request_id === feedback.id))
+        setReload((v) => v + 1);
+      return;
+    }
+    if (
+      feedback.kind === "success" &&
       state.data.entries.some(
         (entry) =>
           entry.request_id === feedback.id &&
           entry.revision !== feedback.revision,
       )
-    )
+    ) {
       setFeedback(undefined);
-  }, [feedback, state.data]);
+      return;
+    }
+    if (
+      feedback.kind === "error" &&
+      !feedback.ambiguous &&
+      feedback.snapshot !== undefined &&
+      state.data !== feedback.snapshot &&
+      !state.data.entries.some((entry) => entry.request_id === feedback.id)
+    ) {
+      setFeedback(undefined);
+      if (errorDispatch.current?.id === feedback.id) {
+        errorDispatch.current = null;
+        setError("");
+      }
+    }
+  }, [feedback, state.data, dispatchedReceipts]);
   latestSnapshot.current = state.data;
   useEffect(() => {
     const pending = focusAfterReorder.current;
@@ -175,12 +266,25 @@ export function MessageQueue({
     acting.current = version;
     if (taking) onEditPending?.(true);
     setBusy(true);
+    const dispatchBaseline: ReceiptBaseline | undefined =
+      command.method === "dispatch_queued_message"
+        ? {
+            interrupt: !!command.interrupt,
+            sinceUserSeq:
+              latestReceipts.current?.get(command.request_id)?.userSeq ??
+              -Infinity,
+            sinceForwardedSeq:
+              latestReceipts.current?.get(command.request_id)?.forwardedSeq ??
+              -Infinity,
+          }
+        : undefined;
     if (command.method === "dispatch_queued_message")
       setFeedback({
         id: command.request_id,
         revision: command.revision,
         kind: "pending",
         text: command.interrupt ? "正在停止当前任务并发送…" : "正在交给 Agent…",
+        baseline: dispatchBaseline,
       });
     else setFeedback(undefined);
     setAnnouncement("");
@@ -209,6 +313,7 @@ export function MessageQueue({
       if (!taken && response.kind !== "message_queue") {
         throw new Error("队列操作未确认，请刷新后核对");
       }
+      errorDispatch.current = null;
       setError("");
       if (command.method === "dispatch_queued_message")
         setFeedback({
@@ -216,6 +321,7 @@ export function MessageQueue({
           revision: command.revision,
           kind: "success",
           text: "已交给 Agent，等待处理",
+          baseline: dispatchBaseline,
         });
       if (command.method === "reorder_message_queue") {
         setAnnouncement("待发送顺序已保存");
@@ -235,14 +341,26 @@ export function MessageQueue({
       )
         setRecover(command);
       if (valid()) {
-        setError(message(cause));
-        if (command.method === "dispatch_queued_message")
+        const detail = message(cause);
+        setError(detail);
+        if (command.method === "dispatch_queued_message" && dispatchBaseline) {
+          errorDispatch.current = {
+            id: command.request_id,
+            baseline: dispatchBaseline,
+          };
+          const formatted = formatDispatchError(cause);
           setFeedback({
             id: command.request_id,
             revision: command.revision,
             kind: "error",
-            text: `未发送：${message(cause)}`,
+            text: formatted.text,
+            ambiguous: formatted.ambiguous,
+            snapshot: latestSnapshot.current,
+            baseline: dispatchBaseline,
           });
+        } else {
+          errorDispatch.current = null;
+        }
         setReload((v) => v + 1);
       }
     } finally {
@@ -270,7 +388,11 @@ export function MessageQueue({
             void act(recover);
             return;
           }
+          errorDispatch.current = null;
           setError("");
+          setFeedback((current) =>
+            current?.kind === "error" ? undefined : current,
+          );
           setReload((v) => v + 1);
         },
       },
@@ -284,7 +406,14 @@ export function MessageQueue({
     return null;
   const disabled = busy || !connected || !active;
   const canReorder = entries.length > 1 && !disabled;
-  const showHeader = paused || entries.length > 1;
+  const effectivelyPaused = paused && reason !== "正在发送消息";
+  const showHeader = effectivelyPaused || entries.length > 1;
+  const inlinePendingId =
+    !collapsed &&
+    feedback?.kind === "pending" &&
+    entries.some((entry) => entry.request_id === feedback.id)
+      ? feedback.id
+      : undefined;
   const nextPreview = entries[0]
     ? userMessageContent(entries[0].text).text
     : "";
@@ -317,7 +446,7 @@ export function MessageQueue({
   return (
     <section
       className="message-queue"
-      data-paused={paused ? "true" : undefined}
+      data-paused={effectivelyPaused ? "true" : undefined}
       data-collapsed={collapsed ? "true" : undefined}
       data-dragging={dragging ? "true" : undefined}
       aria-label="待发送消息"
@@ -325,7 +454,7 @@ export function MessageQueue({
       {showHeader && (
         <div className="message-queue-heading">
           <div className="message-queue-heading-copy">
-            {paused ? (
+            {effectivelyPaused ? (
               <StatusSignal status="waiting" />
             ) : (
               <ListEnd
@@ -337,7 +466,7 @@ export function MessageQueue({
             <span className="message-queue-title">
               待发送 · {entries.length}
             </span>
-            {paused ? (
+            {effectivelyPaused ? (
               <span className="message-queue-reason">
                 {reason || "队列已暂停"}
               </span>
@@ -349,7 +478,7 @@ export function MessageQueue({
             )}
           </div>
           <div className="message-queue-heading-actions">
-            {paused && (
+            {effectivelyPaused && (
               <Button
                 variant="subtle"
                 size="xs"
@@ -540,6 +669,11 @@ export function MessageQueue({
                     <small> · {content.references.length} 个引用</small>
                   )}
                 </span>
+                {inlinePendingId === entry.request_id && feedback && (
+                  <span className="message-queue-row-status" role="status">
+                    {feedback.text}
+                  </span>
+                )}
                 <div
                   className="message-queue-actions"
                   data-busy={rowPending ? "true" : undefined}
@@ -615,7 +749,7 @@ export function MessageQueue({
           })}
         </ol>
       )}
-      {feedback && (
+      {feedback && !inlinePendingId && (
         <p
           className="message-queue-feedback"
           data-tone={feedback.kind === "error" ? "danger" : undefined}

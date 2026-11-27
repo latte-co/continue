@@ -191,6 +191,7 @@ impl Transport {
         self.terminate_with_auxiliary(
             confirm_group,
             false,
+            |status| status.success(),
             tokio::time::Instant::now() + REAP_LIMIT * 2,
             std::future::ready(true),
         )
@@ -200,6 +201,7 @@ impl Transport {
         &mut self,
         confirm_group: bool,
         expect_clean_exit: bool,
+        exit_confirmed: impl FnOnce(std::process::ExitStatus) -> bool,
         deadline: tokio::time::Instant,
         auxiliary: impl std::future::Future<Output = bool>,
     ) -> bool {
@@ -207,7 +209,14 @@ impl Transport {
         // close_group signals only while the direct child is still owned, and
         // waits for auxiliary cleanup before reaping it. Already reaped PerTurn
         // children must never be signalled after that wait.
-        let confirmed = close_group(&mut self.group, deadline, expect_clean_exit, auxiliary).await;
+        let confirmed = close_group(
+            &mut self.group,
+            deadline,
+            expect_clean_exit,
+            exit_confirmed,
+            auxiliary,
+        )
+        .await;
         if live {
             self.retirement_signalled = true;
         }
