@@ -1334,6 +1334,7 @@ it("rechecks the viewport after resize or visibility changes and fences old obse
       loadEarlierHistory: vi.fn().mockResolvedValue(undefined),
     };
     const view = render(<Conversation {...p} />);
+    const initialObservers = callbacks.size;
     const el = view.container.querySelector(
       ".conversation-scroll",
     ) as HTMLDivElement;
@@ -1342,7 +1343,14 @@ it("rechecks the viewport after resize or visibility changes and fences old obse
       scrollHeight: { configurable: true, get: () => Math.max(600, viewport) },
       clientHeight: { configurable: true, get: () => viewport },
     });
-    await waitFor(() => expect(el.getAttribute("aria-busy")).toBe("false"));
+    await act(async () => {
+      await new Promise(requestAnimationFrame);
+      await new Promise(requestAnimationFrame);
+    });
+    await waitFor(() => {
+      expect(el.getAttribute("aria-busy")).toBe("false");
+      expect(callbacks.size).toBeGreaterThan(initialObservers);
+    });
     expect(p.loadEarlierHistory).not.toHaveBeenCalled();
     viewport = 400;
     act(() => callbacks.forEach((callback) => callback()));

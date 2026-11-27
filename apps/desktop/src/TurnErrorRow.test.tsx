@@ -9,7 +9,7 @@ describe("TurnErrorRow", () => {
   const raw429 =
     "API Error: Request rejected (429) · [1302][您的账户已达到速率限制，请您控制请求频率][20261125162645e418428b3b184a3a]";
 
-  it("renders a concise borderless summary row and expands the 22px raw well on demand", async () => {
+  it("renders a concise borderless summary row and expands the row-edge flush raw well on demand", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, { clipboard: { writeText } });
 
