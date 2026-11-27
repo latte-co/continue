@@ -1236,6 +1236,8 @@ function serializeHtmlInline(node: Node): string {
     return (node.textContent ?? "").replace(/\u00A0/g, " ");
   }
   if (!(node instanceof HTMLElement)) return "";
+  const commandName = node.getAttribute("data-command-name")?.trim();
+  if (commandName) return `/${commandName}`;
   const tag = node.tagName.toLowerCase();
   if (tag === "br") return "\n";
   if (tag === "code" && node.parentElement?.tagName.toLowerCase() !== "pre") {
@@ -1446,7 +1448,7 @@ export function htmlToComposerMarkdown(html: string): string | null {
   // syntax-colored IDE/terminal `<div><span>` wrappers.
   const hasRichElement = Boolean(
     body.querySelector(
-      'a[href^="http://"], a[href^="https://"], table, ul, ol, pre, blockquote, h1, h2, h3, h4, h5, h6, code, strong, em, del',
+      'a[href^="http://"], a[href^="https://"], [data-command-name], table, ul, ol, pre, blockquote, h1, h2, h3, h4, h5, h6, code, strong, em, del',
     ),
   );
   if (!hasRichElement) return null;

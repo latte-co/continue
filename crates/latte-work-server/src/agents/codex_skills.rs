@@ -21,37 +21,76 @@ pub(super) struct SkillConfigRule {
 }
 
 impl SkillConfigRule {
-    fn matches(&self, skill_md: &Path, info_name: &str, folder_slug: &str) -> bool {
+    fn matches(&self, skill_md: &Path, info_name: &str) -> bool {
         match (&self.path, &self.name) {
-            (Some(rule_path), Some(rule_name)) => {
-                rule_path == skill_md && (rule_name == info_name || rule_name == folder_slug)
-            }
+            (Some(rule_path), Some(rule_name)) => rule_path == skill_md && rule_name == info_name,
             (Some(rule_path), None) => rule_path == skill_md,
-            (None, Some(rule_name)) => rule_name == info_name || rule_name == folder_slug,
+            (None, Some(rule_name)) => rule_name == info_name,
             (None, None) => false,
         }
     }
 }
 
-pub(super) fn is_skill_enabled(
-    rules: &[SkillConfigRule],
-    skill_md: &Path,
-    info_name: &str,
-    folder_slug: &str,
-) -> bool {
+fn is_skill_enabled(rules: &[SkillConfigRule], skill_md: &Path, info_name: &str) -> bool {
     let mut enabled = true;
     for rule in rules {
-        if rule.matches(skill_md, info_name, folder_slug) {
+        if rule.matches(skill_md, info_name) {
             enabled = rule.enabled;
         }
     }
     enabled
 }
 
+fn effective_command_name<'a>(info_name: &'a str, canonical_slug: &'a str) -> &'a str {
+    if !info_name.is_empty()
+        && info_name.len() <= 256
+        && !info_name
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '/')
+    {
+        info_name
+    } else {
+        canonical_slug
+    }
+}
+
+fn inspect_candidate(
+    dir_path: &Path,
+    requested: &str,
+    seen_skill_md: &mut HashSet<PathBuf>,
+) -> Result<Option<Candidate>> {
+    let canon_dir = match dir_path.canonicalize() {
+        Ok(path) => path,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(canon_slug) = canon_dir.file_name().and_then(|s| s.to_str()) else {
+        return Ok(None);
+    };
+    let Some(info) = super::claude_skills::inspect(&canon_dir, canon_slug)? else {
+        return Ok(None);
+    };
+    let command_name = effective_command_name(&info.name, canon_slug);
+    if command_name != requested {
+        return Ok(None);
+    }
+    let Ok(skill_md) = canon_dir.join("SKILL.md").canonicalize() else {
+        return Ok(None);
+    };
+    if !seen_skill_md.insert(skill_md.clone()) {
+        return Ok(None);
+    }
+    Ok(Some(Candidate {
+        skill_md,
+        command_name: command_name.to_owned(),
+        info,
+    }))
+}
+
 #[derive(Debug)]
 struct Candidate {
     skill_md: PathBuf,
-    folder_slug: String,
+    command_name: String,
     info: SkillInfo,
 }
 
@@ -115,12 +154,7 @@ pub(super) fn find_enabled_in_roots(
     let mut candidates = collect_scope_candidates(scope_roots, name)?;
     candidates.sort_by(|a, b| a.skill_md.cmp(&b.skill_md));
     for candidate in candidates {
-        if is_skill_enabled(
-            rules,
-            &candidate.skill_md,
-            &candidate.info.name,
-            &candidate.folder_slug,
-        ) {
+        if is_skill_enabled(rules, &candidate.skill_md, &candidate.command_name) {
             return Ok(Some(candidate.info));
         }
     }
@@ -168,15 +202,10 @@ fn collect_scope_candidates(roots: &[(PathBuf, bool)], requested: &str) -> Resul
 
     for (root, skip_system) in roots {
         if !(*skip_system && requested == ".system")
-            && let Some(info) = super::claude_skills::inspect(&root.join(requested), requested)?
-            && let Ok(skill_md) = Path::new(&info.directory).join("SKILL.md").canonicalize()
-            && seen_skill_md.insert(skill_md.clone())
+            && let Some(candidate) =
+                inspect_candidate(&root.join(requested), requested, &mut seen_skill_md)?
         {
-            out.push(Candidate {
-                skill_md,
-                folder_slug: requested.to_owned(),
-                info,
-            });
+            out.push(candidate);
         }
 
         let mut visited_dirs = HashSet::new();
@@ -209,16 +238,10 @@ fn collect_scope_candidates(roots: &[(PathBuf, bool)], requested: &str) -> Resul
                     continue;
                 }
                 let entry_path = entry.path();
-                if let Ok(Some(info)) = super::claude_skills::inspect(&entry_path, &entry_name)
-                    && (info.name == requested || entry_name == requested)
-                    && let Ok(skill_md) = Path::new(&info.directory).join("SKILL.md").canonicalize()
-                    && seen_skill_md.insert(skill_md.clone())
+                if let Ok(Some(candidate)) =
+                    inspect_candidate(&entry_path, requested, &mut seen_skill_md)
                 {
-                    out.push(Candidate {
-                        skill_md,
-                        folder_slug: entry_name.clone(),
-                        info,
-                    });
+                    out.push(candidate);
                 }
                 if depth + 1 < WALK_DEPTH_LIMIT
                     && std::fs::metadata(&entry_path).is_ok_and(|meta| meta.is_dir())
@@ -999,6 +1022,159 @@ mod tests {
                 .unwrap()
                 .description,
             "repo-nested-child"
+        );
+    }
+
+    #[test]
+    fn does_not_treat_directory_alias_as_command_name_when_frontmatter_differs() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let codex_home = home.join(".codex");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        write_skill(
+            &repo.join(".codex/skills/cat/target-skill"),
+            "different-skill",
+            "repo-different-skill",
+        );
+        write_skill(
+            &repo.join(".codex/skills/top-alias"),
+            "another-skill",
+            "repo-another-skill",
+        );
+        let nameless_dir = repo.join(".codex/skills/cat/no-frontmatter-name");
+        std::fs::create_dir_all(&nameless_dir).unwrap();
+        std::fs::write(
+            nameless_dir.join("SKILL.md"),
+            "---\ndescription: repo-folder-fallback\n---\nbody\n",
+        )
+        .unwrap();
+
+        write_skill(
+            &codex_home.join("skills/target-skill"),
+            "target-skill",
+            "user-actual-target",
+        );
+        write_skill(
+            &codex_home.join("skills/top-alias"),
+            "top-alias",
+            "user-actual-top",
+        );
+
+        #[cfg(unix)]
+        {
+            let ext_named = repo.join("external-skills/real-named");
+            write_skill(&ext_named, "real-named", "repo-real-named");
+            std::os::unix::fs::symlink(&ext_named, repo.join(".codex/skills/symlink-alias-named"))
+                .unwrap();
+            write_skill(
+                &codex_home.join("skills/symlink-alias-named"),
+                "symlink-alias-named",
+                "user-symlink-alias-named",
+            );
+
+            let ext_nameless = repo.join("external-skills/real-nameless");
+            std::fs::create_dir_all(&ext_nameless).unwrap();
+            std::fs::write(
+                ext_nameless.join("SKILL.md"),
+                "---\ndescription: repo-real-nameless\n---\nbody\n",
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                &ext_nameless,
+                repo.join(".codex/skills/symlink-alias-nameless"),
+            )
+            .unwrap();
+            write_skill(
+                &codex_home.join("skills/symlink-alias-nameless"),
+                "symlink-alias-nameless",
+                "user-symlink-alias-nameless",
+            );
+        }
+
+        let env = AgentEnvironment(BTreeMap::from([
+            ("HOME".into(), home.to_string_lossy().into_owned()),
+            (
+                "CODEX_HOME".into(),
+                codex_home.to_string_lossy().into_owned(),
+            ),
+        ]));
+
+        // Requesting `target-skill` or `top-alias` must NOT open the unrelated repo skills
+        // whose directories happen to share those names.
+        assert_eq!(
+            find(&repo, "target-skill", &env)
+                .unwrap()
+                .unwrap()
+                .description,
+            "user-actual-target"
+        );
+        assert_eq!(
+            find(&repo, "top-alias", &env).unwrap().unwrap().description,
+            "user-actual-top"
+        );
+        // Requesting the actual frontmatter `name` resolves the repo skill, and skills
+        // without frontmatter `name:` still fall back to their directory name.
+        assert_eq!(
+            find(&repo, "different-skill", &env)
+                .unwrap()
+                .unwrap()
+                .description,
+            "repo-different-skill"
+        );
+        assert_eq!(
+            find(&repo, "no-frontmatter-name", &env)
+                .unwrap()
+                .unwrap()
+                .description,
+            "repo-folder-fallback"
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                find(&repo, "symlink-alias-named", &env)
+                    .unwrap()
+                    .unwrap()
+                    .description,
+                "user-symlink-alias-named"
+            );
+            assert_eq!(
+                find(&repo, "symlink-alias-nameless", &env)
+                    .unwrap()
+                    .unwrap()
+                    .description,
+                "user-symlink-alias-nameless"
+            );
+            assert_eq!(
+                find(&repo, "real-named", &env)
+                    .unwrap()
+                    .unwrap()
+                    .description,
+                "repo-real-named"
+            );
+            assert_eq!(
+                find(&repo, "real-nameless", &env)
+                    .unwrap()
+                    .unwrap()
+                    .description,
+                "repo-real-nameless"
+            );
+        }
+
+        // `[[skills.config]] name = "target-skill"` disables `target-skill`, not `different-skill`.
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "[[skills.config]]\nname = \"target-skill\"\nenabled = false\n",
+        )
+        .unwrap();
+        assert!(find(&repo, "target-skill", &env).unwrap().is_none());
+        assert_eq!(
+            find(&repo, "different-skill", &env)
+                .unwrap()
+                .unwrap()
+                .description,
+            "repo-different-skill"
         );
     }
 }

@@ -318,7 +318,7 @@ const CommandPill = TiptapNode.create({
         "data-command-name": name,
         "data-command-icon": icon,
       }),
-      name,
+      `/${name}`,
     ];
   },
 

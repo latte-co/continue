@@ -2495,3 +2495,104 @@ it("converts character-by-character typed commands in rich input into inline pil
     ),
   );
 });
+
+it("preserves leading slash when copying and pasting formatted skill instructions", async () => {
+  const { DOMSerializer } = await import("@tiptap/pm/model");
+  mocks.request.mockImplementation(async (_host, req) =>
+    req.method === "agent_commands"
+      ? {
+          kind: "agent_commands",
+          commands: [
+            {
+              name: "doc-coauthoring",
+              display_name: "Doc Coauthoring",
+              description: "Guide users through co-authoring documentation",
+              argument_hint: "",
+              kind: "skill",
+            },
+          ],
+        }
+      : { kind: "files", entries: [] },
+  );
+  mocks.send.mockResolvedValue(true);
+  const first = render(<Harness agent="codex" />);
+  type("1. /doc");
+  fireEvent.click(
+    await screen.findByRole("option", { name: /Doc Coauthoring/ }),
+  );
+  const rich = screen.getByRole("textbox", { name: "任务输入" });
+  const pmEditor = (
+    rich as unknown as {
+      editor: {
+        schema: Parameters<typeof DOMSerializer.fromSchema>[0];
+        state: {
+          doc: { content: unknown };
+          tr: { insertText: (text: string) => unknown };
+        };
+        view: { dispatch: (tr: unknown) => void };
+      };
+    }
+  ).editor;
+  act(() => {
+    pmEditor.view.dispatch(pmEditor.state.tr.insertText("整理大纲"));
+  });
+
+  // 1. ProseMirror clipboard HTML serializer (`CommandPill.renderHTML`) keeps `/doc-coauthoring`
+  const fragment = DOMSerializer.fromSchema(pmEditor.schema).serializeFragment(
+    pmEditor.state.doc.content as never,
+  );
+  const wrap = document.createElement("div");
+  wrap.append(fragment);
+  const copiedHtml = wrap.innerHTML;
+  expect(copiedHtml).toContain(">/doc-coauthoring</span>");
+
+  // Also capture the live NodeView DOM (where label text has no leading `/`)
+  const liveDomHtml = rich.innerHTML;
+  first.unmount();
+
+  // 2. Pasting copied ProseMirror HTML into a fresh composer preserves `/doc-coauthoring`
+  const second = render(<Harness agent="codex" />);
+  const target = screen.getByRole("textbox", { name: "任务输入" });
+  fireEvent.paste(target, {
+    clipboardData: {
+      files: [],
+      types: ["text/plain", "text/html"],
+      getData: (mime: string) =>
+        mime === "text/html" ? copiedHtml : "1. doc-coauthoring 整理大纲",
+    },
+  });
+  await waitFor(() => {
+    expect(
+      screen.getByRole("textbox").querySelectorAll("ol > li"),
+    ).toHaveLength(1);
+    expect(inputText()).toBe("/doc-coauthoring 整理大纲");
+  });
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() =>
+    expect(mocks.send).toHaveBeenCalledWith("1. /doc-coauthoring 整理大纲"),
+  );
+  second.unmount();
+
+  // 3. Pasting raw NodeView DOM HTML (`<span data-command-name="doc-coauthoring"><svg/><span>doc-coauthoring</span></span>`)
+  // also preserves `/doc-coauthoring` without dropping or doubling the slash.
+  mocks.send.mockClear();
+  render(<Harness agent="codex" />);
+  fireEvent.paste(screen.getByRole("textbox", { name: "任务输入" }), {
+    clipboardData: {
+      files: [],
+      types: ["text/plain", "text/html"],
+      getData: (mime: string) =>
+        mime === "text/html" ? liveDomHtml : "1. doc-coauthoring 整理大纲",
+    },
+  });
+  await waitFor(() => {
+    expect(
+      screen.getByRole("textbox").querySelectorAll("ol > li"),
+    ).toHaveLength(1);
+    expect(inputText()).toBe("/doc-coauthoring 整理大纲");
+  });
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() =>
+    expect(mocks.send).toHaveBeenCalledWith("1. /doc-coauthoring 整理大纲"),
+  );
+});
