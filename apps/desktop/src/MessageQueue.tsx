@@ -46,6 +46,33 @@ function formatDispatchError(cause: unknown): {
   };
 }
 
+export interface DispatchedReceipt {
+  userSeq?: number;
+  forwardedSeq?: number;
+}
+
+interface ReceiptBaseline {
+  interrupt: boolean;
+  sinceUserSeq: number;
+  sinceForwardedSeq: number;
+}
+
+function hasNewerReceipt(
+  receipts: ReadonlyMap<string, DispatchedReceipt> | undefined,
+  requestId: string,
+  baseline: ReceiptBaseline,
+): boolean {
+  const current = receipts?.get(requestId);
+  if (!current) return false;
+  if ((current.userSeq ?? -Infinity) > baseline.sinceUserSeq) return true;
+  if (
+    !baseline.interrupt &&
+    (current.forwardedSeq ?? -Infinity) > baseline.sinceForwardedSeq
+  )
+    return true;
+  return false;
+}
+
 export function MessageQueue({
   hostId,
   sessionId,
@@ -56,7 +83,7 @@ export function MessageQueue({
   onEdit,
   editingBlocked = false,
   onEditPending,
-  dispatchedRequestIds,
+  dispatchedReceipts,
   captureQueuedPredictionRetirement,
 }: {
   hostId: string;
@@ -68,7 +95,7 @@ export function MessageQueue({
   onEdit?: (entry: QueuedMessage) => void;
   editingBlocked?: boolean;
   onEditPending?: (pending: boolean) => void;
-  dispatchedRequestIds?: ReadonlySet<string>;
+  dispatchedReceipts?: ReadonlyMap<string, DispatchedReceipt>;
   captureQueuedPredictionRetirement?: (requestId: string) => () => void;
 }) {
   const scope = JSON.stringify([hostId, sessionId]);
@@ -100,9 +127,15 @@ export function MessageQueue({
     text: string;
     ambiguous?: boolean;
     snapshot?: unknown;
+    baseline?: ReceiptBaseline;
   }>();
   const [error, setError] = useState("");
-  const errorDispatchId = useRef<string | null>(null);
+  const errorDispatch = useRef<{
+    id: string;
+    baseline: ReceiptBaseline;
+  } | null>(null);
+  const latestReceipts = useRef(dispatchedReceipts);
+  latestReceipts.current = dispatchedReceipts;
   const [recover, setRecover] =
     useState<Extract<Request, { method: "take_queued_message" }>>();
   const drag = useRef<
@@ -135,7 +168,7 @@ export function MessageQueue({
   useEffect(() => {
     setBusy(false);
     acting.current = null;
-    errorDispatchId.current = null;
+    errorDispatch.current = null;
     setFeedback(undefined);
     setError("");
     setCollapsed(false);
@@ -168,14 +201,21 @@ export function MessageQueue({
   );
   useEffect(() => {
     if (
-      errorDispatchId.current &&
-      dispatchedRequestIds?.has(errorDispatchId.current)
+      errorDispatch.current &&
+      hasNewerReceipt(
+        dispatchedReceipts,
+        errorDispatch.current.id,
+        errorDispatch.current.baseline,
+      )
     ) {
-      errorDispatchId.current = null;
+      errorDispatch.current = null;
       setError("");
     }
     if (!feedback) return;
-    if (dispatchedRequestIds?.has(feedback.id)) {
+    if (
+      feedback.baseline &&
+      hasNewerReceipt(dispatchedReceipts, feedback.id, feedback.baseline)
+    ) {
       setFeedback(undefined);
       if (state.data.entries.some((entry) => entry.request_id === feedback.id))
         setReload((v) => v + 1);
@@ -200,12 +240,12 @@ export function MessageQueue({
       !state.data.entries.some((entry) => entry.request_id === feedback.id)
     ) {
       setFeedback(undefined);
-      if (errorDispatchId.current === feedback.id) {
-        errorDispatchId.current = null;
+      if (errorDispatch.current?.id === feedback.id) {
+        errorDispatch.current = null;
         setError("");
       }
     }
-  }, [feedback, state.data, dispatchedRequestIds]);
+  }, [feedback, state.data, dispatchedReceipts]);
   latestSnapshot.current = state.data;
   useEffect(() => {
     const pending = focusAfterReorder.current;
@@ -226,12 +266,25 @@ export function MessageQueue({
     acting.current = version;
     if (taking) onEditPending?.(true);
     setBusy(true);
+    const dispatchBaseline: ReceiptBaseline | undefined =
+      command.method === "dispatch_queued_message"
+        ? {
+            interrupt: !!command.interrupt,
+            sinceUserSeq:
+              latestReceipts.current?.get(command.request_id)?.userSeq ??
+              -Infinity,
+            sinceForwardedSeq:
+              latestReceipts.current?.get(command.request_id)?.forwardedSeq ??
+              -Infinity,
+          }
+        : undefined;
     if (command.method === "dispatch_queued_message")
       setFeedback({
         id: command.request_id,
         revision: command.revision,
         kind: "pending",
         text: command.interrupt ? "正在停止当前任务并发送…" : "正在交给 Agent…",
+        baseline: dispatchBaseline,
       });
     else setFeedback(undefined);
     setAnnouncement("");
@@ -260,7 +313,7 @@ export function MessageQueue({
       if (!taken && response.kind !== "message_queue") {
         throw new Error("队列操作未确认，请刷新后核对");
       }
-      errorDispatchId.current = null;
+      errorDispatch.current = null;
       setError("");
       if (command.method === "dispatch_queued_message")
         setFeedback({
@@ -268,6 +321,7 @@ export function MessageQueue({
           revision: command.revision,
           kind: "success",
           text: "已交给 Agent，等待处理",
+          baseline: dispatchBaseline,
         });
       if (command.method === "reorder_message_queue") {
         setAnnouncement("待发送顺序已保存");
@@ -289,8 +343,11 @@ export function MessageQueue({
       if (valid()) {
         const detail = message(cause);
         setError(detail);
-        if (command.method === "dispatch_queued_message") {
-          errorDispatchId.current = command.request_id;
+        if (command.method === "dispatch_queued_message" && dispatchBaseline) {
+          errorDispatch.current = {
+            id: command.request_id,
+            baseline: dispatchBaseline,
+          };
           const formatted = formatDispatchError(cause);
           setFeedback({
             id: command.request_id,
@@ -299,9 +356,10 @@ export function MessageQueue({
             text: formatted.text,
             ambiguous: formatted.ambiguous,
             snapshot: latestSnapshot.current,
+            baseline: dispatchBaseline,
           });
         } else {
-          errorDispatchId.current = null;
+          errorDispatch.current = null;
         }
         setReload((v) => v + 1);
       }
@@ -330,7 +388,7 @@ export function MessageQueue({
             void act(recover);
             return;
           }
-          errorDispatchId.current = null;
+          errorDispatch.current = null;
           setError("");
           setFeedback((current) =>
             current?.kind === "error" ? undefined : current,

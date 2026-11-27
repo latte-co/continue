@@ -24,6 +24,7 @@ turn = None
 count = 0
 waiting = None
 title_prompt = None
+deferred_steer = None
 output_lock = threading.Lock()
 
 def emit(value):
@@ -196,6 +197,8 @@ for line in sys.stdin:
             record.write(json.dumps({'prompt':extra,'params':params,'pid':os.getpid()})+'\n')
         if extra == 'reject-steer':
             emit({'id':value['id'],'error':{'code':-32602,'message':'current turn cannot accept steering'}})
+        elif extra in ('defer-reject-steer-before-complete', 'defer-reject-steer-after-complete', 'defer-accept-steer-after-complete'):
+            deferred_steer = (value['id'], extra, turn)
         else:
             reply(value,{'turnId':turn})
             if extra != 'hold-steer':
@@ -204,12 +207,20 @@ for line in sys.stdin:
     elif method == 'turn/interrupt':
         pathlib.Path('traex-interrupted').write_text('interrupt')
         assert params['turnId'] == turn
+        pending_steer = deferred_steer
+        deferred_steer = None
+        if pending_steer and pending_steer[1] == 'defer-reject-steer-before-complete':
+            emit({'id': pending_steer[0], 'error': {'code': -32602, 'message': 'current turn cannot accept steering'}})
         if prompt == 'wait-interrupt-race':
             complete()
             emit({'id': value['id'], 'error': {'code': -32602, 'message': 'turn not found'}})
         else:
             complete('interrupted')
             reply(value, {})
+        if pending_steer and pending_steer[1] == 'defer-reject-steer-after-complete':
+            emit({'id': pending_steer[0], 'error': {'code': -32602, 'message': 'current turn cannot accept steering'}})
+        elif pending_steer and pending_steer[1] == 'defer-accept-steer-after-complete':
+            emit({'id': pending_steer[0], 'result': {'turnId': pending_steer[2]}})
     elif method is None and waiting:
         if waiting == 'approval':
             assert value['id'] == 73

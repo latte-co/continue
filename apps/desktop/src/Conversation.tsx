@@ -326,18 +326,28 @@ export function Conversation({
     (liveSessionState === "opening" || liveSessionState === "restoring");
   const [away, setAway] = useState(false);
   const turns = useMemo(() => turnTranscript(events), [events]);
-  const dispatchedRequestIds = useMemo(() => {
-    const ids = new Set<string>();
+  const dispatchedReceipts = useMemo(() => {
+    const receipts = new Map<
+      string,
+      { userSeq?: number; forwardedSeq?: number }
+    >();
     for (const item of events) {
-      if (
-        (!session || item.session_id === session.id) &&
-        (item.event.kind === "user" ||
-          item.event.kind === "queued_message_sent")
-      ) {
-        ids.add(item.event.request_id);
+      if (session && item.session_id !== session.id) continue;
+      if (item.event.kind === "user") {
+        const previous = receipts.get(item.event.request_id);
+        receipts.set(item.event.request_id, {
+          ...previous,
+          userSeq: Math.max(previous?.userSeq ?? -Infinity, item.seq),
+        });
+      } else if (item.event.kind === "queued_message_sent") {
+        const previous = receipts.get(item.event.request_id);
+        receipts.set(item.event.request_id, {
+          ...previous,
+          forwardedSeq: Math.max(previous?.forwardedSeq ?? -Infinity, item.seq),
+        });
       }
     }
-    return ids;
+    return receipts;
   }, [events, session]);
   const turnEntries = useMemo(() => turnNavigationEntries(turns), [turns]);
   const showTurnNavigation =
@@ -1316,7 +1326,7 @@ export function Conversation({
           revision={String(sending)}
           running={!!active}
           editingBlocked={sending}
-          dispatchedRequestIds={dispatchedRequestIds}
+          dispatchedReceipts={dispatchedReceipts}
           captureQueuedPredictionRetirement={captureQueuedPredictionRetirement}
           onEditPending={(pending) =>
             setQueueEdits((previous) => {

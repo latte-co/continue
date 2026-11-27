@@ -8882,6 +8882,71 @@ async fn claude_close_accepts_exit_one_only_after_interrupted_turn_not_healthy_t
         Response::Session { session }
             if session.agent_session_open == Some(false) && session.agent_close_pending.is_some()
     ));
+
+    // 3. Turn 1 interrupted with error result, then Turn 2 starts on the same
+    // process and closes with exit 1 without emitting a Turn 2 error result:
+    // Turn 1's stale error must NEVER confirm Turn 2's abnormal exit.
+    let host = Host::start_with_environment(&[(
+        "LATTE_FIXTURE_REALISTIC_EXIT_CODE",
+        std::ffi::OsStr::new("1"),
+    )])
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let mut c = host.client().await;
+    let id = session(&mut c, root.path()).await;
+    queue_send(&mut c, &id, "turn-1", "native-queue-head").await;
+    native_queue_ready(&mut c, &id).await;
+    let initial_pid = agent_pid(root.path());
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::Cancel {
+                session_id: id.clone(),
+            }
+        )
+        .await,
+        Response::Ok
+    ));
+    wait(&mut c, &id, Status::Stopped).await;
+    send(&mut c, &id, "turn-2", "hang-exit-one-without-result").await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let Response::Events { events, .. } = ask(
+            &mut c,
+            Request::Poll {
+                session_id: id.clone(),
+                after: 0.0,
+            },
+        )
+        .await
+        else {
+            panic!("poll")
+        };
+        if events.iter().any(
+            |e| matches!(&e.event, EventKind::Text { text } if text == "HANG_NO_RESULT_STARTED"),
+        ) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "turn 2 did not start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(agent_pid(root.path()), initial_pid);
+    assert!(matches!(
+        ask(
+            &mut c,
+            Request::CloseAgentSession {
+                session_id: id.clone(),
+                only_if_idle: Some(false),
+            }
+        )
+        .await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        ask(&mut c, Request::Session { session_id: id }).await,
+        Response::Session { session }
+            if session.agent_session_open == Some(false) && session.agent_close_pending.is_some()
+    ));
 }
 
 #[tokio::test]

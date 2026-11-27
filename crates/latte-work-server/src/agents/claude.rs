@@ -881,6 +881,7 @@ impl Claude {
         if !self.has_background_work() && self.streamed_children.is_empty() {
             self.child_stream_overflow = false;
         }
+        self.last_result_error = false;
         self.interrupting = false;
         self.streamed = false;
         self.pending_skill_command = None;
@@ -4371,8 +4372,13 @@ mod tests {
         assert!(a.close_exit_confirmed(status(1)));
         assert!(!a.close_exit_confirmed(status(2)));
 
-        // A later healthy turn clears the error-exit allowance.
+        // Starting a new turn clears the previous turn's error-exit allowance
+        // immediately, before any result for the new turn arrives.
         a.advance(Input::Start { prompt: "ok" }).unwrap();
+        assert!(a.close_exit_confirmed(status(0)));
+        assert!(!a.close_exit_confirmed(status(1)));
+
+        // A later healthy turn keeps exit 1 disallowed.
         message(
             &mut a,
             json!({"type":"result","subtype":"success","is_error":false}),

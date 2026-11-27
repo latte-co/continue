@@ -431,6 +431,10 @@ for line in sys.stdin:
             child=subprocess.Popen(['sleep','120'])
             emit({'type':'assistant','message':{'content':[{'type':'text','text':f'child:{child.pid}'}]}})
             continue
+        if text=='hang-exit-one-without-result':
+            os.environ['LATTE_FIXTURE_CLOSE_EXIT_CODE']='1'
+            emit({'type':'assistant','message':{'content':[{'type':'text','text':'HANG_NO_RESULT_STARTED'}]}})
+            continue
         if text=='child-stream-overflow':
             for i in range(513):
                 emit({'type':'system','subtype':'task_started','task_id':f'overflow-{i}','task_type':'local_agent','tool_use_id':f'overflow-tool-{i}','description':'Bounded streaming fixture'})

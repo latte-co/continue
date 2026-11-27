@@ -225,6 +225,12 @@ pub trait AgentAdapter: Send {
     fn interrupt_requires_process_reset(&self) -> bool {
         false
     }
+    /// Whether this live process is still waiting for a native accept/reject
+    /// reply for a forwarded queued input, so a late definitive rejection can
+    /// still return it to the paused queue after the turn ends.
+    fn awaits_forwarded_reply(&self, _request_id: &str) -> bool {
+        false
+    }
     /// Whether this adapter can cancel a pending prompt before startup completes.
     fn can_interrupt_startup(&self) -> bool {
         false

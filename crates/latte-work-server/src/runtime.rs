@@ -88,6 +88,18 @@ impl ForwardedInputs {
     fn deadline(&self) -> Option<tokio::time::Instant> {
         self.0.values().copied().min()
     }
+    fn drain_unawaited(&mut self, mut is_awaited: impl FnMut(&str) -> bool) -> Vec<String> {
+        let settled: Vec<String> = self
+            .0
+            .keys()
+            .filter(|id| !is_awaited(id))
+            .cloned()
+            .collect();
+        for id in &settled {
+            self.0.remove(id);
+        }
+        settled
+    }
 }
 #[derive(Default)]
 pub struct TitleRefreshCache {
@@ -2548,7 +2560,6 @@ async fn actor(
 ) {
     struct Immediate {
         turn: SendTurn,
-        restore_reason: Option<String>,
         reply: oneshot::Sender<Result<Response, String>>,
         deadline: tokio::time::Instant,
     }
@@ -2641,13 +2652,10 @@ async fn actor(
                 Some(Control::Interrupt { reply }) => async {
                     if let Some(pending) = immediate.take() {
                         let _ = db(&database, |d| {
-                            d.pause_queue(
-                                &session.id,
-                                pending
-                                    .restore_reason
-                                    .as_deref()
-                                    .or(Some("当前执行已停止，队列已暂停")),
-                            )
+                            if !d.queue_state(&session.id)?.0 {
+                                d.pause_queue(&session.id, Some("当前执行已停止，队列已暂停"))?;
+                            }
+                            Ok(())
                         });
                         let _ = pending
                             .reply
@@ -2837,14 +2845,13 @@ async fn actor(
                         }
                         db(&database, |d| {
                             let (entry,fingerprint) = d.queued(&session.id)?.into_iter().find(|(e,_)|e.request_id==request_id && e.revision==revision).context("消息已开始执行、移除或更新，请刷新队列")?;
-                            let (paused,reason) = d.queue_state(&session.id)?;
-                            Ok((SendTurn { request_id: entry.request_id, text: entry.text, model: entry.model, fingerprint, config }, if paused {Some(reason.unwrap_or_else(||"队列已暂停".into()))} else {None}))
+                            Ok(SendTurn { request_id: entry.request_id, text: entry.text, model: entry.model, fingerprint, config })
                         })
                     })();
                     match prepared {
                         Err(error) => { let _=reply.send(Err(error.to_string())); Ok(()) },
-                        Ok((turn,restore_reason)) => {
-                            immediate=Some(Immediate {turn,restore_reason,reply,deadline:tokio::time::Instant::now()+Duration::from_secs(8)});
+                        Ok(turn) => {
+                            immediate=Some(Immediate {turn,reply,deadline:tokio::time::Instant::now()+Duration::from_secs(8)});
                             let must_reset_for_forwarded = interrupt
                                 && !forwarded.is_empty()
                                 && process.as_ref().is_none_or(|p| {
@@ -3097,7 +3104,12 @@ async fn actor(
                 // current turn under normal supervision, without replaying input.
                 if let Some(pending) = immediate.take() {
                     let _ = pending.reply.send(Err("发送确认超时，消息保留在队列，请核对后重试".into()));
-                    db(&database, |d| d.pause_queue(&session.id, pending.restore_reason.as_deref().or(Some("发送确认超时，队列已暂停，请核对后继续"))))
+                    db(&database, |d| {
+                        if !d.queue_state(&session.id)?.0 {
+                            d.pause_queue(&session.id, Some("发送确认超时，队列已暂停，请核对后继续"))?;
+                        }
+                        Ok(())
+                    })
                 } else { Ok(()) }
             },
             _ = deadline(init_deadline) => Err(anyhow::anyhow!("Agent 初始化超时（18 秒）")),
@@ -3239,14 +3251,28 @@ async fn actor(
                 && !(status == Status::Stopped && immediate.is_some())
             {
                 db(&database, |d| {
-                    d.pause_queue(&session.id, Some("当前执行未完成，队列已暂停"))
+                    if !d.queue_state(&session.id)?.0 {
+                        d.pause_queue(&session.id, Some("当前执行未完成，队列已暂停"))?;
+                    }
+                    Ok(())
                 })?;
             }
             // Native completions can consume zero, one or several delivered
             // inputs. Never invent another turn or replay them at this boundary.
+            // Keep inputs whose live native process is still awaiting an
+            // explicit accept/reject RPC reply so a late rejection can still
+            // return them to the paused queue.
             if !status.active() && status != Status::Completed && !forwarded.is_empty() {
-                forwarded.clear();
-                db(&database, |d| d.uncertain_forwarded(&session.id))?;
+                let unawaited = forwarded.drain_unawaited(|request_id| {
+                    process
+                        .as_ref()
+                        .is_some_and(|p| p.adapter.awaits_forwarded_reply(request_id))
+                });
+                if !unawaited.is_empty() {
+                    db(&database, |d| {
+                        d.uncertain_forwarded_ids(&session.id, &unawaited)
+                    })?;
+                }
             }
             let status = db(&database, |d| Ok(d.session(&session.id)?.status))?;
             if immediate.is_some()
@@ -3256,17 +3282,16 @@ async fn actor(
                 let pending = immediate.take().expect("checked immediate");
                 if pending.reply.is_closed() {
                     db(&database, |d| {
-                        d.pause_queue(
-                            &session.id,
-                            pending
-                                .restore_reason
-                                .as_deref()
-                                .or(Some("发送确认超时，队列已暂停，请核对后继续")),
-                        )
+                        if !d.queue_state(&session.id)?.0 {
+                            d.pause_queue(
+                                &session.id,
+                                Some("发送确认超时，队列已暂停，请核对后继续"),
+                            )?;
+                        }
+                        Ok(())
                     })?;
                 } else {
                     let mut reply = Some(pending.reply);
-                    let restore_reason = pending.restore_reason;
                     let result = async {
                         if matches!(status, Status::Failed | Status::Unknown)
                             && previous_status.as_ref().is_some_and(|s| s.active())
@@ -3285,10 +3310,9 @@ async fn actor(
                             || {
                                 // Confirm durable admission immediately before slow workspace
                                 // snapshots or process launch can exceed queue_action's budget.
-                                let snapshot = db(&database, |d| {
-                                    d.pause_queue(&session.id, restore_reason.as_deref())?;
-                                    d.queue_snapshot(&session.id)
-                                });
+                                // Preserve the current pause state (including any rejection
+                                // pause written while waiting for the previous turn to stop).
+                                let snapshot = db(&database, |d| d.queue_snapshot(&session.id));
                                 if let Some(reply) = reply.take() {
                                     let _ = reply.send(snapshot.map_err(|e| e.to_string()));
                                 }
@@ -3308,10 +3332,7 @@ async fn actor(
                         })? {
                             bail!("消息发送失败，请检查 Agent 状态");
                         }
-                        db(&database, |d| {
-                            d.pause_queue(&session.id, restore_reason.as_deref())?;
-                            d.queue_snapshot(&session.id)
-                        })
+                        db(&database, |d| d.queue_snapshot(&session.id))
                     }
                     .await;
                     if let Some(reply) = reply {

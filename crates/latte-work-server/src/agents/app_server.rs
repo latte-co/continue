@@ -1061,6 +1061,14 @@ impl AgentAdapter for AppServer {
     fn has_background_work(&self) -> bool {
         !self.children.is_empty() || !self.background_commands.is_empty()
     }
+    fn awaits_forwarded_reply(&self, request_id: &str) -> bool {
+        self.pending.values().any(|pending| {
+            pending
+                .queued_input
+                .as_ref()
+                .is_some_and(|(id, _)| id == request_id)
+        })
+    }
     fn knows_subagent(&self, _: &str) -> bool {
         false
     }
@@ -2650,10 +2658,13 @@ mod tests {
         )
         .remove(0);
         assert!(!agent.interrupt_requires_process_reset());
+        assert!(agent.awaits_forwarded_reply("q"));
+        assert!(!agent.awaits_forwarded_reply("other"));
         message(
             &mut agent,
             json!({"id":write["id"],"result":{"turnId":"turn"}}),
         );
         assert!(!agent.interrupt_requires_process_reset());
+        assert!(!agent.awaits_forwarded_reply("q"));
     }
 }
