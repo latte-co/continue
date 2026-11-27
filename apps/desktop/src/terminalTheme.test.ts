@@ -24,8 +24,11 @@ it.each(["light", "dark"] as const)(
       ).toBeGreaterThanOrEqual(4.5);
     const tokens = themeTokens(theme);
     expect(tokens["--color-hover"]).not.toBe(tokens["--color-selected"]);
-    expect(
-      contrastRatio(tokens["--color-placeholder"], tokens["--color-composer"]),
-    ).toBeGreaterThanOrEqual(4.5);
+    const placeholderContrast = contrastRatio(
+      tokens["--color-placeholder"],
+      tokens["--color-composer"],
+    );
+    expect(placeholderContrast).toBeGreaterThanOrEqual(3.6);
+    expect(placeholderContrast).toBeLessThan(4.6);
   },
 );

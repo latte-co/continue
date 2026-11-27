@@ -81,11 +81,11 @@ export function BrandLogo({
             <g className="brand-logo-pupils">
               <path d={LEFT_PUPIL_PATH} fill={LOGO_INK} />
               <path d={RIGHT_PUPIL_PATH} fill={LOGO_INK} />
-              {/* White 4-point star glint inside the black right pupil (#5 GIF) */}
+              {/* Warm Latte glint inside the right pupil during active work (#5 GIF) */}
               <path
                 className="brand-logo-sparkle"
                 d="M109 96L111.2 103.8L119 106L111.2 108.2L109 116L106.8 108.2L99 106L106.8 103.8Z"
-                fill={LOGO_PAPER}
+                fill={`var(--color-primary, ${LOGO_PAPER})`}
               />
             </g>
             {/* Calm downward blink arcs (#5 GIF) */}

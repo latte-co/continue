@@ -22,26 +22,28 @@ export interface Appearance {
   dark: ThemeConfig;
 }
 export const APPEARANCE_KEY = "latte-work.appearance.v1";
+export const TYPOGRAPHY_MIGRATION_KEY = "latte-work.appearance.editorial-v2";
 export const APPEARANCE_EVENT = "latte-work:appearance";
 export const MAX_THEME_BYTES = 32 * 1024;
 export const fonts = {
   system:
-    '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC", sans-serif',
-  sans: 'Arial, "PingFang SC", sans-serif',
-  serif: 'Georgia, "Songti SC", serif',
-  mono: 'ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace',
+    '"Inter Variable", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", sans-serif',
+  sans: '"Inter Variable", Arial, "PingFang SC", "Hiragino Sans GB", sans-serif',
+  serif:
+    '"Newsreader Variable", "New York", Georgia, "Songti SC", "STSong", "Noto Serif CJK SC", serif',
+  mono: '"JetBrains Mono Variable", ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, "PingFang SC", "Hiragino Sans GB", monospace',
 };
 export const codeFonts = {
   system: fonts.mono,
-  menlo: 'Menlo, Monaco, "Courier New", monospace',
-  consolas: 'Consolas, "Courier New", monospace',
+  menlo: 'Menlo, Monaco, "PingFang SC", "Courier New", monospace',
+  consolas: 'Consolas, "PingFang SC", "Courier New", monospace',
 };
 export const presets: Record<
   ThemeKind,
   Record<string, Pick<ThemeConfig, "accent" | "background" | "foreground">>
 > = {
   dark: {
-    Latte: { accent: "#F2F2F2", background: "#181818", foreground: "#F2F2F2" },
+    Latte: { accent: "#E5A454", background: "#121212", foreground: "#F2F2F2" },
     Material: {
       accent: "#82AAFF",
       background: "#1E272C",
@@ -54,20 +56,72 @@ export const presets: Record<
     },
   },
   light: {
-    Latte: { accent: "#2563EB", background: "#FFFFFF", foreground: "#181818" },
+    Latte: { accent: "#A66022", background: "#FFFFFF", foreground: "#0F0F0F" },
     Paper: { accent: "#806044", background: "#FAF7F2", foreground: "#2C2824" },
     Mint: { accent: "#247564", background: "#F4F8F6", foreground: "#1D312B" },
   },
 };
+
+const LEGACY_LATTE_DEFAULTS: Record<
+  ThemeKind,
+  ReadonlyArray<Pick<ThemeConfig, "accent" | "background" | "foreground">>
+> = {
+  dark: [
+    { accent: "#F2F2F2", background: "#181818", foreground: "#F2F2F2" },
+    { accent: "#E0A458", background: "#161616", foreground: "#F0F0F0" },
+  ],
+  light: [
+    { accent: "#2563EB", background: "#FFFFFF", foreground: "#181818" },
+    { accent: "#A66022", background: "#FFFFFF", foreground: "#111111" },
+  ],
+};
+
+function migrateLegacyDefaultTheme(
+  kind: ThemeKind,
+  theme: ThemeConfig,
+): ThemeConfig {
+  const isLegacyDefault = LEGACY_LATTE_DEFAULTS[kind].some(
+    (legacy) =>
+      theme.accent === legacy.accent &&
+      theme.background === legacy.background &&
+      theme.foreground === legacy.foreground,
+  );
+  return isLegacyDefault ? { ...theme, ...presets[kind].Latte } : theme;
+}
+
+export function migrateLegacyAppearance(
+  settings: Appearance,
+  migrateTypography = false,
+): Appearance {
+  let light = migrateLegacyDefaultTheme("light", settings.light);
+  let dark = migrateLegacyDefaultTheme("dark", settings.dark);
+  if (
+    migrateTypography &&
+    light.uiFont === "system" &&
+    dark.uiFont === "system"
+  ) {
+    if (light.contentFont === "inherit" && dark.contentFont === "inherit") {
+      light = { ...light, contentFont: "serif" };
+      dark = { ...dark, contentFont: "serif" };
+    }
+    if (light.uiWeight === "400" && dark.uiWeight === "400") {
+      light = { ...light, uiWeight: "500" };
+      dark = { ...dark, uiWeight: "500" };
+    }
+  }
+  return light === settings.light && dark === settings.dark
+    ? settings
+    : { ...settings, light, dark };
+}
 export function defaultTheme(kind: ThemeKind): ThemeConfig {
   return {
     ...presets[kind].Latte,
     contrast: 50,
     translucentSidebar: false,
     uiFont: "system",
-    contentFont: "inherit",
+    contentFont: "serif",
     codeFont: "system",
-    uiWeight: "400",
+    uiWeight: "500",
     contentWeight: "400",
     codeWeight: "400",
   };
@@ -154,8 +208,15 @@ export function parseAppearance(text: string): Appearance {
 export function readAppearance(): { settings: Appearance; error: string } {
   try {
     const raw = localStorage.getItem(APPEARANCE_KEY);
+    if (!raw) {
+      return { settings: defaultAppearance(), error: "" };
+    }
+    const migrateTypography = !localStorage.getItem(TYPOGRAPHY_MIGRATION_KEY);
     return {
-      settings: raw ? parseAppearance(raw) : defaultAppearance(),
+      settings: migrateLegacyAppearance(
+        parseAppearance(raw),
+        migrateTypography,
+      ),
       error: "",
     };
   } catch {
@@ -168,6 +229,7 @@ export function readAppearance(): { settings: Appearance; error: string } {
 export function saveAppearance(settings: Appearance): string {
   try {
     localStorage.setItem(APPEARANCE_KEY, JSON.stringify(settings));
+    localStorage.setItem(TYPOGRAPHY_MIGRATION_KEY, "1");
     return "";
   } catch {
     return "外观已应用，但无法保存到本机。重启后可能丢失。";
@@ -278,7 +340,7 @@ export function contrastRatio(a: string, b: string): number {
   return (l[0] + 0.05) / (l[1] + 0.05);
 }
 
-/** Worst-case text-to-surface contrast across canvas, sidebar, cards, inputs, and elevated overlays. */
+/** Worst-case reading contrast across canvas, sidebar, cards, inputs, and elevated overlays. */
 export function minimumThemeContrast(theme: ThemeConfig): number {
   const tokens = themeTokens(theme);
   const surfaces = [
@@ -290,16 +352,17 @@ export function minimumThemeContrast(theme: ThemeConfig): number {
     tokens["--color-input"],
     tokens["--color-composer"],
   ];
-  const texts = [
+  const readingTexts = [
     tokens["--color-text"],
     tokens["--color-text-secondary"],
-    tokens["--color-text-muted"],
   ];
+  const mutedText = tokens["--color-text-muted"];
   let worst = Number.POSITIVE_INFINITY;
-  for (const text of texts) {
-    for (const surface of surfaces) {
+  for (const surface of surfaces) {
+    for (const text of readingTexts) {
       worst = Math.min(worst, contrastRatio(text, surface));
     }
+    worst = Math.min(worst, contrastRatio(mutedText, surface) * (4.5 / 3.5));
   }
   return worst;
 }
@@ -328,7 +391,7 @@ function ensureContrast(
   }
 
   const fgRatio = minContrastAgainst(targetFg, against);
-  const fallbackMin = 4.55;
+  const fallbackMin = Math.min(4.55, minRatio);
   if (fgRatio >= fallbackMin) return targetFg;
 
   const pole =
@@ -359,55 +422,58 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
   const scale = 0.65 + (theme.contrast / 100) * 0.7;
   const step = (n: number) => mix(bg, fg, n);
   const shell = dark
-    ? shiftLightness(bg, -0.022 * scale, 1.06)
-    : shiftLightness(bg, -0.024 * scale, 1.08);
+    ? shiftLightness(bg, -0.024 * scale, 0.96)
+    : shiftLightness(bg, -0.025 * scale, 0.96);
   const sidebarBase = shell;
   const surface = dark
-    ? shiftLightness(bg, 0.03 * scale)
-    : shiftLightness(bg, -0.014 * scale, 1.04);
-  const card = dark ? shiftLightness(bg, 0.03 * scale) : bg;
-  const elevated = dark ? shiftLightness(bg, 0.046 * scale) : bg;
+    ? shiftLightness(bg, 0.026 * scale, 0.72)
+    : shiftLightness(bg, -0.012 * scale, 0.85);
+  const card = dark ? shiftLightness(bg, 0.026 * scale, 0.72) : bg;
+  const elevated = dark ? shiftLightness(bg, 0.044 * scale, 0.72) : bg;
   const input = dark
-    ? shiftLightness(bg, 0.016 * scale)
-    : shiftLightness(bg, -0.009 * scale, 1.02);
-  const composer = dark ? shiftLightness(bg, 0.036 * scale) : bg;
+    ? shiftLightness(bg, -0.014 * scale, 0.88)
+    : shiftLightness(bg, -0.018 * scale, 0.88);
+  const composer = dark ? shiftLightness(bg, 0.032 * scale, 0.72) : bg;
+  const controlBg = dark ? fg + "0a" : bg;
 
   const surfaces = [bg, sidebarBase, surface, card, elevated, input, composer];
   const textSecondary = ensureContrast(
-    step(dark ? 0.84 : 0.78),
+    step(dark ? 0.59 : 0.59),
     surfaces,
     fg,
-    7.0,
+    4.8,
   );
-  const textMuted = ensureContrast(
-    step(dark ? 0.68 : 0.62),
+  const textMuted = ensureContrast(step(dark ? 0.46 : 0.48), surfaces, fg, 3.6);
+  const textFaint = ensureContrast(
+    step(dark ? 0.36 : 0.36),
     surfaces,
     fg,
-    4.75,
+    2.55,
   );
 
   const borderSubtle = dark
-    ? shiftLightness(bg, 0.058 * scale)
-    : shiftLightness(bg, -0.048 * scale);
+    ? shiftLightness(bg, 0.055 * scale, 0.72)
+    : shiftLightness(bg, -0.046 * scale, 0.72);
   const border = dark
-    ? shiftLightness(bg, 0.095 * scale)
-    : shiftLightness(bg, -0.08 * scale);
+    ? shiftLightness(bg, 0.09 * scale, 0.72)
+    : shiftLightness(bg, -0.076 * scale, 0.72);
   const borderStrong = dark
-    ? shiftLightness(bg, 0.13 * scale)
-    : shiftLightness(bg, -0.12 * scale);
+    ? shiftLightness(bg, 0.125 * scale, 0.72)
+    : shiftLightness(bg, -0.118 * scale, 0.72);
   const focusRing = dark
-    ? shiftLightness(bg, 0.22 * scale)
-    : shiftLightness(bg, -0.25 * scale);
-  const action = dark ? mix(fg, bg, 0.11) : mix(fg, bg, 0.04);
-  const actionHover = dark ? mix(fg, bg, 0.03) : mix(fg, bg, 0.14);
-  const btnBg = dark ? shiftLightness(bg, 0.042 * scale) : "#ffffff";
+    ? shiftLightness(bg, 0.21 * scale, 0.72)
+    : shiftLightness(bg, -0.24 * scale, 0.72);
+  const composerFocusRing = mix(focusRing, accent, dark ? 0.52 : 0.45);
+  const action = dark ? mix(fg, bg, 0.06) : fg;
+  const actionHover = dark ? fg : mix(fg, bg, 0.14);
+  const btnBg = dark ? shiftLightness(bg, 0.04 * scale, 0.72) : "#ffffff";
   const btnHover = dark
-    ? shiftLightness(bg, 0.068 * scale)
-    : shiftLightness(bg, -0.022 * scale);
-  const btnElevated = dark ? shiftLightness(bg, 0.064 * scale) : "#ffffff";
+    ? shiftLightness(bg, 0.066 * scale, 0.72)
+    : shiftLightness(bg, -0.02 * scale, 0.85);
+  const btnElevated = dark ? shiftLightness(bg, 0.06 * scale, 0.72) : "#ffffff";
   const btnElevatedHover = dark
-    ? shiftLightness(bg, 0.092 * scale)
-    : shiftLightness(bg, -0.026 * scale);
+    ? shiftLightness(bg, 0.088 * scale, 0.72)
+    : shiftLightness(bg, -0.024 * scale, 0.85);
 
   return {
     "--color-shell": shell,
@@ -419,19 +485,21 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
     "--color-surface": surface,
     "--color-card": card,
     "--color-elevated": elevated,
-    "--color-well": fg + (dark ? "0c" : "0a"),
+    "--color-well": fg + (dark ? "0b" : "08"),
+    "--color-control-bg": controlBg,
     "--color-input": input,
     "--color-composer": composer,
     "--color-text-secondary": textSecondary,
     "--color-text-muted": textMuted,
+    "--color-text-faint": textFaint,
     "--color-placeholder": textMuted,
     "--color-border-subtle": borderSubtle,
     "--color-border": border,
     "--color-border-strong": borderStrong,
-    "--color-hover": fg + (dark ? "0d" : "0a"),
-    "--color-row-selected": fg + (dark ? "15" : "10"),
-    "--color-selected": fg + (dark ? "1c" : "15"),
-    "--color-focus-background": fg + "22",
+    "--color-hover": fg + (dark ? "0c" : "09"),
+    "--color-row-selected": fg + (dark ? "14" : "0f"),
+    "--color-selected": fg + (dark ? "1b" : "14"),
+    "--color-focus-background": fg + "20",
     "--color-focus-ring": focusRing,
     "--color-primary": accent,
     "--color-primary-hover": mix(accent, dark ? "#FFFFFF" : "#000000", 0.12),
@@ -439,6 +507,8 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
       contrastRatio(accent, "#FFFFFF") > contrastRatio(accent, "#121212")
         ? "#FFFFFF"
         : "#121212",
+    "--color-brand": accent,
+    "--color-brand-soft": accent + (dark ? "24" : "1c"),
     "--color-action": action,
     "--color-action-hover": actionHover,
     "--color-on-action":
@@ -459,7 +529,6 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
     "--color-stop": step(dark ? 0.22 : 0.12),
     "--color-stop-hover": step(dark ? 0.3 : 0.18),
     "--color-on-stop": fg,
-    "--color-brand": accent,
     "--color-code-keyword": dark ? "#CDA4D7" : "#6B3D83",
     "--color-code-string": dark ? "#C4C998" : "#526B20",
     "--color-code-number": dark ? "#A7C6BE" : "#256557",
@@ -469,29 +538,29 @@ export function themeTokens(theme: ThemeConfig): Record<string, string> {
     "--color-danger": dark ? "#F08888" : "#C03939",
     "--color-unread": dark ? "#6EA4FF" : "#2563EB",
     "--color-backdrop": dark ? "#0000008c" : "#00000038",
-    "--color-selection": accent + "3d",
+    "--color-selection": accent + (dark ? "38" : "29"),
     "--shadow-island": dark
-      ? `0 0 0 1px ${borderSubtle}, 0 4px 16px -4px rgba(0, 0, 0, 0.24)`
-      : `0 0 0 1px ${borderSubtle}, 0 4px 16px -6px rgba(15, 23, 42, 0.045)`,
+      ? `0 0 0 1px ${borderSubtle}, 0 6px 20px -6px rgba(0, 0, 0, 0.3)`
+      : `0 0 0 1px ${borderSubtle}, 0 6px 20px -8px rgba(0, 0, 0, 0.055)`,
     "--shadow-well": `inset 0 0 0 1px ${border}`,
     "--shadow-card": dark
-      ? `0 0 0 1px ${borderSubtle}`
-      : `0 0 0 1px ${border}, 0 1px 2px rgba(15, 23, 42, 0.03)`,
+      ? `0 0 0 1px ${borderSubtle}, inset 0 1px 0 rgba(255, 255, 255, 0.03)`
+      : `0 0 0 1px ${border}`,
     "--shadow-elevated": dark
-      ? `0 0 0 1px ${border}, 0 2px 6px rgba(0, 0, 0, 0.18)`
-      : `0 0 0 1px ${border}, 0 1px 3px rgba(15, 23, 42, 0.06)`,
+      ? `0 0 0 1px ${border}, 0 4px 12px -2px rgba(0, 0, 0, 0.24)`
+      : `0 0 0 1px ${border}, 0 4px 12px -4px rgba(0, 0, 0, 0.06)`,
     "--shadow-composer": dark
-      ? `0 0 0 1px ${border}, 0 2px 8px rgba(0, 0, 0, 0.16)`
-      : `0 0 0 1px ${border}, 0 2px 8px rgba(15, 23, 42, 0.04)`,
+      ? `0 0 0 1px ${border}, inset 0 1px 0 rgba(255, 255, 255, 0.035), 0 6px 20px -6px rgba(0, 0, 0, 0.24)`
+      : `0 0 0 1px ${border}, 0 6px 20px -8px rgba(0, 0, 0, 0.06)`,
     "--shadow-composer-focus": dark
-      ? `0 0 0 1px ${focusRing}, 0 2px 8px rgba(0, 0, 0, 0.18)`
-      : `0 0 0 1px ${focusRing}, 0 2px 8px rgba(15, 23, 42, 0.05)`,
+      ? `0 0 0 1px ${composerFocusRing}, 0 0 0 3.5px ${accent}22, inset 0 1px 0 rgba(255, 255, 255, 0.045), 0 10px 28px -6px rgba(0, 0, 0, 0.36)`
+      : `0 0 0 1px ${composerFocusRing}, 0 0 0 3.5px ${accent}1c, 0 10px 28px -8px rgba(0, 0, 0, 0.09)`,
     "--shadow-dialog": dark
-      ? `0 16px 40px -8px rgba(0, 0, 0, 0.42), 0 0 0 1px ${border}`
-      : `0 16px 40px -10px rgba(15, 23, 42, 0.14), 0 0 0 1px ${border}`,
+      ? `0 20px 48px -12px rgba(0, 0, 0, 0.5), 0 0 0 1px ${border}`
+      : `0 20px 48px -12px rgba(0, 0, 0, 0.14), 0 0 0 1px ${border}`,
     "--shadow-popover": dark
-      ? `0 12px 28px -6px rgba(0, 0, 0, 0.36), 0 0 0 1px ${borderStrong}`
-      : `0 12px 28px -8px rgba(15, 23, 42, 0.12), 0 0 0 1px ${border}`,
+      ? `0 12px 32px -8px rgba(0, 0, 0, 0.42), 0 0 0 1px ${borderStrong}`
+      : `0 12px 32px -8px rgba(0, 0, 0, 0.1), 0 0 0 1px ${border}`,
     "--focus-ring": `0 0 0 1px ${focusRing}`,
     "--focus-ring-inset": `inset 0 0 0 1px ${focusRing}`,
     "--font-ui": fonts[theme.uiFont],

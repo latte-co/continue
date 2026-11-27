@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronRight, CircleAlert } from "lucide-react";
+import { renderAnsiText, stripAnsi } from "./ansi";
 import { Button } from "./ui";
 import { parseTurnError } from "./turnError";
 
@@ -19,7 +20,8 @@ export function TurnErrorRow({
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const timerRef = useRef<number | null>(null);
-  const parsed = useMemo(() => parseTurnError(message), [message]);
+  const cleanMessage = useMemo(() => stripAnsi(message), [message]);
+  const parsed = useMemo(() => parseTurnError(cleanMessage), [cleanMessage]);
 
   useEffect(() => {
     return () => {
@@ -29,7 +31,7 @@ export function TurnErrorRow({
 
   async function copyRaw() {
     try {
-      await navigator.clipboard?.writeText(message);
+      await navigator.clipboard?.writeText(cleanMessage);
       setCopied(true);
       if (timerRef.current !== null) window.clearTimeout(timerRef.current);
       timerRef.current = window.setTimeout(() => {
@@ -80,7 +82,7 @@ export function TurnErrorRow({
       {open && (
         <div className="activity-output">
           <div className="activity-well turn-error-well">
-            <pre>{message}</pre>
+            <pre>{renderAnsiText(message)}</pre>
             <Button
               size="xs"
               variant="ghost"
