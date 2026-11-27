@@ -326,6 +326,19 @@ export function Conversation({
     (liveSessionState === "opening" || liveSessionState === "restoring");
   const [away, setAway] = useState(false);
   const turns = useMemo(() => turnTranscript(events), [events]);
+  const dispatchedRequestIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const item of events) {
+      if (
+        (!session || item.session_id === session.id) &&
+        (item.event.kind === "user" ||
+          item.event.kind === "queued_message_sent")
+      ) {
+        ids.add(item.event.request_id);
+      }
+    }
+    return ids;
+  }, [events, session]);
   const turnEntries = useMemo(() => turnNavigationEntries(turns), [turns]);
   const showTurnNavigation =
     !preparingHistory &&
@@ -1303,6 +1316,7 @@ export function Conversation({
           revision={String(sending)}
           running={!!active}
           editingBlocked={sending}
+          dispatchedRequestIds={dispatchedRequestIds}
           captureQueuedPredictionRetirement={captureQueuedPredictionRetirement}
           onEditPending={(pending) =>
             setQueueEdits((previous) => {

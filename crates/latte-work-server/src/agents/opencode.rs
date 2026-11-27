@@ -1931,6 +1931,10 @@ impl AgentAdapter for OpenCode {
         })
     }
 
+    fn interrupt_requires_process_reset(&self) -> bool {
+        self.steering.is_some()
+    }
+
     fn can_interrupt_startup(&self) -> bool {
         true
     }

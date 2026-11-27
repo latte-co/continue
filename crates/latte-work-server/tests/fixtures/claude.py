@@ -44,8 +44,12 @@ if prediction_process:
     raise RuntimeError('Claude composer predictions must fail closed before spawn')
 output_lock=threading.Lock()
 native_tasks=set()
+last_result_error=False
 def emit(value):
+    global last_result_error
     with output_lock:
+        if value.get('type')=='result' and not value.get('parent_tool_use_id'):
+            last_result_error=bool(value.get('is_error')) or str(value.get('subtype','')).startswith('error')
         if value.get('type')=='system':
             subtype=value.get('subtype')
             task_id=value.get('task_id')
@@ -96,6 +100,14 @@ for line in sys.stdin:
     if value['type']=='control_request':
         if value['request']['subtype']=='end_session':
             emit({'type':'control_response','response':{'subtype':'success','request_id':value['request_id']}})
+            if os.environ.get('LATTE_FIXTURE_REALISTIC_EXIT_CODE')=='1':
+                with native_lock:
+                    was_running=native_head
+                    native_generation+=1
+                    native_head=False
+                    native_pending.clear()
+                if was_running:
+                    emit({'type':'result','subtype':'error_during_execution','is_error':True})
             if background_mode and background_mode.startswith('background-detached-late'):
                 emit({'type':'system','subtype':'task_started','task_id':'bg-task','task_type':'local_bash'})
             if background_mode=='background-detached':
@@ -112,6 +124,11 @@ for line in sys.stdin:
             for task_id in stopped:
                 if task_id!='bg-task' or background_mode not in ('background-stop-uncertain','background-detached-late-unconfirmed'):
                     emit({'type':'system','subtype':'task_notification','task_id':task_id,'status':'stopped'})
+            close_exit=os.environ.get('LATTE_FIXTURE_CLOSE_EXIT_CODE')
+            if close_exit is not None:
+                sys.exit(int(close_exit))
+            if os.environ.get('LATTE_FIXTURE_REALISTIC_EXIT_CODE')=='1' and last_result_error:
+                sys.exit(1)
             break
         if value['request']['subtype']=='generate_session_title':
             description=value['request']['description'].split('\n\nAssistant reply:', 1)[0]
@@ -152,9 +169,10 @@ for line in sys.stdin:
         if value['request']['subtype']=='interrupt':
             if native_mode: pathlib.Path('native-interrupt-pending').write_text('received')
             result_first=os.environ.get('LATTE_FIXTURE_INTERRUPT_RESULT_FIRST')=='1'
-            if result_first: emit({'type':'result','subtype':'success','is_error':False})
+            interrupt_result={'type':'result','subtype':'error_during_execution','is_error':True} if os.environ.get('LATTE_FIXTURE_REALISTIC_EXIT_CODE')=='1' else {'type':'result','subtype':'success','is_error':False}
+            if result_first: emit(interrupt_result)
             delay=min(15,float(os.environ.get('LATTE_FIXTURE_INTERRUPT_DELAY','0')))
-            def finish_interrupt(request_id=value['request_id'],result_first=result_first,delay=delay):
+            def finish_interrupt(request_id=value['request_id'],result_first=result_first,delay=delay,interrupt_result=interrupt_result):
                 global native_generation,native_head,child
                 time.sleep(delay)
                 with native_lock:
@@ -165,7 +183,7 @@ for line in sys.stdin:
                     with pathlib.Path('native-interrupts').open('a') as record: record.write('interrupt\n')
                 if child is not None:
                     child.terminate();child.wait();child=None
-                if not result_first: emit({'type':'result','subtype':'success','is_error':False})
+                if not result_first: emit(interrupt_result)
                 emit({'type':'control_response','response':{'subtype':'success','request_id':request_id}})
             if delay:
                 # Simulate a late receipt while accepting other controls,
@@ -391,6 +409,10 @@ for line in sys.stdin:
                 with pathlib.Path('native-inputs').open('a') as record: record.write(text+'\n')
                 if native_head:
                     native_pending.append((text,value.get('uuid')))
+                    if text.startswith('native-message-replay-'):
+                        emit({'type':'user','isReplay':True,'uuid':value.get('uuid'),'message':{'role':'user','content':text}})
+                        emit({'type':'assistant','message':{'content':[{'type':'text','text':'NATIVE_REPLAYED:'+text}]}})
+                        pathlib.Path('native-replayed').write_text(text)
                     continue
             emit({'type':'assistant','message':{'content':[{'type':'text','text':'NATIVE_PROCESSED:'+text}]}})
             emit({'type':'result','subtype':'success','is_error':False,'user_message_uuid':value.get('uuid')})

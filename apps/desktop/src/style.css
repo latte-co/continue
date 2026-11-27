@@ -6808,6 +6808,12 @@ button.task-info-row:not(:disabled):hover,
   color: var(--color-text-muted);
   font-size: var(--text-xs);
 }
+.message-queue-row-status {
+  flex-shrink: 0;
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
 .message-queue-actions {
   flex-shrink: 0;
   display: inline-flex;

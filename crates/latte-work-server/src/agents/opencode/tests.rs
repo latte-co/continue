@@ -516,3 +516,15 @@ fn failed_probe_session_reports_original_error() {
     };
     assert!(error.contains("does not belong to cwd"));
 }
+
+#[test]
+fn interrupt_requires_process_reset_only_while_steer_is_undelivered() {
+    let mut adapter = adapter();
+    assert!(!adapter.interrupt_requires_process_reset());
+    begin_prompt(&mut adapter);
+    assert!(!adapter.interrupt_requires_process_reset());
+    let id = queue(&mut adapter);
+    assert!(adapter.interrupt_requires_process_reset());
+    delivered(&mut adapter, &id);
+    assert!(!adapter.interrupt_requires_process_reset());
+}

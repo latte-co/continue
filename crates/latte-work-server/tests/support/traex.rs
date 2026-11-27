@@ -1577,3 +1577,98 @@ async fn traex_platform_instructions_preserve_native_text_on_start_resume_and_di
             .exists()
     );
 }
+
+#[tokio::test]
+async fn traex_stop_and_stop_and_send_during_steered_turn_keep_native_process() {
+    for stop_and_send in [false, true] {
+        let host = Host::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut client = host.client().await;
+        let id = session(&mut client, root.path()).await;
+        send(&mut client, &id, "head", "wait").await;
+        until_text(&mut client, &id, "WAITING").await;
+        send(&mut client, &id, "steered", "hold-steer").await;
+        let steer_entry = pending_entry(&mut client, &id, "steered", 0).await;
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::DispatchQueuedMessage {
+                    session_id: id.clone(),
+                    request_id: steer_entry.request_id.clone(),
+                    revision: steer_entry.revision,
+                    interrupt: false,
+                    provider: Some(TurnProvider::Cli),
+                }
+            )
+            .await,
+            Response::MessageQueue { .. }
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !root.path().join("traex-steers").exists() {
+            assert!(Instant::now() < deadline, "traex steer was not received");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if stop_and_send {
+            send(&mut client, &id, "priority", "after-steer").await;
+            let priority = pending_entry(&mut client, &id, "priority", 0).await;
+            assert!(matches!(
+                ask(
+                    &mut client,
+                    Request::DispatchQueuedMessage {
+                        session_id: id.clone(),
+                        request_id: priority.request_id.clone(),
+                        revision: priority.revision,
+                        interrupt: true,
+                        provider: Some(TurnProvider::Cli),
+                    }
+                )
+                .await,
+                Response::MessageQueue { .. }
+            ));
+            let (current, events) = until(&mut client, &id, Status::Completed).await;
+            assert_eq!(current.agent_session_open, Some(true));
+            assert_eq!(current.agent_close_pending, None);
+            assert!(events.iter().any(
+                |e| matches!(&e.event, EventKind::Text { text } if text == "TRAE:after-steer")
+            ));
+            assert!(events.iter().any(
+                |e| matches!(&e.event, EventKind::Notice { text } if text.contains("不会自动重发"))
+            ));
+        } else {
+            assert!(matches!(
+                ask(
+                    &mut client,
+                    Request::Cancel {
+                        session_id: id.clone(),
+                    }
+                )
+                .await,
+                Response::Ok
+            ));
+            let (current, events) = until(&mut client, &id, Status::Stopped).await;
+            assert_eq!(current.agent_session_open, Some(true));
+            assert_eq!(current.agent_close_pending, None);
+            assert!(events.iter().any(
+                |e| matches!(&e.event, EventKind::Notice { text } if text.contains("不会自动重发"))
+            ));
+            send(&mut client, &id, "followup", "after-stop").await;
+            let (current, events) = until(&mut client, &id, Status::Completed).await;
+            assert_eq!(current.agent_session_open, Some(true));
+            assert!(events.iter().any(
+                |e| matches!(&e.event, EventKind::Text { text } if text == "TRAE:after-stop")
+            ));
+        }
+        assert!(root.path().join("traex-interrupted").exists());
+        let inputs: Vec<serde_json::Value> =
+            std::fs::read_to_string(root.path().join("traex-inputs"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(
+            inputs[0]["pid"], inputs[1]["pid"],
+            "stopping a steered Traex turn must keep the native app-server process"
+        );
+    }
+}

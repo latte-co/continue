@@ -283,6 +283,9 @@ pub struct Claude {
     session_state: Option<String>,
     delegated: bool,
     last_result: Option<String>,
+    last_result_error: bool,
+    interrupting: bool,
+    interrupt_pending: bool,
     queued_inputs: HashMap<String, String>,
     consumed_inputs: HashSet<String>,
 }
@@ -439,8 +442,27 @@ impl AgentAdapter for Claude {
     fn background_close_complete(&self) -> bool {
         self.tasks.is_empty()
     }
+    fn close_exit_confirmed(&self, status: std::process::ExitStatus) -> bool {
+        status.success() || (self.last_result_error && status.code() == Some(1))
+    }
+    fn interrupt_requires_process_reset(&self) -> bool {
+        self.queued_inputs
+            .keys()
+            .any(|uuid| !self.consumed_inputs.contains(uuid))
+    }
     fn observe_close_output(&mut self, line: &str) -> Result<()> {
         let message: Value = serde_json::from_str(line)?;
+        if message["type"] == "result"
+            && message["parent_tool_use_id"]
+                .as_str()
+                .is_none_or(str::is_empty)
+        {
+            self.last_result_error = message["is_error"].as_bool().unwrap_or(false)
+                || message["subtype"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("error"));
+            return Ok(());
+        }
         // Only task lifecycle frames can settle a task. A control receipt
         // acknowledges the request, and unrelated output cannot restart a turn.
         if message["type"] == "system"
@@ -626,6 +648,8 @@ impl AgentAdapter for Claude {
                 if !matches!(self.phase, Phase::Running) {
                     return Ok(vec![Action::Interrupted]);
                 }
+                self.interrupting = true;
+                self.interrupt_pending = true;
                 Ok(vec![write_action(
                     json!({"type":"control_request","request_id":"latte-interrupt","request":{"subtype":"interrupt"}}),
                 )?])
@@ -857,6 +881,7 @@ impl Claude {
         if !self.has_background_work() && self.streamed_children.is_empty() {
             self.child_stream_overflow = false;
         }
+        self.interrupting = false;
         self.streamed = false;
         self.pending_skill_command = None;
         self.requested_skill_commands.clear();
@@ -1117,10 +1142,16 @@ impl Claude {
         }
         match m["type"].as_str().unwrap_or_default() {
             "control_response" if m["response"]["request_id"] == "latte-interrupt" => {
+                let pending = std::mem::take(&mut self.interrupt_pending);
                 if m["response"]["subtype"] != "success" {
-                    bail!("Claude 停止请求失败");
+                    if pending && matches!(self.phase, Phase::BetweenTurns) {
+                        output.push(Action::Interrupted);
+                    } else {
+                        bail!("Claude 停止请求失败");
+                    }
+                } else {
+                    output.push(Action::Interrupted);
                 }
-                output.push(Action::Interrupted);
             }
             "control_response" if m["response"]["request_id"] == "latte-init" => {
                 if m["response"]["subtype"] != "success" {
@@ -1557,12 +1588,13 @@ impl Claude {
                 if !failed && self.expected_side_id.is_some() && self.native_session_id.is_none() {
                     bail!("Claude 未确认独立的侧边聊天 ID");
                 }
+                let interrupting = std::mem::take(&mut self.interrupting);
                 let consumed: Vec<_> = self
                     .consumed_inputs
                     .drain()
                     .filter_map(|uuid| self.queued_inputs.remove(&uuid))
                     .collect();
-                if !consumed.is_empty() {
+                if !consumed.is_empty() && !interrupting {
                     output.push(Action::InputsConsumed(consumed));
                 }
                 if matches!(self.phase, Phase::BetweenTurns) {
@@ -1581,6 +1613,7 @@ impl Claude {
                     bail!("Claude 在初始化完成前返回了任务结果");
                 }
                 self.phase = Phase::BetweenTurns;
+                self.last_result_error = failed;
                 if let Some(context) = &mut self.context {
                     // CLI accounting uses the requested model; gateways may
                     // return an entirely different model name in API messages.
@@ -4317,5 +4350,129 @@ mod tests {
                 .unwrap()[0],
             Action::Finished { failed: true, .. }
         ));
+    }
+    #[test]
+    fn close_exit_confirmed_allows_exit_one_only_after_error_or_interrupted_result() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = |code: i32| std::process::ExitStatus::from_raw(code << 8);
+        let mut a = Claude::default();
+        assert!(a.close_exit_confirmed(status(0)));
+        assert!(!a.close_exit_confirmed(status(1)));
+        assert!(!a.close_exit_confirmed(status(2)));
+
+        a.advance(Input::Start { prompt: "work" }).unwrap();
+        message(&mut a, initialized()).unwrap();
+        message(
+            &mut a,
+            json!({"type":"result","subtype":"error_during_execution","is_error":true}),
+        )
+        .unwrap();
+        assert!(a.close_exit_confirmed(status(0)));
+        assert!(a.close_exit_confirmed(status(1)));
+        assert!(!a.close_exit_confirmed(status(2)));
+
+        // A later healthy turn clears the error-exit allowance.
+        a.advance(Input::Start { prompt: "ok" }).unwrap();
+        message(
+            &mut a,
+            json!({"type":"result","subtype":"success","is_error":false}),
+        )
+        .unwrap();
+        assert!(a.close_exit_confirmed(status(0)));
+        assert!(!a.close_exit_confirmed(status(1)));
+
+        // Child error results observed during close must not relax parent exit confirmation.
+        a.observe_close_output(
+            &json!({"type":"result","parent_tool_use_id":"child-1","is_error":true}).to_string(),
+        )
+        .unwrap();
+        assert!(!a.close_exit_confirmed(status(1)));
+
+        // Parent error result emitted by end_session during an active turn allows exit 1 only.
+        a.observe_close_output(
+            &json!({"type":"result","subtype":"error_during_execution","is_error":true})
+                .to_string(),
+        )
+        .unwrap();
+        assert!(a.close_exit_confirmed(status(1)));
+        assert!(!a.close_exit_confirmed(status(2)));
+    }
+    #[test]
+    fn forwarded_inputs_require_reset_only_while_unconsumed_and_interrupt_withholds_consumption() {
+        let mut a = Claude::default();
+        assert!(!a.interrupt_requires_process_reset());
+        a.advance(Input::Start { prompt: "head" }).unwrap();
+        message(&mut a, initialized()).unwrap();
+
+        let queued_a = encoded(
+            &a.advance(Input::Queue {
+                request_id: "q-1",
+                prompt: "follow-1",
+            })
+            .unwrap(),
+        );
+        let uuid_a = queued_a[0]["uuid"].as_str().unwrap().to_owned();
+        assert!(a.interrupt_requires_process_reset());
+
+        // Mid-turn replay marks the follow-up absorbed into the active turn.
+        message(
+            &mut a,
+            json!({"type":"user","isReplay":true,"uuid":uuid_a,"message":{"role":"user","content":"follow-1"}}),
+        )
+        .unwrap();
+        assert!(!a.interrupt_requires_process_reset());
+
+        let queued_b = encoded(
+            &a.advance(Input::Queue {
+                request_id: "q-2",
+                prompt: "follow-2",
+            })
+            .unwrap(),
+        );
+        let uuid_b = queued_b[0]["uuid"].as_str().unwrap().to_owned();
+        assert!(a.interrupt_requires_process_reset());
+
+        message(
+            &mut a,
+            json!({"type":"user","isReplay":true,"uuid":uuid_b,"message":{"role":"user","content":"follow-2"}}),
+        )
+        .unwrap();
+        assert!(!a.interrupt_requires_process_reset());
+
+        // Interrupting after replay must drain queued_inputs (so the next turn can
+        // start on the same process) without claiming InputsConsumed.
+        let interrupt_writes = encoded(&a.advance(Input::Interrupt).unwrap());
+        assert_eq!(interrupt_writes[0]["request"]["subtype"], "interrupt");
+        let finished = message(
+            &mut a,
+            json!({"type":"result","subtype":"error_during_execution","is_error":true}),
+        )
+        .unwrap();
+        assert!(
+            !finished
+                .iter()
+                .any(|action| matches!(action, Action::InputsConsumed(_))),
+            "interrupted turn must not claim forwarded inputs were consumed"
+        );
+        assert!(a.can_start_turn());
+
+        // Completion-won race: a late interrupt error after BetweenTurns settles as Interrupted.
+        let ack = message(
+            &mut a,
+            json!({"type":"control_response","response":{"request_id":"latte-interrupt","subtype":"error","error":"no active turn"}}),
+        )
+        .unwrap();
+        assert!(matches!(ack.as_slice(), [Action::Interrupted]));
+
+        // By contrast, an interrupt error while still running must fail explicitly.
+        a.advance(Input::Start { prompt: "next" }).unwrap();
+        a.advance(Input::Interrupt).unwrap();
+        assert!(
+            message(
+                &mut a,
+                json!({"type":"control_response","response":{"request_id":"latte-interrupt","subtype":"error","error":"busy"}}),
+            )
+            .is_err()
+        );
     }
 }

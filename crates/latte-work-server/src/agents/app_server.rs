@@ -2636,4 +2636,24 @@ mod tests {
         assert!(!agent.has_background_work());
         assert!(agent.can_reconfigure());
     }
+    #[test]
+    fn steer_never_requires_process_reset_on_interrupt() {
+        let mut agent = running();
+        assert!(!agent.interrupt_requires_process_reset());
+        let write = encoded(
+            &agent
+                .advance(Input::Queue {
+                    request_id: "q",
+                    prompt: "supplement",
+                })
+                .unwrap(),
+        )
+        .remove(0);
+        assert!(!agent.interrupt_requires_process_reset());
+        message(
+            &mut agent,
+            json!({"id":write["id"],"result":{"turnId":"turn"}}),
+        );
+        assert!(!agent.interrupt_requires_process_reset());
+    }
 }
