@@ -9,7 +9,9 @@ use super::{Action, AgentAdapter, AgentCommand, Input, TransportLifetime};
 use crate::providers::LaunchConfig;
 use anyhow::{Context, Result, bail};
 
-pub(crate) use metadata::{discover, models, permission_modes, validate_selection};
+pub(crate) use metadata::{
+    commands, discover, models, permission_modes, skill_info, validate_selection,
+};
 
 const NATIVE_FRAME_LIMIT: usize = 1024 * 1024;
 const PROMPT_ARG_LIMIT: usize = 128 * 1024;

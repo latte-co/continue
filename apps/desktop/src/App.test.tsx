@@ -16,6 +16,7 @@ import type { SidebarPreview } from "./useSidebarPreview";
 const mocks = vi.hoisted(() => ({
   state: {} as Workbench,
   drafts: undefined as DraftStore | undefined,
+  openConversationFile: undefined as ((path: string) => void) | undefined,
   workspaceSideChat: vi.fn(),
   queuedPredictionCapture: undefined as
     Workbench["captureQueuedPredictionRetirement"] | undefined,
@@ -47,12 +48,15 @@ vi.mock("./Sidebar", () => ({
 vi.mock("./Conversation", () => ({
   Conversation: ({
     drafts,
+    openFile,
     captureQueuedPredictionRetirement,
   }: {
     drafts: DraftStore;
+    openFile?: (path: string) => void;
     captureQueuedPredictionRetirement?: Workbench["captureQueuedPredictionRetirement"];
   }) => {
     mocks.drafts = drafts;
+    mocks.openConversationFile = openFile;
     mocks.queuedPredictionCapture = captureQueuedPredictionRetirement;
     return null;
   },
@@ -334,4 +338,56 @@ it("opens a creator draft on the requested host and preserves unsent text withou
     text: "保留已有草稿",
     skillCreator: true,
   });
+});
+
+it("requests Markdown preview mode only when opening Markdown files from the conversation", async () => {
+  const { readWorkspace } = await import("./workspaceState");
+  const workspaceId = crypto.randomUUID();
+  mocks.state = { ...mocks.state, workspaceId };
+  render(<App />);
+  act(() => mocks.openConversationFile?.("docs/Spec.MD"));
+  const mdTab = readWorkspace(workspaceId).tabs.find(
+    (tab) => tab.id === "files",
+  );
+  expect(mdTab).toMatchObject({
+    kind: "files",
+    file: "docs/Spec.MD",
+  });
+  expect(
+    mdTab?.kind === "files" ? typeof mdTab.markdownPreviewRequest : "none",
+  ).toBe("number");
+
+  act(() => mocks.openConversationFile?.("src/lib.rs"));
+  const codeTab = readWorkspace(workspaceId).tabs.find(
+    (tab) => tab.id === "files",
+  );
+  expect(codeTab).toMatchObject({
+    kind: "files",
+    file: "src/lib.rs",
+  });
+  expect(
+    codeTab?.kind === "files" ? codeTab.markdownPreviewRequest : undefined,
+  ).toBeUndefined();
+});
+
+it("hides the main topbar workspace toggle when the right workspace panel is open", () => {
+  const view = render(<App />);
+  const expandBtn = screen.getByRole("button", { name: "展开工作区" });
+  expect(expandBtn.closest(".topbar-actions")).toBeTruthy();
+  expect(document.querySelectorAll(".topbar .titlebar-divider")).toHaveLength(
+    1,
+  );
+  fireEvent.click(expandBtn);
+  expect(mocks.state.setPanel).toHaveBeenCalledWith(true);
+
+  mocks.state = { ...mocks.state, panel: true };
+  view.rerender(<App />);
+  expect(
+    within(document.querySelector(".topbar-actions")!).queryByRole("button", {
+      name: /工作区/,
+    }),
+  ).toBeNull();
+  expect(document.querySelectorAll(".topbar .titlebar-divider")).toHaveLength(
+    0,
+  );
 });

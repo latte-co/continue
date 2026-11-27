@@ -23,7 +23,9 @@ cookie store and loopback HTTP fixture, without browsing, login state or model c
 generated protocol types, Clippy, workflow/shell scripts, the frontend build,
 and Rustdoc. `make setup` uses public npm registry URLs recorded in the lockfile.
 
-GitHub Actions runs host check/Clippy, UT, final-binary E2E, and release builds
+GitHub Actions runs host check/Clippy, UT, final-binary E2E (partitioned into
+concurrent deterministic shards via `scripts/run-e2e-shard.py`, each keeping
+`--test-threads=1` inside its isolated runner), and release builds
 on Linux and macOS. Frontend UT/build runs on Linux, macOS, and Windows;
 Windows also checks, lints, and tests the portable Rust protocol and client.
 The server uses Unix sockets and process groups, so Windows CI does not claim
@@ -901,8 +903,10 @@ on each token, and Markdown fences are stripped in a linear line scan. TodoWrite
 replaces its own snapshot while retaining TaskCreate records. Branch reviews are
 read on opening, settlement and explicit refresh, independent of streamed tool
 activity. Confirmed non-Git directories return `not_git_repository` through the
-existing error envelope; Task Summary shows a disabled branch row without a status
-alert or invented zero totals. Resources, tools and non-Git turn snapshots remain
+existing error envelope; Task Overview, Task Summary and Changes stay silent without a status
+alert or invented zero totals, and bounded `git_repositories` discovery lets umbrella workspaces
+inspect contained child repositories, initialized submodules and `.worktree` / `.oh-my-code/worktree`
+linked worktrees via optional `repo_path`. Resources, tools and non-Git turn snapshots remain
 available. Other Git failures stay actionable, including incomplete `.git` markers.
 The desktop retains Server error codes; older remote Servers must update to provide
 this distinction. The lightweight source inventory refreshes at most once every
@@ -2172,7 +2176,10 @@ old claim cannot be mistaken for an unowned legacy request or steal a newer owne
 A superseded claim fails before execution and never implicitly reclaims or replays
 the request. Adopted resources are already active and do not reserve a future open.
 Earlier overlapping turns remain protected. Side chats accept direct messages
-without native steering or a message queue.
+without native steering or a message queue, generate a friendly title once after
+their first completed turn through the shared title pipeline, and retain bounded
+in-memory transcript and reading-position state per App run (invalidated when
+the host daemon identity changes).
 If native close itself was unconfirmed, users can verify the process and its
 work on the execution host, then call `ConfirmAgentClosed` with the recorded
 close ID. This works for main and side chats after Server restart, and the

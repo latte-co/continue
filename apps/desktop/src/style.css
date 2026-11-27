@@ -1241,6 +1241,9 @@ button.recent-notice {
   font-size: var(--text-xs);
   color: var(--color-text-muted);
 }
+.composer-menu-option .composer-command-badge {
+  flex: none;
+}
 .composer-command-menu {
   max-height: min(296px, 40vh);
 }
@@ -1806,6 +1809,38 @@ button.recent-notice {
 }
 .composer-link-pill-label {
   max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-command-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 1px;
+  padding: 0 4px;
+  border-radius: var(--radius-badge);
+  color: color-mix(in oklab, var(--color-unread) 86%, var(--color-text));
+  font-weight: 500;
+  line-height: 1.45;
+  vertical-align: baseline;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color var(--duration-fast) ease;
+}
+.composer-command-pill:hover {
+  background: var(--color-hover);
+}
+.composer-command-pill.is-selected {
+  background: var(--color-focus-background);
+  outline: 1px solid var(--color-unread);
+}
+.composer-command-pill > svg {
+  flex: none;
+  opacity: 0.92;
+}
+.composer-command-pill-label {
+  max-width: 280px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3576,6 +3611,7 @@ button.recent-notice {
 }
 .workspace-reference-content > p,
 .workspace-reference-content > button {
+  align-self: flex-start;
   margin: var(--space-2) var(--space-3);
 }
 .workspace-file-tree {
@@ -5794,19 +5830,24 @@ button.task-info-row:not(:disabled):hover,
 }
 .source-image-preview {
   display: block;
+  flex-shrink: 0;
   max-width: 100%;
   max-height: 65vh;
   object-fit: contain;
   margin: var(--space-3) auto;
 }
 .source-video-preview {
+  flex-shrink: 0;
   width: 100%;
   max-height: 65vh;
 }
 .source-pdf-preview {
-  width: 100%;
-  height: 65vh;
-  border: 0;
+  width: calc(100% - var(--space-6));
+  max-width: 820px;
+  height: auto;
+  max-height: none;
+  background: #fff;
+  border-radius: var(--radius-control);
 }
 .change-scope-switch {
   display: flex;
@@ -6054,6 +6095,18 @@ button.task-info-row:not(:disabled):hover,
   border: 0;
   box-shadow: none;
   background: transparent;
+}
+.git-review-repo-select .select-trigger {
+  max-width: 220px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-hover);
+  font-size: var(--text-sm);
+}
+.git-review-repo-select .select-trigger > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .git-review-comparison .select-trigger > span {
   overflow: hidden;
@@ -7038,6 +7091,17 @@ button.task-info-row:not(:disabled):hover,
   flex-direction: column;
   min-height: 0;
   margin-bottom: 0;
+}
+.side-chat-transcript-wrap {
+  position: relative;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+.side-chat-transcript-wrap > .return-latest {
+  bottom: var(--space-2);
+  z-index: 2;
 }
 .side-chat-transcript {
   flex: 1;

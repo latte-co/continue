@@ -53,6 +53,81 @@ for line in sys.stdin:
         pass
     elif method == 'config/read':
         reply(value, {'config': {'model_provider': 'fixture-native', 'model': 'seed-test', 'developer_instructions': 'FIXTURE_NATIVE_DEVELOPER_INSTRUCTIONS'}})
+    elif method == 'skills/list':
+        cwds = params.get('cwds') or [os.getcwd()]
+        cwd_path = pathlib.Path(cwds[0])
+        skills = [
+            {
+                'name': 'fixture-traex-skill',
+                'description': 'Full Traex skill body description',
+                'shortDescription': 'Traex 技能说明',
+                'interface': {'displayName': 'Traex 技能'},
+                'path': str((cwd_path / '.agents/skills/fixture-traex-skill/SKILL.md').resolve()),
+                'scope': 'repo',
+                'enabled': True,
+            },
+            {
+                'name': 'disabled-traex-skill',
+                'description': 'Disabled skill',
+                'path': str((cwd_path / '.agents/skills/disabled/SKILL.md').resolve()),
+                'scope': 'repo',
+                'enabled': False,
+            },
+        ]
+        skill_roots = [cwd_path / '.traex/skills', cwd_path / '.trae/skills', cwd_path / '.agents/skills', cwd_path / '.codex/skills']
+        traex_home = os.environ.get('TRAEX_HOME')
+        codex_home = os.environ.get('CODEX_HOME')
+        home_dir = os.environ.get('HOME')
+        if traex_home:
+            skill_roots.append(pathlib.Path(traex_home) / 'skills')
+        elif home_dir:
+            for rel in ('.trae/skills', '.traex/skills'):
+                skill_roots.append(pathlib.Path(home_dir) / rel)
+        effective_codex_home = pathlib.Path(codex_home) if codex_home else (pathlib.Path(home_dir) / '.codex' if home_dir else None)
+        if effective_codex_home:
+            skill_roots.append(effective_codex_home / 'skills')
+        if home_dir:
+            skill_roots.append(pathlib.Path(home_dir) / '.agents/skills')
+        disabled_paths = set()
+        if effective_codex_home and (effective_codex_home / 'config.toml').is_file():
+            cur_path, cur_enabled = None, None
+            for raw_line in (effective_codex_home / 'config.toml').read_text().splitlines():
+                stripped = raw_line.split('#', 1)[0].strip()
+                if stripped.startswith('['):
+                    if cur_path is not None and cur_enabled is not None:
+                        if not cur_enabled:
+                            disabled_paths.add(cur_path)
+                        else:
+                            disabled_paths.discard(cur_path)
+                    cur_path, cur_enabled = None, None
+                elif stripped.startswith('path') and '=' in stripped:
+                    val = stripped.split('=', 1)[1].strip().strip('"').strip("'")
+                    cur_path = str(pathlib.Path(val).resolve())
+                elif stripped.startswith('enabled') and '=' in stripped:
+                    val = stripped.split('=', 1)[1].strip()
+                    cur_enabled = (val == 'true')
+            if cur_path is not None and cur_enabled is not None:
+                if not cur_enabled:
+                    disabled_paths.add(cur_path)
+                else:
+                    disabled_paths.discard(cur_path)
+        for skills_root in skill_roots:
+            if skills_root.is_dir():
+                for child in sorted(skills_root.iterdir()):
+                    skill_md = child / 'SKILL.md'
+                    if skill_md.is_file():
+                        resolved_md = str(skill_md.resolve())
+                        is_enabled = resolved_md not in disabled_paths
+                        if any(s['name'] == child.name and s['enabled'] for s in skills):
+                            continue
+                        skills.append({
+                            'name': child.name,
+                            'description': f'Discovered skill {child.name}',
+                            'path': resolved_md,
+                            'scope': 'user' if skills_root.parent != cwd_path else 'repo',
+                            'enabled': is_enabled,
+                        })
+        reply(value, {'data': [{'cwd': str(cwd_path), 'skills': skills, 'errors': []}]})
     elif method == 'model/list':
         reply(value, {'data': [{'id': 'seed-test', 'displayName': 'Seed Test', 'isDefault': True, 'supportedReasoningEfforts': [{'reasoningEffort': 'high'}]},
             {'id': 'gpt-test', 'displayName': 'GPT Test', 'supportedReasoningEfforts': [{'reasoningEffort': 'high'}],
@@ -108,16 +183,47 @@ for line in sys.stdin:
                 while not pathlib.Path('title-release').exists() and time.monotonic() < deadline:
                     time.sleep(.02)
             notify('thread/name/generated', {'turnId': 'unrelated-request', 'name': 'wrong'})
-            notify('thread/name/generated', {'turnId': 'latte-generate-title', 'name': '' if prompt == 'native-auto-title-empty' else '修复附件拖入失败'})
+            generated_name = (
+                ''
+                if prompt == 'native-auto-title-empty'
+                else 'Side generated title'
+                if prompt == 'native-auto-title-side'
+                else '修复附件拖入失败'
+            )
+            notify('thread/name/generated', {'turnId': 'latte-generate-title', 'name': generated_name})
             pathlib.Path('title-response').write_text('sent')
         threading.Thread(target=finish_title, daemon=True).start()
     elif method == 'thread/name/set':
         notify('thread/name/updated', {'threadName': params['name']})
         reply(value, {})
+    elif method == 'thread/compact/start':
+        assert params['threadId'] == thread
+        count += 1
+        turn = 'turn-' + str(count)
+        with pathlib.Path('traex-inputs').open('a') as record:
+            record.write(json.dumps({'prompt': '/compact', 'params': params, 'pid': os.getpid()}) + '\n')
+        notify('turn/started', {'turn': {'id': turn, 'status': 'inProgress'}})
+        reply(value, {})
+        notify('item/completed', {'item': {'id': 'compact-' + turn, 'type': 'contextCompaction'}})
+        notify('thread/compacted', {})
+        complete()
+    elif method == 'review/start':
+        assert params['threadId'] == thread and params.get('delivery') == 'inline'
+        count += 1
+        turn = 'turn-' + str(count)
+        with pathlib.Path('traex-inputs').open('a') as record:
+            record.write(json.dumps({'prompt': '/review', 'params': params, 'pid': os.getpid()}) + '\n')
+        notify('turn/started', {'turn': {'id': turn, 'status': 'inProgress'}})
+        reply(value, {'turn': {'id': turn, 'status': 'inProgress'}, 'reviewThreadId': thread})
+        notify('item/started', {'item': {'id': 'review-' + turn, 'type': 'enteredReviewMode', 'review': 'current changes'}})
+        notify('item/completed', {'item': {'id': 'review-' + turn, 'type': 'exitedReviewMode',
+                                          'review': 'TRAE_REVIEW:' + json.dumps(params['target'], sort_keys=True, ensure_ascii=False)}})
+        complete()
     elif method == 'turn/start':
         count += 1
         turn = 'turn-' + str(count)
-        prompt = params['input'][0]['text']
+        skill_item = params['input'][0] if params['input'][0]['type'] == 'skill' else None
+        prompt = params['input'][1]['text'] if skill_item else params['input'][0]['text']
         title_prompt = prompt
         assert params['threadId'] == thread
         with pathlib.Path('traex-inputs').open('a') as record:
@@ -129,6 +235,11 @@ for line in sys.stdin:
             continue
         notify('turn/started', {'turn': {'id': turn, 'status': 'inProgress'}})
         reply(value, {'turn': {'id': turn, 'status': 'inProgress'}})
+        if skill_item is not None:
+            notify('item/completed', {'item': {'id': 'user-' + turn, 'type': 'userMessage', 'content': params['input']}})
+            text(f"TRAE:SKILL:{skill_item['name']}:{prompt}")
+            complete()
+            continue
         if prompt == 'eof':
             sys.exit(0)
         if prompt in ('approval', 'question'):
@@ -191,14 +302,19 @@ for line in sys.stdin:
             complete()
     elif method == 'turn/steer':
         assert params['threadId'] == thread and params['expectedTurnId'] == turn
-        extra=params['input'][0]['text']
+        skill_item = params['input'][0] if params['input'][0]['type'] == 'skill' else None
+        extra = params['input'][1]['text'] if skill_item else params['input'][0]['text']
         with pathlib.Path('traex-steers').open('a') as record:
             record.write(json.dumps({'prompt':extra,'params':params,'pid':os.getpid()})+'\n')
         if extra == 'reject-steer':
             emit({'id':value['id'],'error':{'code':-32602,'message':'current turn cannot accept steering'}})
         else:
             reply(value,{'turnId':turn})
-            if extra != 'hold-steer':
+            if skill_item is not None:
+                notify('item/completed', {'item': {'id': 'user-steer-' + turn, 'type': 'userMessage', 'content': params['input']}})
+                text(f"STEER:SKILL:{skill_item['name']}:{extra}")
+                complete()
+            elif extra != 'hold-steer':
                 text('STEER:'+extra)
                 complete()
     elif method == 'turn/interrupt':

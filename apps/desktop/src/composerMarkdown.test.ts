@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import {
+  type ComposerCommandTokenMeta,
   hasRichComposerMarkdown,
   htmlToComposerMarkdown,
   parseMarkdownToDoc,
@@ -143,6 +144,52 @@ describe("parseMarkdownToDoc", () => {
           mimeType: null,
         },
       },
+    ]);
+  });
+
+  it("parses recognized command and skill tokens into commandPill nodes while keeping active triggers and paths plain", () => {
+    const commands = new Map<string, ComposerCommandTokenMeta>([
+      [
+        "doc-coauthoring",
+        { name: "doc-coauthoring", icon: "skill", title: "Doc Coauthoring" },
+      ],
+      ["compact", { name: "compact", icon: "command", title: "压缩上下文" }],
+    ]);
+    expect(hasRichComposerMarkdown("/doc-coauthoring", commands, 0)).toBe(
+      false,
+    );
+    expect(hasRichComposerMarkdown("/doc-coauthoring ", commands, null)).toBe(
+      true,
+    );
+    expect(hasRichComposerMarkdown("/tmp/file 请检查", commands, null)).toBe(
+      false,
+    );
+
+    const doc = parseMarkdownToDoc(
+      "/doc-coauthoring /compact /doc-coauthoring",
+      [],
+      commands,
+      26,
+    );
+    expect(doc.content?.[0]?.content).toEqual([
+      {
+        type: "commandPill",
+        attrs: {
+          name: "doc-coauthoring",
+          icon: "skill",
+          title: "Doc Coauthoring",
+        },
+      },
+      { type: "text", text: " " },
+      {
+        type: "commandPill",
+        attrs: {
+          name: "compact",
+          icon: "command",
+          title: "压缩上下文",
+        },
+      },
+      { type: "text", text: " /doc-coauthoring" },
     ]);
   });
 });

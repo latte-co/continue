@@ -2528,7 +2528,9 @@ async fn terminal_pty_cwd_resize_unicode_reconnect_interrupt_and_exit() {
                     project_id: project_id.clone(),
                     terminal_id: id.clone(),
                     cols: 80,
-                    rows: 24
+                    rows: 24,
+                    session_id: None,
+                    repo_path: None,
                 }
             )
             .await,
@@ -2659,6 +2661,8 @@ async fn terminal_close_kills_shell_that_ignores_hangup() {
                 terminal_id: id.clone(),
                 cols: 80,
                 rows: 24,
+                session_id: None,
+                repo_path: None,
             }
         )
         .await,
@@ -2712,7 +2716,9 @@ async fn terminal_limits_project_isolation_and_close_foreground_process() {
                     project_id: project,
                     terminal_id: id.clone(),
                     cols,
-                    rows: 24
+                    rows: 24,
+                    session_id: None,
+                    repo_path: None,
                 }
             )
             .await,
@@ -2726,7 +2732,9 @@ async fn terminal_limits_project_isolation_and_close_foreground_process() {
                 project_id: project_id.clone(),
                 terminal_id: id.clone(),
                 cols: 80,
-                rows: 24
+                rows: 24,
+                session_id: None,
+                repo_path: None,
             }
         )
         .await,
@@ -2739,7 +2747,9 @@ async fn terminal_limits_project_isolation_and_close_foreground_process() {
                 project_id: other_id.clone(),
                 terminal_id: id.clone(),
                 cols: 80,
-                rows: 24
+                rows: 24,
+                session_id: None,
+                repo_path: None,
             }
         )
         .await,
@@ -2798,6 +2808,8 @@ async fn terminal_limits_project_isolation_and_close_foreground_process() {
             terminal_id: id.clone(),
             cols: 80,
             rows: 24,
+            session_id: None,
+            repo_path: None,
         },
     )
     .await;
@@ -2820,6 +2832,8 @@ async fn terminal_daemon_shutdown_cleans_up_and_restart_never_replays() {
             terminal_id: id.clone(),
             cols: 80,
             rows: 24,
+            session_id: None,
+            repo_path: None,
         },
     )
     .await;
@@ -2977,7 +2991,9 @@ async fn upgrade_refuses_tasks_and_terminals_then_drains_existing_clients() {
                 project_id,
                 terminal_id: terminal_id.clone(),
                 cols: 80,
-                rows: 24
+                rows: 24,
+                session_id: None,
+                repo_path: None,
             }
         )
         .await,
@@ -3389,7 +3405,9 @@ async fn busy_server_with_one_pending_close_releases_other_owned_processes() {
                     project_id: project_id.clone(),
                     terminal_id: id.clone(),
                     cols: 80,
-                    rows: 24
+                    rows: 24,
+                    session_id: None,
+                    repo_path: None,
                 }
             )
             .await,
@@ -3759,6 +3777,188 @@ async fn agent_commands_discovery_dispatch_resume_and_unsupported_are_native() {
     assert!(!events.iter().any(
         |event| matches!(&event.event, EventKind::Text { text } if text.contains("not-supported"))
     ));
+}
+
+#[tokio::test]
+async fn app_server_commands_and_skills_discover_and_execute_natively_for_codex_and_traex() {
+    let host = Host::start().await;
+    let mut client = host.client().await;
+    let folder = tempfile::tempdir().unwrap();
+    let codex_skill = folder.path().join(".codex/skills/repo-codex-skill");
+    let traex_skill = folder.path().join(".agents/skills/shared-agent-skill");
+    std::fs::create_dir_all(&codex_skill).unwrap();
+    std::fs::create_dir_all(&traex_skill).unwrap();
+    std::fs::write(
+        codex_skill.join("SKILL.md"),
+        "---\nname: 仓库 Codex 技能\ndescription: 仓库级 Codex 技能说明\n---\n步骤\n",
+    )
+    .unwrap();
+    std::fs::write(
+        traex_skill.join("SKILL.md"),
+        "---\nname: 共享 Agent 技能\ndescription: 共享技能说明\n---\n步骤\n",
+    )
+    .unwrap();
+    let project_id = terminal_project(&mut client, folder.path()).await;
+
+    for (agent, builtin_skill, builtin_label, repo_slug) in [
+        (
+            "codex",
+            "fixture-codex-skill",
+            "Codex 技能",
+            "repo-codex-skill",
+        ),
+        (
+            "traex",
+            "fixture-traex-skill",
+            "Traex 技能",
+            "shared-agent-skill",
+        ),
+    ] {
+        let response = ask(
+            &mut client,
+            Request::AgentCommands {
+                agent: agent.into(),
+                project_id: project_id.clone(),
+                provider: Some(latte_work_protocol::TurnProvider::Cli),
+            },
+        )
+        .await;
+        match response {
+            Response::AgentCommands { commands } => {
+                assert!(commands.iter().any(|c| {
+                    c.name == "compact"
+                        && c.kind == Some(latte_work_protocol::AgentCommandKind::Command)
+                }));
+                assert!(commands.iter().any(|c| {
+                    c.name == "review"
+                        && c.kind == Some(latte_work_protocol::AgentCommandKind::Command)
+                }));
+                assert!(commands.iter().any(|c| {
+                    c.name == builtin_skill
+                        && c.display_name.as_deref() == Some(builtin_label)
+                        && c.kind == Some(latte_work_protocol::AgentCommandKind::Skill)
+                }));
+                assert!(commands.iter().any(|c| {
+                    c.name == repo_slug
+                        && c.kind == Some(latte_work_protocol::AgentCommandKind::Skill)
+                }));
+                assert!(!commands.iter().any(|c| c.name.starts_with("disabled-")));
+            }
+            other => panic!("unexpected {agent} commands: {other:?}"),
+        }
+    }
+    assert!(!folder.path().join("codex-inputs").exists());
+    assert!(!folder.path().join("traex-inputs").exists());
+
+    for (agent, skill_slug, expected_skill_title, builtin_skill, prefix, review_prefix) in [
+        (
+            "codex",
+            "repo-codex-skill",
+            "仓库 Codex 技能",
+            "fixture-codex-skill",
+            "CODEX:SKILL:fixture-codex-skill:$fixture-codex-skill 检查 @README.md",
+            "CODEX_REVIEW:",
+        ),
+        (
+            "traex",
+            "shared-agent-skill",
+            "共享 Agent 技能",
+            "fixture-traex-skill",
+            "TRAE:SKILL:fixture-traex-skill:$fixture-traex-skill 检查 @README.md",
+            "TRAE_REVIEW:",
+        ),
+    ] {
+        let Response::Session { session } = ask(
+            &mut client,
+            Request::CreateSession {
+                project_id: project_id.clone(),
+                agent: agent.into(),
+            },
+        )
+        .await
+        else {
+            panic!("create {agent} session");
+        };
+        let id = session.id;
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::SkillInfo {
+                    provider: None,
+                    session_id: id.clone(),
+                    name: skill_slug.into(),
+                }
+            )
+            .await,
+            Response::SkillInfo { skill: Some(info) } if info.name == expected_skill_title
+        ));
+
+        let dispatch = |req_id: &str, text: &str| Request::Send {
+            session_id: id.clone(),
+            request_id: format!("{agent}-{req_id}"),
+            text: text.into(),
+            model: None,
+            effort: None,
+            permission_mode: None,
+            provider: Some(latte_work_protocol::TurnProvider::Cli),
+        };
+
+        let res = ask(
+            &mut client,
+            dispatch("run-skill", &format!("/{builtin_skill} 检查 @README.md")),
+        )
+        .await;
+        assert!(
+            matches!(res, Response::Accepted { duplicate: false }),
+            "{agent} run-skill: {res:?}"
+        );
+        let events = wait(&mut client, &id, Status::Completed).await;
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            EventKind::Notice { text } if text == &format!("已加载 Skill：{builtin_skill}")
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.event, EventKind::Text { text } if text == prefix))
+        );
+
+        assert!(matches!(
+            ask(&mut client, dispatch("run-compact", "/compact")).await,
+            Response::Accepted { duplicate: false }
+        ));
+        let events = wait(&mut client, &id, Status::Completed).await;
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            EventKind::Notice { text } if text == "已压缩会话上下文。"
+        )));
+
+        assert!(matches!(
+            ask(
+                &mut client,
+                dispatch("run-review", "/review 重点检查错误处理")
+            )
+            .await,
+            Response::Accepted { duplicate: false }
+        ));
+        let events = wait(&mut client, &id, Status::Completed).await;
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            EventKind::Text { text }
+                if text.starts_with(review_prefix) && text.contains("重点检查错误处理")
+        )));
+
+        assert!(matches!(
+            ask(&mut client, dispatch("run-unsupported", "/not-a-command")).await,
+            Response::Accepted { duplicate: false }
+        ));
+        let events = wait(&mut client, &id, Status::Failed).await;
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            EventKind::State { status: Status::Failed, message: Some(msg) }
+                if msg.contains("不支持命令 /not-a-command")
+        )));
+    }
 }
 
 #[tokio::test]
@@ -4680,7 +4880,9 @@ async fn native_idle_shutdown_preserves_busy_terminal_then_exits_after_close() {
                 project_id,
                 terminal_id: id.clone(),
                 cols: 80,
-                rows: 24
+                rows: 24,
+                session_id: None,
+                repo_path: None,
             }
         )
         .await,
@@ -6023,6 +6225,8 @@ async fn turn_changes_freeze_each_request_and_undo_rejects_conflicts_then_reconc
             terminal_id: terminal_id.clone(),
             cols: 80,
             rows: 24,
+            session_id: None,
+            repo_path: None,
         },
     )
     .await;
@@ -6135,6 +6339,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
         &mut client,
         Request::GitInfo {
             project_id: project.id.clone(),
+            repo_path: None,
         },
     )
     .await
@@ -6152,6 +6357,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
             project_id: project.id.clone(),
             scope: GitReviewScope::Branch,
             base: None,
+            repo_path: None,
         },
     )
     .await
@@ -6169,6 +6375,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
             project_id: project.id.clone(),
             head: None,
             offset: 0,
+            repo_path: None,
         },
     )
     .await
@@ -6184,6 +6391,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
             project_id: project.id.clone(),
             scope: GitReviewScope::Commit,
             base: Some(commits[0].oid.clone()),
+            repo_path: None,
         },
     )
     .await
@@ -6199,6 +6407,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
             project_id: project.id.clone(),
             scope: GitReviewScope::Commit,
             base: Some(commits[1].oid.clone()),
+            repo_path: None,
         },
     )
     .await
@@ -6207,7 +6416,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
     };
     assert!(root_commit.base.is_none());
     assert!(
-        matches!(ask(&mut client, Request::GitReviewDiff { project_id: project.id.clone(), scope: GitReviewScope::Commit, base: None, head: root_commit.head, path: "file.txt".into(), full_context: false }).await, Response::Content { text, .. } if text.contains("+original"))
+        matches!(ask(&mut client, Request::GitReviewDiff { project_id: project.id.clone(), scope: GitReviewScope::Commit, base: None, head: root_commit.head, path: "file.txt".into(), full_context: false, repo_path: None }).await, Response::Content { text, .. } if text.contains("+original"))
     );
     let mut reconnect = host.client().await;
     run(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
@@ -6218,6 +6427,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
         head: review.head.clone(),
         path: path.into(),
         full_context: false,
+        repo_path: None,
     };
     assert!(
         matches!(ask(&mut reconnect,request("file.txt")).await,Response::Content{text,truncated:false} if text.contains("+committed")&&!text.contains("+working"))
@@ -6232,6 +6442,7 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
             project_id: project.id.clone(),
             scope: GitReviewScope::Worktree,
             base: None,
+            repo_path: None,
         },
     )
     .await
@@ -6245,7 +6456,8 @@ async fn git_review_wire_preserves_scope_and_branch_snapshot_after_reconnect() {
             Request::GitReview {
                 project_id: project.id,
                 scope: GitReviewScope::Branch,
-                base: Some("--output=/tmp/escape".into())
+                base: Some("--output=/tmp/escape".into()),
+                repo_path: None,
             }
         )
         .await,
@@ -6780,6 +6992,7 @@ async fn skill_metadata_is_host_local_read_only_and_preview_requires_explicit_re
     let Response::SkillInfo { skill: Some(info) } = ask(
         &mut client,
         Request::SkillInfo {
+            provider: None,
             session_id: session.id.clone(),
             name: "fixture-review".into(),
         },
@@ -6867,6 +7080,7 @@ async fn skill_metadata_is_host_local_read_only_and_preview_requires_explicit_re
         ask(
             &mut client,
             Request::SkillInfo {
+                provider: None,
                 session_id: session.id.clone(),
                 name: "../../secret".into()
             }
@@ -8670,6 +8884,7 @@ async fn non_git_summary_error_is_typed_without_disabling_project_reads() {
                 project_id: project.id.clone(),
                 scope: GitReviewScope::Branch,
                 base: None,
+                repo_path: None,
             },
         )
         .await
@@ -8695,9 +8910,10 @@ async fn non_git_summary_error_is_typed_without_disabling_project_reads() {
     match ask(
         &mut client,
         Request::GitReview {
-            project_id: project.id,
+            project_id: project.id.clone(),
             scope: GitReviewScope::Branch,
             base: None,
+            repo_path: None,
         },
     )
     .await
@@ -8705,6 +8921,127 @@ async fn non_git_summary_error_is_typed_without_disabling_project_reads() {
         Response::Error { code, .. } => assert_eq!(code, "request_failed"),
         response => panic!("unexpected: {response:?}"),
     }
+
+    // Multi-repo non-Git umbrella directory exposes child repos and worktrees cleanly.
+    let umbrella = tempfile::tempdir().unwrap();
+    let child_repo = umbrella.path().join("continue");
+    std::fs::create_dir_all(&child_repo).unwrap();
+    let git = |cwd: &std::path::Path, args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    git(&child_repo, &["init", "-q", "-b", "main"]);
+    git(&child_repo, &["config", "user.name", "Fixture"]);
+    git(
+        &child_repo,
+        &["config", "user.email", "fixture@example.test"],
+    );
+    std::fs::write(child_repo.join("README.md"), "v1\n").unwrap();
+    git(&child_repo, &["add", "."]);
+    git(&child_repo, &["commit", "-qm", "init"]);
+    let wt_dir = umbrella
+        .path()
+        .join(".oh-my-code/worktree/continue/feat-branch");
+    std::fs::create_dir_all(wt_dir.parent().unwrap()).unwrap();
+    git(
+        &child_repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/branch",
+            wt_dir.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    std::fs::write(wt_dir.join("README.md"), "v2\n").unwrap();
+    git(&wt_dir, &["add", "."]);
+    git(&wt_dir, &["commit", "-qm", "feat change"]);
+
+    let Response::Project {
+        project: umbrella_project,
+    } = ask(
+        &mut client,
+        Request::AddProject {
+            path: umbrella.path().to_string_lossy().into(),
+            name: None,
+        },
+    )
+    .await
+    else {
+        panic!("umbrella project")
+    };
+    let Response::GitRepositories {
+        repositories,
+        truncated: false,
+    } = ask(
+        &mut client,
+        Request::GitRepositories {
+            project_id: umbrella_project.id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("expected git_repositories")
+    };
+    assert_eq!(repositories.len(), 2);
+    assert_eq!(repositories[0].path, "continue");
+    assert_eq!(
+        repositories[1].path,
+        ".oh-my-code/worktree/continue/feat-branch"
+    );
+
+    let wt_path = Some(".oh-my-code/worktree/continue/feat-branch".to_owned());
+    let Response::GitInfo { info: wt_info } = ask(
+        &mut client,
+        Request::GitInfo {
+            project_id: umbrella_project.id.clone(),
+            repo_path: wt_path.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("expected child git_info")
+    };
+    assert_eq!(wt_info.branch.as_deref(), Some("feat/branch"));
+
+    let Response::GitReview { review: wt_review } = ask(
+        &mut client,
+        Request::GitReview {
+            project_id: umbrella_project.id.clone(),
+            scope: GitReviewScope::Branch,
+            base: Some("refs/heads/main".into()),
+            repo_path: wt_path.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("expected child git_review")
+    };
+    assert_eq!((wt_review.added, wt_review.removed), (1, 1));
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::GitReviewDiff {
+                project_id: umbrella_project.id,
+                scope: GitReviewScope::Branch,
+                base: wt_review.base,
+                head: wt_review.head,
+                path: "README.md".into(),
+                full_context: false,
+                repo_path: wt_path,
+            },
+        )
+        .await,
+        Response::Content { text, .. } if text.contains("+v2")
+    ));
 }
 
 #[tokio::test]
@@ -9839,6 +10176,8 @@ async fn update_project_directory_guards_terminals_and_preserves_claude_resume_f
                 terminal_id: term_id.clone(),
                 cols: 80,
                 rows: 24,
+                session_id: None,
+                repo_path: None,
             },
         )
         .await,
@@ -10052,6 +10391,8 @@ async fn update_project_directory_guards_terminals_and_preserves_claude_resume_f
                 terminal_id: hidden_term_id.clone(),
                 cols: 80,
                 rows: 24,
+                session_id: None,
+                repo_path: None,
             },
         )
         .await,
@@ -10219,4 +10560,497 @@ async fn default_state_dir_uses_latte_continue_data_under_home() {
     drop(client);
     let _ = server_proc.kill();
     let _ = server_proc.wait();
+}
+
+#[tokio::test]
+async fn terminal_opens_in_active_agent_worktree_across_all_agents_and_falls_back_cleanly() {
+    use serde_json::json;
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_git(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        run_git(dir, &["init", "-q", "-b", "main"]);
+        run_git(dir, &["config", "user.name", "Fixture"]);
+        run_git(dir, &["config", "user.email", "fixture@example.test"]);
+        std::fs::write(dir.join("README.md"), "# fixture\n").unwrap();
+        run_git(dir, &["add", "."]);
+        run_git(dir, &["commit", "-qm", "initial"]);
+    }
+
+    let host = Host::start().await;
+    let mut client = host.client().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+
+    let repo_continue = workspace.path().join("continue");
+    let repo_code = workspace.path().join("latte-code");
+    init_git(&repo_continue);
+    init_git(&repo_code);
+
+    let internal_wt = workspace
+        .path()
+        .join(".oh-my-code/worktree/continue/fix-ux");
+    std::fs::create_dir_all(internal_wt.parent().unwrap()).unwrap();
+    run_git(
+        &repo_continue,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "fix/ux",
+            internal_wt.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+
+    let external_wt = external.path().join("codex-ext-wt");
+    run_git(
+        &repo_continue,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/ext",
+            external_wt.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+
+    let canonical_workspace = workspace.path().canonicalize().unwrap();
+    let canonical_internal_wt = internal_wt.canonicalize().unwrap();
+    let canonical_external_wt = external_wt.canonicalize().unwrap();
+    let canonical_code = repo_code.canonicalize().unwrap();
+
+    let project_id = terminal_project(&mut client, workspace.path()).await;
+
+    async fn make_session(client: &mut Client, project_id: &str, agent: &str) -> String {
+        let Response::Session { session } = ask(
+            client,
+            Request::CreateSession {
+                project_id: project_id.into(),
+                agent: agent.into(),
+            },
+        )
+        .await
+        else {
+            panic!("create session");
+        };
+        session.id
+    }
+
+    let codex_sid = make_session(&mut client, &project_id, "codex").await;
+    let traex_sid = make_session(&mut client, &project_id, "traex").await;
+    let claude_sid = make_session(&mut client, &project_id, "claude").await;
+    let opencode_sid = make_session(&mut client, &project_id, "opencode").await;
+    let cursor_sid = make_session(&mut client, &project_id, "cursor").await;
+    let fresh_sid = make_session(&mut client, &project_id, "codex").await;
+
+    // Seed realistic recorded tool events and native session state across all 5 agents.
+    let db = rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
+    let append_tool = |sid: &str, name: &str, input: serde_json::Value| {
+        let id = uuid::Uuid::new_v4().to_string();
+        for event in [
+            EventKind::Tool {
+                id: id.clone(),
+                name: name.into(),
+                input,
+            },
+            EventKind::ToolResult {
+                id,
+                content: json!("ok"),
+                is_error: false,
+            },
+        ] {
+            db.execute(
+                "INSERT INTO events(session_id, at, data) VALUES (?1, 1.0, ?2)",
+                rusqlite::params![sid, serde_json::to_string(&event).unwrap()],
+            )
+            .unwrap();
+        }
+    };
+
+    // Codex: external worktree commandExecution, followed by default-cwd `gh auth status` & `/tmp`.
+    append_tool(
+        &codex_sid,
+        "Bash",
+        json!({ "command": "cargo test", "cwd": external_wt }),
+    );
+    append_tool(
+        &codex_sid,
+        "Bash",
+        json!({ "command": "gh auth status", "cwd": canonical_workspace }),
+    );
+    append_tool(
+        &codex_sid,
+        "Bash",
+        json!({ "command": "ls", "cwd": "/tmp" }),
+    );
+
+    // Traex: `FileChange` deep inside internal worktree snaps to `internal_wt` root.
+    let deep_dir = internal_wt.join("crates/server/src");
+    std::fs::create_dir_all(&deep_dir).unwrap();
+    append_tool(
+        &traex_sid,
+        "FileChange",
+        json!({ "changes": [{ "path": deep_dir.join("lib.rs") }] }),
+    );
+
+    // Claude: subshell `(cd .oh-my-code/worktree/continue/fix-ux && ...)` + read-only primary `Read`.
+    append_tool(
+        &claude_sid,
+        "Bash",
+        json!({ "command": "(cd .oh-my-code/worktree/continue/fix-ux && cargo check)" }),
+    );
+    append_tool(
+        &claude_sid,
+        "Read",
+        json!({ "file_path": repo_continue.join("README.md") }),
+    );
+    // Give Claude a native_id so `OpenSideChat` can attach a side-chat child session.
+    let mut claude_row: latte_work_protocol::Session = serde_json::from_str(
+        &db.query_row(
+            "SELECT data FROM sessions WHERE id=?1",
+            [&claude_sid],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    claude_row.native_id = Some("11111111-1111-4111-8111-111111111111".into());
+    db.execute(
+        "UPDATE sessions SET data=?1 WHERE id=?2",
+        rusqlite::params![serde_json::to_string(&claude_row).unwrap(), &claude_sid],
+    )
+    .unwrap();
+
+    // OpenCode: cold native session whose exported `location.directory` points to `external_wt`.
+    let mut opencode_row: latte_work_protocol::Session = serde_json::from_str(
+        &db.query_row(
+            "SELECT data FROM sessions WHERE id=?1",
+            [&opencode_sid],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    opencode_row.native_id = Some("ses_wt_export".into());
+    db.execute(
+        "UPDATE sessions SET data=?1 WHERE id=?2",
+        rusqlite::params![serde_json::to_string(&opencode_row).unwrap(), &opencode_sid],
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join("ses_wt_export.json"),
+        json!({
+            "info": { "id": "ses_wt_export", "location": { "directory": external_wt } },
+            "messages": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Cursor: `shellToolCall` with `workingDirectory` in `internal_wt`.
+    append_tool(
+        &cursor_sid,
+        "shellToolCall",
+        json!({ "command": "npm test", "workingDirectory": internal_wt }),
+    );
+    drop(db);
+
+    let Response::Session { session: side } = ask(
+        &mut client,
+        Request::OpenSideChat {
+            session_id: claude_sid.clone(),
+            side_id: None,
+        },
+    )
+    .await
+    else {
+        panic!("open side chat");
+    };
+
+    async fn assert_terminal_pwd(
+        client: &mut Client,
+        project_id: &str,
+        session_id: Option<&str>,
+        repo_path: Option<&str>,
+        expected: &Path,
+    ) {
+        let term_id = uuid::Uuid::new_v4().to_string();
+        let Response::Terminal { terminal } = ask(
+            client,
+            Request::CreateTerminal {
+                project_id: project_id.into(),
+                terminal_id: term_id.clone(),
+                cols: 80,
+                rows: 24,
+                session_id: session_id.map(str::to_owned),
+                repo_path: repo_path.map(str::to_owned),
+            },
+        )
+        .await
+        else {
+            panic!("create terminal");
+        };
+        let expected_str = expected.to_str().unwrap();
+        assert_eq!(terminal.cwd.as_deref(), Some(expected_str));
+        let mut cursor = 0.0;
+        terminal_write(
+            client,
+            &term_id,
+            b"stty -echo; pwd -P; printf 'PWD_DONE\\n'\n",
+        )
+        .await;
+        let output = terminal_until(client, &term_id, &mut cursor, "PWD_DONE\r\n").await;
+        assert!(
+            output.contains(expected_str),
+            "expected PTY pwd `{expected_str}`, got:\n{output}"
+        );
+        ask(
+            client,
+            Request::CloseTerminal {
+                terminal_id: term_id,
+            },
+        )
+        .await;
+    }
+
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&codex_sid),
+        None,
+        &canonical_external_wt,
+    )
+    .await;
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&traex_sid),
+        None,
+        &canonical_internal_wt,
+    )
+    .await;
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&claude_sid),
+        None,
+        &canonical_internal_wt,
+    )
+    .await;
+    // Side chat with no tool calls of its own inherits parent Claude session's worktree!
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&side.id),
+        None,
+        &canonical_internal_wt,
+    )
+    .await;
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&opencode_sid),
+        None,
+        &canonical_external_wt,
+    )
+    .await;
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&cursor_sid),
+        None,
+        &canonical_internal_wt,
+    )
+    .await;
+    // Brand-new session falls back to selected `repo_path` (`latte-code`).
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&fresh_sid),
+        Some("latte-code"),
+        &canonical_code,
+    )
+    .await;
+
+    // Failed or pending `ExitWorktree` and >64 read-only tool calls must not lose the worktree;
+    // only a confirmed successful `ExitWorktree` resets back to the project root.
+    let db = rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
+    let insert_event = |sid: &str, event: EventKind| {
+        db.execute(
+            "INSERT INTO events(session_id, at, data) VALUES (?1, 1.0, ?2)",
+            rusqlite::params![sid, serde_json::to_string(&event).unwrap()],
+        )
+        .unwrap();
+    };
+    insert_event(
+        &claude_sid,
+        EventKind::Tool {
+            id: "exit-failed".into(),
+            name: "ExitWorktree".into(),
+            input: json!({}),
+        },
+    );
+    insert_event(
+        &claude_sid,
+        EventKind::ToolResult {
+            id: "exit-failed".into(),
+            content: json!("exit cancelled"),
+            is_error: true,
+        },
+    );
+    for idx in 0..80 {
+        insert_event(
+            &claude_sid,
+            EventKind::Tool {
+                id: format!("read-{idx}"),
+                name: "Read".into(),
+                input: json!({ "file_path": internal_wt.join("README.md") }),
+            },
+        );
+        insert_event(
+            &claude_sid,
+            EventKind::ToolResult {
+                id: format!("read-{idx}"),
+                content: json!("ok"),
+                is_error: false,
+            },
+        );
+        // >64 default-cwd `git status` commands must not evict `internal_wt` either.
+        insert_event(
+            &claude_sid,
+            EventKind::Tool {
+                id: format!("root-status-{idx}"),
+                name: "Bash".into(),
+                input: json!({
+                    "command": "git status",
+                    "cwd": workspace.path(),
+                }),
+            },
+        );
+        insert_event(
+            &claude_sid,
+            EventKind::ToolResult {
+                id: format!("root-status-{idx}"),
+                content: json!("clean"),
+                is_error: false,
+            },
+        );
+    }
+    // Pending (`EnterWorktree` without `ToolResult`) or rejected (`is_error: true`) directory
+    // transitions must never switch new terminals before user approval.
+    insert_event(
+        &claude_sid,
+        EventKind::Tool {
+            id: "enter-pending".into(),
+            name: "EnterWorktree".into(),
+            input: json!({ "path": external_wt }),
+        },
+    );
+    insert_event(
+        &claude_sid,
+        EventKind::Tool {
+            id: "cd-rejected".into(),
+            name: "Bash".into(),
+            input: json!({
+                "command": format!("cd '{}' && pwd", external_wt.display()),
+            }),
+        },
+    );
+    insert_event(
+        &claude_sid,
+        EventKind::ToolResult {
+            id: "cd-rejected".into(),
+            content: json!("permission denied by user"),
+            is_error: true,
+        },
+    );
+    drop(db);
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&claude_sid),
+        None,
+        &canonical_internal_wt,
+    )
+    .await;
+
+    let db = rusqlite::Connection::open(host.directory.path().join("state.sqlite")).unwrap();
+    for event in [
+        EventKind::Tool {
+            id: "exit-ok".into(),
+            name: "ExitWorktree".into(),
+            input: json!({}),
+        },
+        EventKind::ToolResult {
+            id: "exit-ok".into(),
+            content: json!("exited"),
+            is_error: false,
+        },
+    ] {
+        db.execute(
+            "INSERT INTO events(session_id, at, data) VALUES (?1, 1.0, ?2)",
+            rusqlite::params![&claude_sid, serde_json::to_string(&event).unwrap()],
+        )
+        .unwrap();
+    }
+    drop(db);
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&claude_sid),
+        None,
+        &canonical_workspace,
+    )
+    .await;
+
+    // Case-insensitive `.WEBM` project preview resolves as `video/webm`.
+    std::fs::write(workspace.path().join("upper.WEBM"), b"\x1a\x45\xdf\xa3\x9f").unwrap();
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::PreviewSource {
+                project_id: project_id.clone(),
+                session_id: None,
+                path: "upper.WEBM".into(),
+                offset: 0,
+            },
+        )
+        .await,
+        Response::SourcePreview { ref mime_type, .. } if mime_type == "video/webm"
+    ));
+
+    // Removing the worktree falls back cleanly to `workspace` root instead of failing.
+    run_git(
+        &repo_continue,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            internal_wt.to_str().unwrap(),
+        ],
+    );
+    assert_terminal_pwd(
+        &mut client,
+        &project_id,
+        Some(&cursor_sid),
+        None,
+        &canonical_workspace,
+    )
+    .await;
 }

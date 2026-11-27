@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -13,7 +14,7 @@ import { modelSelectionScope } from "./modelSelectionScope";
 import { DraftStore } from "./drafts";
 import { closeSideChat, SideChat, sideDraftKey } from "./SideChat";
 import { openSideChatTab, useWorkspaceState } from "./workspaceState";
-import type { Request, Session } from "./protocol";
+import type { Event, Request, Session } from "./protocol";
 import { ServerRequestError } from "./api";
 import { annotationPrompt, userMessageContent } from "./annotations";
 import { readWorkspace } from "./workspaceState";
@@ -906,4 +907,977 @@ it("keeps ordinary completed writable side chats banner-free until undo conflict
   await waitFor(() =>
     expect(screen.queryByText(/侧边聊天后台写入待确认/)).toBeNull(),
   );
+});
+
+it("caches loaded side-chat messages across hide/remount, polls incrementally, and invalidates when serverId changes", async () => {
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  const allEvents = [
+    {
+      seq: 1,
+      at: 1,
+      session_id: child.id,
+      event: { kind: "user" as const, text: "第一问", request_id: "r1" },
+    },
+    {
+      seq: 2,
+      at: 2,
+      session_id: child.id,
+      event: { kind: "text" as const, text: "已缓存的侧聊回复" },
+    },
+  ];
+  let liveEvents = [...allEvents];
+  const pollCursors: number[] = [];
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method === "agent_permissions")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.method === "poll") {
+      pollCursors.push(action.after);
+      return {
+        kind: "events",
+        session: { ...child, status: "completed" },
+        events: liveEvents.filter((entry) => entry.seq > action.after),
+        has_more: false,
+      };
+    }
+    throw new Error("unexpected request");
+  });
+  const baseProps = {
+    parent,
+    workspaceId,
+    sideId: child.id,
+    hostId: "local",
+    serverId: "server-1",
+    drafts,
+    active: true,
+    connected: true,
+    supported: true,
+  };
+  const view = render(<SideChat {...baseProps} />);
+  await screen.findByText("已缓存的侧聊回复");
+  expect(pollCursors).toEqual([0]);
+
+  // Hide and re-open panel while mounted: retains ready state and polls after seq 2.
+  view.rerender(<SideChat {...baseProps} active={false} />);
+  liveEvents = [
+    ...allEvents,
+    {
+      seq: 3,
+      at: 3,
+      session_id: child.id,
+      event: { kind: "text" as const, text: "\n\n增量新增回复" },
+    },
+  ];
+  view.rerender(<SideChat {...baseProps} active />);
+  expect(screen.queryByText("正在读取记录…")).toBeNull();
+  expect(screen.getByText("已缓存的侧聊回复")).toBeTruthy();
+  await screen.findByText("增量新增回复");
+  expect(pollCursors.at(-1)).toBe(2);
+
+  // Switch away to another main conversation (unmount) and remount: restores from cache immediately.
+  view.unmount();
+  const remounted = render(<SideChat {...baseProps} />);
+  expect(screen.queryByText("正在读取记录…")).toBeNull();
+  expect(screen.getByText("已缓存的侧聊回复")).toBeTruthy();
+  expect(screen.getByText("增量新增回复")).toBeTruthy();
+  await waitFor(() => expect(pollCursors.at(-1)).toBe(3));
+
+  // Daemon replacement (serverId change) invalidates that host's cache and reloads from 0.
+  remounted.rerender(<SideChat {...baseProps} serverId="server-2" />);
+  await waitFor(() => expect(pollCursors.at(-1)).toBe(0));
+  await screen.findByText("增量新增回复");
+});
+
+it("shows return-to-latest when scrolled up, preserves reading position across updates and remounts, and resets on close", async () => {
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  openSideChatTab(workspaceId, child.id, false);
+  let seq = 2;
+  const events = [
+    {
+      seq: 1,
+      at: 1,
+      session_id: child.id,
+      event: { kind: "user" as const, text: "问题", request_id: "r1" },
+    },
+    {
+      seq: 2,
+      at: 2,
+      session_id: child.id,
+      event: { kind: "text" as const, text: "第一段回答" },
+    },
+  ];
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method === "agent_permissions")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.method === "close_agent_session") return { kind: "ok" };
+    if (action.method === "poll")
+      return {
+        kind: "events",
+        session: { ...child, status: "running" },
+        events: events.filter((entry) => entry.seq > action.after),
+        has_more: false,
+      };
+    throw new Error("unexpected request");
+  });
+  const props = {
+    parent,
+    workspaceId,
+    sideId: child.id,
+    hostId: "local",
+    drafts,
+    active: true,
+    connected: true,
+    supported: true,
+  };
+  const view = render(<SideChat {...props} />);
+  await screen.findByText("第一段回答");
+  const transcript = document.querySelector(
+    ".side-chat-transcript",
+  ) as HTMLDivElement;
+  Object.defineProperties(transcript, {
+    clientHeight: { value: 300, configurable: true },
+    scrollHeight: { value: 1500, configurable: true },
+    scrollTop: { value: 120, writable: true, configurable: true },
+  });
+  transcript.scrollTo = vi.fn();
+  fireEvent.scroll(transcript);
+  expect(screen.getByRole("button", { name: "回到最新" })).toBeTruthy();
+
+  // Incoming output does not yank scroll while reading earlier messages.
+  events.push({
+    seq: ++seq,
+    at: 3,
+    session_id: child.id,
+    event: { kind: "text" as const, text: "\n\n第二段回答" },
+  });
+  view.rerender(<SideChat {...props} active={false} />);
+  view.rerender(<SideChat {...props} active />);
+  await screen.findByText("第二段回答");
+  expect(transcript.scrollTop).toBe(120);
+  expect(screen.getByRole("button", { name: "回到最新" })).toBeTruthy();
+
+  // Unmount and remount preserves scrolled-up position and button.
+  view.unmount();
+  const remount = render(<SideChat {...props} />);
+  const nextTranscript = document.querySelector(
+    ".side-chat-transcript",
+  ) as HTMLDivElement;
+  Object.defineProperties(nextTranscript, {
+    clientHeight: { value: 300, configurable: true },
+    scrollHeight: { value: 1500, configurable: true },
+  });
+  nextTranscript.scrollTo = vi.fn();
+  expect(nextTranscript.scrollTop).toBe(120);
+  fireEvent.click(screen.getByRole("button", { name: "回到最新" }));
+  expect(nextTranscript.scrollTop).toBe(1500);
+  expect(nextTranscript.scrollTo).toHaveBeenCalledWith({ top: 1500 });
+  expect(screen.queryByRole("button", { name: "回到最新" })).toBeNull();
+
+  // Scroll up again, then explicitly close the tab: reopening starts following latest.
+  nextTranscript.scrollTop = 80;
+  fireEvent.scroll(nextTranscript);
+  expect(screen.getByRole("button", { name: "回到最新" })).toBeTruthy();
+  remount.unmount();
+  await closeSideChat(
+    drafts,
+    "local",
+    parent.id,
+    workspaceId,
+    `sideChat:${child.id}`,
+  );
+  openSideChatTab(workspaceId, child.id, false);
+  render(<SideChat {...props} />);
+  expect(screen.queryByRole("button", { name: "回到最新" })).toBeNull();
+});
+
+it("keeps default tab title while first turn runs and updates tab title after first turn completes", async () => {
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  openSideChatTab(workspaceId, child.id, false);
+  let currentSession: Session = {
+    ...child,
+    title: "侧聊首条问题原始前缀",
+    status: "running",
+    title_requested: false,
+    custom_title: false,
+  };
+  let currentEvents: Event[] = [
+    {
+      seq: 1,
+      at: 1,
+      session_id: child.id,
+      event: {
+        kind: "user",
+        text: "侧聊首条问题原始前缀",
+        request_id: "r1",
+      },
+    },
+  ];
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method === "agent_permissions")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.method === "poll")
+      return {
+        kind: "events",
+        session: currentSession,
+        events: currentEvents.filter((entry) => entry.seq > action.after),
+        has_more: false,
+      };
+    throw new Error("unexpected request");
+  });
+  const props = {
+    parent,
+    workspaceId,
+    sideId: child.id,
+    hostId: "local",
+    drafts,
+    active: true,
+    connected: true,
+    supported: true,
+  };
+  const view = render(<SideChat {...props} />);
+  await screen.findByText("侧聊首条问题原始前缀");
+  expect(
+    readWorkspace(workspaceId).tabs.find(
+      (tab) => tab.id === `sideChat:${child.id}`,
+    ),
+  ).not.toHaveProperty("title");
+
+  // First turn completes and generated title arrives -> tab title updates immediately.
+  currentSession = {
+    ...currentSession,
+    title: "排查侧聊重复加载",
+    status: "completed",
+    title_requested: true,
+  };
+  currentEvents = [
+    ...currentEvents,
+    {
+      seq: 2,
+      at: 2,
+      session_id: child.id,
+      event: {
+        kind: "state" as const,
+        status: "completed" as const,
+        message: null,
+      },
+    },
+  ];
+  view.rerender(<SideChat {...props} active={false} />);
+  view.rerender(<SideChat {...props} active />);
+  await waitFor(() =>
+    expect(
+      readWorkspace(workspaceId).tabs.find(
+        (tab) => tab.id === `sideChat:${child.id}`,
+      ),
+    ).toMatchObject({ title: "排查侧聊重复加载" }),
+  );
+});
+
+it("falls back to the prompt prefix when automatic naming fails after the first turn completes", async () => {
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  openSideChatTab(workspaceId, child.id, false);
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method === "agent_permissions")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.method === "poll")
+      return {
+        kind: "events",
+        session: {
+          ...child,
+          title: "为什么侧聊切回会重新加载",
+          status: "completed",
+          title_requested: true,
+          custom_title: false,
+        },
+        events: [
+          {
+            seq: 1,
+            at: 1,
+            session_id: child.id,
+            event: {
+              kind: "user" as const,
+              text: "> 引用片段\n\n为什么侧聊切回会重新加载",
+              request_id: "r1",
+            },
+          },
+          {
+            seq: 2,
+            at: 2,
+            session_id: child.id,
+            event: {
+              kind: "notice" as const,
+              text: "会话自动命名未完成，保留原名称：unsupported",
+            },
+          },
+          {
+            seq: 3,
+            at: 3,
+            session_id: child.id,
+            event: {
+              kind: "state" as const,
+              status: "completed" as const,
+              message: null,
+            },
+          },
+        ].filter((entry) => entry.seq > action.after),
+        has_more: false,
+      };
+    throw new Error("unexpected request");
+  });
+  render(
+    <SideChat
+      parent={parent}
+      workspaceId={workspaceId}
+      sideId={child.id}
+      hostId="local"
+      drafts={drafts}
+      active
+      connected
+      supported
+    />,
+  );
+  await waitFor(() =>
+    expect(
+      readWorkspace(workspaceId).tabs.find(
+        (tab) => tab.id === `sideChat:${child.id}`,
+      ),
+    ).toMatchObject({ title: "为什么侧聊切回会重新加载" }),
+  );
+});
+
+function createSideChatReviewFixture() {
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  const sideId = crypto.randomUUID();
+  openSideChatTab(workspaceId, sideId, false);
+  const props = {
+    parent,
+    sideId,
+    workspaceId,
+    hostId: "local",
+    serverId: "server-a",
+    drafts,
+    active: true,
+    connected: true,
+    supported: true,
+  };
+  const readTabTitle = () => {
+    const tab = readWorkspace(workspaceId).tabs.find(
+      (entry) => entry.id === `sideChat:${sideId}`,
+    );
+    return tab?.kind === "sideChat" ? tab.title : undefined;
+  };
+  const question = "侧聊评审回归问题";
+  const state = {
+    session: {
+      ...child,
+      id: sideId,
+      status: "completed",
+      title: question,
+      title_requested: true,
+      agent_session_open: true,
+      custom_title: false,
+    } as Session,
+    events: [
+      {
+        seq: 1,
+        at: 1,
+        session_id: sideId,
+        event: { kind: "user", text: question, request_id: "q" },
+      },
+    ] as Event[],
+  };
+  const cursors: number[] = [];
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method === "poll") {
+      cursors.push(action.after);
+      return {
+        kind: "events",
+        session: { ...state.session },
+        events: state.events.filter((entry) => entry.seq > action.after),
+        has_more: false,
+      };
+    }
+    return { kind: "agent_permissions", modes: [] };
+  });
+  return { props, readTabTitle, state, cursors, question };
+}
+
+it("preserves an undo-triggered write confirmation on cold mount from cached state", async () => {
+  const { props, state, question } = createSideChatReviewFixture();
+  const { clearSideWriteConfirmation, requestSideWriteConfirmation } =
+    await import("./sideWritePrompts");
+  try {
+    const initialView = render(<SideChat {...props} />);
+    await screen.findByText(question);
+    initialView.unmount();
+
+    state.session = {
+      ...state.session,
+      side_write_pending: "new-pending-write",
+    };
+    requestSideWriteConfirmation("local", props.sideId);
+    render(<SideChat {...props} />);
+    expect(
+      await screen.findByRole("button", { name: "核对后台写入已结束" }),
+    ).toBeTruthy();
+  } finally {
+    clearSideWriteConfirmation("local", props.sideId);
+  }
+});
+
+it("reloads from seq 0 if cached events were mounted while disconnected before a new server handshake", async () => {
+  const { props, state, question, cursors } = createSideChatReviewFixture();
+  const initialView = render(<SideChat {...props} />);
+  await screen.findByText(question);
+  initialView.unmount();
+
+  const offlineView = render(
+    <SideChat {...props} serverId="" connected={false} supported={false} />,
+  );
+  state.events = [
+    {
+      seq: 1,
+      at: 1,
+      session_id: props.sideId,
+      event: {
+        kind: "user",
+        text: "replacement history",
+        request_id: "new",
+      },
+    },
+  ];
+  offlineView.rerender(<SideChat {...props} serverId="server-b" />);
+  await waitFor(() => expect(cursors.length).toBeGreaterThan(1));
+  expect(cursors[1]).toBe(0);
+  expect(await screen.findByText("replacement history")).toBeTruthy();
+});
+
+it("falls back to prompt prefix after settle window even while live polling continues", async () => {
+  const { props, question, readTabTitle } = createSideChatReviewFixture();
+  render(<SideChat {...props} />);
+  await screen.findByText(question);
+  await waitFor(() => expect(readTabTitle()).toBe(question), {
+    timeout: 3250,
+  });
+});
+
+it("publishes a generated first-turn title when the user switches to a sibling workspace tab", async () => {
+  const { props, state, readTabTitle, question } =
+    createSideChatReviewFixture();
+  state.session = {
+    ...state.session,
+    status: "running",
+    title_requested: false,
+  };
+  const view = render(<SideChat {...props} />);
+  await screen.findByText(question);
+  view.rerender(<SideChat {...props} active={false} />);
+  state.session = {
+    ...state.session,
+    status: "completed",
+    title_requested: true,
+    title: "finished in background",
+  };
+  await waitFor(() => expect(readTabTitle()).toBe("finished in background"), {
+    timeout: 2650,
+  });
+});
+
+it("reuses cached transcript byte size on status-only polls without re-serializing events", async () => {
+  const { props, question, cursors } = createSideChatReviewFixture();
+  const originalStringify = JSON.stringify;
+  let serializations = 0;
+  const spy = vi.spyOn(JSON, "stringify").mockImplementation(function (
+    value,
+    ...rest
+  ) {
+    if (
+      Array.isArray(value) &&
+      typeof value[0] === "object" &&
+      value[0] !== null &&
+      (value[0] as Event).event?.kind === "user" &&
+      ((value[0] as Event).event as { text?: string }).text === question
+    ) {
+      serializations += 1;
+    }
+    return originalStringify(
+      value,
+      ...(rest as [
+        ((this: unknown, key: string, value: unknown) => unknown)?,
+        (string | number)?,
+      ]),
+    );
+  });
+  try {
+    render(<SideChat {...props} />);
+    await screen.findByText(question);
+    const initialCount = serializations;
+    await waitFor(() => expect(cursors.length).toBeGreaterThan(2), {
+      timeout: 2200,
+    });
+    expect(serializations).toBe(initialCount);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+it("restores saved scroll position after the transcript cache entry has been evicted", async () => {
+  const { props } = createSideChatReviewFixture();
+  const offsets = new WeakMap<Element, number>();
+  // jsdom has no layout engine; model native scrollTop clamping against loaded content height.
+  const maxTop = (el: HTMLElement) =>
+    el.textContent?.includes("loaded-page") ? 1200 : 0;
+  const beforeTop = Object.getOwnPropertyDescriptor(
+    HTMLElement.prototype,
+    "scrollTop",
+  );
+  const beforeHeight = Object.getOwnPropertyDescriptor(
+    HTMLElement.prototype,
+    "scrollHeight",
+  );
+  const beforeClient = Object.getOwnPropertyDescriptor(
+    HTMLElement.prototype,
+    "clientHeight",
+  );
+  Object.defineProperties(HTMLElement.prototype, {
+    scrollTop: {
+      configurable: true,
+      get(this: HTMLElement) {
+        return offsets.get(this) ?? 0;
+      },
+      set(this: HTMLElement, value: number) {
+        offsets.set(this, Math.max(0, Math.min(value, maxTop(this))));
+      },
+    },
+    clientHeight: {
+      configurable: true,
+      get() {
+        return 300;
+      },
+    },
+    scrollHeight: {
+      configurable: true,
+      get(this: HTMLElement) {
+        return 300 + maxTop(this);
+      },
+    },
+  });
+  try {
+    request.mockImplementation(async (_host: string, action: Request) => {
+      if (action.method !== "poll")
+        return { kind: "agent_permissions", modes: [] };
+      const session = {
+        ...child,
+        id: action.session_id,
+        status: "completed" as const,
+      };
+      return {
+        kind: "events",
+        session,
+        events: action.after
+          ? []
+          : [
+              {
+                seq: 1,
+                at: 1,
+                session_id: session.id,
+                event: {
+                  kind: "user" as const,
+                  text: `loaded-page ${session.id}`,
+                  request_id: "r",
+                },
+              },
+            ],
+        has_more: false,
+      };
+    });
+    const element = () =>
+      document.querySelector<HTMLElement>(".side-chat-transcript")!;
+    let view = render(<SideChat {...props} />);
+    await screen.findByText(`loaded-page ${props.sideId}`);
+    element().scrollTop = 500;
+    fireEvent.scroll(element());
+    view.unmount();
+
+    for (let i = 0; i < 24; i += 1) {
+      const other = crypto.randomUUID();
+      view = render(<SideChat {...props} sideId={other} />);
+      await screen.findByText(`loaded-page ${other}`);
+      view.unmount();
+    }
+
+    view = render(<SideChat {...props} />);
+    await screen.findByText(`loaded-page ${props.sideId}`);
+    expect(element().scrollTop).toBe(500);
+  } finally {
+    for (const [prop, descriptor] of Object.entries({
+      scrollTop: beforeTop,
+      scrollHeight: beforeHeight,
+      clientHeight: beforeClient,
+    })) {
+      if (descriptor) {
+        Object.defineProperty(HTMLElement.prototype, prop, descriptor);
+      } else {
+        Reflect.deleteProperty(HTMLElement.prototype, prop);
+      }
+    }
+  }
+});
+
+it("shows both Add annotation and Add to main conversation when selecting side-chat reply text", async () => {
+  const { props, state, question } = createSideChatReviewFixture();
+  const reply = "终值与 Stage1 排行的差异（语义分改变了什么）";
+  state.events = [
+    ...state.events,
+    {
+      seq: 2,
+      at: 2,
+      session_id: props.sideId,
+      event: { kind: "text", text: reply },
+    },
+    {
+      seq: 3,
+      at: 3,
+      session_id: props.sideId,
+      event: { kind: "state", status: "completed", message: null },
+    },
+  ];
+  const rect = {
+    left: 100,
+    right: 260,
+    top: 160,
+    bottom: 180,
+    width: 160,
+    height: 20,
+    x: 100,
+    y: 160,
+    toJSON: () => ({}),
+  } as DOMRect;
+  const beforeBounding = Range.prototype.getBoundingClientRect;
+  const beforeRects = Range.prototype.getClientRects;
+  Range.prototype.getBoundingClientRect = () => rect;
+  Range.prototype.getClientRects = () => [rect] as unknown as DOMRectList;
+  try {
+    const addToMainChat = vi.fn();
+    render(<SideChat {...props} addToMainChat={addToMainChat} />);
+    await screen.findByText(question);
+    const node = await screen.findByText(reply);
+
+    const selectNode = () => {
+      fireEvent.pointerDown(node);
+      fireEvent.mouseDown(node, { clientX: 0, clientY: 0 });
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      fireEvent.mouseUp(node, { clientX: 20, clientY: 0 });
+    };
+
+    selectNode();
+    expect(screen.getByRole("menuitem", { name: "添加注释" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("menuitem", { name: "添加到主对话" }));
+    expect(addToMainChat).toHaveBeenCalledWith(reply);
+
+    selectNode();
+    fireEvent.click(screen.getByRole("menuitem", { name: "添加注释" }));
+    fireEvent.click(screen.getByRole("button", { name: "提交注释" }));
+    expect(await screen.findByText("1 条注释")).toBeTruthy();
+  } finally {
+    Range.prototype.getBoundingClientRect = beforeBounding;
+    Range.prototype.getClientRects = beforeRects;
+  }
+});
+
+it("receives a late background generated title even after falling back to the prompt prefix", async () => {
+  const { props, state, readTabTitle, question } =
+    createSideChatReviewFixture();
+  state.session = {
+    ...state.session,
+    status: "running",
+    title_requested: false,
+  };
+  const view = render(<SideChat {...props} />);
+  await screen.findByText(question);
+  view.rerender(<SideChat {...props} active={false} />);
+  state.session = {
+    ...state.session,
+    status: "completed",
+    title_requested: true,
+  };
+  await waitFor(() => expect(readTabTitle()).toBe(question), {
+    timeout: 4500,
+  });
+  state.session = {
+    ...state.session,
+    title: "later generated title",
+  };
+  await waitFor(() => expect(readTabTitle()).toBe("later generated title"), {
+    timeout: 3500,
+  });
+}, 8500);
+
+it("skips repeated full-array sizing on idle polls when the active transcript exceeds cache budget", async () => {
+  const { props, state } = createSideChatReviewFixture();
+  const detail = "x".repeat(64 * 1024);
+  const history: Event[] = Array.from({ length: 144 }, (_, index) => ({
+    seq: index + 1,
+    at: 1,
+    session_id: props.sideId,
+    event: { kind: "notice" as const, text: detail },
+  }));
+  let idlePolls = 0;
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method !== "poll")
+      return { kind: "agent_permissions", modes: [] };
+    const page = history.slice(action.after, action.after + 16);
+    if (!page.length) idlePolls += 1;
+    return {
+      kind: "events",
+      session: { ...state.session },
+      events: page,
+      has_more: action.after + page.length < history.length,
+    };
+  });
+  const originalStringify = JSON.stringify;
+  let fullSizes = 0;
+  const spy = vi.spyOn(JSON, "stringify").mockImplementation(function (
+    value,
+    ...rest
+  ) {
+    if (
+      Array.isArray(value) &&
+      value.length === history.length &&
+      (value[0] as Event | undefined)?.session_id === props.sideId
+    ) {
+      fullSizes += 1;
+    }
+    return originalStringify(
+      value,
+      ...(rest as [
+        ((this: unknown, key: string, value: unknown) => unknown)?,
+        (string | number)?,
+      ]),
+    );
+  });
+  try {
+    render(<SideChat {...props} />);
+    await waitFor(() => expect(idlePolls).toBeGreaterThanOrEqual(2), {
+      timeout: 5000,
+    });
+    expect(fullSizes).toBe(1);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+it("syncs background generated titles arriving more than 17 seconds after turn completion", async () => {
+  vi.useFakeTimers();
+  try {
+    const { props, state, readTabTitle, question } =
+      createSideChatReviewFixture();
+    state.session = {
+      ...state.session,
+      status: "running",
+      title_requested: false,
+    };
+    const view = render(<SideChat {...props} />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
+    expect(screen.getByText(question)).toBeTruthy();
+
+    view.rerender(<SideChat {...props} active={false} />);
+    state.session = {
+      ...state.session,
+      status: "completed",
+      title_requested: true,
+    };
+    // First flush the poll that observes `status: "completed"` so the settle/background effects arm.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(readTabTitle()).toBe(question);
+
+    const pollsBeforeBackoff = request.mock.calls.filter(
+      ([, cmd]) => cmd.method === "poll",
+    ).length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20000);
+    });
+    const pollsDuringBackoff =
+      request.mock.calls.filter(([, cmd]) => cmd.method === "poll").length -
+      pollsBeforeBackoff;
+    // With exponential backoff capped at 5s, 20s of background waiting performs <= 6 polls (not ~30).
+    expect(pollsDuringBackoff).toBeLessThanOrEqual(7);
+    state.session = {
+      ...state.session,
+      title: "later generated title",
+    };
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    expect(readTabTitle()).toBe("later generated title");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("keeps leading slash skill before quoted context and trailing file references in side chat", async () => {
+  const drafts = new DraftStore();
+  const workspaceId = crypto.randomUUID();
+  openSideChatTab(workspaceId, child.id, true);
+  const key = sideDraftKey("local", parent.id, child.id);
+  drafts.update(key, {
+    quotes: ["MR 编号与链接：!3"],
+  });
+  let sentText = "";
+  request.mockImplementation(async (_host, action: Request) => {
+    if (action.method === "agent_permissions")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.method === "agent_commands")
+      return {
+        kind: "agent_commands",
+        commands: [
+          {
+            name: "review-code-changes",
+            display_name: "代码评审",
+            description: "按评审契约审查变更",
+            argument_hint: "[范围]",
+            kind: "skill",
+          },
+          {
+            name: "compact",
+            description: "压缩会话上下文",
+            argument_hint: "",
+            kind: "command",
+          },
+        ],
+      };
+    if (action.method === "files")
+      return {
+        kind: "files",
+        entries: [{ name: "README.md", path: "README.md", directory: false }],
+      };
+    if (action.method === "open_side_chat")
+      return { kind: "session", session: child };
+    if (action.method === "send") {
+      sentText = action.text;
+      return { kind: "accepted", duplicate: false };
+    }
+    if (action.method === "poll")
+      return { kind: "events", session: child, events: [], has_more: false };
+    throw new Error(`unexpected ${action.method}`);
+  });
+  render(
+    <ChatTab
+      parent={parent}
+      sideId={child.id}
+      workspaceId={workspaceId}
+      hostId="local"
+      drafts={drafts}
+      active
+      connected
+      supported
+    />,
+  );
+  const input = screen.getByRole<HTMLTextAreaElement>("textbox", {
+    name: "侧边聊天输入",
+  });
+  fireEvent.change(input, {
+    target: {
+      value: "/review-code-changes 评审下 @READ",
+      selectionStart: 32,
+      selectionEnd: 32,
+    },
+  });
+  fireEvent.click(await screen.findByRole("option", { name: /README\.md/ }));
+  const send = screen.getByRole<HTMLButtonElement>("button", {
+    name: "发送侧边聊天消息",
+  });
+  await waitFor(() => expect(send.disabled).toBe(false));
+  fireEvent.click(send);
+  await waitFor(() => expect(sentText).not.toBe(""));
+  expect(
+    sentText.startsWith("/review-code-changes 评审下\n\n> MR 编号与链接：!3"),
+  ).toBe(true);
+  expect(sentText).toMatch(/README\.md.*\]$/);
+});
+
+it("sizes cached transcripts incrementally on new poll pages without re-serializing full history", async () => {
+  const { props, state } = createSideChatReviewFixture();
+  const baseEvents: Event[] = Array.from({ length: 12 }, (_, index) => ({
+    seq: index + 1,
+    at: 1,
+    session_id: props.sideId,
+    event: { kind: "text" as const, text: `chunk-${index}` },
+  }));
+  const deltaEvent: Event = {
+    seq: 13,
+    at: 2,
+    session_id: props.sideId,
+    event: { kind: "text" as const, text: "delta-13" },
+  };
+  let deliveredDelta = false;
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method !== "poll")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.after === 0) {
+      return {
+        kind: "events",
+        session: { ...state.session, status: "running" },
+        events: baseEvents,
+        has_more: false,
+      };
+    }
+    if (!deliveredDelta) {
+      deliveredDelta = true;
+      return {
+        kind: "events",
+        session: { ...state.session, status: "completed" },
+        events: [deltaEvent],
+        has_more: false,
+      };
+    }
+    return {
+      kind: "events",
+      session: { ...state.session, status: "completed" },
+      events: [],
+      has_more: false,
+    };
+  });
+  const originalStringify = JSON.stringify;
+  let fullCombinedSerializations = 0;
+  const spy = vi.spyOn(JSON, "stringify").mockImplementation(function (
+    value,
+    ...rest
+  ) {
+    if (
+      Array.isArray(value) &&
+      value.length === baseEvents.length + 1 &&
+      (value[0] as Event | undefined)?.session_id === props.sideId
+    ) {
+      fullCombinedSerializations += 1;
+    }
+    return originalStringify(
+      value,
+      ...(rest as [
+        ((this: unknown, key: string, value: unknown) => unknown)?,
+        (string | number)?,
+      ]),
+    );
+  });
+  try {
+    render(<SideChat {...props} />);
+    await screen.findByText(/delta-13/);
+    expect(fullCombinedSerializations).toBe(0);
+  } finally {
+    spy.mockRestore();
+  }
 });

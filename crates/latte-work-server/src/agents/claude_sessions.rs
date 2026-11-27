@@ -23,12 +23,23 @@ struct Titles {
     summary: Option<String>,
 }
 impl Titles {
-    fn record(&mut self, line: &[u8]) {
+    fn record(&mut self, line: &[u8], expected_id: Option<uuid::Uuid>) {
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
             return;
         };
         // Only native metadata records may name the parent session. User messages
-        // and tool payloads can contain identically named fields.
+        // and tool payloads can contain identically named fields. Forked side-chat
+        // transcripts may also copy parent metadata records carrying the parent ID.
+        if let (Some(expected), Some(recorded)) = (
+            expected_id,
+            value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .and_then(|id| uuid::Uuid::parse_str(id).ok()),
+        ) && recorded != expected
+        {
+            return;
+        }
         let slot = match value.get("type").and_then(Value::as_str) {
             Some("custom-title") => (&mut self.custom, "customTitle"),
             Some("ai-title") => (&mut self.generated, "aiTitle"),
@@ -84,7 +95,12 @@ impl TitleIndex {
             touched: Instant::now(),
         }
     }
-    fn read(&mut self, file: &mut std::fs::File, meta: &Metadata) -> Result<Option<Title>> {
+    fn read(
+        &mut self,
+        file: &mut std::fs::File,
+        meta: &Metadata,
+        expected_id: Option<uuid::Uuid>,
+    ) -> Result<Option<Title>> {
         if self.identity != (meta.dev(), meta.ino())
             || meta.len() < self.size
             || (meta.len() == self.size && self.modified != (meta.mtime(), meta.mtime_nsec()))
@@ -107,7 +123,7 @@ impl TitleIndex {
             }
             if part.ends_with(b"\n") {
                 if !self.oversized {
-                    self.titles.record(&self.line);
+                    self.titles.record(&self.line, expected_id);
                 }
                 self.line.clear();
                 self.oversized = false;
@@ -427,7 +443,13 @@ pub fn ensure_resumable_in_cwd(
     temp.persist(&destination).map_err(|e| e.error)?;
     Ok(())
 }
+fn expected_session_uuid(path: &Path) -> Option<uuid::Uuid> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| uuid::Uuid::parse_str(stem).ok())
+}
 fn read_path(path: &Path) -> Result<Option<Title>> {
+    let expected_id = expected_session_uuid(path);
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
@@ -457,11 +479,12 @@ fn read_path(path: &Path) -> Result<Option<Title>> {
     indexes
         .entry(path.to_owned())
         .or_insert_with(|| TitleIndex::new(&metadata))
-        .read(&mut file, &metadata)
+        .read(&mut file, &metadata, expected_id)
 }
 /// Offline rename always verifies the latest bounded tail, even if a large file's
 /// incremental index has not caught up yet. Partial tail records are ignored.
 fn read_tail(path: &Path) -> Result<Option<Title>> {
+    let expected_id = expected_session_uuid(path);
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
@@ -480,7 +503,7 @@ fn read_tail(path: &Path) -> Result<Option<Title>> {
     }
     let mut titles = Titles::default();
     for line in records.filter(|line| line.ends_with(b"\n")) {
-        titles.record(line);
+        titles.record(line, expected_id);
     }
     Ok(titles.title())
 }
@@ -1292,5 +1315,41 @@ mod tests {
         .unwrap();
         assert!(ensure_resumable_in_cwd(&canonical_a, &former_b, id3, &env).is_err());
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+    }
+
+    #[test]
+    fn forked_session_ignores_parent_session_id_title_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_id = "11111111-1111-4111-8111-111111111111";
+        let child_id = "22222222-2222-4222-8222-222222222222";
+        let path = dir.path().join(format!("{child_id}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"custom-title\",\"customTitle\":\"Parent manual\",\"sessionId\":\"{parent_id}\"}}\n\
+                 {{\"type\":\"ai-title\",\"aiTitle\":\"Parent generated\",\"sessionId\":\"{parent_id}\"}}\n"
+            ),
+        )
+        .unwrap();
+        assert!(super::read_path(&path).unwrap().is_none());
+        assert!(super::read_tail(&path).unwrap().is_none());
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{{\"type\":\"ai-title\",\"aiTitle\":\"Side generated\",\"sessionId\":\"{child_id}\"}}\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let indexed = super::read_path(&path).unwrap().unwrap();
+        assert_eq!(indexed.text, "Side generated");
+        assert!(!indexed.custom);
+        let tail = super::read_tail(&path).unwrap().unwrap();
+        assert_eq!(tail.text, "Side generated");
+        assert!(!tail.custom);
     }
 }

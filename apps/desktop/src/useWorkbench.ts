@@ -18,6 +18,7 @@ import {
   workspaceKey,
 } from "./workspaceState";
 import { resolveSideChatNavigation } from "./sideChatNavigation";
+import { settledSideChatTitle } from "./SideChatHistory";
 import type { StandaloneSideChatTarget } from "./SideChatRecoveryDialog";
 import { requestSideWriteConfirmation } from "./sideWritePrompts";
 import { useEffect, useRef, useState } from "react";
@@ -1115,6 +1116,58 @@ export function useWorkbench() {
     )
       setSessions((old) => old.map((s) => (s.id === value.id ? value : s)));
   }
+  function notifySideChatStatus(
+    targetHostId: string,
+    targetProjectId: string,
+    parentId: string,
+    sideStatus: Session["status"],
+  ) {
+    if (sideStatus === "running" || sideStatus === "waiting") {
+      const applyOptimistic = (s: Session): Session =>
+        s.id === parentId
+          ? {
+              ...s,
+              side_chat_status:
+                sideStatus === "running" || s.side_chat_status === "running"
+                  ? "running"
+                  : "waiting",
+            }
+          : s;
+      setPinCache((old) =>
+        old[targetHostId]
+          ? { ...old, [targetHostId]: old[targetHostId].map(applyOptimistic) }
+          : old,
+      );
+      if (
+        selection.current.hostId === targetHostId &&
+        selection.current.projectId === targetProjectId
+      ) {
+        setSessions((old) => old.map(applyOptimistic));
+      }
+      if (sideStatus === "running") return;
+    }
+    const connectionVersion = connectionVersions.current.get(targetHostId);
+    const server = hostHellos.current.get(targetHostId)?.server_id;
+    void request(targetHostId, {
+      method: "session",
+      session_id: parentId,
+    })
+      .then((result) => {
+        if (
+          result.kind !== "session" ||
+          !liveHosts.current.has(targetHostId) ||
+          connectionVersions.current.get(targetHostId) !== connectionVersion ||
+          currentHostConnectionVersions.current[targetHostId] !==
+            connectionVersion ||
+          hostHellos.current.get(targetHostId)?.server_id !== server
+        )
+          return;
+        updateSession(targetHostId, result.session);
+      })
+      .catch(() => {
+        /* Periodic session polling reconciles transient errors. */
+      });
+  }
   async function sessionAction(targetHostId: string, action: Request) {
     const result = await request(targetHostId, action);
     if (
@@ -1241,7 +1294,12 @@ export function useWorkbench() {
       return;
     }
     setStandaloneSideChat(null);
-    openSideChatTab(workspaceKey(target.parent.id), sideId, false);
+    openSideChatTab(
+      workspaceKey(target.parent.id),
+      sideId,
+      false,
+      settledSideChatTitle(target.side),
+    );
     openSession({ ...target.parent, hostId: targetHostId });
   }
   async function loadEarlierHistory(minTurns = 1): Promise<void> {
@@ -1989,6 +2047,7 @@ export function useWorkbench() {
     movePinnedSession,
     openSession,
     openSideChatSession,
+    notifySideChatStatus,
     standaloneSideChat,
     closeStandaloneSideChat: () => setStandaloneSideChat(null),
     sessionAction,

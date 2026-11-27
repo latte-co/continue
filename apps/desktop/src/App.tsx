@@ -10,6 +10,7 @@ import { Folder, PanelRight, SquarePen } from "lucide-react";
 import { request, message } from "./api";
 import { closeSideChat, SideChat, sideDraftKey } from "./SideChat";
 import { Conversation } from "./Conversation";
+import { isMarkdownFile } from "./FileTextView";
 import { supportsSideChatAgent } from "./composerActions";
 import { Workspace } from "./Workspace";
 import { Sidebar } from "./Sidebar";
@@ -32,6 +33,7 @@ import {
   sideChatId,
   openTurnChanges,
   openSubagents,
+  updateWorkspace,
   CONVERSATION_MIN_WIDTH,
 } from "./workspaceState";
 
@@ -40,6 +42,7 @@ export default function App() {
   const workbench = useWorkbench();
   const skillsOpen = workbench.modal === "skills";
   const [skillsBusy, setSkillsBusy] = useState(false);
+  const [mainComposerFocus, setMainComposerFocus] = useState(0);
   const drafts = useRef(new DraftStore()).current;
   const historyScope = JSON.stringify([
     workbench.hostId,
@@ -242,6 +245,25 @@ export default function App() {
     openSideChatTab(owner, sideId, true);
     return true;
   };
+  const addToMainChat =
+    session && !session.archived
+      ? (quote: string) => {
+          const key = JSON.stringify([hostId, session.id]);
+          const current = drafts.get(key);
+          drafts.update(key, {
+            quotes: [...(current.quotes ?? []), quote],
+          });
+          if (
+            workbench.workspace.expanded &&
+            !workbench.workspace.conversationActive
+          ) {
+            updateWorkspace(workbench.workspaceId, {
+              conversationActive: true,
+            });
+          }
+          setMainComposerFocus((value) => value + 1);
+        }
+      : undefined;
   const conversationActions =
     !workbench.modal && !dialogOpen ? (
       <SessionMenuButton state={workbench} />
@@ -262,7 +284,8 @@ export default function App() {
               hostId,
               parentId: session.id,
               currentId: sideChatId(workbench.workspace.current),
-              onOpen: (id) => openSideChatTab(workbench.workspaceId, id),
+              onOpen: (id, tabTitle) =>
+                openSideChatTab(workbench.workspaceId, id, false, tabTitle),
             }
           : undefined
       }
@@ -344,19 +367,23 @@ export default function App() {
               <div className="topbar-actions">
                 {!merged && conversationActions}
                 {overview}
-                <span className="titlebar-divider" aria-hidden="true" />
-                <IconButton
-                  size="sm"
-                  active={panel}
-                  className="panel-toggle"
-                  title={panel ? "收起工作区" : "展开工作区"}
-                  label={panel ? "收起工作区" : "展开工作区"}
-                  aria-expanded={panel}
-                  aria-controls="project-workspace"
-                  onClick={() => setPanel((v) => !v)}
-                >
-                  <PanelRight size={15.5} />
-                </IconButton>
+                {!panel && (
+                  <>
+                    <span className="titlebar-divider" aria-hidden="true" />
+                    <IconButton
+                      size="sm"
+                      data-workspace-toggle
+                      className="panel-toggle"
+                      title="展开工作区"
+                      label="展开工作区"
+                      aria-expanded={false}
+                      aria-controls="project-workspace"
+                      onClick={() => setPanel(true)}
+                    >
+                      <PanelRight size={15.5} />
+                    </IconButton>
+                  </>
+                )}
               </div>
             </Topbar>
             <Conversation
@@ -374,6 +401,7 @@ export default function App() {
               quoteInSideChat={
                 canOpenSide ? (text) => void showSide(text, true) : undefined
               }
+              focusRequest={mainComposerFocus}
               openTurnChanges={(changes, path) => {
                 if (session)
                   openTurnChanges(
@@ -387,6 +415,7 @@ export default function App() {
               openFile={(path) =>
                 openWorkspaceResource(workbench.workspaceId, "files", {
                   file: path,
+                  markdownPreview: isMarkdownFile(path),
                 })
               }
               openModelSettings={() => {
@@ -522,6 +551,7 @@ export default function App() {
                       workspaceId={workbench.workspaceId}
                       isDraft={tab.draft}
                       hostId={hostId}
+                      serverId={workbench.serverId}
                       projectPath={project?.path}
                       drafts={drafts}
                       active={active && !workbench.modal && !dialogOpen}
@@ -530,6 +560,15 @@ export default function App() {
                       supportsInheritPermission={
                         workbench.supportsSideChatInheritPermission
                       }
+                      onStatusChange={(sideStatus) =>
+                        workbench.notifySideChatStatus(
+                          hostId,
+                          session.project_id,
+                          session.id,
+                          sideStatus,
+                        )
+                      }
+                      addToMainChat={addToMainChat}
                     />
                   )
                 : undefined
@@ -579,9 +618,23 @@ export default function App() {
             project={project}
             visible={panel && workbench.modal !== "settings" && !skillsOpen}
             connected={connected}
-            close={() =>
-              merged ? workbench.restoreWorkspace() : setPanel(false)
-            }
+            close={() => {
+              if (merged) {
+                workbench.restoreWorkspace();
+                return;
+              }
+              const restoreFocus = document
+                .getElementById("project-workspace")
+                ?.contains(document.activeElement);
+              setPanel(false);
+              if (restoreFocus) {
+                requestAnimationFrame(() => {
+                  document
+                    .querySelector<HTMLElement>("[data-workspace-toggle]")
+                    ?.focus();
+                });
+              }
+            }}
           />
           <SkillsPage
             state={workbench}

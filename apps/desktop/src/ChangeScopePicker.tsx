@@ -14,11 +14,13 @@ export type ReviewScope = GitReviewScope | "lastTurn" | "turn" | "task";
 function CommitChoices({
   hostId,
   projectId,
+  repoPath,
   selected,
   choose,
 }: {
   hostId: string;
   projectId: string;
+  repoPath?: string;
   selected: string;
   choose: (commit: GitCommit) => void;
 }) {
@@ -41,6 +43,7 @@ function CommitChoices({
     void request(hostId, {
       method: "git_commits",
       project_id: projectId,
+      ...(repoPath ? { repo_path: repoPath } : {}),
       ...cursor.current,
     })
       .then((response) => {
@@ -65,7 +68,7 @@ function CommitChoices({
       disposed = true;
     };
     // The ref is updated only when the user explicitly requests another page.
-  }, [hostId, projectId, offset, retry]);
+  }, [hostId, projectId, repoPath, offset, retry]);
   const visible = rows.filter((row) =>
     `${row.subject} ${row.oid}`
       .toLowerCase()
@@ -127,6 +130,7 @@ function CommitChoices({
 export function ChangeScopePicker({
   hostId,
   projectId,
+  repoPath,
   scope,
   commit,
   sessionId,
@@ -136,6 +140,7 @@ export function ChangeScopePicker({
 }: {
   hostId: string;
   projectId: string;
+  repoPath?: string;
   scope: ReviewScope;
   commit?: GitCommit;
   sessionId?: string;
@@ -143,7 +148,13 @@ export function ChangeScopePicker({
   disabled: boolean;
   choose: (scope: ReviewScope, commit?: GitCommit) => void;
 }) {
-  const context = JSON.stringify([hostId, projectId, sessionId, requestId]);
+  const context = JSON.stringify([
+    hostId,
+    projectId,
+    repoPath ?? ".",
+    sessionId,
+    requestId,
+  ]);
   const [openedFor, setOpenedFor] = useState<string | null>(null);
   const open = openedFor === context && !disabled;
   const [commits, showCommits] = useState(false);
@@ -166,7 +177,7 @@ export function ChangeScopePicker({
   }, []);
   useEffect(() => {
     close(false);
-  }, [hostId, projectId, close]);
+  }, [hostId, projectId, repoPath, close]);
   useEffect(() => {
     if (disabled) close(false);
   }, [disabled, close]);
@@ -356,6 +367,7 @@ export function ChangeScopePicker({
                 <CommitChoices
                   hostId={hostId}
                   projectId={projectId}
+                  repoPath={repoPath}
                   selected={commit?.oid ?? ""}
                   choose={(row) => {
                     choose("commit", row);

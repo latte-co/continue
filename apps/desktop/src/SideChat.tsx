@@ -1,8 +1,10 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Quote, X } from "lucide-react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ArrowDown, Quote, X } from "lucide-react";
 import { ApprovalCard } from "./ApprovalCard";
 import { Composer } from "./Composer";
 import { ComposerAction } from "./ComposerAction";
+import { leadingSlashCommand, referencePrompt } from "./composerActions";
+import { referenceMessage } from "./referenceMessage";
 import { ModelPicker, type ModelPickerHandle } from "./ModelPicker";
 import { modelSelectionScope } from "./modelSelectionScope";
 import { PermissionPicker } from "./PermissionPicker";
@@ -11,6 +13,7 @@ import { DraftStore, useDraft, type Draft } from "./drafts";
 import { AnnotatedMessage, AnnotationSummary } from "./AnnotationUI";
 import { annotationError, type Annotation } from "./annotations";
 import { QuestionCard } from "./QuestionCard";
+import { settledSideChatTitle } from "./SideChatHistory";
 import { TurnTranscript } from "./TurnTranscript";
 import { ToolGroup, ToolRow } from "./ToolActivity";
 import { ToolImages } from "./ToolImages";
@@ -21,11 +24,115 @@ import { executionStatus } from "./executionStatus";
 import type { Effort, Event, Request, Session } from "./protocol";
 import {
   clearSideWriteConfirmation,
-  useSideWriteConfirmationRequested,
+  sideWriteConfirmationVersion,
+  useSideWriteConfirmationVersion,
 } from "./sideWritePrompts";
 import { LIVE_POLL_MS } from "./usePollingSnapshot";
-import { readWorkspace, setSideChatDraft, sideChatId } from "./workspaceState";
+import {
+  readWorkspace,
+  setSideChatDraft,
+  setSideChatTitle,
+  sideChatId,
+} from "./workspaceState";
 import { Button } from "./ui";
+
+const FOLLOW_THRESHOLD = 90;
+const SIDE_TITLE_SETTLE_MS = 2500;
+const SIDE_BG_TITLE_POLL_MS = 180000;
+const MAX_READING_POSITIONS = 64;
+const eventArraySizes = new WeakMap<Event[], number>();
+
+function estimateEventsByteSize(events: Event[]): number {
+  const cached = eventArraySizes.get(events);
+  if (cached !== undefined) return cached;
+  const size = JSON.stringify(events).length * 2;
+  eventArraySizes.set(events, size);
+  return size;
+}
+
+type CachedSideChat = {
+  hostId: string;
+  serverId?: string;
+  session: Session;
+  events: Event[];
+  after: number;
+  ready: boolean;
+  size: number;
+};
+
+class SideChatTranscriptCache {
+  private entries = new Map<string, CachedSideChat>();
+  private totalSize = 0;
+  constructor(
+    private maxEntries = 24,
+    private maxSize = 16 * 1024 * 1024,
+  ) {}
+  get(key: string, hostId: string, serverId?: string) {
+    const currentServerId = serverId || undefined;
+    const entry = this.entries.get(key);
+    if (!entry) return undefined;
+    if (currentServerId && entry.serverId !== currentServerId) {
+      this.clearHost(hostId, currentServerId);
+      return undefined;
+    }
+    this.entries.delete(key);
+    this.entries.set(key, entry);
+    return entry;
+  }
+  set(
+    key: string,
+    value: Omit<CachedSideChat, "size">,
+    appendedEvents?: Event[],
+  ) {
+    const previous = this.entries.get(key);
+    const nextServerId = value.serverId || previous?.serverId || undefined;
+    if (
+      previous?.session === value.session &&
+      previous.events === value.events &&
+      previous.after === value.after &&
+      previous.ready === value.ready &&
+      previous.serverId === nextServerId
+    ) {
+      return;
+    }
+    const size =
+      previous?.events === value.events
+        ? previous.size
+        : previous && appendedEvents?.length
+          ? previous.size + estimateEventsByteSize(appendedEvents)
+          : estimateEventsByteSize(value.events);
+    this.totalSize -= previous?.size ?? 0;
+    this.entries.delete(key);
+    if (size > this.maxSize) return;
+    this.entries.set(key, { ...value, serverId: nextServerId, size });
+    this.totalSize += size;
+    while (
+      this.entries.size > this.maxEntries ||
+      this.totalSize > this.maxSize
+    ) {
+      const oldest = this.entries.keys().next().value!;
+      this.totalSize -= this.entries.get(oldest)!.size;
+      this.entries.delete(oldest);
+    }
+  }
+  delete(key: string) {
+    const previous = this.entries.get(key);
+    if (!previous) return;
+    this.totalSize -= previous.size;
+    this.entries.delete(key);
+  }
+  clearHost(hostId: string, keepServerId?: string) {
+    for (const [key, entry] of this.entries) {
+      if (
+        entry.hostId === hostId &&
+        (!keepServerId || entry.serverId !== keepServerId)
+      ) {
+        this.totalSize -= entry.size;
+        this.entries.delete(key);
+      }
+    }
+  }
+}
 
 export const sideDraftKey = (host: string, parent: string, side: string) =>
   JSON.stringify(["side", host, parent, side]);
@@ -47,6 +154,54 @@ type Selection = {
 // Workspace navigation unmounts side views. Keep unsent settings for the same
 // App lifetime and owner as the draft, without changing its admission version.
 const selections = new WeakMap<DraftStore, Map<string, Selection>>();
+const caches = new WeakMap<DraftStore, SideChatTranscriptCache>();
+const readingPositions = new WeakMap<
+  DraftStore,
+  Map<string, { top: number; follow: boolean }>
+>();
+
+function sideCache(drafts: DraftStore) {
+  let cache = caches.get(drafts);
+  if (!cache) {
+    cache = new SideChatTranscriptCache();
+    caches.set(drafts, cache);
+  }
+  return cache;
+}
+
+function sidePositions(drafts: DraftStore) {
+  let map = readingPositions.get(drafts);
+  if (!map) {
+    map = new Map();
+    readingPositions.set(drafts, map);
+  }
+  return map;
+}
+
+function setSidePosition(
+  drafts: DraftStore,
+  key: string,
+  value: { top: number; follow: boolean },
+) {
+  const map = sidePositions(drafts);
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > MAX_READING_POSITIONS) {
+    map.delete(map.keys().next().value!);
+  }
+}
+
+function initialPromptPrefix(events: Event[]) {
+  const firstUser = events.find((entry) => entry.event.kind === "user")?.event;
+  if (firstUser?.kind !== "user") return undefined;
+  const line =
+    firstUser.text
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .find((item) => item.length > 0 && !item.startsWith(">")) ??
+    firstUser.text.trim();
+  return [...line].slice(0, 48).join("");
+}
 
 function sideOperations(drafts: DraftStore) {
   let pending = operations.get(drafts);
@@ -97,6 +252,7 @@ export async function closeSideChat(
     drafts.clear(key, drafts.get(key));
     admissions.get(drafts)?.delete(key);
     selections.get(drafts)?.delete(key);
+    sidePositions(drafts).delete(key);
   })();
   pending.set(key, closing);
   try {
@@ -106,48 +262,89 @@ export async function closeSideChat(
   }
 }
 
-export function SideChat({
-  parent,
-  sideId,
-  workspaceId,
-  isDraft = false,
-  hostId,
-  projectPath,
-  drafts,
-  active,
-  connected,
-  supported,
-  supportsInheritPermission = true,
-}: {
+type SideChatComponentProps = {
   parent: Session;
   sideId: string;
   workspaceId: string;
   isDraft?: boolean;
   hostId: string;
+  serverId?: string;
   projectPath?: string;
   drafts: DraftStore;
   active: boolean;
   connected: boolean;
   supported: boolean;
   supportsInheritPermission?: boolean;
-}) {
-  const key = sideDraftKey(hostId, parent.id, sideId);
+  onStatusChange?: (status: Session["status"]) => void;
+  addToMainChat?: (quote: string) => void;
+};
+
+export function SideChat(props: SideChatComponentProps) {
+  const key = sideDraftKey(props.hostId, props.parent.id, props.sideId);
+  return <SideChatPane key={key} {...props} draftKey={key} />;
+}
+
+function SideChatPane({
+  parent,
+  sideId,
+  workspaceId,
+  isDraft = false,
+  hostId,
+  serverId,
+  projectPath,
+  drafts,
+  active,
+  connected,
+  supported,
+  supportsInheritPermission = true,
+  onStatusChange,
+  addToMainChat,
+  draftKey: key,
+}: SideChatComponentProps & { draftKey: string }) {
+  const onStatusChangeRef = useRef(onStatusChange);
+  onStatusChangeRef.current = onStatusChange;
+  const lastPublishedStatus = useRef<Session["status"] | undefined>(undefined);
+  function publishLiveStatus(nextStatus: Session["status"]) {
+    if (lastPublishedStatus.current === nextStatus) return;
+    lastPublishedStatus.current = nextStatus;
+    onStatusChangeRef.current?.(nextStatus);
+  }
   const draft = useDraft(drafts, key);
-  const [session, setSession] = useState<Session>();
-  const [events, setEvents] = useState<Event[]>([]);
+  const knownServerId = serverId || undefined;
+  const [initial] = useState(() =>
+    isDraft ? undefined : sideCache(drafts).get(key, hostId, knownServerId),
+  );
+  const [session, setSession] = useState<Session | undefined>(
+    () => initial?.session,
+  );
+  const [events, setEvents] = useState<Event[]>(() => initial?.events ?? []);
+  const [ready, setReady] = useState(() => initial?.ready ?? false);
+  const after = useRef(initial?.after ?? 0);
+  const lastServerId = useRef<string | undefined>(
+    knownServerId ?? initial?.serverId,
+  );
+  const serverChanged = Boolean(
+    knownServerId &&
+    (lastServerId.current
+      ? lastServerId.current !== knownServerId
+      : after.current > 0 || session !== undefined),
+  );
+  const effectiveSession = serverChanged ? undefined : session;
+  const effectiveEvents = serverChanged ? [] : events;
+  const effectiveReady = serverChanged ? false : ready;
+  const eventsRef = useRef(effectiveEvents);
+  eventsRef.current = effectiveEvents;
   const [readError, setReadError] = useState("");
   const [error, setError] = useState("");
   const [confirming, setConfirming] = useState<string>();
-  const writeConfirmRequested = useSideWriteConfirmationRequested(
-    hostId,
-    sideId,
-  );
-  const closePending = session?.agent_close_pending;
+  const writeConfirmVersion = useSideWriteConfirmationVersion(hostId, sideId);
+  const writeConfirmRequested = writeConfirmVersion > 0;
+  const closePending = effectiveSession?.agent_close_pending;
   const sideWritePending =
     !closePending &&
-    session?.side_write_pending &&
-    (session.status === "unknown" || writeConfirmRequested)
-      ? session.side_write_pending
+    effectiveSession?.side_write_pending &&
+    (effectiveSession.status === "unknown" || writeConfirmRequested)
+      ? effectiveSession.side_write_pending
       : undefined;
   const pendingToken = closePending
     ? `close:${closePending}`
@@ -155,14 +352,18 @@ export function SideChat({
       ? `write:${sideWritePending}`
       : undefined;
   const showingConfirmation = !!confirming && confirming === pendingToken;
-  useEffect(() => {
-    if (session && !session.side_write_pending && writeConfirmRequested) {
-      clearSideWriteConfirmation(hostId, sideId);
-    }
-  }, [hostId, sideId, session, writeConfirmRequested]);
-  const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState(false);
   const [revision, refresh] = useState(0);
+  const lastConfirmVersion = useRef(writeConfirmVersion);
+  useEffect(() => {
+    if (
+      writeConfirmVersion > 0 &&
+      writeConfirmVersion !== lastConfirmVersion.current
+    ) {
+      refresh((v) => v + 1);
+    }
+    lastConfirmVersion.current = writeConfirmVersion;
+  }, [writeConfirmVersion]);
   const picker = useRef<ModelPickerHandle>(null);
   const [focus, setFocus] = useState(0);
   const [selection, updateSelection] = useState<Selection | undefined>(() =>
@@ -183,23 +384,25 @@ export function SideChat({
   }>();
   const model = selection
     ? selection.model
-    : ((session ?? parent).model ?? null);
+    : ((effectiveSession ?? parent).model ?? null);
   const effort = selection
     ? selection.effort
-    : ((session ?? parent).effort ?? null);
+    : ((effectiveSession ?? parent).effort ?? null);
   const hadDraft = useRef(isDraft);
   if (isDraft) hadDraft.current = true;
-  if (session) hadDraft.current = false;
+  if (effectiveSession) hadDraft.current = false;
   const rawPermission = selection
     ? selection.permission
-    : session
-      ? (session.permission_mode ?? null)
+    : effectiveSession
+      ? (effectiveSession.permission_mode ?? null)
       : hadDraft.current
         ? (parent.permission_mode ??
           (supportsInheritPermission ? "inherit" : null))
         : null;
   const permission =
-    !session && !supportsInheritPermission && rawPermission === "inherit"
+    !effectiveSession &&
+    !supportsInheritPermission &&
+    rawPermission === "inherit"
       ? null
       : rawPermission;
   const quotes = draft.quotes ?? [];
@@ -222,23 +425,143 @@ export function SideChat({
     });
   }
   const scroll = useRef<HTMLDivElement>(null);
-  const follow = useRef(true);
-  const after = useRef(0);
+  const savedPosition = sidePositions(drafts).get(key);
+  const follow = useRef(savedPosition?.follow ?? true);
+  const [away, setAway] = useState(() => !(savedPosition?.follow ?? true));
+  const restoredPosition = useRef(false);
+  const [titleSettleExpired, setTitleSettleExpired] = useState(false);
+  const [bgTitlePollExpired, setBgTitlePollExpired] = useState(false);
+  const [turnSubmitted, setTurnSubmitted] = useState(false);
+
+  useEffect(() => {
+    if (
+      knownServerId &&
+      (lastServerId.current
+        ? lastServerId.current !== knownServerId
+        : after.current > 0 || session !== undefined)
+    ) {
+      sideCache(drafts).clearHost(hostId, knownServerId);
+      sidePositions(drafts).delete(key);
+      follow.current = true;
+      restoredPosition.current = false;
+      setAway(false);
+      setTitleSettleExpired(false);
+      setBgTitlePollExpired(false);
+      setTurnSubmitted(false);
+      lastPublishedStatus.current = undefined;
+      after.current = 0;
+      eventsRef.current = [];
+      setEvents([]);
+      setSession(undefined);
+      setReady(false);
+      setReadError("");
+    }
+    if (knownServerId) {
+      lastServerId.current = knownServerId;
+    }
+  }, [drafts, hostId, key, knownServerId, session]);
+
+  const hasCompletedTurn = useMemo(
+    () =>
+      effectiveEvents.some(
+        (entry) =>
+          entry.event.kind === "state" && entry.event.status === "completed",
+      ),
+    [effectiveEvents],
+  );
+  const hasTitleFailureNotice = useMemo(
+    () =>
+      effectiveEvents.some(
+        (entry) =>
+          entry.event.kind === "notice" &&
+          entry.event.text.startsWith("会话自动命名"),
+      ),
+    [effectiveEvents],
+  );
+  const promptPrefix = useMemo(
+    () => initialPromptPrefix(effectiveEvents),
+    [effectiveEvents],
+  );
+  const candidateTitle =
+    !isDraft && effectiveSession
+      ? settledSideChatTitle(effectiveSession, hasCompletedTurn)
+      : undefined;
+  const titleGenerationPending = Boolean(
+    candidateTitle &&
+    effectiveSession?.title_requested &&
+    !effectiveSession.custom_title &&
+    effectiveSession.agent_session_open !== false &&
+    !hasTitleFailureNotice &&
+    promptPrefix !== undefined &&
+    candidateTitle === promptPrefix,
+  );
+  const awaitingGeneratedTitle = titleGenerationPending && !titleSettleExpired;
+  const awaitingBackgroundTitle = titleGenerationPending && !bgTitlePollExpired;
+  useEffect(() => {
+    if (!awaitingGeneratedTitle) return;
+    const timer = setTimeout(() => {
+      setTitleSettleExpired(true);
+    }, SIDE_TITLE_SETTLE_MS);
+    return () => clearTimeout(timer);
+  }, [awaitingGeneratedTitle, key]);
+
+  useEffect(() => {
+    if (!awaitingBackgroundTitle) return;
+    const timer = setTimeout(() => {
+      setBgTitlePollExpired(true);
+    }, SIDE_BG_TITLE_POLL_MS);
+    return () => clearTimeout(timer);
+  }, [awaitingBackgroundTitle, key]);
+
+  useEffect(() => {
+    if (!candidateTitle || awaitingGeneratedTitle) return;
+    setSideChatTitle(workspaceId, sideId, candidateTitle);
+    if (turnSubmitted) setTurnSubmitted(false);
+  }, [
+    awaitingGeneratedTitle,
+    candidateTitle,
+    sideId,
+    turnSubmitted,
+    workspaceId,
+  ]);
+
+  useEffect(() => {
+    if (
+      turnSubmitted &&
+      effectiveSession &&
+      effectiveSession.status !== "running" &&
+      effectiveSession.status !== "waiting" &&
+      effectiveSession.status !== "ready"
+    ) {
+      setTurnSubmitted(false);
+    }
+  }, [effectiveSession, turnSubmitted]);
+
+  const unsettledFirstTurn =
+    !isDraft &&
+    (awaitingBackgroundTitle ||
+      (!candidateTitle &&
+        (turnSubmitted ||
+          effectiveSession?.status === "running" ||
+          effectiveSession?.status === "waiting")));
   const enabled = active && connected && supported;
+  const shouldPoll =
+    (active || unsettledFirstTurn) && connected && supported && !serverChanged;
   useEffect(() => {
     if (!enabled) return;
     setFocus((v) => v + 1);
   }, [enabled]);
 
   useEffect(() => {
-    setReady(false);
-    if (!enabled || busy || isDraft) return;
+    if (!shouldPoll || busy || isDraft) return;
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
+    let idleBackgroundPolls = 0;
     async function read() {
       try {
         await sideOperations(drafts).get(key);
         if (disposed) return;
+        const confirmVersion = sideWriteConfirmationVersion(hostId, sideId);
         const page = await request(hostId, {
           method: "poll",
           session_id: sideId,
@@ -256,6 +579,7 @@ export function SideChat({
           throw new Error("侧边聊天记录不匹配");
         if (page.has_more && !page.events.length)
           throw new Error("侧边聊天记录分页未前进");
+        let nextEvents = eventsRef.current;
         if (page.events.length) {
           const next = page.events.at(-1)!.seq;
           if (
@@ -264,7 +588,9 @@ export function SideChat({
           )
             throw new Error("侧边聊天记录游标无效");
           after.current = next;
-          setEvents((previous) => [...previous, ...page.events]);
+          nextEvents = [...eventsRef.current, ...page.events];
+          eventsRef.current = nextEvents;
+          setEvents(nextEvents);
           const pending = admissions.get(drafts)?.get(key);
           if (
             pending &&
@@ -279,16 +605,64 @@ export function SideChat({
             setError("");
           }
         }
+        const nextReady = !page.has_more;
+        if (
+          nextReady &&
+          confirmVersion > 0 &&
+          !page.session.side_write_pending &&
+          !page.session.agent_close_pending
+        ) {
+          clearSideWriteConfirmation(hostId, sideId, confirmVersion);
+        }
         setSession(page.session);
-        setReady(!page.has_more);
+        setReady(nextReady);
+        if (nextReady) publishLiveStatus(page.session.status);
+        sideCache(drafts).set(
+          key,
+          {
+            hostId,
+            serverId: knownServerId,
+            session: page.session,
+            events: nextEvents,
+            after: after.current,
+            ready: nextReady,
+          },
+          page.events.length ? page.events : undefined,
+        );
         setReadError("");
-        timer = setTimeout(read, page.has_more ? 0 : LIVE_POLL_MS);
+        const sessionActive =
+          page.session.status === "running" ||
+          page.session.status === "waiting";
+        let delay = LIVE_POLL_MS;
+        if (page.has_more) {
+          idleBackgroundPolls = 0;
+          delay = 0;
+        } else if (!active && !sessionActive && !page.events.length) {
+          idleBackgroundPolls += 1;
+          delay = Math.min(
+            LIVE_POLL_MS * 2 ** Math.min(idleBackgroundPolls - 1, 3),
+            5000,
+          );
+        } else {
+          idleBackgroundPolls = 0;
+        }
+        timer = setTimeout(read, delay);
       } catch (cause) {
         if (!disposed) {
           if (missingSession(cause)) {
             after.current = 0;
+            eventsRef.current = [];
+            sideCache(drafts).delete(key);
+            sidePositions(drafts).delete(key);
+            follow.current = true;
+            restoredPosition.current = false;
+            setAway(false);
+            setTitleSettleExpired(false);
+            setBgTitlePollExpired(false);
+            setTurnSubmitted(false);
             setSession(undefined);
             setEvents([]);
+            setReady(false);
             setSideChatDraft(workspaceId, sideId, true);
             setReadError("");
             return;
@@ -304,9 +678,11 @@ export function SideChat({
       clearTimeout(timer);
     };
   }, [
+    shouldPoll,
     enabled,
     busy,
     hostId,
+    knownServerId,
     parent.id,
     parent.project_id,
     sideId,
@@ -318,11 +694,43 @@ export function SideChat({
   ]);
 
   useLayoutEffect(() => {
-    if (active && follow.current && scroll.current)
-      scroll.current.scrollTop = scroll.current.scrollHeight;
-  }, [active, events, session?.status]);
+    const el = scroll.current;
+    if (!active) {
+      restoredPosition.current = false;
+      return;
+    }
+    if (!effectiveReady && !isDraft) {
+      restoredPosition.current = false;
+    }
+    if (!el) return;
+    if (follow.current) {
+      el.scrollTop = el.scrollHeight;
+    } else if (!restoredPosition.current) {
+      const saved = sidePositions(drafts).get(key);
+      if (saved) el.scrollTop = saved.top;
+    }
+    if (effectiveReady || isDraft) {
+      restoredPosition.current = true;
+    }
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (follow.current) el.scrollTop = el.scrollHeight;
+    });
+    observer.observe(el);
+    const content = el.querySelector(".side-chat-messages");
+    if (content) observer.observe(content);
+    return () => observer.disconnect();
+  }, [
+    active,
+    effectiveEvents,
+    effectiveReady,
+    isDraft,
+    effectiveSession?.status,
+    drafts,
+    key,
+  ]);
 
-  const canInteract = enabled && (ready || isDraft);
+  const canInteract = enabled && (effectiveReady || isDraft);
   function confirmEnd() {
     if (!confirming || confirming !== pendingToken) return;
     setConfirming(undefined);
@@ -334,7 +742,7 @@ export function SideChat({
           close_id: closePending,
         },
         () => {
-          if (!session?.side_write_pending) {
+          if (!effectiveSession?.side_write_pending) {
             clearSideWriteConfirmation(hostId, sideId);
           }
         },
@@ -385,9 +793,24 @@ export function SideChat({
               : "ok";
         if (response.kind !== expected)
           throw new Error("操作结果待确认，请核对侧边聊天的记录");
-        if (response.kind === "session") setSession(response.session);
+        if (response.kind === "session") {
+          setSession(response.session);
+          publishLiveStatus(response.session.status);
+          sideCache(drafts).set(key, {
+            hostId,
+            serverId: knownServerId,
+            session: response.session,
+            events: eventsRef.current,
+            after: after.current,
+            ready: effectiveReady,
+          });
+        }
+        if (action.method === "send") {
+          publishLiveStatus("running");
+          if (!candidateTitle) setTurnSubmitted(true);
+        }
         accepted?.();
-        setReady(false);
+        if (!effectiveSession) setReady(false);
         refresh((v) => v + 1);
         return true;
       } catch (cause) {
@@ -416,7 +839,8 @@ export function SideChat({
     return operation;
   }
   const running =
-    session?.status === "running" || session?.status === "waiting";
+    effectiveSession?.status === "running" ||
+    effectiveSession?.status === "waiting";
   const disabled = !canInteract || busy || parent.archived;
   const modelReady =
     modelReadiness?.scope ===
@@ -437,10 +861,6 @@ export function SideChat({
       !modelReady
     )
       return Promise.resolve(false);
-    if (draft.text.trimStart().startsWith("/")) {
-      setError("侧边聊天暂不支持 Agent 原生命令，请输入普通消息。");
-      return Promise.resolve(false);
-    }
     let requests = admissions.get(drafts);
     if (!requests) {
       requests = new Map();
@@ -459,6 +879,26 @@ export function SideChat({
       );
       return Promise.resolve(false);
     }
+    const formattedQuotes = quotes.map((quote) =>
+      quote
+        .split("\n")
+        .map((line) => `> ${line}`)
+        .join("\n"),
+    );
+    const sendText =
+      formattedQuotes.length && leadingSlashCommand(prompt)
+        ? (() => {
+            const parsed = referenceMessage(prompt);
+            return referencePrompt(
+              [parsed.text.trim(), ...formattedQuotes]
+                .filter(Boolean)
+                .join("\n\n"),
+              parsed.references,
+            );
+          })()
+        : [...formattedQuotes, prompt || "请结合主会话解释引用的文本。"].join(
+            "\n\n",
+          );
     const send: Send =
       old && drafts.isCurrent(key, old.draft)
         ? old.request
@@ -466,15 +906,7 @@ export function SideChat({
             method: "send",
             session_id: sideId,
             request_id: crypto.randomUUID(),
-            text: [
-              ...quotes.map((quote) =>
-                quote
-                  .split("\n")
-                  .map((line) => `> ${line}`)
-                  .join("\n"),
-              ),
-              prompt || "请结合主会话解释引用的文本。",
-            ].join("\n\n"),
+            text: sendText,
             model,
             effort,
             permission_mode: permission,
@@ -487,133 +919,184 @@ export function SideChat({
     }
     requests.set(key, { draft, request: send });
     follow.current = true;
+    setAway(false);
+    setSidePosition(drafts, key, {
+      top: scroll.current?.scrollHeight ?? 0,
+      follow: true,
+    });
     return perform(send, () => {
       drafts.clear(key, draft);
       if (requests.get(key)?.request.request_id === send.request_id)
         requests.delete(key);
     });
   }
-  const status = executionStatus(session, events, connected);
+  const status = executionStatus(effectiveSession, effectiveEvents, connected);
   return (
     <div className="side-chat">
-      <div
-        className="side-chat-transcript"
-        ref={scroll}
-        onScroll={(e) => {
-          const el = e.currentTarget;
-          follow.current =
-            el.scrollHeight - el.clientHeight - el.scrollTop < 90;
-        }}
-      >
-        <div className="side-chat-messages">
-          {!isDraft && !ready && !events.length && enabled && !readError && (
-            <WorkingStatus label="正在读取记录…" animated />
-          )}
-          <TurnTranscript events={events}>
-            {(item) => {
-              if (item.type === "user")
-                return (
-                  <UserMessage
-                    text={item.text}
-                    at={item.at}
-                    hostId={hostId}
-                    projectId={parent.project_id}
-                    projectPath={projectPath}
-                    sessionId={session?.id}
-                    connected={connected}
-                    active={active}
-                  />
-                );
-              if (item.type === "assistant")
-                return (
-                  <AnnotatedMessage
-                    key={`${key}:${item.key}`}
-                    text={item.text}
-                    message={item.key}
-                    entries={annotations}
-                    enabled={active && !busy && !parent.archived}
-                    onSave={saveAnnotation}
-                    onRemove={removeAnnotation}
-                  />
-                );
-              if (item.type === "tool")
-                return (
-                  <ToolRow
-                    tool={item}
-                    projectPath={projectPath}
-                    loadContext={
-                      session ? { hostId, sessionId: session.id } : undefined
-                    }
-                  />
-                );
-              if (item.type === "tools")
-                return (
-                  <ToolGroup
-                    tools={item.tools}
-                    unrecovered={item.unrecovered}
-                    projectPath={projectPath}
-                    loadContext={
-                      session ? { hostId, sessionId: session.id } : undefined
-                    }
-                  />
-                );
-              if (item.type === "tool_images")
-                return <ToolImages images={item.images} active={enabled} />;
-              if (item.type !== "event") return null;
-              const v = item.value;
-              if (v.kind === "notice")
-                return <p className="notice">{v.text}</p>;
-              if (v.kind === "state" && v.status === "failed" && v.message)
-                return <TurnErrorRow message={v.message} />;
-              if (v.kind === "state" && (v.message || v.status === "unknown"))
-                return (
-                  <p className="notice">{v.message || "侧边聊天状态待确认"}</p>
-                );
-              if (v.kind === "approval" && session)
-                return (
-                  <ApprovalCard
-                    request={v}
-                    resolved={item.resolved}
-                    decision={item.decision}
-                    tool={item.approvalTool}
-                    projectPath={projectPath}
-                    loadContext={{ hostId, sessionId: session.id }}
-                    disabled={disabled || !running}
-                    busy={busy}
-                    onDecision={(allow) =>
-                      void perform({
-                        method: "approve",
-                        session_id: session.id,
-                        request_id: v.request_id,
-                        allow,
-                      })
-                    }
-                  />
-                );
-              if (v.kind === "question" && session)
-                return (
-                  <QuestionCard
-                    request={v}
-                    resolved={item.resolved}
-                    answers={item.answers}
-                    disabled={disabled || !running}
-                    onAnswer={(answers) =>
-                      void perform({
-                        method: "answer_question",
-                        session_id: session.id,
-                        request_id: v.request_id,
-                        answers,
-                      })
-                    }
-                  />
-                );
-              return null;
-            }}
-          </TurnTranscript>
-          {status && (
-            <WorkingStatus label={status} animated={enabled && running} />
-          )}
+      <div className="side-chat-transcript-wrap">
+        <div
+          className="side-chat-transcript"
+          ref={scroll}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            if (!active || (!effectiveReady && !isDraft) || !el.clientHeight)
+              return;
+            const nextFollow =
+              el.scrollHeight - el.clientHeight - el.scrollTop <
+              FOLLOW_THRESHOLD;
+            follow.current = nextFollow;
+            setSidePosition(drafts, key, {
+              top: el.scrollTop,
+              follow: nextFollow,
+            });
+            setAway(!nextFollow);
+          }}
+        >
+          <div className="side-chat-messages">
+            {!isDraft &&
+              !effectiveReady &&
+              !effectiveEvents.length &&
+              enabled &&
+              !readError && <WorkingStatus label="正在读取记录…" animated />}
+            <TurnTranscript key={key} events={effectiveEvents}>
+              {(item) => {
+                if (item.type === "user")
+                  return (
+                    <UserMessage
+                      text={item.text}
+                      at={item.at}
+                      hostId={hostId}
+                      projectId={parent.project_id}
+                      projectPath={projectPath}
+                      sessionId={effectiveSession?.id}
+                      connected={connected}
+                      active={active}
+                    />
+                  );
+                if (item.type === "assistant")
+                  return (
+                    <AnnotatedMessage
+                      key={`${key}:${item.key}`}
+                      text={item.text}
+                      message={item.key}
+                      entries={annotations}
+                      enabled={active && !busy && !parent.archived}
+                      onSave={saveAnnotation}
+                      onRemove={removeAnnotation}
+                      addToMainChat={
+                        !parent.archived ? addToMainChat : undefined
+                      }
+                    />
+                  );
+                if (item.type === "tool")
+                  return (
+                    <ToolRow
+                      tool={item}
+                      projectPath={projectPath}
+                      loadContext={
+                        effectiveSession
+                          ? { hostId, sessionId: effectiveSession.id }
+                          : undefined
+                      }
+                    />
+                  );
+                if (item.type === "tools")
+                  return (
+                    <ToolGroup
+                      tools={item.tools}
+                      unrecovered={item.unrecovered}
+                      projectPath={projectPath}
+                      loadContext={
+                        effectiveSession
+                          ? { hostId, sessionId: effectiveSession.id }
+                          : undefined
+                      }
+                    />
+                  );
+                if (item.type === "tool_images")
+                  return <ToolImages images={item.images} active={enabled} />;
+                if (item.type !== "event") return null;
+                const v = item.value;
+                if (v.kind === "notice")
+                  return <p className="notice">{v.text}</p>;
+                if (v.kind === "state" && v.status === "failed" && v.message)
+                  return <TurnErrorRow message={v.message} />;
+                if (v.kind === "state" && (v.message || v.status === "unknown"))
+                  return (
+                    <p className="notice">
+                      {v.message || "侧边聊天状态待确认"}
+                    </p>
+                  );
+                if (v.kind === "approval" && effectiveSession)
+                  return (
+                    <ApprovalCard
+                      request={v}
+                      resolved={item.resolved}
+                      decision={item.decision}
+                      tool={item.approvalTool}
+                      projectPath={projectPath}
+                      loadContext={{ hostId, sessionId: effectiveSession.id }}
+                      disabled={disabled || !running}
+                      busy={busy}
+                      onDecision={(allow) =>
+                        void perform({
+                          method: "approve",
+                          session_id: effectiveSession.id,
+                          request_id: v.request_id,
+                          allow,
+                        })
+                      }
+                    />
+                  );
+                if (v.kind === "question" && effectiveSession)
+                  return (
+                    <QuestionCard
+                      request={v}
+                      resolved={item.resolved}
+                      answers={item.answers}
+                      disabled={disabled || !running}
+                      onAnswer={(answers) =>
+                        void perform({
+                          method: "answer_question",
+                          session_id: effectiveSession.id,
+                          request_id: v.request_id,
+                          answers,
+                        })
+                      }
+                    />
+                  );
+                return null;
+              }}
+            </TurnTranscript>
+            {status && (
+              <WorkingStatus label={status} animated={enabled && running} />
+            )}
+          </div>
         </div>
+        {away && (
+          <button
+            type="button"
+            className="return-latest"
+            aria-label="回到最新"
+            title="回到最新"
+            onClick={() => {
+              follow.current = true;
+              setAway(false);
+              const el = scroll.current;
+              if (el) {
+                setSidePosition(drafts, key, {
+                  top: el.scrollHeight,
+                  follow: true,
+                });
+                el.scrollTop = el.scrollHeight;
+                el.scrollTo?.({ top: el.scrollHeight });
+              }
+            }}
+          >
+            <ArrowDown size={15} />
+            <span>回到最新</span>
+          </button>
+        )}
       </div>
       <div className="side-chat-compose">
         {pendingToken && !running && (
@@ -640,7 +1123,7 @@ export function SideChat({
               disabled={
                 !canInteract ||
                 busy ||
-                (!!closePending && !!session?.agent_session_busy)
+                (!!closePending && !!effectiveSession?.agent_session_busy)
               }
               onClick={() =>
                 showingConfirmation ? confirmEnd() : setConfirming(pendingToken)
@@ -728,9 +1211,9 @@ export function SideChat({
           hostId={hostId}
           projectId={parent.project_id}
           projectPath={projectPath}
-          sessionId={session?.id}
+          sessionId={effectiveSession?.id}
           connected={connected}
-          hidden={!active}
+          hidden={!active || (!isDraft && !effectiveSession)}
           disabled={parent.archived}
           sending={busy}
           value={draft.text}
@@ -746,12 +1229,14 @@ export function SideChat({
                 hostId={hostId}
                 agent={parent.agent}
                 connected={connected}
-                hidden={!active || (!isDraft && !session)}
+                hidden={!active || (!isDraft && !effectiveSession)}
                 value={permission}
                 onChange={(permission) =>
                   setSelection({ model, effort, permission })
                 }
-                disabled={disabled || running || (!isDraft && !session)}
+                disabled={
+                  disabled || running || (!isDraft && !effectiveSession)
+                }
                 sideChat
                 allowInherit={supportsInheritPermission}
               />
@@ -764,7 +1249,7 @@ export function SideChat({
                 agent={parent.agent}
                 conversationKey={key}
                 connected={connected}
-                settingsOpen={!active || (!isDraft && !session)}
+                settingsOpen={!active || (!isDraft && !effectiveSession)}
                 preserveUnavailableModel
                 value={model}
                 onChange={(model) =>
@@ -780,7 +1265,9 @@ export function SideChat({
                 onEffortInvalid={() =>
                   setSelection({ model, effort: null, permission })
                 }
-                disabled={disabled || running || (!isDraft && !session)}
+                disabled={
+                  disabled || running || (!isDraft && !effectiveSession)
+                }
               />
               <ComposerAction
                 active={running}
@@ -791,11 +1278,11 @@ export function SideChat({
                   (!running && (!hasContent || (!navigation && !modelReady)))
                 }
                 onClick={
-                  running && session
+                  running && effectiveSession
                     ? () =>
                         void perform({
                           method: "cancel",
-                          session_id: session.id,
+                          session_id: effectiveSession.id,
                         })
                     : send
                 }

@@ -1055,3 +1055,293 @@ async fn custom_agent_environment_reaches_all_adapters_and_reconfigures_without_
         }
     }
 }
+
+#[tokio::test]
+async fn custom_agent_environment_resolves_agent_commands_and_skill_info_for_cold_and_open_sessions()
+ {
+    let fake_home = tempfile::tempdir().unwrap();
+    let fake_xdg = fake_home.path().join(".config");
+    let empty = std::ffi::OsStr::new("");
+    let host = Host::start_with_environment(&[
+        ("HOME", fake_home.path().as_os_str()),
+        ("XDG_CONFIG_HOME", fake_xdg.as_os_str()),
+        ("CODEX_HOME", empty),
+        ("OPENCODE_CONFIG_DIR", empty),
+        ("CURSOR_CONFIG_DIR", empty),
+        ("TRAEX_HOME", empty),
+    ])
+    .await;
+    let app = tempfile::tempdir().unwrap();
+    let app_path = app.path();
+    let target = Mutex::new(host.client().await);
+    let mut observer = host.client().await;
+    let project_dir = tempfile::tempdir().unwrap();
+    let Response::Project { project } = ask(
+        &mut observer,
+        Request::AddProject {
+            path: project_dir.path().to_string_lossy().into_owned(),
+            name: None,
+        },
+    )
+    .await
+    else {
+        panic!("project")
+    };
+
+    let write_skill = |dir: &std::path::Path, name: &str, desc: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {desc}\n---\nbody\n"),
+        )
+        .unwrap();
+    };
+    // Seed a default copy of `dual-demo` in each agent's unconfigured default root so
+    // configured overrides prove they replace (not duplicate) the default home root.
+    for default_skill_dir in [
+        fake_home.path().join(".codex/skills/dual-demo"),
+        host.directory.path().join("claude-config/skills/dual-demo"),
+        fake_home.path().join(".config/opencode/skills/dual-demo"),
+        fake_home.path().join(".cursor/skills/dual-demo"),
+        fake_home.path().join(".traex/skills/dual-demo"),
+    ] {
+        write_skill(&default_skill_dir, "Dual Demo", "default home copy");
+    }
+
+    for (agent, env_key, rel_skill_dir, expected_desc) in [
+        (
+            "codex",
+            "CODEX_HOME",
+            "skills/configured-demo",
+            "expected codex instance file",
+        ),
+        (
+            "claude",
+            "CLAUDE_CONFIG_DIR",
+            "skills/configured-demo",
+            "expected claude instance file",
+        ),
+        (
+            "opencode",
+            "OPENCODE_CONFIG_DIR",
+            "skills/configured-demo",
+            "expected opencode instance file",
+        ),
+        (
+            "cursor",
+            "CURSOR_CONFIG_DIR",
+            "skills/configured-demo",
+            "expected cursor instance file",
+        ),
+        (
+            "traex",
+            "TRAEX_HOME",
+            "skills/configured-demo",
+            "expected traex instance file",
+        ),
+    ] {
+        let instance_dir = tempfile::tempdir().unwrap();
+        let skill_dir = instance_dir.path().join(rel_skill_dir);
+        write_skill(&skill_dir, "Configured Demo", expected_desc);
+        let custom_dual_desc = format!("custom {agent} override copy");
+        write_skill(
+            &instance_dir.path().join("skills/dual-demo"),
+            "Dual Demo",
+            &custom_dual_desc,
+        );
+
+        let env = AgentEnvironment(BTreeMap::from([(
+            env_key.into(),
+            instance_dir.path().to_string_lossy().into_owned(),
+        )]));
+        ProviderStore::open(app_path, None)
+            .unwrap()
+            .save_environment("target", agent, env)
+            .unwrap();
+        let resolve = |agent: String| async move {
+            ProviderStore::open(app_path, None)?.launch_for_host("target", &agent)
+        };
+
+        // 1. Desktop-style `AgentCommands` attaches configured environment for every agent.
+        let catalog = request_with_app_agent_config(
+            &target,
+            Request::AgentCommands {
+                agent: agent.into(),
+                project_id: project.id.clone(),
+                provider: None,
+            },
+            resolve,
+        )
+        .await
+        .unwrap();
+        match catalog {
+            Response::AgentCommands { commands } => {
+                for expected_slug in ["configured-demo", "dual-demo"] {
+                    assert!(
+                        commands.iter().any(|c| {
+                            c.name == expected_slug
+                                && c.kind == Some(latte_work_protocol::AgentCommandKind::Skill)
+                        }),
+                        "{agent} missing {expected_slug} in commands: {commands:?}"
+                    );
+                }
+            }
+            other => panic!("expected {agent} commands, got {other:?}"),
+        }
+
+        let Response::Session { session } = ask(
+            &mut observer,
+            Request::CreateSession {
+                project_id: project.id.clone(),
+                agent: agent.into(),
+            },
+        )
+        .await
+        else {
+            panic!("session")
+        };
+
+        // 2. Cold session without `provider` sees default host environment (`None` for
+        //    `configured-demo`, `"default home copy"` for `dual-demo`), while
+        //    `request_with_app_agent_config` attaches the configured override without ambiguity.
+        assert!(matches!(
+            ask(
+                &mut observer,
+                Request::SkillInfo {
+                    provider: None,
+                    session_id: session.id.clone(),
+                    name: "configured-demo".into(),
+                },
+            )
+            .await,
+            Response::SkillInfo { skill: None }
+        ));
+        assert!(matches!(
+            ask(
+                &mut observer,
+                Request::SkillInfo {
+                    provider: None,
+                    session_id: session.id.clone(),
+                    name: "dual-demo".into(),
+                },
+            )
+            .await,
+            Response::SkillInfo { skill: Some(info) } if info.description == "default home copy"
+        ));
+        for (slug, desc) in [
+            ("configured-demo", expected_desc),
+            ("dual-demo", custom_dual_desc.as_str()),
+        ] {
+            let cold_info = request_with_app_agent_config(
+                &target,
+                Request::SkillInfo {
+                    provider: None,
+                    session_id: session.id.clone(),
+                    name: slug.into(),
+                },
+                resolve,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    &cold_info,
+                    Response::SkillInfo { skill: Some(info) } if info.description == desc
+                ),
+                "{agent} cold SkillInfo({slug}) mismatch: {cold_info:?}"
+            );
+        }
+
+        // 3. Once the session is opened with the configured environment, direct RPC `SkillInfo`
+        //    with `provider: None` also uses the active session's environment.
+        if matches!(agent, "codex" | "claude" | "traex") {
+            assert!(matches!(
+                request_with_app_agent_config(
+                    &target,
+                    Request::OpenAgentSession {
+                        session_id: session.id.clone(),
+                        provider: None,
+                    },
+                    resolve,
+                )
+                .await
+                .unwrap(),
+                Response::Ok
+            ));
+            for (slug, desc) in [
+                ("configured-demo", expected_desc),
+                ("dual-demo", custom_dual_desc.as_str()),
+            ] {
+                let open_info = ask(
+                    &mut observer,
+                    Request::SkillInfo {
+                        provider: None,
+                        session_id: session.id.clone(),
+                        name: slug.into(),
+                    },
+                )
+                .await;
+                assert!(
+                    matches!(
+                        &open_info,
+                        Response::SkillInfo { skill: Some(info) } if info.description == desc
+                    ),
+                    "{agent} open-session SkillInfo({slug}) mismatch: {open_info:?}"
+                );
+            }
+            if agent == "codex" {
+                // Disabling a same-named project copy in Codex `config.toml` must keep
+                // `AgentCommands` and `SkillInfo` aligned on the enabled user copy.
+                let proj_dup_dir = project_dir.path().join(".codex/skills/dual-demo");
+                write_skill(&proj_dup_dir, "Dual Demo", "disabled project copy");
+                std::fs::write(
+                    instance_dir.path().join("config.toml"),
+                    format!(
+                        "[[skills.config]]\npath = \"{}\"\nenabled = false\n",
+                        proj_dup_dir.join("SKILL.md").display()
+                    ),
+                )
+                .unwrap();
+                let Response::AgentCommands { commands } = request_with_app_agent_config(
+                    &target,
+                    Request::AgentCommands {
+                        agent: "codex".into(),
+                        project_id: project.id.clone(),
+                        provider: None,
+                    },
+                    resolve,
+                )
+                .await
+                .unwrap() else {
+                    panic!("expected codex commands")
+                };
+                assert!(commands.iter().any(|c| c.name == "dual-demo"));
+                let disabled_check = ask(
+                    &mut observer,
+                    Request::SkillInfo {
+                        provider: None,
+                        session_id: session.id.clone(),
+                        name: "dual-demo".into(),
+                    },
+                )
+                .await;
+                assert!(
+                    matches!(
+                        &disabled_check,
+                        Response::SkillInfo { skill: Some(info) } if info.description == custom_dual_desc
+                    ),
+                    "expected enabled user copy when project copy is disabled, got {disabled_check:?}"
+                );
+                let _ = std::fs::remove_dir_all(&proj_dup_dir);
+            }
+            ask(
+                &mut observer,
+                Request::CloseAgentSession {
+                    session_id: session.id,
+                    only_if_idle: None,
+                },
+            )
+            .await;
+        }
+    }
+}

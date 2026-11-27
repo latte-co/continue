@@ -26,20 +26,18 @@ const SIGNAL_LABELS: Record<Exclude<SignalKind, "idle">, string> = {
 export function StatusSignal({
   status,
   label,
+  title,
 }: {
   status: SignalKind;
   label?: string;
+  title?: string;
 }) {
   if (status === "idle") return null;
   const text = label ?? SIGNAL_LABELS[status];
+  const tip = title ?? text;
   if (status === "running") {
     return (
-      <span
-        className="ui-signal-dots"
-        role="img"
-        aria-label={text}
-        title={text}
-      >
+      <span className="ui-signal-dots" role="img" aria-label={text} title={tip}>
         <i />
         <i />
         <i />
@@ -54,7 +52,7 @@ export function StatusSignal({
         role="img"
         aria-label={text}
       >
-        <title>{text}</title>
+        <title>{tip}</title>
       </CirclePause>
     );
   }
@@ -66,7 +64,7 @@ export function StatusSignal({
         role="img"
         aria-label={text}
       >
-        <title>{text}</title>
+        <title>{tip}</title>
       </CircleAlert>
     );
   }
@@ -78,7 +76,7 @@ export function StatusSignal({
         role="img"
         aria-label={text}
       >
-        <title>{text}</title>
+        <title>{tip}</title>
       </CircleHelp>
     );
   }
@@ -87,7 +85,7 @@ export function StatusSignal({
       className="ui-signal-unread"
       role="img"
       aria-label={text}
-      title={text}
+      title={tip}
     />
   );
 }

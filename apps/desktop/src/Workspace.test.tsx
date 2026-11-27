@@ -840,3 +840,127 @@ it("keeps a single history button when the expanded side chat shares its session
   fireEvent.click(screen.getByRole("tab", { name: "侧边聊天" }));
   expect(screen.getAllByRole("button", { name: "历史" })).toHaveLength(1);
 });
+
+it("displays settled side-chat tab titles while numbering untitled sibling tabs", async () => {
+  const { openSideChatTab, setSideChatTitle } =
+    await import("./workspaceState");
+  const first = crypto.randomUUID();
+  const second = crypto.randomUUID();
+  const completedHistory = crypto.randomUUID();
+  openSideChatTab(props.workspaceId, first, true);
+  openSideChatTab(props.workspaceId, second, true);
+  mocks.request.mockImplementation(async (_host: string, r: Request) => {
+    if (r.method === "side_chat_history")
+      return {
+        kind: "side_chat_history",
+        next: null,
+        sessions: [
+          {
+            id: completedHistory,
+            title: "历史侧聊自动标题",
+            created_at: 1,
+            status: "completed",
+            title_requested: true,
+            custom_title: false,
+          },
+        ],
+      };
+    return { kind: "ok" };
+  });
+  render(<Workspace {...props} sessionId="parent" canOpenSideChat />);
+  expect(screen.getByRole("tab", { name: "侧边聊天 1" })).toBeTruthy();
+  expect(screen.getByRole("tab", { name: "侧边聊天 2" })).toBeTruthy();
+
+  act(() => setSideChatTitle(props.workspaceId, first, "侧聊缓存优化"));
+  expect(screen.getByRole("tab", { name: "侧聊缓存优化" })).toBeTruthy();
+  expect(screen.getByRole("tab", { name: "侧边聊天 2" })).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "历史" }));
+  fireEvent.click(
+    await screen.findByRole("button", { name: /历史侧聊自动标题/ }),
+  );
+  expect(screen.getByRole("tab", { name: "历史侧聊自动标题" })).toBeTruthy();
+});
+
+it("forwards active session or side-chat ID and selected repo_path when creating a terminal and badges worktree cwd", async () => {
+  const { terminalDirectoryBadge } = await import("./Workspace");
+  const { setSelectedGitRepository } = await import("./gitRepositories");
+  const { openSideChatTab } = await import("./workspaceState");
+
+  expect(terminalDirectoryBadge("/work/app", "/work/app")).toBeNull();
+  expect(
+    terminalDirectoryBadge(
+      "/work/app",
+      "/work/app/.oh-my-code/worktree/continue/fix-ux",
+    ),
+  ).toBe("continue/fix-ux");
+  expect(
+    terminalDirectoryBadge(
+      "/work/app",
+      "/work/app/continue/.claude/worktrees/feat-a",
+    ),
+  ).toBe("continue/feat-a");
+  expect(
+    terminalDirectoryBadge("/work/app", "/Users/dev/.codex/worktrees/ext-wt"),
+  ).toBe("ext-wt");
+
+  setSelectedGitRepository(
+    "local",
+    project,
+    ".oh-my-code/worktree/continue/fix-ux",
+  );
+  const worktreeCwd = `${project.path}/.oh-my-code/worktree/continue/fix-ux`;
+  mocks.request.mockImplementation(async (_host: string, req: Request) => {
+    if (req.method === "terminals") return { kind: "terminals", terminals: [] };
+    if (req.method === "create_terminal") {
+      return {
+        kind: "terminal",
+        terminal: {
+          id: req.terminal_id,
+          project_id: project.id,
+          title: "zsh",
+          exited: false,
+          exit_code: null,
+          cwd: worktreeCwd,
+        },
+      };
+    }
+    return { kind: "ok" };
+  });
+
+  render(<Workspace {...props} sessionId="main-session-1" canOpenSideChat />);
+  await act(async () => {});
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "终端" }));
+  });
+  expect(mocks.request).toHaveBeenCalledWith(
+    "local",
+    expect.objectContaining({
+      method: "create_terminal",
+      project_id: project.id,
+      session_id: "main-session-1",
+      repo_path: ".oh-my-code/worktree/continue/fix-ux",
+    }),
+  );
+  const wtTab = await screen.findByRole("tab", {
+    name: "zsh (continue/fix-ux) · 本机",
+  });
+  expect(wtTab.getAttribute("title")).toContain(worktreeCwd);
+
+  // Opening a terminal while focused on a side-chat tab forwards the side-chat session ID.
+  const sideId = crypto.randomUUID();
+  act(() => openSideChatTab(props.workspaceId, sideId, true));
+  fireEvent.click(screen.getByRole("button", { name: "添加工作区标签" }));
+  await act(async () => {
+    fireEvent.click(screen.getByRole("menuitem", { name: "终端" }));
+  });
+  expect(mocks.request).toHaveBeenLastCalledWith(
+    "local",
+    expect.objectContaining({
+      method: "create_terminal",
+      project_id: project.id,
+      session_id: sideId,
+    }),
+  );
+  setSelectedGitRepository("local", project, undefined);
+});

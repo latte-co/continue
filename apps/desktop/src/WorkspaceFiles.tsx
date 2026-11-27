@@ -1,6 +1,10 @@
 import { useAppClose } from "./appLifecycle";
 import { SourcePreview } from "./SourcePreview";
-import { FileTextView, isMarkdownFile } from "./FileTextView";
+import {
+  FileTextView,
+  isMarkdownFile,
+  isRichPreviewFile,
+} from "./FileTextView";
 import { useEffect, useState } from "react";
 import { Code2, Eye, Folders, RefreshCw, WrapText } from "lucide-react";
 import type { FileEntry, Project } from "./protocol";
@@ -38,6 +42,8 @@ export function WorkspaceFiles({
   navigate,
   reference,
   sessionId,
+  markdownPreviewRequest,
+  clearMarkdownPreviewRequest,
 }: {
   hostId: string;
   project: Project;
@@ -48,6 +54,8 @@ export function WorkspaceFiles({
   navigate: (value: { path?: string; file?: string }) => void;
   reference?: FileEntry;
   sessionId?: string;
+  markdownPreviewRequest?: number;
+  clearMarkdownPreviewRequest?: () => void;
 }) {
   const [closing, setClosing] = useState(false);
   const active = visible && !closing;
@@ -65,7 +73,6 @@ export function WorkspaceFiles({
   const [loading, setLoading] = useState(false);
   const [treeOpen, setTreeOpen] = useState(true);
   const [wrap, setWrap] = useState(savedWrap);
-  const [markdownScope, setMarkdownScope] = useState("");
   const fileScope = JSON.stringify([
     hostId,
     project.id,
@@ -73,8 +80,41 @@ export function WorkspaceFiles({
     reference?.path,
     file,
   ]);
-  const markdown = isMarkdownFile(file) && markdownScope === fileScope;
-  useEffect(() => setMarkdownScope(""), [fileScope]);
+  const [markdownState, setMarkdownState] = useState(() => ({
+    scope: fileScope,
+    request: markdownPreviewRequest,
+    enabled: Boolean(markdownPreviewRequest) && isMarkdownFile(file),
+  }));
+  const nextMarkdownEnabled =
+    Boolean(markdownPreviewRequest) &&
+    markdownPreviewRequest !== markdownState.request
+      ? isMarkdownFile(file)
+      : fileScope !== markdownState.scope ||
+          (markdownState.request !== undefined &&
+            markdownPreviewRequest === undefined)
+        ? false
+        : markdownState.enabled;
+  const markdown = isMarkdownFile(file) && nextMarkdownEnabled;
+  useEffect(() => {
+    setMarkdownState((current) => {
+      const enabled =
+        Boolean(markdownPreviewRequest) &&
+        markdownPreviewRequest !== current.request
+          ? isMarkdownFile(file)
+          : fileScope !== current.scope ||
+              (current.request !== undefined &&
+                markdownPreviewRequest === undefined)
+            ? false
+            : current.enabled;
+      return current.scope === fileScope &&
+        current.request === markdownPreviewRequest &&
+        current.enabled === enabled
+        ? current
+        : { scope: fileScope, request: markdownPreviewRequest, enabled };
+    });
+  }, [file, fileScope, markdownPreviewRequest]);
+  const richPreview =
+    Boolean(reference) || (Boolean(file) && isRichPreviewFile(file));
   const treeWidth = useFileTreeWidth(active && tab === "files" && treeOpen);
 
   useEffect(() => {
@@ -87,7 +127,7 @@ export function WorkspaceFiles({
 
   useEffect(() => {
     if (!active || tab !== "files") return;
-    if (reference) {
+    if (richPreview) {
       setLoading(false);
       setError("");
       setTruncated(false);
@@ -130,14 +170,14 @@ export function WorkspaceFiles({
     tab,
     revision,
     active,
-    reference,
+    richPreview,
   ]);
   useStatusIssues([
     {
       id: `file:${hostId}:${project.id}:${project.path}:${file || path}`,
       title: `${file || path || project.name} 未能读取`,
-      error: active && tab === "files" && file && !reference ? error : "",
-      pending: active && tab === "files" && !!file && loading,
+      error: active && tab === "files" && file && !richPreview ? error : "",
+      pending: active && tab === "files" && !!file && !richPreview && loading,
       action: { label: "重试", run: () => refresh((value) => value + 1) },
     },
   ]);
@@ -183,7 +223,7 @@ export function WorkspaceFiles({
               : file || path || "文件"}
           </span>
         </div>
-        {file && !reference && !loading && !error && truncated && (
+        {file && !richPreview && !loading && !error && truncated && (
           <Badge tone="warning" className="workspace-file-truncated">
             内容已截断
           </Badge>
@@ -196,7 +236,15 @@ export function WorkspaceFiles({
               active={markdown}
               aria-pressed={markdown}
               disabled={!active}
-              onClick={() => setMarkdownScope(markdown ? "" : fileScope)}
+              onClick={() => {
+                const next = !markdown;
+                if (!next) clearMarkdownPreviewRequest?.();
+                setMarkdownState({
+                  scope: fileScope,
+                  request: markdownPreviewRequest,
+                  enabled: next,
+                });
+              }}
             >
               {markdown ? <Code2 size={15} /> : <Eye size={15} />}
             </IconButton>
@@ -206,7 +254,7 @@ export function WorkspaceFiles({
             label="自动换行"
             active={wrap}
             aria-pressed={wrap}
-            disabled={markdown}
+            disabled={markdown || isRichPreviewFile(file)}
             onClick={() => setWrap((value) => !value)}
           >
             <WrapText size={15} />
@@ -240,13 +288,13 @@ export function WorkspaceFiles({
                 description="从右侧目录选择文件"
               />
             </div>
-          ) : reference ? (
+          ) : richPreview ? (
             <SourcePreview
               key={`${file}:${revision}`}
               hostId={hostId}
               projectId={project.id}
               projectPath={project.path}
-              sessionId={sessionId}
+              sessionId={reference ? sessionId : undefined}
               source={{
                 path: file,
                 name: file.split("/").at(-1) || file,

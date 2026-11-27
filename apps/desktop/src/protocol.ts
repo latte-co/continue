@@ -14,6 +14,10 @@ export type TerminalInfo = {
   title: string;
   exited: boolean;
   exit_code: number | null;
+  /**
+   * Canonical working directory where this terminal shell was spawned.
+   */
+  cwd?: string;
 };
 export type Status =
   | "ready"
@@ -55,6 +59,10 @@ export type Session = {
    * Parent session ID when this session is a side chat; live server projection only.
    */
   parent_session_id?: string;
+  /**
+   * Highest-priority active side-chat status (`running` or `waiting`) for a parent session.
+   */
+  side_chat_status?: Status;
   /**
    * Live server projection only; absent on older servers and in durable history.
    */
@@ -118,6 +126,7 @@ export type Subagent = {
   started_at: number | null;
   updated_at: number;
 };
+export type AgentCommandKind = "command" | "skill";
 export type AgentCommandUiAction = "subagents";
 export type ComposerPredictionStatus =
   "pending" | "ready" | "none" | "unsupported" | "failed";
@@ -196,6 +205,7 @@ export type ChangePreviewTarget =
       scope: GitReviewScope;
       base: string | null;
       head: string | null;
+      repo_path?: string;
     }
   | { kind: "task"; session_id: string }
   | { kind: "turn"; session_id: string; request_id: string };
@@ -222,6 +232,13 @@ export type GitChange = {
 };
 export type GitReviewScope =
   "branch" | "commit" | "worktree" | "unstaged" | "staged";
+export type GitRepositoryKind =
+  "root" | "repository" | "submodule" | "worktree";
+export type GitRepository = {
+  path: string;
+  name: string;
+  kind: GitRepositoryKind;
+};
 export type GitRef = { name: string; full_name: string };
 export type GitCommit = { oid: string; subject: string };
 export type GitInfo = {
@@ -230,6 +247,8 @@ export type GitInfo = {
   default_base: string | null;
   refs: Array<GitRef>;
   truncated: boolean;
+  repositories?: Array<GitRepository>;
+  repositories_truncated?: boolean;
 };
 export type GitReviewFile = {
   path: string;
@@ -334,6 +353,7 @@ export type AgentSlashCommand = {
   display_name?: string | null;
   description: string;
   argument_hint: string;
+  kind?: AgentCommandKind;
   /**
    * Presentation hint supplied only for an advertised native command.
    */
@@ -403,6 +423,8 @@ export type Request =
       terminal_id: string;
       cols: number;
       rows: number;
+      session_id?: string;
+      repo_path?: string;
     }
   | { method: "read_terminal"; terminal_id: string; after: number }
   | { method: "write_terminal"; terminal_id: string; data: Array<number> }
@@ -611,18 +633,21 @@ export type Request =
   | { method: "read_file"; project_id: string; path: string }
   | { method: "diff"; project_id: string }
   | { method: "changes"; project_id: string }
-  | { method: "git_info"; project_id: string }
+  | { method: "git_repositories"; project_id: string }
+  | { method: "git_info"; project_id: string; repo_path?: string }
   | {
       method: "git_commits";
       project_id: string;
       head: string | null;
       offset: number;
+      repo_path?: string;
     }
   | {
       method: "git_review";
       project_id: string;
       scope: GitReviewScope;
       base: string | null;
+      repo_path?: string;
     }
   | {
       method: "git_review_diff";
@@ -632,6 +657,7 @@ export type Request =
       head: string | null;
       path: string;
       full_context: boolean;
+      repo_path?: string;
     }
   | {
       method: "change_summary";
@@ -681,7 +707,12 @@ export type Request =
       name: string;
       files: Array<SkillImportFile>;
     }
-  | { method: "skill_info"; session_id: string; name: string }
+  | {
+      method: "skill_info";
+      provider?: TurnProvider;
+      session_id: string;
+      name: string;
+    }
   | { method: "sources"; session_id: string }
   | {
       method: "preview_source";
@@ -762,6 +793,11 @@ export type Response =
       source: string;
     }
   | { kind: "changes"; entries: Array<GitChange>; truncated: boolean }
+  | {
+      kind: "git_repositories";
+      repositories: Array<GitRepository>;
+      truncated: boolean;
+    }
   | { kind: "git_info"; info: GitInfo }
   | {
       kind: "git_commits";

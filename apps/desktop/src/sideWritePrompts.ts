@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 
-const requested = new Set<string>();
+let nextVersion = 0;
+const requested = new Map<string, number>();
 const listeners = new Set<() => void>();
 
 function scopeKey(hostId: string, sideId: string) {
@@ -27,16 +28,35 @@ export function parsePendingSideWriteSessionId(
   return match?.[1] ?? null;
 }
 
+export function sideWriteConfirmationVersion(hostId: string, sideId: string) {
+  return requested.get(scopeKey(hostId, sideId)) ?? 0;
+}
+
 export function requestSideWriteConfirmation(hostId: string, sideId: string) {
-  const target = scopeKey(hostId, sideId);
-  if (requested.has(target)) return;
-  requested.add(target);
+  requested.set(scopeKey(hostId, sideId), ++nextVersion);
   notify();
 }
 
-export function clearSideWriteConfirmation(hostId: string, sideId: string) {
-  if (!requested.delete(scopeKey(hostId, sideId))) return;
+export function clearSideWriteConfirmation(
+  hostId: string,
+  sideId: string,
+  maxVersion?: number,
+) {
+  const target = scopeKey(hostId, sideId);
+  const current = requested.get(target);
+  if (current === undefined) return;
+  if (maxVersion !== undefined && current > maxVersion) return;
+  requested.delete(target);
   notify();
+}
+
+export function useSideWriteConfirmationVersion(
+  hostId: string,
+  sideId: string,
+) {
+  return useSyncExternalStore(subscribe, () =>
+    sideWriteConfirmationVersion(hostId, sideId),
+  );
 }
 
 export function useSideWriteConfirmationRequested(

@@ -455,6 +455,8 @@ it("keeps non-Git summaries quiet and usable, then refreshes after Git initializ
         "not_git_repository",
         "此项目无 Git 分支信息",
       );
+    if (request.method === "git_repositories")
+      return { kind: "git_repositories", repositories: [], truncated: false };
     return normal(host, request);
   });
   render(<TaskInfo {...props} />);

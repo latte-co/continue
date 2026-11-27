@@ -194,6 +194,7 @@ impl Terminals {
         &mut self,
         project_id: String,
         path: &Path,
+        preferred_cwd: Option<&Path>,
         id: String,
         cols: u16,
         rows: u16,
@@ -211,13 +212,18 @@ impl Terminals {
         if self.entries.len() >= MAX_TERMINALS {
             bail!("此 Host 最多打开 16 个终端，请先关闭不使用的终端");
         }
-        let path = path.canonicalize().context("项目目录不存在")?;
-        if !path.is_dir() {
+        let project_root = path.canonicalize().context("项目目录不存在")?;
+        if !project_root.is_dir() {
             bail!("项目路径不是目录");
         }
+        let cwd = preferred_cwd
+            .and_then(|dir| dir.canonicalize().ok())
+            .filter(|dir| dir.is_dir())
+            .unwrap_or(project_root);
+        let cwd_string = cwd.to_string_lossy().into_owned();
         let pair = native_pty_system().openpty(dimensions)?;
         let mut command = CommandBuilder::new_default_prog();
-        command.cwd(path);
+        command.cwd(cwd);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         // Duplicates share O_NONBLOCK. Safe descriptor APIs avoid uninterruptible
@@ -255,6 +261,7 @@ impl Terminals {
                     .unwrap_or_else(|| "终端".into()),
                 exited: false,
                 exit_code: None,
+                cwd: Some(cwd_string),
             },
             control: control.clone(),
             output: output.clone(),

@@ -453,14 +453,81 @@ async fn cursor_models_and_unsupported_overrides_are_host_owned() {
         ));
     }
     assert!(!root.path().join("cursor-inputs").exists());
+    std::fs::create_dir_all(root.path().join(".cursor/commands")).unwrap();
+    std::fs::create_dir_all(root.path().join(".cursor/skills/cursor-skill")).unwrap();
+    std::fs::write(
+        root.path().join(".cursor/commands/check-cursor.md"),
+        "---\nname: 检查配置\ndescription: Cursor 命令说明\n---\n内容\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(".cursor/skills/cursor-skill/SKILL.md"),
+        "---\nname: Cursor 技能\ndescription: Cursor 技能说明\n---\n步骤\n",
+    )
+    .unwrap();
     let project_id = current(&mut client, &id).await.project_id;
+    let discovered = ask(
+        &mut client,
+        Request::AgentCommands {
+            agent: "cursor".into(),
+            project_id: project_id.clone(),
+            provider: Some(TurnProvider::Cli),
+        },
+    )
+    .await;
+    match discovered {
+        Response::AgentCommands { commands } => {
+            assert!(commands.iter().any(|c| {
+                c.name == "check-cursor"
+                    && c.display_name.as_deref() == Some("检查配置")
+                    && c.kind == Some(latte_work_protocol::AgentCommandKind::Command)
+            }));
+            assert!(commands.iter().any(|c| {
+                c.name == "cursor-skill"
+                    && c.display_name.as_deref() == Some("Cursor 技能")
+                    && c.kind == Some(latte_work_protocol::AgentCommandKind::Skill)
+            }));
+        }
+        other => panic!("expected cursor commands: {other:?}"),
+    }
+    assert!(matches!(
+        ask(
+            &mut client,
+            Request::SkillInfo {
+                provider: None,
+                session_id: id.clone(),
+                name: "cursor-skill".into(),
+            }
+        )
+        .await,
+        Response::SkillInfo { skill: Some(info) }
+            if info.name == "Cursor 技能" && info.description == "Cursor 技能说明"
+    ));
+    assert!(!root.path().join("cursor-inputs").exists());
     assert!(matches!(
         ask(
             &mut client,
             Request::AgentCommands {
                 agent: "cursor".into(),
                 project_id,
-                provider: Some(TurnProvider::Cli),
+                provider: Some(TurnProvider::Snapshot(Box::new(
+                    latte_work_protocol::ProviderSnapshot {
+                        provider: latte_work_protocol::Provider {
+                            id: "p".into(),
+                            name: "Provider".into(),
+                            protocol: latte_work_protocol::ProviderProtocol::AnthropicMessages,
+                            base_url: "https://example.invalid".into(),
+                            model: "m".into(),
+                            models: vec![],
+                            model_labels: Default::default(),
+                            models_1m: vec![],
+                            auth: latte_work_protocol::ProviderAuth::ApiKey,
+                            has_credential: true,
+                            revision: "1".into(),
+                        },
+                        credential: "secret".into(),
+                    },
+                ))),
             }
         )
         .await,

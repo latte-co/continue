@@ -455,6 +455,12 @@ var(--color-border)`) `.activity-well` containers:
       the prompt.
     - **Inline Link Pills (`.composer-link-pill`)**: Markdown links `[文档](https://...)`
       render as compact atomic inline pills with a `Globe` icon + label (`🌐 文档`).
+    - **Inline Command & Skill Pills (`.composer-command-pill`)**: Completed
+      slash commands and skills (`/doc-coauthoring`, `/compact`, `/agents`,
+      `/model`, `/effort`, `/side`) render as borderless sky-blue atomic inline
+      tokens (`14px` semantic command/skill SVG icon + bare command/skill `name`
+      without leading `/`), while serializing losslessly back to `/name` on
+      submit or copy.
     - **GFM Tables & Code Blocks**: Live bordered Markdown tables (`th` in
       `--color-well`) and fenced `.composer-md-codeblock` blocks displaying their
       `data-language` label in the top-left header strip.
@@ -469,8 +475,8 @@ var(--color-border)`) `.activity-well` containers:
     - `@` menu: `14px` file/folder icon + primary filename/dirname + muted
       relative parent directory (`small`), with a subtle right chevron on folders
       and an inline `28px` `.composer-menu-search` input at the top.
-    - `/` menu: `14px` command/skill icon + `/name` + muted single-line
-      description (`small`).
+    - `/` menu: `14px` command/skill icon + bare command/skill `name` (without
+      leading `/`) + muted single-line description (`small`).
   - **Keyboard Navigation Contract**:
     - `ArrowUp` / `ArrowDown`: Roving highlight across `.composer-menu-option`s.
     - `Tab`: On a directory (`@dir`), drills into `@dir/` to browse its children

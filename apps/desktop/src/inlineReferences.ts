@@ -12,15 +12,19 @@ const MAX_REFERENCE_LENGTH = 512;
 const URL_PATTERN = /^https?:\/\/[^\s<>"'`]+$/;
 // Characters that mark shell/code syntax rather than a literal path.
 const PATH_HOSTILE = /[\s{}()[\]$*?|\\;"'`<>,=]/;
+const LINK_PATH_HOSTILE = /[\0-\x1f\x7f{}()[\]$*?|\\;"'`<>,=]/;
 const LINE_SUFFIX = /:(\d{1,5}(?:-\d{1,5})?)$/;
 const EXTENSION = /\.[A-Za-z][A-Za-z0-9]{0,15}$/;
 
-function pathLike(text: string): {
+function pathLike(
+  text: string,
+  allowSpaces = false,
+): {
   kind: "projectPath" | "externalPath";
   path: string;
   line?: string;
 } | null {
-  if (PATH_HOSTILE.test(text)) return null;
+  if ((allowSpaces ? LINK_PATH_HOSTILE : PATH_HOSTILE).test(text)) return null;
   // A trailing `file.ts:12` or `file.ts:12-20` line hint is stripped, not
   // treated as part of the path; the number rides along for tooltips.
   const line = text.match(LINE_SUFFIX)?.[1];
@@ -54,23 +58,51 @@ const OTHER_SCHEME = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
 const FILE_URL = /^file:\/\/(.+)$/;
 const FRAGMENT_LINE = /#L(\d{1,5}(?:-\d{1,5})?)$/;
 
+function decodeHrefPath(raw: string): string | null {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Classify a markdown link target. Same path rules as code spans, plus
- * `file:///` unwrapping and `#L12` line fragments; anchors and unknown
- * schemes stay inert instead of guessing at local paths.
+ * `file:///` unwrapping, percent-decoding for non-ASCII/spaced filenames, and
+ * `#L12` line fragments; anchors and unknown schemes stay inert instead of
+ * guessing at local paths.
  */
 export function classifyLinkHref(href: string): InlineReference {
   const text = href.trim();
-  if (!text || text.length > MAX_REFERENCE_LENGTH) return { kind: "text" };
-  if (URL_PATTERN.test(text)) return { kind: "url", url: text };
-  const file = text.match(FILE_URL)?.[1];
-  if (file) return pathLike(file) ?? { kind: "text" };
-  if (text.startsWith("#") || OTHER_SCHEME.test(text)) return { kind: "text" };
+  if (!text || text.length > MAX_REFERENCE_LENGTH * 3) return { kind: "text" };
+  if (URL_PATTERN.test(text))
+    return text.length <= MAX_REFERENCE_LENGTH
+      ? { kind: "url", url: text }
+      : { kind: "text" };
   const fragment = text.match(FRAGMENT_LINE)?.[1];
-  const body = fragment
+  const withoutFragment = fragment
     ? text.slice(0, text.length - fragment.length - 2)
     : text;
-  const reference = pathLike(body);
+  const file = withoutFragment.match(FILE_URL)?.[1];
+  if (file) {
+    const decoded = decodeHrefPath(file);
+    if (!decoded || decoded.length > MAX_REFERENCE_LENGTH)
+      return { kind: "text" };
+    const reference = pathLike(decoded, true);
+    return reference
+      ? { ...reference, line: reference.line ?? fragment }
+      : { kind: "text" };
+  }
+  if (text.startsWith("#") || OTHER_SCHEME.test(text)) return { kind: "text" };
+  const decoded = decodeHrefPath(withoutFragment);
+  if (
+    !decoded ||
+    decoded.length > MAX_REFERENCE_LENGTH ||
+    decoded.startsWith("#") ||
+    OTHER_SCHEME.test(decoded)
+  )
+    return { kind: "text" };
+  const reference = pathLike(decoded, true);
   if (!reference) return { kind: "text" };
   return { ...reference, line: reference.line ?? fragment };
 }

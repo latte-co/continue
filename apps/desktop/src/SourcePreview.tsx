@@ -237,8 +237,8 @@ export function SourcePreview({
           <p className="source-path">{source.path}</p>
         </>
       )}
-      {!embedded && preview.error && (
-        <p role="alert" className="notice failure">
+      {preview.error && (
+        <p role={embedded ? undefined : "alert"} className="notice failure">
           {preview.error}
         </p>
       )}
@@ -280,15 +280,19 @@ export function SourcePreview({
                 controls
                 preload="metadata"
               />
-            ) : data.mime === "application/pdf" && preview.url ? (
-              <>
-                <p className="muted">PDF 首页 · 系统预览可查看完整文件</p>
-                <img
-                  className="source-image-preview"
-                  src={preview.url}
-                  alt={`${source.name} 首页`}
-                />
-              </>
+            ) : data.mime === "application/pdf" ? (
+              preview.url ? (
+                <>
+                  <p className="muted">PDF 首页 · 系统预览可查看完整文件</p>
+                  <img
+                    className="source-image-preview source-pdf-preview"
+                    src={preview.url}
+                    alt={`${source.name} 首页`}
+                  />
+                </>
+              ) : !preview.error ? (
+                <p className="muted">正在生成 PDF 预览…</p>
+              ) : null
             ) : data.mime === "text/plain" ? (
               <FileTextView
                 content={new TextDecoder().decode(data.bytes)}
@@ -300,6 +304,7 @@ export function SourcePreview({
             )}
             {(!embedded || data.mime !== "text/plain") && (
               <button
+                className={embedded ? "secondary small" : undefined}
                 disabled={busy || !active}
                 onClick={() => void nativePreview()}
               >

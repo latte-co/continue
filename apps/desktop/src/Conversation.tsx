@@ -27,7 +27,7 @@ import { createExternalImageLoader } from "./externalImageLoader";
 import { loadSource } from "./sourceLoader";
 import { DraftStore, useDraft, type Draft } from "./drafts";
 import { useStatusIssues } from "./statusNotices";
-import { ArrowUp, ArrowDown, Bot } from "lucide-react";
+import { ArrowUp, ArrowDown, Bot, Quote, X } from "lucide-react";
 import type {
   AgentInfo,
   Effort,
@@ -77,6 +77,7 @@ interface Props {
   openSideChat?: (draft?: string) => boolean | Promise<boolean>;
   openBlockingSideChat?: (sideId: string) => void | Promise<void>;
   quoteInSideChat?: (text: string) => void;
+  focusRequest?: number;
   openSubagents?: () => void;
   openTurnChanges?: (changes: TurnChanges, path?: string) => void;
   openFile?: (path: string) => void;
@@ -136,6 +137,7 @@ export function Conversation({
   openSideChat,
   openBlockingSideChat,
   quoteInSideChat,
+  focusRequest,
   openTurnChanges,
   openFile,
   openModelSettings,
@@ -193,6 +195,7 @@ export function Conversation({
   const editingScope = useRef(draftKey);
   editingScope.current = draftKey;
   const text = draft.text;
+  const quotes = draft.quotes ?? [];
   const annotations = useMemo(
     () => draft.annotations ?? [],
     [draft.annotations],
@@ -1364,23 +1367,64 @@ export function Conversation({
           prediction={prediction.prediction}
           onDismissPrediction={prediction.dismiss}
           predictionBlocked={predictionBlocked}
+          quotes={quotes}
           annotations={annotations}
-          hasContext={annotations.length > 0}
+          hasContext={annotations.length > 0 || quotes.length > 0}
           context={
-            annotations.length > 0 ? (
-              <AnnotationSummary
-                key={draftKey}
-                entries={annotations}
-                onSave={saveAnnotation}
-                onRemove={removeAnnotation}
-                onClear={() => drafts.update(draftKey, { annotations: [] })}
-                onFocusComposer={() => setComposerFocus((value) => value + 1)}
-                disabled={sending || queueEditing || !!session?.archived}
-                active={!settingsOpen}
-              />
+            annotations.length > 0 || quotes.length > 0 ? (
+              <>
+                {annotations.length > 0 && (
+                  <AnnotationSummary
+                    key={draftKey}
+                    entries={annotations}
+                    onSave={saveAnnotation}
+                    onRemove={removeAnnotation}
+                    onClear={() => drafts.update(draftKey, { annotations: [] })}
+                    onFocusComposer={() =>
+                      setComposerFocus((value) => value + 1)
+                    }
+                    disabled={sending || queueEditing || !!session?.archived}
+                    active={!settingsOpen}
+                  />
+                )}
+                {quotes.length > 0 && (
+                  <div
+                    className="composer-references side-chat-quotes"
+                    aria-label="引用的文本片段"
+                  >
+                    {quotes.map((quote, index) => (
+                      <span key={index}>
+                        <details>
+                          <summary>
+                            <Quote size={14} /> 文本片段
+                            {quotes.length > 1 ? ` ${index + 1}` : ""}
+                          </summary>
+                          <p>{quote}</p>
+                        </details>
+                        <button
+                          type="button"
+                          aria-label={`移除文本片段 ${index + 1}`}
+                          disabled={
+                            sending || queueEditing || !!session?.archived
+                          }
+                          onClick={() => {
+                            const next = quotes.filter((_, i) => i !== index);
+                            drafts.update(draftKey, {
+                              quotes: next.length ? next : undefined,
+                            });
+                            setComposerFocus((value) => value + 1);
+                          }}
+                        >
+                          <X size={13} />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </>
             ) : null
           }
-          focusRequest={composerFocus}
+          focusRequest={composerFocus + (focusRequest ?? 0)}
           skillCreator={draft.skillCreator}
           onRemoveSkillCreator={() =>
             drafts.update(draftKey, { skillCreator: undefined })
@@ -1420,7 +1464,7 @@ export function Conversation({
                   : projectName
                     ? draft.skillCreator
                       ? "描述你想创建的技能…"
-                      : "描述任务，@ 添加引用，/ 调用 Agent 命令…"
+                      : "描述任务，@ 添加引用，/ 调用命令和技能…"
                     : draft.skillCreator
                       ? "先选择工作目录以创建技能"
                       : "先添加或选择一个项目"

@@ -2,16 +2,23 @@
 use crate::files;
 use anyhow::{Context, Result, bail};
 use latte_work_protocol::{
-    ChangeSection, GitCommit, GitInfo, GitRef, GitReview, GitReviewFile, GitReviewScope,
+    ChangeSection, GitCommit, GitInfo, GitRef, GitRepository, GitRepositoryKind, GitReview,
+    GitReviewFile, GitReviewScope,
 };
 use std::{
-    collections::HashMap,
-    path::{Component, Path},
+    collections::{HashMap, HashSet, VecDeque},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 use tokio::io::AsyncReadExt;
 const FILE_LIMIT: usize = 1000;
 const CONTENT_LIMIT: usize = 512 * 1024;
+const REPO_SCAN_DIR_LIMIT: usize = 512;
+const REPO_DIR_ENTRY_LIMIT: usize = 512;
+const REPO_RESULT_LIMIT: usize = 64;
+const REPO_CHILD_DEPTH_LIMIT: usize = 3;
+const REPO_ROOT_NESTED_DEPTH_LIMIT: usize = 2;
+const WORKTREE_CONTAINER_DEPTH_LIMIT: usize = 2;
 
 async fn command(root: &Path, args: &[&str]) -> Result<String> {
     let (text, truncated) = files::git(root, args).await?;
@@ -113,10 +120,827 @@ pub async fn info(root: &Path) -> Result<GitInfo> {
             default_base,
             refs,
             truncated,
+            repositories: None,
+            repositories_truncated: None,
         })
     })
     .await
     .context("读取分支超时")?
+}
+
+fn is_ignored_scan_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | "out"
+            | "__pycache__"
+            | "venv"
+            | "Pods"
+            | "DerivedData"
+    )
+}
+
+fn repository_display_name(rel_path: &str, kind: GitRepositoryKind) -> String {
+    if kind != GitRepositoryKind::Worktree {
+        return rel_path.to_owned();
+    }
+    for prefix in [
+        ".oh-my-code/worktree/",
+        ".oh-my-code/worktrees/",
+        ".claude/worktrees/",
+        ".claude/worktree/",
+        ".worktrees/",
+        ".worktree/",
+    ] {
+        if let Some(rest) = rel_path.strip_prefix(prefix).filter(|s| !s.is_empty()) {
+            return rest.to_owned();
+        }
+    }
+    for infix in [
+        "/.oh-my-code/worktree/",
+        "/.oh-my-code/worktrees/",
+        "/.claude/worktrees/",
+        "/.claude/worktree/",
+        "/.worktrees/",
+        "/.worktree/",
+    ] {
+        if let Some((head, tail)) = rel_path.split_once(infix)
+            && !head.is_empty()
+            && !tail.is_empty()
+        {
+            return format!("{head}/{tail}");
+        }
+    }
+    rel_path.to_owned()
+}
+
+async fn repo_entry_metadata(path: &Path) -> Result<std::fs::Metadata> {
+    tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => anyhow::anyhow!("子仓库目录不存在"),
+            std::io::ErrorKind::PermissionDenied => anyhow::anyhow!("无权访问子仓库目录"),
+            _ => anyhow::Error::new(err).context("无法访问子仓库目录"),
+        })
+}
+
+async fn canonicalize_repo_component(
+    path: &Path,
+    missing_context: &'static str,
+) -> Result<PathBuf> {
+    tokio::fs::canonicalize(path)
+        .await
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => anyhow::anyhow!("{missing_context}"),
+            std::io::ErrorKind::PermissionDenied => anyhow::anyhow!("无权访问子仓库目录"),
+            _ => anyhow::Error::new(err).context("无法访问子仓库目录"),
+        })
+}
+
+fn git_meta_io_error(err: std::io::Error, missing_context: &'static str) -> anyhow::Error {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => anyhow::anyhow!("{missing_context}"),
+        std::io::ErrorKind::PermissionDenied => anyhow::anyhow!("无权访问子仓库 Git 元数据"),
+        _ => anyhow::Error::new(err).context("无法访问子仓库 Git 元数据"),
+    }
+}
+
+async fn read_git_metadata_file(
+    path: &Path,
+    limit: usize,
+    missing_context: &'static str,
+) -> Result<Vec<u8>> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|err| git_meta_io_error(err, missing_context))?;
+    let mut bytes = Vec::new();
+    file.take((limit + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|err| git_meta_io_error(err, missing_context))?;
+    anyhow::ensure!(bytes.len() <= limit, "Git 元数据超出读取上限");
+    Ok(bytes)
+}
+
+async fn verify_git_dir_accessible(dir: &Path, missing_context: &'static str) -> Result<()> {
+    let mut dot = dir.as_os_str().to_os_string();
+    dot.push("/.");
+    tokio::fs::symlink_metadata(PathBuf::from(dot))
+        .await
+        .map_err(|err| git_meta_io_error(err, missing_context))?;
+    let _ = tokio::fs::read_dir(dir)
+        .await
+        .map_err(|err| git_meta_io_error(err, missing_context))?;
+    Ok(())
+}
+
+async fn verify_dot_git_access(canonical_root: &Path, canonical_repo: &Path) -> Result<()> {
+    let dot_git = canonical_repo.join(".git");
+    match tokio::fs::symlink_metadata(&dot_git).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(files::NotGitRepository.into());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            bail!("无权访问子仓库目录");
+        }
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context("无法访问子仓库目录"));
+        }
+    }
+
+    let resolved_dot_git = tokio::fs::canonicalize(&dot_git)
+        .await
+        .map_err(|err| git_meta_io_error(err, "无法解析 Git 元数据路径"))?;
+    anyhow::ensure!(
+        resolved_dot_git.starts_with(canonical_root),
+        "拒绝访问指向项目外部的 Git 仓库"
+    );
+    let resolved_meta = tokio::fs::metadata(&resolved_dot_git)
+        .await
+        .map_err(|err| git_meta_io_error(err, "无法解析 Git 元数据路径"))?;
+
+    let git_dir = if resolved_meta.is_dir() {
+        resolved_dot_git
+    } else if resolved_meta.is_file() {
+        let bytes =
+            read_git_metadata_file(&resolved_dot_git, 8192, "无法解析 Git 元数据路径").await?;
+        let Some(raw_gitdir) = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| text.lines().next())
+            .and_then(|line| line.strip_prefix("gitdir:"))
+            .map(|value| value.trim_start_matches([' ', '\t']))
+            .filter(|value| !value.is_empty())
+        else {
+            bail!("所选子目录不是独立的 Git 仓库");
+        };
+        let resolved = tokio::fs::canonicalize(canonical_repo.join(raw_gitdir))
+            .await
+            .map_err(|err| git_meta_io_error(err, "无法解析 Git 元数据路径"))?;
+        anyhow::ensure!(
+            resolved.starts_with(canonical_root),
+            "拒绝访问指向项目外部的 Git 仓库"
+        );
+        resolved
+    } else {
+        bail!("所选子目录不是独立的 Git 仓库");
+    };
+
+    verify_git_dir_accessible(&git_dir, "无法解析 Git 元数据路径").await?;
+
+    let head_path = git_dir.join("HEAD");
+    let head_meta = tokio::fs::symlink_metadata(&head_path)
+        .await
+        .map_err(|err| git_meta_io_error(err, "Git 仓库路径元数据不完整"))?;
+    if head_meta.file_type().is_symlink() {
+        tokio::fs::read_link(&head_path)
+            .await
+            .map_err(|err| git_meta_io_error(err, "Git 仓库路径元数据不完整"))?;
+        if let Err(err) = tokio::fs::File::open(&head_path).await
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(git_meta_io_error(err, "Git 仓库路径元数据不完整"));
+        }
+    } else {
+        let _ = read_git_metadata_file(&head_path, 4096, "Git 仓库路径元数据不完整").await?;
+    }
+
+    let commondir_path = git_dir.join("commondir");
+    let common_dir = match tokio::fs::symlink_metadata(&commondir_path).await {
+        Ok(_) => {
+            let bytes =
+                read_git_metadata_file(&commondir_path, 4096, "无法解析 Git 共享元数据路径")
+                    .await?;
+            let rel = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|text| text.lines().next())
+                .map(|line| line.trim_end_matches('\r'))
+                .filter(|value| !value.is_empty())
+                .context("无法解析 Git 共享元数据路径")?;
+            let resolved = tokio::fs::canonicalize(git_dir.join(rel))
+                .await
+                .map_err(|err| git_meta_io_error(err, "无法解析 Git 共享元数据路径"))?;
+            anyhow::ensure!(
+                resolved.starts_with(canonical_root),
+                "拒绝访问指向项目外部的 Git 仓库"
+            );
+            resolved
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
+        Err(err) => return Err(git_meta_io_error(err, "无法解析 Git 共享元数据路径")),
+    };
+
+    if common_dir != git_dir {
+        verify_git_dir_accessible(&common_dir, "无法解析 Git 共享元数据路径").await?;
+    }
+
+    for required_dir in ["objects", "refs"] {
+        verify_git_dir_accessible(&common_dir.join(required_dir), "Git 仓库路径元数据不完整")
+            .await?;
+    }
+    for optional_dir in ["refs/heads", "refs/remotes"] {
+        let dir = common_dir.join(optional_dir);
+        match tokio::fs::symlink_metadata(&dir).await {
+            Ok(meta) if meta.file_type().is_dir() => {
+                verify_git_dir_accessible(&dir, "Git 仓库路径元数据不完整").await?;
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(git_meta_io_error(err, "Git 仓库路径元数据不完整")),
+        }
+    }
+    for optional_file in [
+        git_dir.join("config"),
+        git_dir.join("index"),
+        common_dir.join("config"),
+        common_dir.join("packed-refs"),
+        common_dir.join("HEAD"),
+    ] {
+        if let Err(err) = tokio::fs::File::open(&optional_file).await
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(git_meta_io_error(err, "Git 仓库路径元数据不完整"));
+        }
+    }
+    Ok(())
+}
+
+async fn verify_contained_repository(
+    canonical_root: &Path,
+    canonical_repo: &Path,
+    submodule_hint: bool,
+) -> Result<GitRepositoryKind> {
+    verify_dot_git_access(canonical_root, canonical_repo).await?;
+    let output = command(
+        canonical_repo,
+        &[
+            "rev-parse",
+            "--show-toplevel",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )
+    .await?;
+    let mut lines = output.lines();
+    let (Some(raw_top), Some(raw_git_dir), Some(raw_common_dir)) =
+        (lines.next(), lines.next(), lines.next())
+    else {
+        bail!("Git 仓库路径元数据不完整");
+    };
+    let toplevel =
+        canonicalize_repo_component(&canonical_repo.join(raw_top), "无法解析 Git 工作区路径")
+            .await?;
+    anyhow::ensure!(toplevel == canonical_repo, "子仓库 Git 元数据损坏或不完整");
+    let git_dir =
+        canonicalize_repo_component(&canonical_repo.join(raw_git_dir), "无法解析 Git 元数据路径")
+            .await?;
+    let git_common_dir = canonicalize_repo_component(
+        &canonical_repo.join(raw_common_dir),
+        "无法解析 Git 共享元数据路径",
+    )
+    .await?;
+    anyhow::ensure!(
+        git_dir.starts_with(canonical_root) && git_common_dir.starts_with(canonical_root),
+        "拒绝访问指向项目外部的 Git 仓库"
+    );
+    Ok(if git_dir != git_common_dir {
+        GitRepositoryKind::Worktree
+    } else if submodule_hint || git_dir != canonical_repo.join(".git") {
+        GitRepositoryKind::Submodule
+    } else {
+        GitRepositoryKind::Repository
+    })
+}
+
+pub async fn resolve_repository(project_root: &Path, repo_path: Option<&str>) -> Result<PathBuf> {
+    let Some(subpath) = repo_path.filter(|path| !path.is_empty() && *path != ".") else {
+        return Ok(project_root.to_path_buf());
+    };
+    valid_path(subpath)?;
+    let canonical_root = tokio::fs::canonicalize(project_root)
+        .await
+        .context("项目目录不存在或无法访问")?;
+    let mut cursor = canonical_root.clone();
+    for component in Path::new(subpath).components() {
+        cursor.push(component);
+        let meta = repo_entry_metadata(&cursor).await?;
+        anyhow::ensure!(!meta.file_type().is_symlink(), "拒绝访问符号链接仓库路径");
+    }
+    let meta = repo_entry_metadata(&cursor).await?;
+    anyhow::ensure!(meta.file_type().is_dir(), "子仓库路径不是目录");
+    let canonical_repo = canonicalize_repo_component(&cursor, "子仓库目录不存在").await?;
+    anyhow::ensure!(
+        canonical_repo.starts_with(&canonical_root),
+        "拒绝访问指向项目外部的路径"
+    );
+    verify_contained_repository(&canonical_root, &canonical_repo, false).await?;
+    Ok(canonical_repo)
+}
+
+#[derive(Clone, Copy)]
+enum ScanMode {
+    Normal { remaining: usize },
+    ToolWorktreeParent,
+    WorktreeContainer { remaining: usize },
+}
+
+async fn enqueue_worktree_containers(
+    dir: &Path,
+    rel_prefix: &str,
+    queue: &mut VecDeque<(PathBuf, String, ScanMode)>,
+    truncated: &mut bool,
+) {
+    for (name, mode) in [
+        (
+            ".worktree",
+            ScanMode::WorktreeContainer {
+                remaining: WORKTREE_CONTAINER_DEPTH_LIMIT,
+            },
+        ),
+        (
+            ".worktrees",
+            ScanMode::WorktreeContainer {
+                remaining: WORKTREE_CONTAINER_DEPTH_LIMIT,
+            },
+        ),
+        (".oh-my-code", ScanMode::ToolWorktreeParent),
+        (".claude", ScanMode::ToolWorktreeParent),
+    ] {
+        let candidate = dir.join(name);
+        match tokio::fs::symlink_metadata(&candidate).await {
+            Ok(meta) if meta.file_type().is_dir() => {
+                let rel = if rel_prefix.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{rel_prefix}/{name}")
+                };
+                queue.push_back((candidate, rel, mode));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => *truncated = true,
+        }
+    }
+}
+
+async fn discover_submodules_for(
+    canonical_root: &Path,
+    initial_dir: &Path,
+    initial_rel: &str,
+    deadline: tokio::time::Instant,
+    found_paths: &mut HashSet<String>,
+    found: &mut Vec<GitRepository>,
+    truncated: &mut bool,
+) {
+    let mut sub_queue =
+        VecDeque::from([(initial_dir.to_path_buf(), initial_rel.to_owned(), 0_usize)]);
+    while let Some((repo_dir, repo_rel, depth)) = sub_queue.pop_front() {
+        if tokio::time::Instant::now() >= deadline {
+            *truncated = true;
+            return;
+        }
+        match tokio::fs::symlink_metadata(repo_dir.join(".gitmodules")).await {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                *truncated = true;
+                continue;
+            }
+        }
+        let Ok(Ok((output, partial))) = tokio::time::timeout_at(
+            deadline,
+            files::git(
+                &repo_dir,
+                &["config", "--file", ".gitmodules", "--null", "--list"],
+            ),
+        )
+        .await
+        else {
+            *truncated = true;
+            continue;
+        };
+        *truncated |= partial;
+        let complete = if partial {
+            output.rfind('\0').map(|end| &output[..end]).unwrap_or("")
+        } else {
+            &output
+        };
+        for record in complete.split('\0').filter(|entry| !entry.is_empty()) {
+            let Some((key, subpath)) = record.split_once('\n') else {
+                continue;
+            };
+            if key
+                .strip_prefix("submodule.")
+                .and_then(|rest| rest.strip_suffix(".path"))
+                .is_none_or(str::is_empty)
+            {
+                continue;
+            }
+            if valid_path(subpath).is_err() {
+                continue;
+            }
+            let mut cursor = repo_dir.clone();
+            let mut valid_dir = true;
+            for component in Path::new(subpath).components() {
+                cursor.push(component);
+                match tokio::fs::symlink_metadata(&cursor).await {
+                    Ok(meta) if meta.file_type().is_dir() => {}
+                    Ok(_) => {
+                        valid_dir = false;
+                        break;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        valid_dir = false;
+                        break;
+                    }
+                    Err(_) => {
+                        *truncated = true;
+                        valid_dir = false;
+                        break;
+                    }
+                }
+            }
+            if !valid_dir {
+                continue;
+            }
+            let canonical_sub = match tokio::fs::canonicalize(&cursor).await {
+                Ok(path) => path,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    *truncated = true;
+                    continue;
+                }
+            };
+            if !canonical_sub.starts_with(canonical_root) {
+                continue;
+            }
+            let full_rel = if repo_rel.is_empty() {
+                subpath.to_owned()
+            } else {
+                format!("{repo_rel}/{subpath}")
+            };
+            if found_paths.contains(&full_rel) {
+                continue;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                *truncated = true;
+                return;
+            }
+            match tokio::time::timeout_at(
+                deadline,
+                verify_contained_repository(canonical_root, &canonical_sub, true),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    if found.len() >= REPO_RESULT_LIMIT {
+                        *truncated = true;
+                        return;
+                    }
+                    found_paths.insert(full_rel.clone());
+                    found.push(GitRepository {
+                        name: full_rel.clone(),
+                        path: full_rel.clone(),
+                        kind: GitRepositoryKind::Submodule,
+                    });
+                    if depth + 1 < 2 {
+                        sub_queue.push_back((canonical_sub, full_rel, depth + 1));
+                    }
+                }
+                Err(_) => {
+                    *truncated = true;
+                    return;
+                }
+                Ok(Err(err))
+                    if err.to_string().contains("无权访问")
+                        || err.to_string().contains("无法访问") =>
+                {
+                    *truncated = true;
+                }
+                Ok(Err(_)) => {}
+            }
+        }
+    }
+}
+
+pub async fn discover_repositories(project_root: &Path) -> Result<(Vec<GitRepository>, bool)> {
+    discover_repositories_bounded(project_root, Duration::from_secs(10)).await
+}
+
+async fn discover_repositories_bounded(
+    project_root: &Path,
+    budget: Duration,
+) -> Result<(Vec<GitRepository>, bool)> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let canonical_root = tokio::time::timeout_at(deadline, tokio::fs::canonicalize(project_root))
+        .await
+        .context("扫描 Git 仓库超时")?
+        .context("项目目录不存在或无法访问")?;
+    let mut found = Vec::new();
+    let mut found_paths = HashSet::new();
+    let mut truncated = false;
+    let mut queue = VecDeque::new();
+
+    let root_is_git = match tokio::time::timeout_at(
+        deadline,
+        command(&canonical_root, &["rev-parse", "--show-prefix"]),
+    )
+    .await
+    .context("扫描 Git 仓库超时")?
+    {
+        Ok(_) => true,
+        Err(error) if error.is::<files::NotGitRepository>() => false,
+        Err(error) => return Err(error),
+    };
+    if root_is_git {
+        let root_name = project_root
+            .file_name()
+            .or_else(|| canonical_root.file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(".")
+            .to_owned();
+        found_paths.insert(".".into());
+        found.push(GitRepository {
+            path: ".".into(),
+            name: root_name,
+            kind: GitRepositoryKind::Root,
+        });
+        discover_submodules_for(
+            &canonical_root,
+            &canonical_root,
+            "",
+            deadline,
+            &mut found_paths,
+            &mut found,
+            &mut truncated,
+        )
+        .await;
+        enqueue_worktree_containers(&canonical_root, "", &mut queue, &mut truncated).await;
+        queue.push_back((
+            canonical_root.clone(),
+            String::new(),
+            ScanMode::Normal {
+                remaining: REPO_ROOT_NESTED_DEPTH_LIMIT,
+            },
+        ));
+    } else {
+        queue.push_back((
+            canonical_root.clone(),
+            String::new(),
+            ScanMode::Normal {
+                remaining: REPO_CHILD_DEPTH_LIMIT,
+            },
+        ));
+    }
+
+    let mut scanned_dirs = 0_usize;
+    while let Some((dir, rel, mode)) = queue.pop_front() {
+        if tokio::time::Instant::now() >= deadline {
+            truncated = true;
+            break;
+        }
+        if !rel.is_empty()
+            && matches!(
+                mode,
+                ScanMode::Normal { .. } | ScanMode::WorktreeContainer { .. }
+            )
+        {
+            match tokio::fs::symlink_metadata(dir.join(".git")).await {
+                Ok(_) => {
+                    if found_paths.contains(&rel) {
+                        continue;
+                    }
+                    match tokio::time::timeout_at(
+                        deadline,
+                        verify_contained_repository(&canonical_root, &dir, false),
+                    )
+                    .await
+                    {
+                        Ok(Ok(detected_kind)) => {
+                            if found.len() >= REPO_RESULT_LIMIT {
+                                truncated = true;
+                                break;
+                            }
+                            let kind = if matches!(mode, ScanMode::WorktreeContainer { .. })
+                                && detected_kind != GitRepositoryKind::Submodule
+                            {
+                                GitRepositoryKind::Worktree
+                            } else {
+                                detected_kind
+                            };
+                            let name = repository_display_name(&rel, kind);
+                            found_paths.insert(rel.clone());
+                            found.push(GitRepository {
+                                path: rel.clone(),
+                                name,
+                                kind,
+                            });
+                            discover_submodules_for(
+                                &canonical_root,
+                                &dir,
+                                &rel,
+                                deadline,
+                                &mut found_paths,
+                                &mut found,
+                                &mut truncated,
+                            )
+                            .await;
+                            if kind != GitRepositoryKind::Worktree {
+                                enqueue_worktree_containers(&dir, &rel, &mut queue, &mut truncated)
+                                    .await;
+                            }
+                            continue;
+                        }
+                        Err(_) => {
+                            truncated = true;
+                            break;
+                        }
+                        Ok(Err(err))
+                            if err.to_string().contains("无权访问")
+                                || err.to_string().contains("无法访问") =>
+                        {
+                            truncated = true;
+                        }
+                        Ok(Err(_)) => {}
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    truncated = true;
+                    continue;
+                }
+            }
+        }
+
+        let can_descend = match mode {
+            ScanMode::Normal { remaining } | ScanMode::WorktreeContainer { remaining } => {
+                remaining > 0
+            }
+            ScanMode::ToolWorktreeParent => true,
+        };
+        if !can_descend {
+            continue;
+        }
+        if scanned_dirs >= REPO_SCAN_DIR_LIMIT {
+            truncated = true;
+            continue;
+        }
+        scanned_dirs += 1;
+
+        let mut entries_iter = match tokio::fs::read_dir(&dir).await {
+            Ok(iter) => iter,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                truncated = true;
+                continue;
+            }
+        };
+        let mut children = Vec::new();
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                truncated = true;
+                break;
+            }
+            match tokio::time::timeout_at(deadline, entries_iter.next_entry()).await {
+                Ok(Ok(Some(entry))) => {
+                    if children.len() >= REPO_DIR_ENTRY_LIMIT {
+                        truncated = true;
+                        break;
+                    }
+                    let file_type = match entry.file_type().await {
+                        Ok(ft) => ft,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => {
+                            truncated = true;
+                            continue;
+                        }
+                    };
+                    if !file_type.is_dir() {
+                        continue;
+                    }
+                    let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    children.push((name, entry.path()));
+                }
+                Ok(Ok(None)) => break,
+                Err(_) | Ok(Err(_)) => {
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            truncated = true;
+            break;
+        }
+        children.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (name, child_path) in children {
+            let next_mode = match mode {
+                ScanMode::ToolWorktreeParent => {
+                    if matches!(name.as_str(), "worktree" | "worktrees") {
+                        Some(ScanMode::WorktreeContainer {
+                            remaining: WORKTREE_CONTAINER_DEPTH_LIMIT,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                ScanMode::WorktreeContainer { remaining } => {
+                    if name.starts_with('.') || is_ignored_scan_dir(&name) {
+                        None
+                    } else {
+                        Some(ScanMode::WorktreeContainer {
+                            remaining: remaining - 1,
+                        })
+                    }
+                }
+                ScanMode::Normal { remaining } => match name.as_str() {
+                    ".worktree" | ".worktrees" => {
+                        if root_is_git && rel.is_empty() {
+                            None
+                        } else {
+                            Some(ScanMode::WorktreeContainer {
+                                remaining: WORKTREE_CONTAINER_DEPTH_LIMIT,
+                            })
+                        }
+                    }
+                    ".oh-my-code" | ".claude" => {
+                        if root_is_git && rel.is_empty() {
+                            None
+                        } else {
+                            Some(ScanMode::ToolWorktreeParent)
+                        }
+                    }
+                    _ if name.starts_with('.') || is_ignored_scan_dir(&name) => None,
+                    _ => Some(ScanMode::Normal {
+                        remaining: remaining - 1,
+                    }),
+                },
+            };
+            let Some(next_mode) = next_mode else {
+                continue;
+            };
+            let canonical_child = match tokio::fs::canonicalize(&child_path).await {
+                Ok(path) => path,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    truncated = true;
+                    continue;
+                }
+            };
+            if !canonical_child.starts_with(&canonical_root) {
+                continue;
+            }
+            let next_rel = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            queue.push_back((canonical_child, next_rel, next_mode));
+        }
+    }
+
+    let rank = |kind: GitRepositoryKind| match kind {
+        GitRepositoryKind::Root => 0_u8,
+        GitRepositoryKind::Repository => 1,
+        GitRepositoryKind::Submodule => 2,
+        GitRepositoryKind::Worktree => 3,
+    };
+    found.sort_by(|a, b| {
+        rank(a.kind)
+            .cmp(&rank(b.kind))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok((found, truncated))
+}
+
+pub async fn info_for_project(project_root: &Path, repo_path: Option<&str>) -> Result<GitInfo> {
+    if let Some(subpath) = repo_path.filter(|path| !path.is_empty() && *path != ".") {
+        let repo_root = resolve_repository(project_root, Some(subpath)).await?;
+        return info(&repo_root).await;
+    }
+    let mut git_info = info(project_root).await?;
+    match discover_repositories_bounded(project_root, Duration::from_secs(3)).await {
+        Ok((repositories, repositories_truncated)) => {
+            if repositories.len() > 1 || repositories_truncated {
+                git_info.repositories = Some(repositories);
+            }
+            if repositories_truncated {
+                git_info.repositories_truncated = Some(true);
+            }
+        }
+        Err(_) => {
+            git_info.repositories_truncated = Some(true);
+        }
+    }
+    Ok(git_info)
 }
 /// Pages follow a fixed first-parent lineage even when the working branch moves.
 pub async fn commits(
@@ -1262,5 +2086,425 @@ mod tests {
         let metadata = info(root.path()).await.unwrap();
         assert!(metadata.branch.is_none());
         assert!(metadata.head.is_some());
+    }
+
+    #[tokio::test]
+    async fn discovers_child_repos_submodules_and_worktrees_within_bounds_and_rejects_escapes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let init_repo = |path: &Path, branch: &str, file: &str, content: &str| {
+            std::fs::create_dir_all(path).unwrap();
+            run(path, &["init", "-q", "-b", branch]);
+            run(path, &["config", "user.name", "Fixture"]);
+            run(path, &["config", "user.email", "fixture@example.test"]);
+            std::fs::write(path.join(file), content).unwrap();
+            run(path, &["add", "."]);
+            run(path, &["commit", "-qm", "initial"]);
+        };
+
+        // External repo used both as submodule upstream and to verify escape rejection.
+        let external_repo = outside.path().join("external");
+        init_repo(&external_repo, "main", "lib.rs", "pub fn v() -> u8 { 1 }\n");
+
+        // Primary child repositories under non-Git umbrella workspace.
+        let continue_repo = workspace.path().join("continue");
+        init_repo(&continue_repo, "main", "app.ts", "export const a = 1;\n");
+        let code_repo = workspace.path().join("latte-code");
+        init_repo(&code_repo, "main", "main.rs", "fn main() {}\n");
+
+        // Initialized submodule inside `continue/vendor/sub-lib` + plain non-repo folder.
+        std::fs::create_dir_all(continue_repo.join("vendor")).unwrap();
+        run(
+            &continue_repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "-q",
+                "add",
+                external_repo.to_str().unwrap(),
+                "vendor/sub-lib",
+            ],
+        );
+        run(&continue_repo, &["commit", "-qm", "add submodule"]);
+        std::fs::write(
+            continue_repo.join("vendor/sub-lib/lib.rs"),
+            "pub fn v() -> u8 { 2 }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(continue_repo.join("plain-subdir")).unwrap();
+
+        // Linked worktrees under `.oh-my-code/worktree/continue/fix-ux` and `.worktree/quick`.
+        let omc_wt = workspace
+            .path()
+            .join(".oh-my-code/worktree/continue/fix-ux");
+        std::fs::create_dir_all(omc_wt.parent().unwrap()).unwrap();
+        run(
+            &continue_repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "fix/ux",
+                omc_wt.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        std::fs::write(omc_wt.join("app.ts"), "export const a = 2;\n").unwrap();
+
+        let direct_wt = workspace.path().join(".worktree/quick");
+        std::fs::create_dir_all(direct_wt.parent().unwrap()).unwrap();
+        run(
+            &code_repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/quick",
+                direct_wt.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        // Out-of-bounds, ignored, hidden, symlinked, and gitfile-escaped directories must be excluded.
+        init_repo(
+            &workspace.path().join("a/b/c/d/too-deep"),
+            "main",
+            "deep.txt",
+            "deep\n",
+        );
+        init_repo(
+            &workspace.path().join("node_modules/pkg-repo"),
+            "main",
+            "idx.js",
+            "1\n",
+        );
+        init_repo(
+            &workspace.path().join(".cache/hidden-repo"),
+            "main",
+            "h.txt",
+            "1\n",
+        );
+        std::os::unix::fs::symlink(&external_repo, workspace.path().join("linked-external"))
+            .unwrap();
+        let crafted_escape = workspace.path().join("crafted-gitfile");
+        std::fs::create_dir_all(&crafted_escape).unwrap();
+        std::fs::write(
+            crafted_escape.join(".git"),
+            format!("gitdir: {}\n", external_repo.join(".git").display()),
+        )
+        .unwrap();
+
+        let (repos, truncated) = discover_repositories(workspace.path()).await.unwrap();
+        assert!(!truncated);
+        assert_eq!(
+            repos,
+            vec![
+                GitRepository {
+                    path: "continue".into(),
+                    name: "continue".into(),
+                    kind: GitRepositoryKind::Repository,
+                },
+                GitRepository {
+                    path: "latte-code".into(),
+                    name: "latte-code".into(),
+                    kind: GitRepositoryKind::Repository,
+                },
+                GitRepository {
+                    path: "continue/vendor/sub-lib".into(),
+                    name: "continue/vendor/sub-lib".into(),
+                    kind: GitRepositoryKind::Submodule,
+                },
+                GitRepository {
+                    path: ".oh-my-code/worktree/continue/fix-ux".into(),
+                    name: "continue/fix-ux".into(),
+                    kind: GitRepositoryKind::Worktree,
+                },
+                GitRepository {
+                    path: ".worktree/quick".into(),
+                    name: "quick".into(),
+                    kind: GitRepositoryKind::Worktree,
+                },
+            ]
+        );
+
+        // Scoped review on submodule and linked worktree reads their independent diffs.
+        let sub_root = resolve_repository(workspace.path(), Some("continue/vendor/sub-lib"))
+            .await
+            .unwrap();
+        let sub_review = review(&sub_root, GitReviewScope::Worktree, None)
+            .await
+            .unwrap();
+        assert_eq!(sub_review.entries.len(), 1);
+        assert_eq!(sub_review.entries[0].path, "lib.rs");
+
+        let wt_root = resolve_repository(
+            workspace.path(),
+            Some(".oh-my-code/worktree/continue/fix-ux"),
+        )
+        .await
+        .unwrap();
+        let wt_info = info(&wt_root).await.unwrap();
+        assert_eq!(wt_info.branch.as_deref(), Some("fix/ux"));
+        let wt_review = review(&wt_root, GitReviewScope::Worktree, None)
+            .await
+            .unwrap();
+        assert_eq!(wt_review.entries.len(), 1);
+        assert_eq!(wt_review.entries[0].path, "app.ts");
+
+        // Plain subdirectories, symlinks, crafted gitfiles, and path traversals are rejected.
+        for rejected in [
+            "continue/plain-subdir",
+            "linked-external",
+            "crafted-gitfile",
+            "../external",
+            "/tmp",
+        ] {
+            assert!(
+                resolve_repository(workspace.path(), Some(rejected))
+                    .await
+                    .is_err(),
+                "expected {rejected} to be rejected"
+            );
+        }
+
+        // When opening `continue` itself as a root Git project, `info_for_project` includes its submodule.
+        let root_info = info_for_project(&continue_repo, None).await.unwrap();
+        let nested = root_info.repositories.expect("root + submodule list");
+        assert_eq!(nested.len(), 2);
+        assert_eq!(nested[0].kind, GitRepositoryKind::Root);
+        assert_eq!(nested[1].path, "vendor/sub-lib");
+        assert_eq!(nested[1].kind, GitRepositoryKind::Submodule);
+
+        // Leading-space child directory names remain distinct from trimmed siblings.
+        let spaced_workspace = tempfile::tempdir().unwrap();
+        init_repo(
+            &spaced_workspace.path().join("child"),
+            "plain-branch",
+            "a.txt",
+            "plain\n",
+        );
+        init_repo(
+            &spaced_workspace.path().join(" child"),
+            "spaced-branch",
+            "a.txt",
+            "spaced\n",
+        );
+        let spaced_info = info_for_project(spaced_workspace.path(), Some(" child"))
+            .await
+            .unwrap();
+        assert_eq!(spaced_info.branch.as_deref(), Some("spaced-branch"));
+
+        // Deep `.gitmodules` submodule paths with trailing spaces stay verbatim and addressable.
+        let deep_parent = tempfile::tempdir().unwrap();
+        init_repo(deep_parent.path(), "main", "root.txt", "root\n");
+        let deep_subpath = "deps/deep/vendor ";
+        std::fs::create_dir_all(deep_parent.path().join("deps/deep")).unwrap();
+        run(
+            deep_parent.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "-q",
+                "add",
+                external_repo.to_str().unwrap(),
+                deep_subpath,
+            ],
+        );
+        run(
+            deep_parent.path(),
+            &["commit", "-qm", "add deep spaced submodule"],
+        );
+        std::fs::write(
+            deep_parent.path().join(deep_subpath).join("lib.rs"),
+            "pub fn v() -> u8 { 9 }\n",
+        )
+        .unwrap();
+        let (deep_repos, deep_truncated) = discover_repositories(deep_parent.path()).await.unwrap();
+        assert!(!deep_truncated);
+        assert_eq!(
+            deep_repos,
+            vec![
+                GitRepository {
+                    path: ".".into(),
+                    name: deep_parent
+                        .path()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    kind: GitRepositoryKind::Root,
+                },
+                GitRepository {
+                    path: deep_subpath.into(),
+                    name: deep_subpath.into(),
+                    kind: GitRepositoryKind::Submodule,
+                },
+            ]
+        );
+        let deep_resolved = resolve_repository(deep_parent.path(), Some(deep_subpath))
+            .await
+            .unwrap();
+        let deep_review = review(&deep_resolved, GitReviewScope::Worktree, None)
+            .await
+            .unwrap();
+        assert_eq!(deep_review.entries.len(), 1);
+        assert_eq!(deep_review.entries[0].path, "lib.rs");
+
+        // Unreadable parent or repository directories report explicit permission errors
+        // (never `NotGitRepository` or "子仓库目录不存在") and mark discovery `truncated`.
+        if nix::unistd::geteuid().as_raw() != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            struct ModeGuard(PathBuf);
+            impl Drop for ModeGuard {
+                fn drop(&mut self) {
+                    let _ =
+                        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+            let perm_ws = tempfile::tempdir().unwrap();
+            let group_a = perm_ws.path().join("group-a");
+            let child_a = group_a.join("child");
+            let group_b = perm_ws.path().join("group-b");
+            init_repo(&child_a, "main", "a.txt", "a\n");
+            init_repo(&group_b, "main", "b.txt", "b\n");
+
+            {
+                let _guard = ModeGuard(group_a.clone());
+                std::fs::set_permissions(&group_a, std::fs::Permissions::from_mode(0o000)).unwrap();
+                let err = resolve_repository(perm_ws.path(), Some("group-a/child"))
+                    .await
+                    .unwrap_err();
+                assert!(!err.is::<files::NotGitRepository>());
+                assert!(
+                    err.to_string().contains("无权访问子仓库目录"),
+                    "unexpected parent permission error: {err:#}"
+                );
+                let (repos, truncated) = discover_repositories(perm_ws.path()).await.unwrap();
+                assert!(
+                    truncated,
+                    "unreadable parent directory must mark discovery truncated"
+                );
+                assert_eq!(repos.len(), 1);
+                assert_eq!(repos[0].path, "group-b");
+            }
+
+            {
+                let _guard = ModeGuard(child_a.clone());
+                std::fs::set_permissions(&child_a, std::fs::Permissions::from_mode(0o000)).unwrap();
+                let err = resolve_repository(perm_ws.path(), Some("group-a/child"))
+                    .await
+                    .unwrap_err();
+                assert!(!err.is::<files::NotGitRepository>());
+                assert!(
+                    err.to_string().contains("无权访问子仓库目录"),
+                    "unexpected repo permission error: {err:#}"
+                );
+                let (repos, truncated) = discover_repositories(perm_ws.path()).await.unwrap();
+                assert!(
+                    truncated,
+                    "unreadable child repository must mark discovery truncated"
+                );
+                assert_eq!(repos.len(), 1);
+                assert_eq!(repos[0].path, "group-b");
+            }
+
+            // Nested repository inside a valid parent Git repository whose `.git/HEAD` is
+            // unreadable must NOT report "所选子目录不是独立的 Git 仓库" or return `truncated = false`.
+            let parent_git = tempfile::tempdir().unwrap();
+            init_repo(parent_git.path(), "main", "root.txt", "root\n");
+            let nested_child = parent_git.path().join("nested-sub");
+            init_repo(&nested_child, "main", "sub.txt", "sub\n");
+            {
+                let head_file = nested_child.join(".git/HEAD");
+                struct FileModeGuard(PathBuf);
+                impl Drop for FileModeGuard {
+                    fn drop(&mut self) {
+                        let _ = std::fs::set_permissions(
+                            &self.0,
+                            std::fs::Permissions::from_mode(0o600),
+                        );
+                    }
+                }
+                let _head_guard = FileModeGuard(head_file.clone());
+                std::fs::set_permissions(&head_file, std::fs::Permissions::from_mode(0o000))
+                    .unwrap();
+
+                let err = resolve_repository(parent_git.path(), Some("nested-sub"))
+                    .await
+                    .unwrap_err();
+                assert!(!err.is::<files::NotGitRepository>());
+                assert!(
+                    err.to_string().contains("无权访问子仓库 Git 元数据"),
+                    "unexpected .git/HEAD permission error: {err:#}"
+                );
+                assert!(!err.to_string().contains("不是独立的 Git 仓库"));
+
+                let (repos, truncated) = discover_repositories(parent_git.path()).await.unwrap();
+                assert!(
+                    truncated,
+                    "unreadable nested .git/HEAD must mark discovery truncated"
+                );
+                assert_eq!(repos.len(), 1);
+                assert_eq!(repos[0].path, ".");
+                let root_info_truncated = info_for_project(parent_git.path(), None).await.unwrap();
+                assert_eq!(root_info_truncated.repositories_truncated, Some(true));
+            }
+        }
+
+        // Submodules inside a standalone clone or worktree under `.worktree/` are also discovered.
+        let wt_clone_root = tempfile::tempdir().unwrap();
+        let wt_clone = wt_clone_root.path().join(".worktree/feature-clone");
+        init_repo(&wt_clone, "main", "main.rs", "fn main() {}\n");
+        std::fs::create_dir_all(wt_clone.join("deps")).unwrap();
+        run(
+            &wt_clone,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "-q",
+                "add",
+                external_repo.to_str().unwrap(),
+                "deps/sub",
+            ],
+        );
+        run(&wt_clone, &["commit", "-qm", "add clone submodule"]);
+        let (wt_repos, wt_truncated) = discover_repositories(wt_clone_root.path()).await.unwrap();
+        assert!(!wt_truncated);
+        assert!(
+            wt_repos
+                .iter()
+                .any(|r| r.path == ".worktree/feature-clone/deps/sub"
+                    && r.kind == GitRepositoryKind::Submodule),
+            "expected submodule inside .worktree/ clone to be discovered: {wt_repos:?}"
+        );
+
+        // Empty or comment-only `.gitmodules` must not mark repository discovery as `truncated`.
+        let gm_parent = tempfile::tempdir().unwrap();
+        init_repo(gm_parent.path(), "main", "root.txt", "root\n");
+        let gm_child = gm_parent.path().join("packages/sub");
+        init_repo(&gm_child, "main", "sub.txt", "sub\n");
+        let (baseline_repos, baseline_truncated) =
+            discover_repositories(gm_parent.path()).await.unwrap();
+        assert!(!baseline_truncated);
+        for content in [
+            "",
+            "   \n\t\n",
+            "# empty submodule list\n; comment\n",
+            "[submodule \"orphan\"]\n\turl = https://example.invalid/repo.git\n",
+        ] {
+            std::fs::write(gm_parent.path().join(".gitmodules"), content).unwrap();
+            let (repos, truncated) = discover_repositories(gm_parent.path()).await.unwrap();
+            assert!(
+                !truncated,
+                "expected truncated=false for .gitmodules content {content:?}"
+            );
+            assert_eq!(repos, baseline_repos);
+        }
     }
 }

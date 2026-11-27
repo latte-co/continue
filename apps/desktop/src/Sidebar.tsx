@@ -28,7 +28,12 @@ import { SessionTitle } from "./SessionTitle";
 import { agentSessionLabels, agentSessionState } from "./agentSessionState";
 import { useHistoryLoadingIndicator } from "./useHistoryLoadingIndicator";
 import { SessionActions } from "./SessionActions";
-import { recentSessions, type HostedSession } from "./sessionNavigation";
+import {
+  effectiveSessionActivityStatus,
+  hasActiveSideChat,
+  recentSessions,
+  type HostedSession,
+} from "./sessionNavigation";
 import { useRecentSessions } from "./useRecentSessions";
 import { useStatusIssues, type StatusIssue } from "./statusNotices";
 import { ProjectActions } from "./ProjectActions";
@@ -410,19 +415,33 @@ export function Sidebar({
       : pendingAgent
         ? liveLabel
         : null;
+    const activityStatus = effectiveSessionActivityStatus(s);
+    const mainActive = ["running", "waiting"].includes(s.status);
+    const sideActive = hasActiveSideChat(s);
+    const sideOnlyRunning =
+      s.status !== "running" && s.side_chat_status === "running";
+    const sideOnlyWaiting =
+      s.status !== "running" &&
+      s.status !== "waiting" &&
+      s.side_chat_status === "waiting";
+    const taskStatusLabel = sideOnlyRunning
+      ? `${statusNames[s.status]} · 侧边聊天执行中`
+      : sideOnlyWaiting
+        ? `${statusNames[s.status]} · 侧边聊天等待确认`
+        : statusNames[s.status];
     const row = (
       <SessionHoverCard
         disabled={!!reorder.drag || !!pinReorder.drag}
         title={s.title}
         project={sourceProject?.name ?? "项目"}
         host={sourceHost?.name ?? s.hostId}
-        taskStatus={statusNames[s.status]}
+        taskStatus={taskStatusLabel}
         agentState={liveState}
       >
         <button
           className={`session-row ${list === "pinned" ? "pinned-session" : list === "recent" ? "recent-session" : ""} ${state.modal !== "skills" && s.id === sessionId && s.hostId === hostId ? "active" : ""}`}
           aria-label={s.title}
-          aria-description={`${sourceProject?.name ?? "项目"} · ${sourceHost?.name ?? s.hostId} · ${statusNames[s.status]}${liveState === "closed" ? "" : ` · ${liveLabel}`}${list === "pinned" ? " · 拖动调整顺序，或按 Option + 上下方向键" : ""}`}
+          aria-description={`${sourceProject?.name ?? "项目"} · ${sourceHost?.name ?? s.hostId} · ${taskStatusLabel}${liveState === "closed" ? "" : ` · ${liveLabel}`}${list === "pinned" ? " · 拖动调整顺序，或按 Option + 上下方向键" : ""}`}
           onPointerDown={
             list === "pinned"
               ? (event) => pinReorder.start(event, s)
@@ -470,10 +489,16 @@ export function Sidebar({
               >
                 <WorkingStatus label="" animated />
               </span>
-            ) : s.status === "running" ? (
-              <StatusSignal status="running" />
-            ) : s.status === "waiting" ? (
-              <StatusSignal status="waiting" />
+            ) : activityStatus === "running" ? (
+              <StatusSignal
+                status="running"
+                title={sideOnlyRunning ? "侧边聊天执行中" : undefined}
+              />
+            ) : activityStatus === "waiting" ? (
+              <StatusSignal
+                status="waiting"
+                title={sideOnlyWaiting ? "侧边聊天等待确认" : undefined}
+              />
             ) : s.status === "failed" && s.unread ? (
               <StatusSignal status="failed" />
             ) : s.status === "unknown" ? (
@@ -551,13 +576,15 @@ export function Sidebar({
             className="icon-button"
             aria-label={`${s.archived ? "取消归档" : "归档"} ${s.title}`}
             title={
-              ["running", "waiting"].includes(s.status)
+              mainActive
                 ? "请先停止任务，再归档"
-                : s.archived
-                  ? "取消归档"
-                  : "归档"
+                : sideActive
+                  ? "侧边聊天仍在执行，请等待完成或停止后再归档"
+                  : s.archived
+                    ? "取消归档"
+                    : "归档"
             }
-            disabled={!!actionBusy || ["running", "waiting"].includes(s.status)}
+            disabled={!!actionBusy || mainActive || sideActive}
             onClick={() =>
               void runAction({
                 method: "archive_session",
@@ -722,8 +749,12 @@ export function Sidebar({
               !loadingProjects[key] &&
               !projectErrors[key] &&
               noSessions;
-            const running = listedSessions.some((s) => s.status === "running");
-            const waiting = listedSessions.some((s) => s.status === "waiting");
+            const running = listedSessions.some(
+              (s) => effectiveSessionActivityStatus(s) === "running",
+            );
+            const waiting = listedSessions.some(
+              (s) => effectiveSessionActivityStatus(s) === "waiting",
+            );
             const unreadCompleted = listedSessions.some(
               (s) => s.status === "completed" && s.unread,
             );

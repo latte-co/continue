@@ -359,3 +359,262 @@ async fn cursor_metadata_bounds_output_and_reaps_timeout() {
         Err(nix::errno::Errno::ESRCH)
     );
 }
+
+#[tokio::test]
+async fn cursor_commands_and_skills_scan_local_catalog_safely_without_prompts() {
+    let _permit = fixture_permit().await;
+    let (cli_dir, binary) = probe_fixture(COMPATIBLE_HELP);
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("escaped.md"), "# Escaped\n").unwrap();
+    std::fs::create_dir_all(root.path().join(".git")).unwrap();
+    std::fs::create_dir_all(root.path().join(".cursor/commands")).unwrap();
+    std::fs::create_dir_all(root.path().join(".claude/commands")).unwrap();
+    std::fs::create_dir_all(root.path().join(".cursor/skills/fix-ci")).unwrap();
+    std::fs::create_dir_all(root.path().join(".cursor/skills/hidden-skill")).unwrap();
+    std::fs::write(
+        root.path().join(".cursor/commands/deploy-check.md"),
+        "---\nname: 部署检查\ndescription: 检查部署配置\n---\n执行检查\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(".claude/commands/review-pr.md"),
+        "# PR 审查\n检查变更风险\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("escaped.md"),
+        root.path().join(".cursor/commands/escaped.md"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(".cursor/skills/fix-ci/SKILL.md"),
+        "---\nname: 修复 CI\ndescription: 诊断并修复流水线\n---\n步骤\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(".cursor/skills/hidden-skill/SKILL.md"),
+        "---\nname: 隐藏技能\ndescription: 仅内部调用\nuser-invocable: false\n---\n步骤\n",
+    )
+    .unwrap();
+
+    let mut config = crate::providers::LaunchConfig {
+        environment: AgentEnvironment(BTreeMap::from([(
+            "HOME".into(),
+            root.path().to_string_lossy().into_owned(),
+        )])),
+        traex_model: None,
+        provider: None,
+        settings_dir: root.path().to_path_buf(),
+        model: None,
+        effort: None,
+        permission_mode: None,
+    };
+    let catalog = commands(&binary, root.path().to_str().unwrap(), &config)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(cli_dir.path().join("cursor.args")).unwrap(),
+        "--help\n"
+    );
+    assert_eq!(
+        catalog
+            .iter()
+            .map(|c| (
+                c.name.as_str(),
+                c.display_name.as_deref(),
+                c.description.as_str(),
+                c.kind
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "deploy-check",
+                Some("部署检查"),
+                "检查部署配置",
+                Some(AgentCommandKind::Command),
+            ),
+            (
+                "review-pr",
+                Some("PR 审查"),
+                "PR 审查",
+                Some(AgentCommandKind::Command),
+            ),
+            (
+                "fix-ci",
+                Some("修复 CI"),
+                "诊断并修复流水线",
+                Some(AgentCommandKind::Skill),
+            ),
+        ]
+    );
+    let info = skill_info(root.path(), "fix-ci", &config.environment)
+        .unwrap()
+        .unwrap();
+    assert_eq!(info.name, "修复 CI");
+    assert_eq!(info.description, "诊断并修复流水线");
+
+    // Configured `CURSOR_CONFIG_DIR`, `CLAUDE_CONFIG_DIR`, and `CODEX_HOME` replace their
+    // corresponding `$HOME` subdirectories so `commands` and `skill_info` agree when the
+    // same skill/command slug also exists under `$HOME/.cursor`, `$HOME/.claude`, or `$HOME/.codex`.
+    let fake_home = tempfile::tempdir().unwrap();
+    let custom_cursor = tempfile::tempdir().unwrap();
+    let custom_claude = tempfile::tempdir().unwrap();
+    let custom_codex = tempfile::tempdir().unwrap();
+    let empty_project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(empty_project.path().join(".git")).unwrap();
+
+    let write_skill = |dir: &std::path::Path, desc: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\ndescription: {desc}\n---\nbody\n"),
+        )
+        .unwrap();
+    };
+    write_skill(
+        &fake_home.path().join(".cursor/skills/dual-demo"),
+        "default cursor copy",
+    );
+    write_skill(
+        &custom_cursor.path().join("skills/dual-demo"),
+        "custom cursor copy",
+    );
+    write_skill(
+        &fake_home.path().join(".claude/skills/claude-dual"),
+        "default claude copy",
+    );
+    write_skill(
+        &custom_claude.path().join("skills/claude-dual"),
+        "custom claude copy",
+    );
+    write_skill(
+        &fake_home.path().join(".codex/skills/codex-dual"),
+        "default codex copy",
+    );
+    write_skill(
+        &custom_codex.path().join("skills/codex-dual"),
+        "custom codex copy",
+    );
+    std::fs::create_dir_all(fake_home.path().join(".cursor/commands")).unwrap();
+    std::fs::write(
+        fake_home.path().join(".cursor/commands/home-only.md"),
+        "# Should be replaced by CURSOR_CONFIG_DIR\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(custom_cursor.path().join("commands")).unwrap();
+    std::fs::write(
+        custom_cursor.path().join("commands/custom-cmd.md"),
+        "---\ndescription: custom cursor cmd\n---\nbody\n",
+    )
+    .unwrap();
+
+    let dual_env = AgentEnvironment(BTreeMap::from([
+        (
+            "HOME".into(),
+            fake_home.path().to_string_lossy().into_owned(),
+        ),
+        (
+            "CURSOR_CONFIG_DIR".into(),
+            custom_cursor.path().to_string_lossy().into_owned(),
+        ),
+        (
+            "CLAUDE_CONFIG_DIR".into(),
+            custom_claude.path().to_string_lossy().into_owned(),
+        ),
+        (
+            "CODEX_HOME".into(),
+            custom_codex.path().to_string_lossy().into_owned(),
+        ),
+    ]));
+    let dual_config = crate::providers::LaunchConfig {
+        environment: dual_env.clone(),
+        traex_model: None,
+        provider: None,
+        settings_dir: empty_project.path().to_path_buf(),
+        model: None,
+        effort: None,
+        permission_mode: None,
+    };
+    let dual_catalog = commands(
+        &binary,
+        empty_project.path().to_str().unwrap(),
+        &dual_config,
+    )
+    .await
+    .unwrap();
+    assert!(!dual_catalog.iter().any(|c| c.name == "home-only"));
+    assert!(
+        dual_catalog
+            .iter()
+            .any(|c| c.name == "custom-cmd" && c.description == "custom cursor cmd")
+    );
+    for (slug, expected_desc) in [
+        ("dual-demo", "custom cursor copy"),
+        ("claude-dual", "custom claude copy"),
+        ("codex-dual", "custom codex copy"),
+    ] {
+        assert!(
+            dual_catalog
+                .iter()
+                .any(|c| c.name == slug && c.description == expected_desc),
+            "missing {slug} in catalog: {dual_catalog:?}"
+        );
+        let resolved = skill_info(empty_project.path(), slug, &dual_env)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.description, expected_desc);
+    }
+
+    // Traex `TRAEX_HOME` similarly replaces `$HOME/.trae` and `$HOME/.traex`.
+    let custom_traex = tempfile::tempdir().unwrap();
+    write_skill(
+        &fake_home.path().join(".trae/skills/traex-dual"),
+        "default traex copy",
+    );
+    write_skill(
+        &fake_home.path().join(".traex/skills/traex-dual"),
+        "default traex2 copy",
+    );
+    write_skill(
+        &custom_traex.path().join("skills/traex-dual"),
+        "custom traex copy",
+    );
+    let traex_env = AgentEnvironment(BTreeMap::from([
+        (
+            "HOME".into(),
+            fake_home.path().to_string_lossy().into_owned(),
+        ),
+        (
+            "TRAEX_HOME".into(),
+            custom_traex.path().to_string_lossy().into_owned(),
+        ),
+    ]));
+    let traex_resolved =
+        crate::agents::traex_skill_info(empty_project.path(), "traex-dual", &traex_env)
+            .unwrap()
+            .unwrap();
+    assert_eq!(traex_resolved.description, "custom traex copy");
+
+    config.provider = Some(crate::providers::ResolvedProvider {
+        metadata: latte_work_protocol::Provider {
+            id: "p".into(),
+            name: "Provider".into(),
+            protocol: latte_work_protocol::ProviderProtocol::AnthropicMessages,
+            base_url: "https://example.invalid".into(),
+            model: "m".into(),
+            models: vec![],
+            model_labels: Default::default(),
+            models_1m: vec![],
+            auth: latte_work_protocol::ProviderAuth::ApiKey,
+            has_credential: true,
+            revision: "1".into(),
+        },
+        credential: "secret".into(),
+    });
+    assert!(
+        commands(&binary, root.path().to_str().unwrap(), &config)
+            .await
+            .is_err()
+    );
+}

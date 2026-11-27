@@ -674,6 +674,7 @@ export function AnnotatedMessage({
   onSave,
   onRemove,
   askInSideChat,
+  addToMainChat,
 }: {
   text: string;
   message: number;
@@ -682,6 +683,7 @@ export function AnnotatedMessage({
   onSave: Change;
   onRemove: (id: string) => void;
   askInSideChat?: (quote: string) => void;
+  addToMainChat?: (quote: string) => void;
 }) {
   const body = useRef<HTMLDivElement>(null);
   const releaseClick = useRef<Element | null>(null);
@@ -1088,7 +1090,8 @@ export function AnnotatedMessage({
                   8,
                   Math.min(
                     selection.anchor.left,
-                    window.innerWidth - (askInSideChat ? 268 : 112),
+                    window.innerWidth -
+                      (askInSideChat || addToMainChat ? 268 : 112),
                   ),
                 ),
                 top: Math.max(
@@ -1138,6 +1141,21 @@ export function AnnotatedMessage({
                   }}
                 >
                   在侧边聊天中提问
+                </button>
+              )}
+              {addToMainChat && (
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    const quote = selection.entry.quote;
+                    setSelection(null);
+                    setEditing(false);
+                    releaseClick.current = null;
+                    clearSelection();
+                    addToMainChat(quote);
+                  }}
+                >
+                  添加到主对话
                 </button>
               )}
             </div>,

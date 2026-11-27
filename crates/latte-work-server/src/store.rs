@@ -48,6 +48,20 @@ impl ConfirmedNotStarted {
     }
 }
 
+fn initial_prompt_title(text: &str, is_side_chat: bool) -> String {
+    if is_side_chat {
+        text.lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('>'))
+            .unwrap_or(text.trim())
+            .chars()
+            .take(48)
+            .collect()
+    } else {
+        text.chars().take(48).collect()
+    }
+}
+
 /// The streamable payload of an event plus how a client should reassemble it:
 /// `Text` chunks concatenate into displayable prose, `Json` must be parsed
 /// once fully received.
@@ -191,6 +205,9 @@ impl Store {
         }
         migration.execute_batch("CREATE INDEX IF NOT EXISTS side_chats_parent ON side_chats(parent_id);
         CREATE INDEX IF NOT EXISTS events_recent_activity_v2 ON events(session_id,seq DESC) WHERE json_extract(data,'$.kind') IN ('user','queued_message_sent','text','tool','tool_result','approval','approval_resolved','subagent');
+        CREATE INDEX IF NOT EXISTS events_workdir_tool_calls ON events(session_id,seq DESC) WHERE json_extract(data,'$.kind')='tool' AND lower(COALESCE(json_extract(data,'$.name'),'')) NOT IN ('read','glob','grep','ls','webfetch','websearch','todowrite','todoread','skill','askuserquestion','taskoutput','taskstop');
+        CREATE INDEX IF NOT EXISTS events_workdir_tool_results ON events(session_id,json_extract(data,'$.id'),seq ASC,COALESCE(json_extract(data,'$.is_error'),0)) WHERE json_extract(data,'$.kind')='tool_result';
+        DROP INDEX IF EXISTS events_workdir_tools;
         DROP INDEX IF EXISTS events_recent_activity;")?;
         let columns = migration
             .prepare("PRAGMA table_info(requests)")?
@@ -356,18 +373,19 @@ impl Store {
             let Ok(mut session) = serde_json::from_str::<Session>(&data) else {
                 continue;
             };
+            let is_side_chat = self.side_parent(&id)?.is_some();
             session.title_requested = if session.native_id.is_some() {
                 match first_prompt
                     .query_row(params![id], |row| row.get::<_, String>(0))
                     .optional()?
-                    .map(|text| text.chars().take(48).collect::<String>())
+                    .map(|text| initial_prompt_title(&text, is_side_chat))
                 {
                     // Opening a native session alone already records its id, so
                     // only a title that moved past the placeholder proves a
                     // chance was consumed; rows that were merely opened keep
                     // theirs. Native history without a locally admitted turn
                     // and a moved-away title is still never regenerated over.
-                    None => session.title != "新任务",
+                    None => session.title != "新任务" && session.title != "侧边聊天",
                     // A manual rename is not a generated title; only an
                     // un-customized title that left the prompt prefix behind
                     // is that proof.
@@ -666,6 +684,55 @@ impl Store {
             .map(|row| Ok(serde_json::from_str(&row?)?))
             .collect()
     }
+    pub(crate) fn workdir_tool_event_page(
+        &self,
+        session_id: &str,
+        before_seq: Option<i64>,
+        page_limit: usize,
+    ) -> Result<Vec<crate::agent_workdir::RawWorkdirEventRow>> {
+        let clamped = i64::try_from(page_limit.min(512)).unwrap_or(512);
+        let mut query = self.db.prepare_cached(
+            "SELECT
+                 t.seq,
+                 (SELECT r.seq
+                  FROM events r
+                  WHERE r.session_id=t.session_id
+                    AND json_extract(r.data,'$.kind')='tool_result'
+                    AND json_extract(r.data,'$.id')=json_extract(t.data,'$.id')
+                    AND r.seq>t.seq
+                  ORDER BY r.seq ASC
+                  LIMIT 1),
+                 (SELECT COALESCE(json_extract(r.data,'$.is_error'),0)
+                  FROM events r
+                  WHERE r.session_id=t.session_id
+                    AND json_extract(r.data,'$.kind')='tool_result'
+                    AND json_extract(r.data,'$.id')=json_extract(t.data,'$.id')
+                    AND r.seq>t.seq
+                  ORDER BY r.seq ASC
+                  LIMIT 1),
+                 CASE WHEN length(t.data) <= 262144 THEN t.data END
+             FROM events t
+             WHERE t.session_id=?1
+               AND (?2 IS NULL OR t.seq<?2)
+               AND json_extract(t.data,'$.kind')='tool'
+               AND lower(COALESCE(json_extract(t.data,'$.name'),'')) NOT IN (
+                   'read','glob','grep','ls','webfetch','websearch',
+                   'todowrite','todoread','skill','askuserquestion',
+                   'taskoutput','taskstop'
+               )
+             ORDER BY t.seq DESC
+             LIMIT ?3",
+        )?;
+        let rows = query.query_map(params![session_id, before_seq, clamped], |row| {
+            Ok(crate::agent_workdir::RawWorkdirEventRow {
+                seq: row.get(0)?,
+                result_seq: row.get(1)?,
+                result_is_error: row.get::<_, Option<i64>>(2)?.map(|v| v != 0),
+                raw_tool: row.get(3)?,
+            })
+        })?;
+        rows.map(|r| Ok(r?)).collect()
+    }
     pub fn recent_sessions(
         &self,
         before: Option<&RecentCursor>,
@@ -745,6 +812,7 @@ impl Store {
             unread: false,
             archived: false,
             parent_session_id: None,
+            side_chat_status: None,
             agent_session_open: None,
             agent_session_busy: None,
             side_write_pending: None,
@@ -1829,10 +1897,36 @@ impl Store {
         tx.commit()?;
         self.session(session_id)
     }
+    pub fn active_side_chat_status(&self, parent_id: &str) -> Result<Option<Status>> {
+        let raw: Option<String> = self
+            .db
+            .query_row(
+                "SELECT json_extract(s.data, '$.status')
+                 FROM side_chats c
+                 JOIN sessions s ON s.id = c.session_id
+                 WHERE c.parent_id = ?1
+                   AND json_extract(s.data, '$.status') IN ('running', 'waiting')
+                 ORDER BY CASE json_extract(s.data, '$.status') WHEN 'running' THEN 0 ELSE 1 END
+                 LIMIT 1",
+                [parent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(match raw.as_deref() {
+            Some("running") => Some(Status::Running),
+            Some("waiting") => Some(Status::Waiting),
+            _ => None,
+        })
+    }
     pub fn project_session_recovery(&self, session: &mut Session) -> Result<()> {
         session.parent_session_id = self
             .side_parent(&session.id)?
             .map(|(parent_id, _)| parent_id);
+        session.side_chat_status = if session.parent_session_id.is_none() {
+            self.active_side_chat_status(&session.id)?
+        } else {
+            None
+        };
         session.side_write_pending = self.pending_side_write(&session.id)?;
         session.agent_close_pending = self
             .db
@@ -2262,20 +2356,13 @@ impl Store {
         session.permission_mode = permission_mode.map(str::to_owned);
         let is_side_chat = self.side_parent(id)?.is_some();
         if !session.custom_title && session.title == "新任务" {
-            session.title = text.chars().take(48).collect();
+            session.title = initial_prompt_title(text, false);
         } else if !session.custom_title
             && session.title == "侧边聊天"
             && session.native_id.is_none()
             && is_side_chat
         {
-            session.title = text
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty() && !line.starts_with('>'))
-                .unwrap_or(text.trim())
-                .chars()
-                .take(48)
-                .collect();
+            session.title = initial_prompt_title(text, true);
         }
         let tx = self.db.transaction()?;
         tx.execute(
@@ -3416,6 +3503,67 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn parent_projection_summarizes_active_side_chats_with_running_priority_and_clears_after_restart()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let mut store = super::Store::open(&path).unwrap();
+        let project = store.add_project(directory.path()).unwrap();
+        let mut parent = store.create_session(project.id, "claude".into()).unwrap();
+        parent.native_id = Some("native-parent".into());
+        parent.status = super::Status::Completed;
+        store.save(&parent).unwrap();
+
+        let side_a_id = uuid::Uuid::new_v4().to_string();
+        let side_b_id = uuid::Uuid::new_v4().to_string();
+        let side_a = store.open_side_chat(&parent.id, Some(&side_a_id)).unwrap();
+        let side_b = store.open_side_chat(&parent.id, Some(&side_b_id)).unwrap();
+
+        let mut projected = store.session(&parent.id).unwrap();
+        store.project_session_recovery(&mut projected).unwrap();
+        assert_eq!(projected.side_chat_status, None);
+
+        store
+            .state(&side_a.id, super::Status::Waiting, None)
+            .unwrap();
+        let mut projected = store.session(&parent.id).unwrap();
+        store.project_session_recovery(&mut projected).unwrap();
+        assert_eq!(projected.side_chat_status, Some(super::Status::Waiting));
+
+        let mut projected_side = store.session(&side_a.id).unwrap();
+        store.project_session_recovery(&mut projected_side).unwrap();
+        assert_eq!(
+            projected_side.parent_session_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        assert_eq!(projected_side.side_chat_status, None);
+
+        store
+            .state(&side_b.id, super::Status::Running, None)
+            .unwrap();
+        let mut projected = store.session(&parent.id).unwrap();
+        store.project_session_recovery(&mut projected).unwrap();
+        assert_eq!(projected.side_chat_status, Some(super::Status::Running));
+
+        store
+            .state(&side_b.id, super::Status::Completed, None)
+            .unwrap();
+        let mut projected = store.session(&parent.id).unwrap();
+        store.project_session_recovery(&mut projected).unwrap();
+        assert_eq!(projected.side_chat_status, Some(super::Status::Waiting));
+
+        drop(store);
+        let reopened = super::Store::open(&path).unwrap();
+        assert_eq!(
+            reopened.session(&side_a.id).unwrap().status,
+            super::Status::Unknown
+        );
+        let mut projected = reopened.session(&parent.id).unwrap();
+        reopened.project_session_recovery(&mut projected).unwrap();
+        assert_eq!(projected.side_chat_status, None);
     }
 
     #[test]

@@ -927,3 +927,160 @@ async fn legacy_sessions_with_existing_ai_titles_are_never_regenerated() {
         "an existing AI title consumes the generation chance; the request must not re-fire"
     );
 }
+
+#[tokio::test]
+async fn side_chats_generate_first_turn_titles_once_without_renaming_parents() {
+    for agent in ["claude", "codex", "traex"] {
+        let host = Host::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut client = host.client().await;
+        let parent_id = create(&mut client, root.path(), agent).await;
+        assert!(matches!(
+            send(&mut client, &parent_id, "parent-first", "native-auto-title").await,
+            Response::Accepted { .. }
+        ));
+        wait(&mut client, &parent_id, Status::Completed).await;
+        let parent_expected = if agent == "claude" {
+            "Friendly generated title"
+        } else {
+            "修复附件拖入失败"
+        };
+        // Keep the parent on an auto-generated title (`!custom_title`, including
+        // Claude's native `ai-title` JSONL entry copied on `--fork-session`) so a
+        // side-chat title leak or inherited-title suppression would fail this test.
+        title(&mut client, &parent_id, parent_expected).await;
+        let Response::Session {
+            session: parent_before,
+        } = ask(
+            &mut client,
+            Request::Session {
+                session_id: parent_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("parent before side chat")
+        };
+        assert!(!parent_before.custom_title);
+
+        let Response::Session { session: side } = ask(
+            &mut client,
+            Request::OpenSideChat {
+                session_id: parent_id.clone(),
+                side_id: None,
+            },
+        )
+        .await
+        else {
+            panic!("open side chat")
+        };
+        assert_eq!(side.title, "侧边聊天");
+        assert!(!side.title_requested);
+
+        assert!(matches!(
+            send(
+                &mut client,
+                &side.id,
+                "side-first",
+                "native-auto-title-side"
+            )
+            .await,
+            Response::Accepted { .. }
+        ));
+        wait(&mut client, &side.id, Status::Completed).await;
+        let expected = "Side generated title";
+        title(&mut client, &side.id, expected).await;
+
+        let Response::Session {
+            session: updated_side,
+        } = ask(
+            &mut client,
+            Request::Session {
+                session_id: side.id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("side session")
+        };
+        assert!(updated_side.title_requested);
+        assert!(!updated_side.custom_title);
+
+        let Response::SideChatHistory { sessions, .. } = ask(
+            &mut client,
+            Request::SideChatHistory {
+                session_id: parent_id.clone(),
+                before: None,
+            },
+        )
+        .await
+        else {
+            panic!("side chat history")
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, expected);
+
+        let Response::Session {
+            session: parent_after,
+        } = ask(
+            &mut client,
+            Request::Session {
+                session_id: parent_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("parent session")
+        };
+        assert_eq!(parent_after.title, parent_expected);
+        assert!(!parent_after.custom_title);
+
+        let path = root.path().join(match agent {
+            "claude" => "fixture-title-requests",
+            "codex" => "codex-title-inputs",
+            _ => "traex-title-inputs",
+        });
+        let requests_after_first = std::fs::read_to_string(&path).unwrap();
+
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::CloseAgentSession {
+                    session_id: side.id.clone(),
+                    only_if_idle: Some(true),
+                }
+            )
+            .await,
+            Response::Ok
+        ));
+        assert!(matches!(
+            send(
+                &mut client,
+                &side.id,
+                "side-second",
+                "native-auto-title-side"
+            )
+            .await,
+            Response::Accepted { .. }
+        ));
+        wait(&mut client, &side.id, Status::Completed).await;
+        // Deterministic barrier: closing the session awaits/drains any auxiliary
+        // title jobs on `side` before returning `Response::Ok`.
+        assert!(matches!(
+            ask(
+                &mut client,
+                Request::CloseAgentSession {
+                    session_id: side.id.clone(),
+                    only_if_idle: Some(false),
+                }
+            )
+            .await,
+            Response::Ok
+        ));
+        title(&mut client, &side.id, expected).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            requests_after_first
+        );
+    }
+}

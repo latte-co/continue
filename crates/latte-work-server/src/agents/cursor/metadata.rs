@@ -3,7 +3,10 @@
 #[path = "metadata_permission_tests.rs"]
 mod permission_tests;
 use anyhow::{Context, Result, bail};
-use latte_work_protocol::{AgentEnvironment, AgentInfo, AgentPermissionMode, Effort, Response};
+use latte_work_protocol::{
+    AgentCommandKind, AgentEnvironment, AgentInfo, AgentPermissionMode, AgentSlashCommand, Effort,
+    Response, SkillInfo,
+};
 use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
 use tokio::io::AsyncReadExt;
 
@@ -562,6 +565,251 @@ pub(super) fn catalog(output: &str, _selected: Option<&str>) -> Result<Response>
         model_labels: labels,
         model_variants: None,
     })
+}
+
+fn valid_cursor_slash_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn skill_roots(project: &std::path::Path, environment: &AgentEnvironment) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for parent in project.ancestors().take(32) {
+        roots.extend(
+            [
+                ".cursor/skills",
+                ".claude/skills",
+                ".codex/skills",
+                ".agents/skills",
+            ]
+            .map(|relative| parent.join(relative)),
+        );
+        if parent.join(".git").exists() {
+            break;
+        }
+    }
+    let home = crate::agent_environment::configured_variable("HOME", environment)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    if let Some(cursor_config) =
+        crate::agent_environment::configured_variable("CURSOR_CONFIG_DIR", environment)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".cursor")))
+    {
+        roots.extend(["skills", "skills-cursor"].map(|relative| cursor_config.join(relative)));
+    }
+    if let Some(claude_config) =
+        crate::agent_environment::configured_variable("CLAUDE_CONFIG_DIR", environment)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".claude")))
+    {
+        roots.push(claude_config.join("skills"));
+    }
+    if let Some(codex_home) =
+        crate::agent_environment::configured_variable("CODEX_HOME", environment)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".codex")))
+    {
+        roots.push(codex_home.join("skills"));
+    }
+    if let Some(home) = home {
+        roots.push(home.join(".agents/skills"));
+    }
+    roots
+}
+
+fn command_roots(project: &std::path::Path, environment: &AgentEnvironment) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for parent in project.ancestors().take(32) {
+        roots.extend([".cursor/commands", ".claude/commands"].map(|r| parent.join(r)));
+        if parent.join(".git").exists() {
+            break;
+        }
+    }
+    let home = crate::agent_environment::configured_variable("HOME", environment)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    if let Some(cursor_config) =
+        crate::agent_environment::configured_variable("CURSOR_CONFIG_DIR", environment)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".cursor")))
+    {
+        roots.push(cursor_config.join("commands"));
+    }
+    if let Some(claude_config) =
+        crate::agent_environment::configured_variable("CLAUDE_CONFIG_DIR", environment)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".claude")))
+    {
+        roots.push(claude_config.join("commands"));
+    }
+    roots
+}
+
+fn parse_markdown_command(path: &std::path::Path, id: &str) -> Result<Option<AgentSlashCommand>> {
+    let document = crate::agents::claude_skills::read(path, 64 * 1024)?;
+    if document.trim().is_empty() {
+        return Ok(None);
+    }
+    let front_desc = crate::agents::claude_skills::field(&document, "description");
+    let front_name = crate::agents::claude_skills::field(&document, "name");
+    let body = document
+        .trim_start_matches('\u{feff}')
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n").map(|(_, body)| body))
+        .or_else(|| {
+            document
+                .trim_start_matches('\u{feff}')
+                .strip_prefix("---\r\n")
+                .and_then(|rest| rest.split_once("\r\n---\r\n").map(|(_, body)| body))
+        })
+        .unwrap_or(&document);
+    let mut heading: Option<String> = None;
+    let mut first_line: Option<String> = None;
+    for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if let Some(stripped) = line.strip_prefix('#') {
+            let clean = stripped.trim_start_matches('#').trim();
+            if !clean.is_empty() {
+                heading = Some(clean.into());
+                break;
+            }
+        } else if first_line.is_none() {
+            first_line = Some(line.into());
+        }
+    }
+    let display_candidate = if !front_name.is_empty() {
+        Some(front_name)
+    } else {
+        heading.clone()
+    };
+    let display_name = display_candidate.filter(|label| {
+        label != id && label.chars().count() <= 80 && !label.chars().any(char::is_control)
+    });
+    let description = if !front_desc.is_empty() {
+        front_desc
+    } else {
+        heading.or(first_line).unwrap_or_default()
+    };
+    Ok(Some(AgentSlashCommand {
+        name: id.into(),
+        display_name,
+        description: description.chars().take(240).collect(),
+        argument_hint: "[参数]".into(),
+        kind: Some(AgentCommandKind::Command),
+        ui_action: None,
+    }))
+}
+
+fn scan_local_catalog(
+    project: &std::path::Path,
+    environment: &AgentEnvironment,
+) -> Vec<AgentSlashCommand> {
+    const LIMIT: usize = 512;
+    const DIR_SCAN_HARD_LIMIT: usize = 8192;
+    let mut seen = std::collections::HashSet::new();
+    let mut catalog = Vec::new();
+    for root in command_roots(project, environment) {
+        let Ok(canonical_root) = root.canonicalize() else {
+            continue;
+        };
+        let Ok(listing) = std::fs::read_dir(&canonical_root) else {
+            continue;
+        };
+        let mut files: Vec<(String, PathBuf)> = listing
+            .take(DIR_SCAN_HARD_LIMIT)
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let file_name = entry.file_name().into_string().ok()?;
+                let stem = file_name.strip_suffix(".md")?;
+                valid_cursor_slash_id(stem).then(|| (stem.to_owned(), entry.path()))
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        for (stem, path) in files {
+            if catalog.len() >= LIMIT {
+                return catalog;
+            }
+            if seen.contains(&stem) {
+                continue;
+            }
+            let Ok(resolved) = path.canonicalize() else {
+                continue;
+            };
+            if !resolved.starts_with(&canonical_root) {
+                continue;
+            }
+            if let Ok(Some(cmd)) = parse_markdown_command(&resolved, &stem) {
+                seen.insert(stem);
+                catalog.push(cmd);
+            }
+        }
+    }
+    for (slug, info) in crate::agents::claude_skills::scan_roots(&skill_roots(project, environment))
+    {
+        if catalog.len() >= LIMIT {
+            break;
+        }
+        if !valid_cursor_slash_id(&slug) || seen.contains(&slug) {
+            continue;
+        }
+        let skill_file = PathBuf::from(&info.directory).join("SKILL.md");
+        if let Ok(doc) = crate::agents::claude_skills::read(&skill_file, 64 * 1024)
+            && crate::agents::claude_skills::field(&doc, "user-invocable")
+                .eq_ignore_ascii_case("false")
+        {
+            continue;
+        }
+        seen.insert(slug.clone());
+        let display_name = (info.name != slug
+            && info.name.chars().count() <= 80
+            && !info.name.chars().any(char::is_control))
+        .then_some(info.name);
+        catalog.push(AgentSlashCommand {
+            name: slug,
+            display_name,
+            description: info.description.chars().take(240).collect(),
+            argument_hint: "[任务说明]".into(),
+            kind: Some(AgentCommandKind::Skill),
+            ui_action: None,
+        });
+    }
+    catalog
+}
+
+pub(crate) async fn commands(
+    binary: &str,
+    cwd: &str,
+    config: &crate::providers::LaunchConfig,
+) -> Result<Vec<AgentSlashCommand>> {
+    if config.provider.is_some() {
+        bail!("Cursor Agent 不支持 App Provider");
+    }
+    validate_capabilities(&output(binary, &["--help"], Some(cwd), &config.environment).await?)?;
+    let project = PathBuf::from(cwd);
+    let environment = config.environment.clone();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || scan_local_catalog(&project, &environment)),
+    )
+    .await
+    .context("读取 Cursor 命令与技能目录超时")?
+    .context("读取 Cursor 命令与技能目录失败")
+}
+
+pub(crate) fn skill_info(
+    project: &std::path::Path,
+    name: &str,
+    environment: &AgentEnvironment,
+) -> Result<Option<SkillInfo>> {
+    crate::agents::claude_skills::find_in_roots(&skill_roots(project, environment), name)
 }
 
 #[cfg(test)]

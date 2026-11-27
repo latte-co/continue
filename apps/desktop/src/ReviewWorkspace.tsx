@@ -328,6 +328,7 @@ function ReviewFileSection({
 }
 
 export function ReviewWorkspace({
+  repositoryControl,
   scopeControl,
   comparisonControl,
   files,
@@ -346,6 +347,7 @@ export function ReviewWorkspace({
   loadDiff,
   loadImage,
 }: {
+  repositoryControl?: ReactNode;
   scopeControl: ReactNode;
   comparisonControl?: ReactNode;
   files: GitReviewFile[];
@@ -473,6 +475,7 @@ export function ReviewWorkspace({
     <div className="git-review">
       <Subbar className="git-review-toolbar">
         <div className="review-scope-control">
+          {repositoryControl}
           <div className="review-scope-summary">
             {scopeControl}
             {!loading && files.length > 0 && (

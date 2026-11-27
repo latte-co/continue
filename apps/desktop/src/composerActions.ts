@@ -12,6 +12,7 @@ export function composerTrigger(
   text: string,
   cursor: number,
 ): ComposerTrigger | null {
+  if (cursor < 0) return null;
   const prefix = text.slice(0, cursor);
   const command = /(?:^|\s)\/([^\s/]*)$/.exec(prefix);
   if (command)
@@ -59,6 +60,13 @@ export type AppCommandAction = "subagents" | "model" | "effort" | "side";
 export type ComposerCommand = Omit<AgentSlashCommand, "ui_action"> & {
   ui_action?: AppCommandAction;
 };
+export type CommandPillIconKind =
+  "skill" | "command" | "model" | "effort" | "subagents" | "side";
+export interface ComposerCommandTokenMeta {
+  name: string;
+  icon: CommandPillIconKind;
+  title?: string;
+}
 export const supportsSideChatAgent = (agent: string) =>
   agent === "claude" || agent === "codex" || agent === "traex";
 
@@ -80,6 +88,44 @@ export function appCommandAction(
   return commands.find((command) => command.name === name)?.ui_action ?? null;
 }
 
+const agentNames: Record<string, string> = {
+  claude: "Claude Code",
+  codex: "Codex",
+  traex: "Traex",
+  opencode: "OpenCode",
+  cursor: "Cursor Agent",
+};
+
+export function agentDisplayName(agent: string): string {
+  return agentNames[agent] ?? agent;
+}
+
+export function leadingSlashCommand(text: string): string | undefined {
+  return /^\/([^\s/]+)(?:\s|$)/.exec(text.trim())?.[1];
+}
+
+const alwaysCommandNames = new Set([
+  "compact",
+  "context",
+  "usage",
+  "cost",
+  "clear",
+  "init",
+  "mcp",
+  "config",
+  "fast",
+  "rename",
+  "output-style",
+  "reload-plugins",
+  "reload-skills",
+  "insights",
+  "recap",
+]);
+
+export function isAlwaysNativeCommand(name: string): boolean {
+  return alwaysCommandNames.has(name);
+}
+
 export function unifiedComposerCommands(
   commands: AgentSlashCommand[],
   ownsSideCommands: boolean,
@@ -91,6 +137,7 @@ export function unifiedComposerCommands(
       display_name: "子智能体",
       description: "打开 Continue 子智能体面板",
       argument_hint: "",
+      kind: "command",
       ui_action: "subagents",
     },
     {
@@ -98,6 +145,7 @@ export function unifiedComposerCommands(
       display_name: "选择模型",
       description: "打开 Continue 模型菜单",
       argument_hint: "",
+      kind: "command",
       ui_action: "model",
     },
     {
@@ -105,6 +153,7 @@ export function unifiedComposerCommands(
       display_name: "思考强度",
       description: "打开 Continue 思考强度菜单",
       argument_hint: "",
+      kind: "command",
       ui_action: "effort",
     },
     ...(showSideChat
@@ -114,6 +163,7 @@ export function unifiedComposerCommands(
             display_name: "侧边聊天",
             description: "在右侧引用主聊上下文继续提问",
             argument_hint: "[问题]",
+            kind: "command" as const,
             ui_action: "side" as const,
           },
         ]
@@ -128,8 +178,9 @@ export function unifiedComposerCommands(
   ];
 }
 
-const claudeCommandTitles: Record<string, string> = {
+const builtinCommandTitles: Record<string, string> = {
   compact: "压缩上下文",
+  review: "代码审查",
   context: "上下文用量",
   usage: "使用情况",
   cost: "使用费用",
@@ -150,14 +201,26 @@ const claudeCommandTitles: Record<string, string> = {
   recap: "会话回顾",
   goal: "设置目标",
 };
+const verifiedSlashAgents = new Set([
+  "claude",
+  "codex",
+  "traex",
+  "opencode",
+  "cursor",
+]);
 export function commandTitle(
   command: Omit<AgentSlashCommand, "ui_action">,
-  agent: string,
+  agent?: string,
 ): string {
   const label = command.display_name?.trim();
   if (label && label !== command.name) return label;
-  if (agent === "claude" && claudeCommandTitles[command.name])
-    return claudeCommandTitles[command.name];
+  if (
+    agent &&
+    verifiedSlashAgents.has(agent) &&
+    command.kind !== "skill" &&
+    builtinCommandTitles[command.name]
+  )
+    return builtinCommandTitles[command.name];
   // Some skills expose their human title at the beginning of the description.
   // Use only a short explicit title; do not turn arbitrary prose into a label.
   const title = /^([^：:\n]{2,28})[：:]/u
@@ -169,4 +232,63 @@ export function commandTitle(
     .filter(Boolean)
     .map((word) => word[0].toUpperCase() + word.slice(1))
     .join(" ");
+}
+
+export function recognizedComposerCommands(
+  commands: AgentSlashCommand[],
+  agent: string,
+  sideChat: boolean,
+  sideAgent: boolean,
+): Map<string, ComposerCommandTokenMeta> {
+  const map = new Map<string, ComposerCommandTokenMeta>();
+  map.set("model", { name: "model", icon: "model", title: "选择模型" });
+  map.set("effort", { name: "effort", icon: "effort", title: "思考强度" });
+  if (sideChat) {
+    for (const cmd of commands) {
+      if (cmd.kind === "skill" && !map.has(cmd.name)) {
+        map.set(cmd.name, {
+          name: cmd.name,
+          icon: "skill",
+          title: commandTitle(cmd, agent),
+        });
+      }
+    }
+    return map;
+  }
+
+  for (const alias of subagentPanelAliases) {
+    map.set(alias, { name: alias, icon: "subagents", title: "子智能体" });
+  }
+  if (sideAgent) {
+    map.set("side", { name: "side", icon: "side", title: "侧边聊天" });
+    map.set("btw", { name: "btw", icon: "side", title: "侧边聊天" });
+  }
+  if (agent !== "opencode") {
+    for (const name of alwaysCommandNames) {
+      map.set(name, {
+        name,
+        icon: "command",
+        title: builtinCommandTitles[name] ?? name,
+      });
+    }
+  }
+  for (const cmd of commands) {
+    const icon: CommandPillIconKind = isNativeSubagentCommand(cmd)
+      ? "subagents"
+      : sideAgent && (cmd.name === "side" || cmd.name === "btw")
+        ? "side"
+        : cmd.name === "model"
+          ? "model"
+          : cmd.name === "effort"
+            ? "effort"
+            : cmd.kind === "skill"
+              ? "skill"
+              : "command";
+    map.set(cmd.name, {
+      name: cmd.name,
+      icon,
+      title: commandTitle(cmd, agent),
+    });
+  }
+  return map;
 }

@@ -7,6 +7,7 @@ mod claude_sessions;
 pub(crate) mod claude_skills;
 pub(crate) mod codex;
 pub(crate) mod codex_jobs;
+mod codex_skills;
 pub(crate) mod codex_title;
 mod opencode;
 mod titles;
@@ -42,6 +43,7 @@ impl ToolImages {
         }
     }
 }
+pub(crate) use cursor::commands as cursor_commands;
 pub(crate) use opencode::commands as opencode_commands;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn opencode_child_history(
@@ -326,15 +328,104 @@ pub fn provider_model_variants(
     }
 }
 
+fn codex_skill_info(
+    project: &std::path::Path,
+    name: &str,
+    environment: &latte_work_protocol::AgentEnvironment,
+) -> Result<Option<latte_work_protocol::SkillInfo>> {
+    codex_skills::find(project, name, environment)
+}
+
+pub(crate) fn traex_skill_info(
+    project: &std::path::Path,
+    name: &str,
+    environment: &latte_work_protocol::AgentEnvironment,
+) -> Result<Option<latte_work_protocol::SkillInfo>> {
+    let home = crate::agent_environment::configured_variable("HOME", environment)
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let traex_home = crate::agent_environment::configured_variable("TRAEX_HOME", environment)
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let codex_home = crate::agent_environment::configured_variable("CODEX_HOME", environment)
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    if name.contains(':') {
+        if let Some(traex_home) = &traex_home {
+            return claude_skills::find_in(project, traex_home, name);
+        }
+        let Some(home) = home else {
+            return Ok(None);
+        };
+        for dir in [".trae", ".traex"] {
+            if let Some(found) = claude_skills::find_in(project, &home.join(dir), name)? {
+                return Ok(Some(found));
+            }
+        }
+        return Ok(None);
+    }
+    let mut config_files = Vec::new();
+    if let Some(codex_home) = &codex_home {
+        config_files.push(codex_home.join("config.toml"));
+    }
+    if let Some(traex_home) = &traex_home {
+        config_files.push(traex_home.join("config.toml"));
+    } else if let Some(home) = &home {
+        config_files.extend([".trae/config.toml", ".traex/config.toml"].map(|r| home.join(r)));
+    }
+    let rules = codex_skills::load_config_rules(&config_files, home.as_deref());
+    let mut roots = Vec::new();
+    for parent in project.ancestors().take(32) {
+        roots.extend([".trae/skills", ".traex/skills", ".agents/skills"].map(|r| parent.join(r)));
+        if parent.join(".git").exists() {
+            break;
+        }
+    }
+    if let Some(traex_home) = traex_home {
+        roots.push(traex_home.join("skills"));
+    } else if let Some(home) = &home {
+        roots.extend([".trae/skills", ".traex/skills"].map(|r| home.join(r)));
+    }
+    if let Some(codex_home) = codex_home {
+        roots.push(codex_home.join("skills"));
+    }
+    if let Some(home) = home {
+        roots.push(home.join(".agents/skills"));
+    }
+    if !crate::skills::component(name) {
+        bail!("Skill 名称无效");
+    }
+    for root in &roots {
+        if let Some(found) =
+            codex_skills::find_enabled_in_roots(&[(root.clone(), false)], name, &rules)?
+        {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
 /// Inspect known native skill locations. This never starts an Agent or grants file access.
 pub async fn skill_info(
     agent: &str,
     project: std::path::PathBuf,
     name: String,
+    environment: latte_work_protocol::AgentEnvironment,
+    native_skill_path: Option<std::path::PathBuf>,
 ) -> Result<Option<latte_work_protocol::SkillInfo>> {
-    if !matches!(agent, "claude" | "opencode") {
-        bail!("此 Agent 尚不支持 Skill 信息");
-    }
+    type SkillFinder = fn(
+        &std::path::Path,
+        &str,
+        &latte_work_protocol::AgentEnvironment,
+    ) -> Result<Option<latte_work_protocol::SkillInfo>>;
+    let find: SkillFinder = match agent {
+        "claude" => claude_skills::find_with_env,
+        "opencode" => opencode::skill_info,
+        "codex" => codex_skill_info,
+        "traex" => traex_skill_info,
+        "cursor" => cursor::skill_info,
+        _ => bail!("此 Agent 尚不支持 Skill 信息"),
+    };
     static READS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
     let permit = READS
@@ -342,16 +433,20 @@ pub async fn skill_info(
         .clone()
         .try_acquire_owned()
         .map_err(|_| anyhow::anyhow!("Skill 信息正在读取，请稍后重试"))?;
-    let find = if agent == "opencode" {
-        opencode::skill_info
-    } else {
-        claude_skills::find
-    };
     tokio::time::timeout(
         std::time::Duration::from_secs(3),
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            find(&project, &name)
+            if let Some(skill_md) = native_skill_path
+                && crate::skills::component(&name)
+                && skill_md.is_absolute()
+                && skill_md.file_name().and_then(|s| s.to_str()) == Some("SKILL.md")
+                && let Some(dir) = skill_md.parent()
+                && let Ok(Some(found)) = claude_skills::inspect(dir, &name)
+            {
+                return Ok(Some(found));
+            }
+            find(&project, &name, &environment)
         }),
     )
     .await

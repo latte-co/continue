@@ -1,9 +1,16 @@
 import type { JSONContent } from "@tiptap/core";
 import type { Mark, Node as ProseMirrorNode } from "@tiptap/pm/model";
+import type {
+  CommandPillIconKind,
+  ComposerCommandTokenMeta,
+} from "./composerActions";
 import type { ComposerReference } from "./pasteAttachments";
+
+export type { CommandPillIconKind, ComposerCommandTokenMeta };
 
 const REF_OPEN = "\uE000";
 const REF_CLOSE = "\uE001";
+const CMD_SKIP = "\uE002";
 const REF_TOKEN_GLOBAL = /\uE000(\d+)\uE001/g;
 
 const ORDERED_ITEM_RE = /^([ \t]*)(\d{1,9})\.[ \t](.*)$/;
@@ -74,11 +81,57 @@ export function isTableHeaderPair(
   return headerCells.length >= 1 && headerCells.length === delimCells.length;
 }
 
+function hasRecognizedSlashTokenInLine(
+  line: string,
+  lineOffset: number,
+  recognizedCommands: ReadonlyMap<string, ComposerCommandTokenMeta>,
+  activeCommandTriggerStart?: number | null,
+): boolean {
+  let i = 0;
+  while (i < line.length) {
+    if (line[i] === "`") {
+      const closeTick = line.indexOf("`", i + 1);
+      if (closeTick > i + 1) {
+        i = closeTick + 1;
+        continue;
+      }
+    }
+    if (
+      line[i] === "/" &&
+      (i === 0 || line[i - 1] === " " || line[i - 1] === "\t")
+    ) {
+      const slashAbs = lineOffset + i;
+      let end = i + 1;
+      while (end < line.length && line[end] !== " " && line[end] !== "\t") {
+        end++;
+      }
+      const name = line.slice(i + 1, end);
+      if (
+        name.length > 0 &&
+        !name.includes("/") &&
+        slashAbs !== activeCommandTriggerStart &&
+        recognizedCommands.has(name)
+      ) {
+        return true;
+      }
+      i = end;
+      continue;
+    }
+    i++;
+  }
+  return false;
+}
+
 /**
- * Detects whether a composer draft contains rich Markdown syntax that should
- * activate the WYSIWYG rich editor instead of the plain `<textarea>`.
+ * Detects whether a composer draft contains rich Markdown syntax or recognized
+ * slash command/skill tokens that should activate the WYSIWYG rich editor
+ * instead of the plain `<textarea>`.
  */
-export function hasRichComposerMarkdown(text: string): boolean {
+export function hasRichComposerMarkdown(
+  text: string,
+  recognizedCommands?: ReadonlyMap<string, ComposerCommandTokenMeta>,
+  activeCommandTriggerStart?: number | null,
+): boolean {
   if (!text) return false;
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
@@ -108,14 +161,39 @@ export function hasRichComposerMarkdown(text: string): boolean {
   if (/(?:^|[^\w*])\*([^\s*][^*\n]*?[^\s*]|[^\s*])\*(?!\*)/.test(text)) {
     return true;
   }
+  if (recognizedCommands && recognizedCommands.size > 0) {
+    let offset = 0;
+    for (const line of lines) {
+      if (
+        hasRecognizedSlashTokenInLine(
+          line,
+          offset,
+          recognizedCommands,
+          activeCommandTriggerStart,
+        )
+      ) {
+        return true;
+      }
+      offset += line.length + 1;
+    }
+  }
   return false;
 }
 
 function injectReferenceTokens(
   text: string,
   references: ComposerReference[],
+  activeCommandTriggerStart?: number | null,
 ): string {
-  if (!references.length) return text;
+  const skipSlash =
+    activeCommandTriggerStart !== null &&
+    activeCommandTriggerStart !== undefined &&
+    activeCommandTriggerStart >= 0 &&
+    activeCommandTriggerStart < text.length &&
+    text[activeCommandTriggerStart] === "/"
+      ? activeCommandTriggerStart
+      : null;
+  if (!references.length && skipSlash === null) return text;
   const sorted = references
     .map((entry, index) => ({
       index,
@@ -127,12 +205,21 @@ function injectReferenceTokens(
     .sort((a, b) => a.offset - b.offset || a.index - b.index);
   let out = "";
   let cursor = 0;
+  const appendSlice = (from: number, to: number) => {
+    if (skipSlash !== null && skipSlash >= from && skipSlash < to) {
+      out += text.slice(from, skipSlash + 1);
+      out += CMD_SKIP;
+      out += text.slice(skipSlash + 1, to);
+    } else {
+      out += text.slice(from, to);
+    }
+  };
   for (const { index, offset } of sorted) {
-    out += text.slice(cursor, offset);
+    appendSlice(cursor, offset);
     out += `${REF_OPEN}${index}${REF_CLOSE}`;
     cursor = offset;
   }
-  out += text.slice(cursor);
+  appendSlice(cursor, text.length);
   return out;
 }
 
@@ -140,14 +227,15 @@ function stripReferenceTokens(
   raw: string,
   references: ComposerReference[],
 ): { text: string; nodes: JSONContent[] } {
+  const cleaned = raw.includes(CMD_SKIP) ? raw.replaceAll(CMD_SKIP, "") : raw;
   const nodes: JSONContent[] = [];
   let plain = "";
   let last = 0;
   REF_TOKEN_GLOBAL.lastIndex = 0;
   let match: RegExpExecArray | null;
-  while ((match = REF_TOKEN_GLOBAL.exec(raw)) !== null) {
+  while ((match = REF_TOKEN_GLOBAL.exec(cleaned)) !== null) {
     if (match.index > last) {
-      const chunk = raw.slice(last, match.index);
+      const chunk = cleaned.slice(last, match.index);
       plain += chunk;
       nodes.push({ type: "text", text: chunk });
     }
@@ -166,8 +254,8 @@ function stripReferenceTokens(
     }
     last = match.index + match[0].length;
   }
-  if (last < raw.length) {
-    const tail = raw.slice(last);
+  if (last < cleaned.length) {
+    const tail = cleaned.slice(last);
     plain += tail;
     nodes.push({ type: "text", text: tail });
   }
@@ -183,9 +271,30 @@ function addMark(nodes: JSONContent[], markType: string): JSONContent[] {
   });
 }
 
+function hasSlashWordBoundaryBefore(raw: string, index: number): boolean {
+  let k = index - 1;
+  while (k >= 0 && raw[k] === REF_CLOSE) {
+    const open = raw.lastIndexOf(REF_OPEN, k - 1);
+    if (open < 0 || !/^\d+$/.test(raw.slice(open + 1, k))) break;
+    k = open - 1;
+  }
+  return k < 0 || raw[k] === " " || raw[k] === "\t";
+}
+
+function hasSlashWordBoundaryAfter(raw: string, index: number): boolean {
+  let k = index;
+  while (k < raw.length && raw[k] === REF_OPEN) {
+    const close = raw.indexOf(REF_CLOSE, k + 1);
+    if (close < 0 || !/^\d+$/.test(raw.slice(k + 1, close))) break;
+    k = close + 1;
+  }
+  return k >= raw.length || raw[k] === " " || raw[k] === "\t";
+}
+
 export function parseInlineMarkdown(
   raw: string,
   references: ComposerReference[],
+  recognizedCommands?: ReadonlyMap<string, ComposerCommandTokenMeta>,
 ): JSONContent[] {
   if (!raw) return [];
   const out: JSONContent[] = [];
@@ -218,6 +327,46 @@ export function parseInlineMarkdown(
             });
           }
           i = closeIdx + 1;
+          continue;
+        }
+      }
+    }
+
+    // Recognized slash command / skill pill: /name at whitespace boundary
+    if (
+      recognizedCommands &&
+      recognizedCommands.size > 0 &&
+      raw[i] === "/" &&
+      raw[i + 1] !== CMD_SKIP &&
+      hasSlashWordBoundaryBefore(raw, i)
+    ) {
+      let end = i + 1;
+      while (
+        end < raw.length &&
+        raw[end] !== " " &&
+        raw[end] !== "\t" &&
+        raw[end] !== REF_OPEN &&
+        raw[end] !== CMD_SKIP
+      ) {
+        end++;
+      }
+      if (raw[end] !== CMD_SKIP && hasSlashWordBoundaryAfter(raw, end)) {
+        const name = raw.slice(i + 1, end);
+        const meta =
+          name && !name.includes("/")
+            ? recognizedCommands.get(name)
+            : undefined;
+        if (meta) {
+          flush();
+          out.push({
+            type: "commandPill",
+            attrs: {
+              name: meta.name,
+              icon: meta.icon,
+              title: meta.title ?? "",
+            },
+          });
+          i = end;
           continue;
         }
       }
@@ -257,7 +406,9 @@ export function parseInlineMarkdown(
         flush();
         const rawLabel = linkMatch[1];
         const href = linkMatch[2];
-        const cleanLabel = rawLabel.replace(REF_TOKEN_GLOBAL, "");
+        const cleanLabel = rawLabel
+          .replace(REF_TOKEN_GLOBAL, "")
+          .replaceAll(CMD_SKIP, "");
         out.push({
           type: "linkPill",
           attrs: { label: cleanLabel || href, href },
@@ -291,7 +442,12 @@ export function parseInlineMarkdown(
         const inner = raw.slice(i + 2, closeBold);
         if (!inner.includes("\n")) {
           flush();
-          out.push(...addMark(parseInlineMarkdown(inner, references), "bold"));
+          out.push(
+            ...addMark(
+              parseInlineMarkdown(inner, references, recognizedCommands),
+              "bold",
+            ),
+          );
           i = closeBold + 2;
           continue;
         }
@@ -306,7 +462,10 @@ export function parseInlineMarkdown(
         if (!inner.includes("\n")) {
           flush();
           out.push(
-            ...addMark(parseInlineMarkdown(inner, references), "strike"),
+            ...addMark(
+              parseInlineMarkdown(inner, references, recognizedCommands),
+              "strike",
+            ),
           );
           i = closeStrike + 2;
           continue;
@@ -340,7 +499,10 @@ export function parseInlineMarkdown(
         if (!inner.includes("\n")) {
           flush();
           out.push(
-            ...addMark(parseInlineMarkdown(inner, references), "italic"),
+            ...addMark(
+              parseInlineMarkdown(inner, references, recognizedCommands),
+              "italic",
+            ),
           );
           i = found + 1;
           continue;
@@ -359,8 +521,9 @@ export function parseInlineMarkdown(
 function paragraphNode(
   raw: string,
   references: ComposerReference[],
+  recognizedCommands?: ReadonlyMap<string, ComposerCommandTokenMeta>,
 ): JSONContent {
-  const content = parseInlineMarkdown(raw, references);
+  const content = parseInlineMarkdown(raw, references, recognizedCommands);
   return content.length
     ? { type: "paragraph", content }
     : { type: "paragraph" };
@@ -439,6 +602,7 @@ function parseListCluster(
   lines: string[],
   startIndex: number,
   references: ComposerReference[],
+  recognizedCommands?: ReadonlyMap<string, ComposerCommandTokenMeta>,
 ): { node: JSONContent; nextIndex: number } {
   const first = matchListLine(lines[startIndex])!;
 
@@ -466,7 +630,11 @@ function parseListCluster(
         continue;
       }
 
-      const itemParagraph = paragraphNode(parsed.body, references);
+      const itemParagraph = paragraphNode(
+        parsed.body,
+        references,
+        recognizedCommands,
+      );
       if (parsed.kind === "taskList") {
         items.push({
           type: "taskItem",
@@ -521,17 +689,26 @@ function parseListCluster(
 export function parseMarkdownToDoc(
   text: string,
   references: ComposerReference[] = [],
+  recognizedCommands?: ReadonlyMap<string, ComposerCommandTokenMeta>,
+  activeCommandTriggerStart?: number | null,
 ): JSONContent {
-  const tokenized = injectReferenceTokens(text, references);
+  const tokenized = injectReferenceTokens(
+    text,
+    references,
+    activeCommandTriggerStart,
+  );
   const lines = tokenized.split("\n");
   const blocks: JSONContent[] = [];
   let i = 0;
 
   while (i < lines.length) {
     const line = lines[i];
+    const cleanCheckLine = line.includes(CMD_SKIP)
+      ? line.replaceAll(CMD_SKIP, "")
+      : line;
 
     // 1. Single-line fence space trigger (e.g. "```ts ")
-    const spaceFence = line.match(FENCE_SPACE_TRIGGER_RE);
+    const spaceFence = cleanCheckLine.match(FENCE_SPACE_TRIGGER_RE);
     if (spaceFence && i === lines.length - 1) {
       const language = spaceFence[2] || "";
       blocks.push({
@@ -543,7 +720,7 @@ export function parseMarkdownToDoc(
     }
 
     // 2. Multi-line fenced code block
-    const fenceOpen = line.match(FENCE_OPEN_RE);
+    const fenceOpen = cleanCheckLine.match(FENCE_OPEN_RE);
     if (fenceOpen && i < lines.length - 1) {
       const fenceChars = fenceOpen[1];
       const fenceChar = fenceChars[0];
@@ -551,7 +728,9 @@ export function parseMarkdownToDoc(
       const codeLines: string[] = [];
       i++;
       while (i < lines.length) {
-        const candidate = lines[i].replace(REF_TOKEN_GLOBAL, "");
+        const candidate = lines[i]
+          .replace(REF_TOKEN_GLOBAL, "")
+          .replaceAll(CMD_SKIP, "");
         const closeRe = new RegExp(
           `^[ \\t]{0,3}${fenceChar}{${fenceChars.length},}[ \\t]*$`,
         );
@@ -579,7 +758,7 @@ export function parseMarkdownToDoc(
         type: "tableRow",
         content: headerCells.map((cell) => ({
           type: "tableHeader",
-          content: [paragraphNode(cell, references)],
+          content: [paragraphNode(cell, references, recognizedCommands)],
         })),
       };
       const rows: JSONContent[] = [headerRow];
@@ -602,7 +781,7 @@ export function parseMarkdownToDoc(
           type: "tableRow",
           content: normalized.map((cell) => ({
             type: "tableCell",
-            content: [paragraphNode(cell, references)],
+            content: [paragraphNode(cell, references, recognizedCommands)],
           })),
         });
         i++;
@@ -622,7 +801,12 @@ export function parseMarkdownToDoc(
 
     // 4. Lists (ordered, bullet, task)
     if (matchListLine(line)) {
-      const cluster = parseListCluster(lines, i, references);
+      const cluster = parseListCluster(
+        lines,
+        i,
+        references,
+        recognizedCommands,
+      );
       blocks.push(cluster.node);
       i = cluster.nextIndex;
       continue;
@@ -632,7 +816,11 @@ export function parseMarkdownToDoc(
     const headingMatch = line.match(HEADING_RE);
     if (headingMatch) {
       const level = Math.min(6, headingMatch[1].length);
-      const content = parseInlineMarkdown(headingMatch[2], references);
+      const content = parseInlineMarkdown(
+        headingMatch[2],
+        references,
+        recognizedCommands,
+      );
       blocks.push({
         type: "heading",
         attrs: { level },
@@ -643,7 +831,7 @@ export function parseMarkdownToDoc(
     }
 
     // 6. Horizontal rule
-    if (HR_RE.test(line)) {
+    if (HR_RE.test(cleanCheckLine)) {
       blocks.push({ type: "horizontalRule" });
       i++;
       continue;
@@ -656,7 +844,9 @@ export function parseMarkdownToDoc(
       while (i < lines.length) {
         const m = lines[i].match(BLOCKQUOTE_RE);
         if (!m || !lines[i].trimStart().startsWith(">")) break;
-        quoteParagraphs.push(paragraphNode(m[1] ?? "", references));
+        quoteParagraphs.push(
+          paragraphNode(m[1] ?? "", references, recognizedCommands),
+        );
         i++;
       }
       blocks.push({
@@ -667,7 +857,7 @@ export function parseMarkdownToDoc(
     }
 
     // 8. Default Paragraph
-    blocks.push(paragraphNode(line, references));
+    blocks.push(paragraphNode(line, references, recognizedCommands));
     i++;
   }
 
@@ -774,6 +964,13 @@ export function serializeDocWithSelection(
         const href = String(child.attrs.href ?? "");
         const safeLabel = inTableCell ? label.replace(/\|/g, "\\|") : label;
         out += `[${safeLabel}](${href})`;
+        pushAnchor(pos + child.nodeSize);
+        pos += child.nodeSize;
+      } else if (child.type.name === "commandPill") {
+        pushAnchor(pos);
+        const name = String(child.attrs.name ?? "");
+        const safeName = inTableCell ? name.replace(/\|/g, "\\|") : name;
+        out += `/${safeName}`;
         pushAnchor(pos + child.nodeSize);
         pos += child.nodeSize;
       } else if (child.type.name === "referenceChip") {
@@ -1039,6 +1236,8 @@ function serializeHtmlInline(node: Node): string {
     return (node.textContent ?? "").replace(/\u00A0/g, " ");
   }
   if (!(node instanceof HTMLElement)) return "";
+  const commandName = node.getAttribute("data-command-name")?.trim();
+  if (commandName) return `/${commandName}`;
   const tag = node.tagName.toLowerCase();
   if (tag === "br") return "\n";
   if (tag === "code" && node.parentElement?.tagName.toLowerCase() !== "pre") {
@@ -1249,7 +1448,7 @@ export function htmlToComposerMarkdown(html: string): string | null {
   // syntax-colored IDE/terminal `<div><span>` wrappers.
   const hasRichElement = Boolean(
     body.querySelector(
-      'a[href^="http://"], a[href^="https://"], table, ul, ol, pre, blockquote, h1, h2, h3, h4, h5, h6, code, strong, em, del',
+      'a[href^="http://"], a[href^="https://"], [data-command-name], table, ul, ol, pre, blockquote, h1, h2, h3, h4, h5, h6, code, strong, em, del',
     ),
   );
   if (!hasRichElement) return null;

@@ -413,7 +413,16 @@ async fn opencode_skill_metadata_reads_project_install_without_starting_agent() 
         "---\nname: Fixture Skill\ndescription: Project skill\n---\nprivate body\n",
     )
     .unwrap();
+    // A skill sharing a native command's name must not reclassify the native command as a skill.
+    let colliding_skill = folder.path().join(".opencode/skills/compact");
+    std::fs::create_dir_all(&colliding_skill).unwrap();
+    std::fs::write(
+        colliding_skill.join("SKILL.md"),
+        "---\nname: Colliding Compact Skill\ndescription: Should not overwrite native command\n---\nbody\n",
+    )
+    .unwrap();
     let request = |name: &str| Request::SkillInfo {
+        provider: None,
         session_id: id.clone(),
         name: name.into(),
     };
@@ -431,6 +440,74 @@ async fn opencode_skill_metadata_reads_project_install_without_starting_agent() 
         current(&mut client, &id).await.agent_session_open,
         Some(false)
     );
+    let catalog = ask(
+        &mut client,
+        Request::AgentCommands {
+            agent: "opencode".into(),
+            project_id,
+            provider: Some(TurnProvider::Cli),
+        },
+    )
+    .await;
+    match catalog {
+        Response::AgentCommands { commands } => {
+            assert!(commands.iter().any(|c| {
+                c.name == "project:check"
+                    && c.kind == Some(latte_work_protocol::AgentCommandKind::Command)
+            }));
+            assert!(commands.iter().any(|c| {
+                c.name == "compact"
+                    && c.kind == Some(latte_work_protocol::AgentCommandKind::Command)
+            }));
+            assert!(commands.iter().any(|c| {
+                c.name == "fixture-opencode-skill"
+                    && c.display_name.as_deref() == Some("Fixture Skill")
+                    && c.description == "Project skill"
+                    && c.kind == Some(latte_work_protocol::AgentCommandKind::Skill)
+            }));
+        }
+        other => panic!("expected opencode commands & skills: {other:?}"),
+    }
+    assert!(!folder.path().join("prompts").exists());
+
+    // Skills remain composable with `@` file references during execution, while native commands reject them.
+    std::fs::write(folder.path().join("README.md"), "# Demo\n").unwrap();
+    let ref_manifest = "\n引用（相对项目；绝对路径在当前主机，按现有权限读取）：\n[{\"type\":\"file\",\"path\":\"README.md\",\"name\":\"README.md\"}]";
+    assert!(matches!(
+        ask(
+            &mut client,
+            turn(
+                &id,
+                "skill-with-ref",
+                &format!("/fixture-opencode-skill 检查{ref_manifest}")
+            )
+        )
+        .await,
+        Response::Accepted { duplicate: false }
+    ));
+    let events = wait(&mut client, &id, Status::Completed).await;
+    assert!(contains_text(&events, "fixture "));
+    assert!(matches!(
+        ask(
+            &mut client,
+            turn(
+                &id,
+                "cmd-with-ref",
+                &format!("/project:check 检查{ref_manifest}")
+            )
+        )
+        .await,
+        Response::Accepted { duplicate: false }
+    ));
+    let failed = wait(&mut client, &id, Status::Failed).await;
+    assert!(failed.iter().any(|e| matches!(
+        &e.event,
+        EventKind::State { status: Status::Failed, message: Some(msg) } if msg.contains("请先移除项目引用")
+    )));
+    assert!(matches!(
+        ask(&mut client, close(&id, true)).await,
+        Response::Ok
+    ));
 }
 
 #[tokio::test]

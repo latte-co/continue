@@ -36,6 +36,7 @@ vi.mock("./api", () => ({
   chooseReferencePath: mocks.choose,
   message: (e: unknown) => String(e),
 }));
+let resetHarnessDraft: (() => void) | null = null;
 function Harness({
   hostId = "remote",
   projectId = "p",
@@ -44,6 +45,7 @@ function Harness({
   ...props
 }: Partial<ComponentProps<typeof Composer>>) {
   const [text, setText] = useState("");
+  resetHarnessDraft = () => setText("");
   return (
     <Composer
       agent={agent}
@@ -73,7 +75,11 @@ function Harness({
   );
 }
 function type(value: string, cursor = value.length) {
-  const input = screen.getByRole("textbox", { name: "任务输入" });
+  let input = screen.getByRole("textbox", { name: "任务输入" });
+  if (input.classList.contains("composer-rich-input") && resetHarnessDraft) {
+    act(() => resetHarnessDraft?.());
+    input = screen.getByRole("textbox", { name: "任务输入" });
+  }
   if (input instanceof HTMLTextAreaElement) {
     fireEvent.change(input, {
       target: { value, selectionStart: cursor, selectionEnd: cursor },
@@ -96,6 +102,21 @@ function type(value: string, cursor = value.length) {
 function inputText() {
   const input = screen.getByRole("textbox", { name: "任务输入" });
   if (input instanceof HTMLTextAreaElement) return input.value;
+  if (input.classList.contains("composer-rich-input")) {
+    return Array.from(input.children)
+      .map((block) =>
+        Array.from(block.childNodes)
+          .map((node) => {
+            if (node instanceof HTMLElement && node.dataset.commandName)
+              return `/${node.dataset.commandName}`;
+            if (node instanceof HTMLElement && node.dataset.referencePath)
+              return "";
+            return node.textContent ?? "";
+          })
+          .join(""),
+      )
+      .join("\n");
+  }
   return Array.from(input.childNodes)
     .filter((node) => node.nodeType === Node.TEXT_NODE)
     .map((node) => node.textContent ?? "")
@@ -431,8 +452,31 @@ it("detects only standalone mention and slash triggers", () => {
   });
 });
 
-it("offers local settings and does not discover or submit native commands in side chat", () => {
-  render(<Harness sideChat />);
+it("discovers and submits skills in side chat while keeping control commands blocked", async () => {
+  mocks.request.mockImplementation(async (_host, req) =>
+    req.method === "agent_commands"
+      ? {
+          kind: "agent_commands",
+          commands: [
+            {
+              name: "compact",
+              description: "压缩会话上下文",
+              argument_hint: "",
+              kind: "command",
+            },
+            {
+              name: "review-code-changes",
+              display_name: "代码评审",
+              description: "按评审契约审查变更",
+              argument_hint: "[范围]",
+              kind: "skill",
+            },
+          ],
+        }
+      : { kind: "files", entries: [] },
+  );
+  mocks.send.mockResolvedValue(true);
+  const { container } = render(<Harness sideChat />);
   type("/");
   expect(screen.getAllByRole("option")).toHaveLength(2);
   fireEvent.click(screen.getByRole("option", { name: /选择模型/ }));
@@ -442,11 +486,32 @@ it("offers local settings and does not discover or submit native commands in sid
     expect.any(Function),
   );
 
+  // Known built-in control commands fail closed immediately without network or send.
+  mocks.request.mockClear();
   type("/compact ");
   fireEvent.click(screen.getByText("发送"));
-  expect(screen.getByText(/侧边聊天暂不支持 Agent 原生命令/)).toBeTruthy();
+  expect(screen.getByText(/侧边聊天不支持 Agent 原生命令/)).toBeTruthy();
   expect(mocks.request).not.toHaveBeenCalled();
   expect(mocks.send).not.toHaveBeenCalled();
+
+  // Opening `/` in side chat lists `/model`, `/effort`, and skills (hiding `/compact` and `/agents`).
+  type("/");
+  const skillOption = await screen.findByRole("option", {
+    name: /review-code-changes.*代码评审/,
+  });
+  expect(screen.queryByRole("option", { name: /compact/ })).toBeNull();
+  expect(screen.queryByRole("option", { name: /agents/ })).toBeNull();
+  fireEvent.click(skillOption);
+  expect(inputText()).toBe("/review-code-changes ");
+  expect(container.querySelector(".composer-command-pill")?.textContent).toBe(
+    "review-code-changes",
+  );
+
+  type("/review-code-changes 评审下");
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() =>
+    expect(mocks.send).toHaveBeenCalledWith("/review-code-changes 评审下"),
+  );
 });
 it.each([
   ["local", "请检查 /comp", "Enter"],
@@ -464,7 +529,11 @@ it.each([
     });
     fireEvent.keyDown(screen.getByRole("textbox"), { key });
     const completed = draft.replace(/\/comp$/, "/compact ");
-    expect(screen.getByRole("textbox")).toHaveProperty("value", completed);
+    expect(inputText()).toBe(completed);
+    expect(
+      screen.getByRole("textbox").querySelector('[data-command-name="compact"]')
+        ?.textContent,
+    ).toBe("compact");
     expect(mocks.send).not.toHaveBeenCalled();
     expect(screen.queryByRole("listbox")).toBeNull();
     fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
@@ -482,16 +551,11 @@ it("completes a command at the caret without replacing surrounding text", async 
   const after = " 后文";
   type(`${before}/comp${after}`, before.length + "/comp".length);
   fireEvent.click(await screen.findByRole("option", { name: /compact/ }));
-  expect(screen.getByRole("textbox")).toHaveProperty(
-    "value",
-    `${before}/compact ${after}`,
-  );
-  await waitFor(() =>
-    expect(screen.getByRole("textbox")).toHaveProperty(
-      "selectionStart",
-      before.length + "/compact ".length,
-    ),
-  );
+  expect(inputText()).toBe(`${before}/compact ${after}`);
+  expect(
+    screen.getByRole("textbox").querySelector('[data-command-name="compact"]')
+      ?.textContent,
+  ).toBe("compact");
   expect(mocks.send).not.toHaveBeenCalled();
 });
 it("loads native commands from the selected host and inserts without running; sends exact arguments", async () => {
@@ -504,9 +568,7 @@ it("loads native commands from the selected host and inserts without running; se
     agent: "claude",
   });
   fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
-  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-    "/compact ",
-  );
+  expect(inputText()).toBe("/compact ");
   expect(mocks.send).not.toHaveBeenCalled();
   type("/compact 保留结论");
   fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
@@ -752,17 +814,16 @@ it("keeps adjacent chips on the left of command completion and successive deleti
   fireEvent.input(editor);
   fireEvent.click(await screen.findByRole("option", { name: /compact/ }));
   expect(inputText()).toBe("前文 /compact ");
-  expect(editor.lastChild?.textContent).toBe("/compact ");
+  const richEditor = screen.getByRole("textbox", { name: "任务输入" });
+  expect(
+    richEditor.querySelector('[data-command-name="compact"]')?.textContent,
+  ).toBe("compact");
 
-  const afterChips = document.createRange();
-  afterChips.setStartAfter(
-    editor.querySelector('[data-reference-path="src/中文 file.ts"]')!,
+  fireEvent.click(
+    screen.getByRole("button", { name: "移除引用 src/中文 file.ts" }),
   );
-  afterChips.collapse(true);
-  selectComposerRange(afterChips);
-  fireEvent.keyDown(editor, { key: "Backspace" });
-  expect(editor.querySelectorAll("[data-reference-path]")).toHaveLength(1);
-  fireEvent.keyDown(editor, { key: "Backspace" });
+  expect(richEditor.querySelectorAll("[data-reference-path]")).toHaveLength(1);
+  fireEvent.click(screen.getByRole("button", { name: "移除引用 README.md" }));
   expect(screen.queryByRole("button", { name: /移除引用/ })).toBeNull();
   expect(inputText()).toBe("前文 /compact ");
 });
@@ -1005,9 +1066,7 @@ it("searches friendly titles but inserts the original agent command", async () =
   render(<Harness />);
   type("/压缩");
   fireEvent.click(await screen.findByRole("option", { name: /压缩上下文/ }));
-  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-    "/compact ",
-  );
+  expect(inputText()).toBe("/compact ");
   expect(mocks.send).not.toHaveBeenCalled();
 });
 
@@ -1293,9 +1352,11 @@ it("shows one local subagent entry and hides native listing variants", async () 
   await waitFor(() => expect(mocks.request).toHaveBeenCalled());
   await screen.findByRole("option", { name: /压缩上下文/ });
   expect(screen.getAllByRole("option")).toHaveLength(4);
+  const subagentOption = screen.getByRole("option", { name: /子智能体/ });
   expect(
-    screen.getByRole("option", { name: /子智能体/ }).textContent,
-  ).toContain("/agents");
+    subagentOption.querySelector(".composer-menu-option-primary")?.textContent,
+  ).toBe("agents");
+  expect(subagentOption.textContent).not.toContain("/agents");
   expect(
     screen.queryByRole("option", {
       name: /list-agents|Native wizard|Native list|Native tasks/,
@@ -1413,9 +1474,7 @@ it.each([
     expect(mocks.openSubagents).toHaveBeenCalledOnce();
     expect(mocks.send).not.toHaveBeenCalled();
     expect(mocks.request).not.toHaveBeenCalled();
-    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-      command,
-    );
+    expect(inputText()).toBe(command);
     expect(screen.getByText(/此命令不接受参数/)).toBeTruthy();
   },
 );
@@ -1437,9 +1496,7 @@ it("prioritizes the exact native command over matches in other command descripti
   type("/agents");
   await screen.findAllByRole("option");
   fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
-  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-    "/agents ",
-  );
+  expect(inputText()).toBe("/agents ");
   expect(mocks.send).not.toHaveBeenCalled();
 });
 
@@ -1518,9 +1575,7 @@ it.each(["/model opus", "/effort high", "/model\n检查项目"])(
     fireEvent.click(screen.getByText("发送"));
     expect(mocks.send).not.toHaveBeenCalled();
     expect(mocks.request).not.toHaveBeenCalled();
-    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-      command,
-    );
+    expect(inputText()).toBe(command);
     expect(screen.getByText(/请在菜单中选择/)).toBeTruthy();
   },
 );
@@ -1531,9 +1586,7 @@ it("preserves the draft when the App model settings are unavailable", () => {
   type("/effort ");
   fireEvent.click(screen.getByText("发送"));
   expect(screen.getByText(/不支持调整思考强度/)).toBeTruthy();
-  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
-    "/effort ",
-  );
+  expect(inputText()).toBe("/effort ");
   expect(mocks.send).not.toHaveBeenCalled();
 });
 
@@ -2090,4 +2143,456 @@ it("uses Tab to drill into directory subpaths and complete files, while Enter di
   await screen.findByRole("option", { name: /^src/ });
   fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
   expect(screen.getByRole("button", { name: "移除引用 src" })).toBeTruthy();
+});
+
+it.each([
+  ["claude", "Claude Code"],
+  ["codex", "Codex"],
+  ["traex", "Traex"],
+  ["opencode", "OpenCode"],
+  ["cursor", "Cursor Agent"],
+])(
+  "renders unified commands and skills menu for %s (%s) with skill badges",
+  async (agent) => {
+    mocks.request.mockImplementation(async (_host, req) =>
+      req.method === "agent_commands"
+        ? {
+            kind: "agent_commands",
+            commands: [
+              {
+                name: "compact",
+                description: "压缩会话上下文",
+                argument_hint: "",
+                kind: "command",
+              },
+              {
+                name: "review",
+                description: "审查当前改动",
+                argument_hint: "[说明]",
+                kind: "command",
+              },
+              {
+                name: "fix-ci",
+                display_name: "修复 CI",
+                description: "诊断并修复流水线失败",
+                argument_hint: "[任务说明]",
+                kind: "skill",
+              },
+            ],
+          }
+        : { kind: "files", entries: [] },
+    );
+    render(<Harness agent={agent} />);
+    type("/");
+    await screen.findByRole("option", { name: /修复 CI/ });
+    const compactOption = screen.getByRole("option", { name: /压缩上下文/ });
+    expect(
+      compactOption.querySelector(".composer-menu-option-primary")?.textContent,
+    ).toBe("compact");
+    expect(compactOption.textContent).not.toContain("/compact");
+    expect(screen.getByRole("option", { name: /代码审查/ })).toBeTruthy();
+    const skillOption = screen.getByRole("option", { name: /修复 CI/ });
+    expect(
+      skillOption.querySelector(".composer-menu-option-primary")?.textContent,
+    ).toBe("fix-ci");
+    expect(skillOption.textContent).not.toContain("/fix-ci");
+    expect(
+      skillOption.querySelector(".composer-command-badge")?.textContent,
+    ).toBe("技能");
+    expect(mocks.request).toHaveBeenCalledWith("remote", {
+      method: "agent_commands",
+      project_id: "p",
+      agent,
+    });
+  },
+);
+
+it("composes skills with @ references, quotes, and annotations while keeping control commands guarded", async () => {
+  mocks.request.mockImplementation(async (_host, req) =>
+    req.method === "agent_commands"
+      ? {
+          kind: "agent_commands",
+          commands: [
+            {
+              name: "compact",
+              description: "压缩会话上下文",
+              argument_hint: "",
+              kind: "command",
+            },
+            {
+              name: "fix-ci",
+              display_name: "修复 CI",
+              description: "诊断并修复流水线失败",
+              argument_hint: "[任务说明]",
+              kind: "skill",
+            },
+          ],
+        }
+      : {
+          kind: "files",
+          entries: [{ name: "README.md", path: "README.md", directory: false }],
+        },
+  );
+  mocks.send.mockResolvedValue(true);
+  render(
+    <Harness
+      agent="codex"
+      quotes={["请同步修复快照断言"]}
+      annotations={[
+        {
+          id: "a1",
+          quote: "expect(status).toBe(200)",
+          comment: "补充失败分支检查",
+          source: { message: 1, start: 0, end: 24 },
+        },
+      ]}
+    />,
+  );
+  type("/fix");
+  fireEvent.click(await screen.findByRole("option", { name: /修复 CI/ }));
+  expect(inputText()).toBe("/fix-ci ");
+
+  type("/fix-ci 检查 @READ");
+  fireEvent.click(await screen.findByRole("option", { name: /README\.md/ }));
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+  const submitted = mocks.send.mock.calls[0][0] as string;
+  expect(submitted.startsWith("/fix-ci ")).toBe(true);
+  expect(submitted).toContain("README.md");
+  expect(submitted).toContain("请同步修复快照断言");
+  expect(submitted).toContain("补充失败分支检查");
+
+  // Control commands (kind !== "skill") still reject mixing references/quotes/annotations.
+  type("/compact ");
+  fireEvent.click(screen.getByText("发送"));
+  expect(
+    await screen.findByText(/请先移除引用的文本片段，再使用 Agent 原生命令/),
+  ).toBeTruthy();
+  expect(mocks.send).toHaveBeenCalledOnce();
+});
+
+it("permits a catalog skill named init with @ references, quotes, and annotations", async () => {
+  mocks.request.mockImplementation(async (_host, req) =>
+    req.method === "agent_commands"
+      ? {
+          kind: "agent_commands",
+          commands: [
+            {
+              name: "compact",
+              description: "压缩会话上下文",
+              argument_hint: "",
+              kind: "command",
+            },
+            {
+              name: "init",
+              display_name: "初始化项目技能",
+              description: "按团队规范初始化配置",
+              argument_hint: "[任务说明]",
+              kind: "skill",
+            },
+          ],
+        }
+      : {
+          kind: "files",
+          entries: [{ name: "README.md", path: "README.md", directory: false }],
+        },
+  );
+  mocks.send.mockResolvedValue(true);
+  const view = render(
+    <Harness
+      agent="codex"
+      quotes={["请同步修复快照断言"]}
+      annotations={[
+        {
+          id: "a1",
+          quote: "expect(status).toBe(200)",
+          comment: "补充失败分支检查",
+          source: { message: 1, start: 0, end: 24 },
+        },
+      ]}
+    />,
+  );
+  // Submitting `/init` directly with quotes before opening `/` menu fetches catalog and permits skill.
+  type("/init 直接提交");
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(1));
+  expect(mocks.send.mock.calls[0][0] as string).toContain("/init 直接提交");
+  expect(mocks.send.mock.calls[0][0] as string).toContain("请同步修复快照断言");
+
+  // Also works after opening `/` menu and attaching an `@` file reference.
+  type("/ini");
+  fireEvent.click(
+    await screen.findByRole("option", { name: /初始化项目技能/ }),
+  );
+  expect(inputText()).toBe("/init ");
+  type("/init 检查 @READ");
+  fireEvent.click(await screen.findByRole("option", { name: /README\.md/ }));
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
+  const submitted = mocks.send.mock.calls[1][0] as string;
+  expect(submitted.startsWith("/init ")).toBe(true);
+  expect(submitted).toContain("README.md");
+  expect(submitted).toContain("补充失败分支检查");
+  view.unmount();
+});
+
+it("renders selected skills and commands as inline icon pills without leading slash and supports multiple tokens", async () => {
+  mocks.request.mockImplementation(async (_host, req) =>
+    req.method === "agent_commands"
+      ? {
+          kind: "agent_commands",
+          commands: [
+            {
+              name: "doc-coauthoring",
+              display_name: "Doc Coauthoring",
+              description: "Guide users through co-authoring documentation",
+              argument_hint: "",
+              kind: "skill",
+            },
+            {
+              name: "fix-ci",
+              display_name: "修复 CI",
+              description: "诊断并修复流水线失败",
+              argument_hint: "",
+              kind: "skill",
+            },
+          ],
+        }
+      : { kind: "files", entries: [] },
+  );
+  mocks.send.mockResolvedValue(true);
+  render(<Harness agent="codex" />);
+  type("/doc");
+  fireEvent.click(
+    await screen.findByRole("option", { name: /Doc Coauthoring/ }),
+  );
+  const rich = screen.getByRole("textbox", { name: "任务输入" });
+  expect(rich.classList.contains("composer-rich-input")).toBe(true);
+  const firstPill = rich.querySelector<HTMLElement>(
+    '.composer-command-pill[data-command-name="doc-coauthoring"]',
+  );
+  expect(firstPill).not.toBeNull();
+  expect(firstPill?.dataset.commandIcon).toBe("skill");
+  expect(firstPill?.textContent).toBe("doc-coauthoring");
+  expect(firstPill?.querySelector("svg")).not.toBeNull();
+
+  // Select a second skill inline alongside the first pill
+  fireEvent.paste(rich, {
+    clipboardData: {
+      files: [],
+      types: ["text/plain"],
+      getData: (mime: string) => (mime === "text/plain" ? "/fix" : ""),
+    },
+  });
+  await waitFor(() => expect(inputText()).toBe("/doc-coauthoring /fix"));
+  rich.click();
+  type("/doc-coauthoring /fix");
+  fireEvent.click(await screen.findByRole("option", { name: /修复 CI/ }));
+  const pills = Array.from(
+    screen
+      .getByRole("textbox")
+      .querySelectorAll<HTMLElement>(".composer-command-pill"),
+  );
+  expect(pills.map((p) => p.textContent)).toEqual([
+    "doc-coauthoring",
+    "fix-ci",
+  ]);
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() =>
+    expect(mocks.send).toHaveBeenCalledWith("/doc-coauthoring /fix-ci"),
+  );
+});
+
+it("converts character-by-character typed commands in rich input into inline pills upon completion", async () => {
+  mocks.request.mockImplementation(async (_host, req) =>
+    req.method === "agent_commands"
+      ? {
+          kind: "agent_commands",
+          commands: [
+            {
+              name: "doc-coauthoring",
+              display_name: "Doc Coauthoring",
+              description: "Guide users through co-authoring documentation",
+              argument_hint: "",
+              kind: "skill",
+            },
+            {
+              name: "fix-ci",
+              display_name: "修复 CI",
+              description: "诊断并修复流水线失败",
+              argument_hint: "",
+              kind: "skill",
+            },
+          ],
+        }
+      : { kind: "files", entries: [] },
+  );
+  mocks.send.mockResolvedValue(true);
+  render(<Harness agent="codex" />);
+
+  // Enter rich mode via a first command pill (`/doc-coauthoring `)
+  type("/doc");
+  fireEvent.click(
+    await screen.findByRole("option", { name: /Doc Coauthoring/ }),
+  );
+  const rich = screen.getByRole("textbox", { name: "任务输入" });
+  expect(rich.classList.contains("composer-rich-input")).toBe(true);
+
+  const pmView = (
+    rich as unknown as {
+      editor: {
+        view: {
+          state: { tr: { insertText: (text: string) => unknown } };
+          dispatch: (tr: unknown) => void;
+        };
+      };
+    }
+  ).editor.view;
+
+  // Type `/fix-ci` character-by-character inside `ComposerRichInput`: while the
+  // slash trigger is still active (no trailing space yet), `/fix-ci` stays plain text.
+  for (const ch of "/fix-ci") {
+    act(() => {
+      pmView.dispatch(pmView.state.tr.insertText(ch));
+    });
+  }
+  expect(
+    Array.from(rich.querySelectorAll(".composer-command-pill")).map(
+      (el) => el.textContent,
+    ),
+  ).toEqual(["doc-coauthoring"]);
+  expect(rich.querySelector(".composer-command-pill svg")).not.toBeNull();
+  expect(await screen.findByRole("option", { name: /修复 CI/ })).toBeTruthy();
+
+  // Completing the command with a space immediately converts `/fix-ci` into a pill
+  // on the same live rich-editor instance and keeps the caret positioned after the space.
+  expect(screen.getByRole("textbox", { name: "任务输入" })).toBe(rich);
+  act(() => {
+    pmView.dispatch(pmView.state.tr.insertText(" "));
+  });
+  await waitFor(() =>
+    expect(
+      Array.from(rich.querySelectorAll(".composer-command-pill")).map(
+        (el) => el.textContent,
+      ),
+    ).toEqual(["doc-coauthoring", "fix-ci"]),
+  );
+
+  for (const ch of "检查构建") {
+    act(() => {
+      pmView.dispatch(pmView.state.tr.insertText(ch));
+    });
+  }
+  expect(
+    Array.from(rich.querySelectorAll(".composer-command-pill")).every(
+      (el) => el.querySelector("svg") !== null,
+    ),
+  ).toBe(true);
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() =>
+    expect(mocks.send).toHaveBeenCalledWith(
+      "/doc-coauthoring /fix-ci 检查构建",
+    ),
+  );
+});
+
+it("preserves leading slash when copying and pasting formatted skill instructions", async () => {
+  const { DOMSerializer } = await import("@tiptap/pm/model");
+  mocks.request.mockImplementation(async (_host, req) =>
+    req.method === "agent_commands"
+      ? {
+          kind: "agent_commands",
+          commands: [
+            {
+              name: "doc-coauthoring",
+              display_name: "Doc Coauthoring",
+              description: "Guide users through co-authoring documentation",
+              argument_hint: "",
+              kind: "skill",
+            },
+          ],
+        }
+      : { kind: "files", entries: [] },
+  );
+  mocks.send.mockResolvedValue(true);
+  const first = render(<Harness agent="codex" />);
+  type("1. /doc");
+  fireEvent.click(
+    await screen.findByRole("option", { name: /Doc Coauthoring/ }),
+  );
+  const rich = screen.getByRole("textbox", { name: "任务输入" });
+  const pmEditor = (
+    rich as unknown as {
+      editor: {
+        schema: Parameters<typeof DOMSerializer.fromSchema>[0];
+        state: {
+          doc: { content: unknown };
+          tr: { insertText: (text: string) => unknown };
+        };
+        view: { dispatch: (tr: unknown) => void };
+      };
+    }
+  ).editor;
+  act(() => {
+    pmEditor.view.dispatch(pmEditor.state.tr.insertText("整理大纲"));
+  });
+
+  // 1. ProseMirror clipboard HTML serializer (`CommandPill.renderHTML`) keeps `/doc-coauthoring`
+  const fragment = DOMSerializer.fromSchema(pmEditor.schema).serializeFragment(
+    pmEditor.state.doc.content as never,
+  );
+  const wrap = document.createElement("div");
+  wrap.append(fragment);
+  const copiedHtml = wrap.innerHTML;
+  expect(copiedHtml).toContain(">/doc-coauthoring</span>");
+
+  // Also capture the live NodeView DOM (where label text has no leading `/`)
+  const liveDomHtml = rich.innerHTML;
+  first.unmount();
+
+  // 2. Pasting copied ProseMirror HTML into a fresh composer preserves `/doc-coauthoring`
+  const second = render(<Harness agent="codex" />);
+  const target = screen.getByRole("textbox", { name: "任务输入" });
+  fireEvent.paste(target, {
+    clipboardData: {
+      files: [],
+      types: ["text/plain", "text/html"],
+      getData: (mime: string) =>
+        mime === "text/html" ? copiedHtml : "1. doc-coauthoring 整理大纲",
+    },
+  });
+  await waitFor(() => {
+    expect(
+      screen.getByRole("textbox").querySelectorAll("ol > li"),
+    ).toHaveLength(1);
+    expect(inputText()).toBe("/doc-coauthoring 整理大纲");
+  });
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() =>
+    expect(mocks.send).toHaveBeenCalledWith("1. /doc-coauthoring 整理大纲"),
+  );
+  second.unmount();
+
+  // 3. Pasting raw NodeView DOM HTML (`<span data-command-name="doc-coauthoring"><svg/><span>doc-coauthoring</span></span>`)
+  // also preserves `/doc-coauthoring` without dropping or doubling the slash.
+  mocks.send.mockClear();
+  render(<Harness agent="codex" />);
+  fireEvent.paste(screen.getByRole("textbox", { name: "任务输入" }), {
+    clipboardData: {
+      files: [],
+      types: ["text/plain", "text/html"],
+      getData: (mime: string) =>
+        mime === "text/html" ? liveDomHtml : "1. doc-coauthoring 整理大纲",
+    },
+  });
+  await waitFor(() => {
+    expect(
+      screen.getByRole("textbox").querySelectorAll("ol > li"),
+    ).toHaveLength(1);
+    expect(inputText()).toBe("/doc-coauthoring 整理大纲");
+  });
+  fireEvent.click(screen.getByText("发送"));
+  await waitFor(() =>
+    expect(mocks.send).toHaveBeenCalledWith("1. /doc-coauthoring 整理大纲"),
+  );
 });

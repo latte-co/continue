@@ -120,6 +120,7 @@ impl Client {
             | Request::ResumeMessageQueue { provider, .. }
             | Request::OpenAgentSession { provider, .. }
             | Request::AgentCommands { provider, .. }
+            | Request::SkillInfo { provider, .. }
             | Request::RenameSession { provider, .. }
             | Request::SubagentHistory { provider, .. } => matches!(
                 provider,
@@ -461,6 +462,7 @@ where
         | Request::DispatchQueuedMessage { session_id, .. }
         | Request::ResumeMessageQueue { session_id, .. }
         | Request::OpenAgentSession { session_id, .. }
+        | Request::SkillInfo { session_id, .. }
         | Request::RenameSession { session_id, .. }
         | Request::SubagentHistory { session_id, .. } => {
             match target
@@ -509,6 +511,7 @@ async fn request_with_launch_config(
     );
     let is_models = matches!(&request, Request::Models { .. });
     let is_commands = matches!(&request, Request::AgentCommands { .. });
+    let is_skill_info = matches!(&request, Request::SkillInfo { .. });
     let is_open = matches!(&request, Request::OpenAgentSession { .. });
     let is_history = matches!(&request, Request::SubagentHistory { .. });
     let is_rename = matches!(&request, Request::RenameSession { .. });
@@ -519,6 +522,17 @@ async fn request_with_launch_config(
             agent,
             project_id,
             provider: Some(config),
+        },
+        Request::SkillInfo {
+            session_id, name, ..
+        } => Request::SkillInfo {
+            session_id,
+            name,
+            provider: matches!(
+                &config,
+                latte_work_protocol::TurnProvider::Configured { .. }
+            )
+            .then_some(config),
         },
         Request::Models {
             agent,
@@ -624,6 +638,7 @@ async fn request_with_launch_config(
     match response {
         Response::Models { .. } if is_models => Ok(response),
         Response::AgentCommands { .. } if is_commands => Ok(response),
+        Response::SkillInfo { .. } if is_skill_info => Ok(response),
         Response::Accepted { .. } | Response::MessageQueued { .. } if is_send => Ok(response),
         Response::MessageQueue { .. } if is_queue_control => Ok(response),
         Response::Ok if is_open => Ok(response),

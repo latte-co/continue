@@ -714,3 +714,40 @@ it("clips the code-block portion of a cross-scroller selection without clipping 
   expect(highlights[1].style.left).toBe("5px");
   expect(highlights[1].style.width).toBe("210px");
 });
+
+it("offers Add to main conversation alongside Add annotation when addToMainChat is provided", () => {
+  const save = vi.fn().mockReturnValue(null);
+  const addToMain = vi.fn();
+  render(
+    <AnnotatedMessage
+      text="终值与 Stage1 排行的差异"
+      message={2}
+      entries={[]}
+      enabled
+      onSave={save}
+      onRemove={vi.fn()}
+      addToMainChat={addToMain}
+    />,
+  );
+  select(screen.getByText("终值与 Stage1 排行的差异"));
+  const annotate = screen.getByRole("menuitem", { name: "添加注释" });
+  const toMain = screen.getByRole("menuitem", { name: "添加到主对话" });
+  act(() => annotate.focus());
+  fireEvent.keyDown(annotate, { key: "ArrowRight" });
+  expect(document.activeElement).toBe(toMain);
+
+  fireEvent.click(toMain);
+  expect(addToMain).toHaveBeenCalledWith("终值与 Stage1 排行的差异");
+  expect(screen.queryByRole("menu")).toBeNull();
+  expect(window.getSelection()?.toString()).toBe("");
+
+  select(screen.getByText("终值与 Stage1 排行的差异"));
+  fireEvent.click(screen.getByRole("menuitem", { name: "添加注释" }));
+  fireEvent.click(screen.getByRole("button", { name: "提交注释" }));
+  expect(save).toHaveBeenCalledWith(
+    expect.objectContaining({
+      quote: "终值与 Stage1 排行的差异",
+      comment: "",
+    }),
+  );
+});

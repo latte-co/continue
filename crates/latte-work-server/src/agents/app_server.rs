@@ -4,7 +4,9 @@ use super::traex::{ModelSelection, provider};
 use super::{Action, AgentAdapter, AgentCommand, Input};
 use crate::providers::LaunchConfig;
 use anyhow::{Context, Result, bail};
-use latte_work_protocol::{EventKind, ExecutionPhase, QuestionOption, UserQuestion};
+use latte_work_protocol::{
+    AgentCommandKind, AgentSlashCommand, EventKind, ExecutionPhase, QuestionOption, UserQuestion,
+};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
@@ -50,6 +52,10 @@ pub struct AppServer {
     title_context: Option<super::titles::Context>,
     generating_title: bool,
     pending_prompt: Option<String>,
+    pending_skill_prompt: Option<String>,
+    skills: Option<HashMap<String, String>>,
+    skill_notices: HashSet<String>,
+    compacting: bool,
     platform_instructions: String,
     native_developer_instructions: Option<String>,
     config: Option<LaunchConfig>,
@@ -91,6 +97,23 @@ fn command_process(item: &Value) -> Option<String> {
     })?;
     (!process.is_empty() && process.len() <= 1024).then_some(process)
 }
+fn parse_slash(prompt: &str) -> Option<(&str, &str)> {
+    let trimmed = prompt.trim_start();
+    let rest = trimmed.strip_prefix('/')?;
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = &rest[..end];
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some((name, rest[end..].trim()))
+}
+fn skill_prompt_text(name: &str, body: &str) -> String {
+    if body.is_empty() {
+        format!("${name}")
+    } else {
+        format!("${name} {body}")
+    }
+}
 impl AppServer {
     fn name(&self) -> &'static str {
         if self.codex { "Codex" } else { "Traex" }
@@ -100,6 +123,133 @@ impl AppServer {
             codex: true,
             ..Self::default()
         }
+    }
+
+    fn turn_params(&self, input: Value) -> Result<Value> {
+        let config = self.config.as_ref().context("Agent 启动配置缺失")?;
+        let mut params = json!({
+            "threadId": self.thread,
+            "input": input,
+            "model": config.traex_model.as_ref().map(|m| &m.model).or(config.model.as_ref()),
+            "effort": config.effort,
+            "modelProvider": self.model_provider
+        });
+        if self.codex {
+            params
+                .as_object_mut()
+                .expect("object")
+                .remove("modelProvider");
+        }
+        if let Some(selection) = &config.traex_model {
+            params["modelBackendVariant"] = json!(selection.backend_variant);
+        }
+        Ok(params)
+    }
+    fn parse_skills_list(
+        &self,
+        result: &Value,
+    ) -> Result<(HashMap<String, String>, Vec<AgentSlashCommand>)> {
+        let buckets = result["data"].as_array().context("Agent 未返回技能目录")?;
+        if buckets.len() > 64 {
+            bail!("Agent 技能目录分组超出限制");
+        }
+        let mut commands = vec![
+            AgentSlashCommand {
+                name: "compact".into(),
+                display_name: Some("压缩上下文".into()),
+                description: format!("压缩当前 {} 会话的上下文", self.name()),
+                argument_hint: String::new(),
+                kind: Some(AgentCommandKind::Command),
+                ui_action: None,
+            },
+            AgentSlashCommand {
+                name: "review".into(),
+                display_name: Some("代码审查".into()),
+                description: "审查当前未提交变更，或按说明执行代码审查".into(),
+                argument_hint: "[审查说明]".into(),
+                kind: Some(AgentCommandKind::Command),
+                ui_action: None,
+            },
+        ];
+        let mut seen: HashSet<String> = commands.iter().map(|c| c.name.clone()).collect();
+        let mut paths = HashMap::new();
+        for bucket in buckets {
+            let Some(skills) = bucket["skills"].as_array() else {
+                continue;
+            };
+            for skill in skills {
+                if commands.len() >= 1000 {
+                    bail!("Agent 命令与技能列表超出限制");
+                }
+                if skill["enabled"] == false {
+                    continue;
+                }
+                let Some(name) = skill["name"].as_str().filter(|s| {
+                    !s.is_empty()
+                        && s.len() <= 256
+                        && !s
+                            .chars()
+                            .any(|c| c.is_whitespace() || c.is_control() || c == '/')
+                }) else {
+                    continue;
+                };
+                let Some(path) = skill["path"].as_str().filter(|s| {
+                    !s.is_empty() && s.len() <= 4096 && !s.chars().any(char::is_control)
+                }) else {
+                    continue;
+                };
+                paths
+                    .entry(name.to_owned())
+                    .or_insert_with(|| path.to_owned());
+                if !seen.insert(name.to_owned()) {
+                    continue;
+                }
+                let display_name = skill["interface"]["displayName"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| {
+                        !s.is_empty() && s.chars().count() <= 80 && !s.chars().any(char::is_control)
+                    })
+                    .map(str::to_owned);
+                let description = [
+                    skill["interface"]["shortDescription"].as_str(),
+                    skill["shortDescription"].as_str(),
+                    skill["description"].as_str(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(str::trim)
+                .find(|s| !s.is_empty())
+                .unwrap_or_default()
+                .chars()
+                .take(2048)
+                .collect();
+                commands.push(AgentSlashCommand {
+                    name: name.into(),
+                    display_name,
+                    description,
+                    argument_hint: "[任务说明]".into(),
+                    kind: Some(AgentCommandKind::Skill),
+                    ui_action: None,
+                });
+            }
+        }
+        Ok((paths, commands))
+    }
+    fn reset_turn_state(&mut self, prompt_for_title: Option<&str>) {
+        self.phase = Phase::Starting;
+        self.compacting = false;
+        self.pending_skill_prompt = None;
+        if let Some(prompt) = prompt_for_title
+            && !self.title_attempted
+            && !self.native_named
+        {
+            self.title_context = Some(super::titles::Context::new(prompt));
+        }
+        self.early_completions.clear();
+        self.streamed.clear();
+        self.tools.clear();
+        self.skill_notices.clear();
     }
 
     fn request(&mut self, method: &'static str, params: Value) -> Result<Action> {
@@ -135,9 +285,23 @@ impl AppServer {
         if self.phase != Phase::Running || self.turn.is_none() {
             bail!("Agent 正在准备本轮任务，消息保留在队列，请稍后再发送");
         }
-        if prompt.trim_start().starts_with('/') {
-            bail!("Agent 尚不支持原生命令，消息保留在队列");
-        }
+        let input = if let Some((name, body)) = parse_slash(prompt) {
+            if self.side_parent.is_some() && matches!(name, "compact" | "review") {
+                bail!("侧边聊天不支持原生控制命令 /{name}，消息保留在队列");
+            }
+            if matches!(name, "compact" | "review") {
+                bail!("请在独立轮次运行 /{name} 命令，消息保留在队列");
+            }
+            let Some(path) = self.skills.as_ref().and_then(|skills| skills.get(name)) else {
+                bail!("请在当前轮结束后调用 /{name}，消息保留在队列");
+            };
+            json!([
+                {"type": "skill", "name": name, "path": path},
+                {"type": "text", "text": skill_prompt_text(name, body)}
+            ])
+        } else {
+            json!([{"type": "text", "text": prompt}])
+        };
         if self.steered.len()
             + self
                 .pending
@@ -149,7 +313,10 @@ impl AppServer {
             bail!("Agent 待处理消息已达上限，消息保留在队列");
         }
         let turn = self.turn.clone().expect("checked turn");
-        let action = self.request("turn/steer", json!({"threadId":self.thread,"expectedTurnId":turn,"input":[{"type":"text","text":prompt}]}))?;
+        let action = self.request(
+            "turn/steer",
+            json!({"threadId":self.thread,"expectedTurnId":turn,"input":input}),
+        )?;
         self.pending
             .get_mut(&format!("latte-{}", self.counter))
             .expect("inserted request")
@@ -157,27 +324,67 @@ impl AppServer {
         Ok(vec![action])
     }
     fn start(&mut self, prompt: &str) -> Result<Vec<Action>> {
-        if prompt.trim_start().starts_with('/') {
-            bail!("Agent 尚不支持原生命令，请使用普通消息");
+        if let Some((name, body)) = parse_slash(prompt) {
+            if self.side_parent.is_some() && matches!(name, "compact" | "review") {
+                self.phase = Phase::Ready;
+                self.title_context = None;
+                return Ok(vec![Action::Finished {
+                    failed: true,
+                    message: Some(format!(
+                        "侧边聊天不支持原生控制命令 /{name}，可调用技能或直接提问"
+                    )),
+                }]);
+            }
+            if name == "compact" {
+                if !body.is_empty() {
+                    bail!("{} 命令 /compact 不接受额外参数或引用", self.name());
+                }
+                self.reset_turn_state(None);
+                self.compacting = true;
+                return Ok(vec![self.request(
+                    "thread/compact/start",
+                    json!({"threadId": self.thread}),
+                )?]);
+            }
+            if name == "review" {
+                self.reset_turn_state(Some(prompt));
+                let target = if body.is_empty() {
+                    json!({"type": "uncommittedChanges"})
+                } else {
+                    json!({"type": "custom", "instructions": body})
+                };
+                return Ok(vec![self.request(
+                    "review/start",
+                    json!({
+                        "threadId": self.thread,
+                        "target": target,
+                        "delivery": "inline"
+                    }),
+                )?]);
+            }
+            if let Some(path) = self
+                .skills
+                .as_ref()
+                .and_then(|skills| skills.get(name))
+                .cloned()
+            {
+                self.reset_turn_state(Some(prompt));
+                let params = self.turn_params(json!([
+                    {"type": "skill", "name": name, "path": path},
+                    {"type": "text", "text": skill_prompt_text(name, body)}
+                ]))?;
+                return Ok(vec![self.request("turn/start", params)?]);
+            }
+            let force_reload = self.skills.is_some();
+            self.reset_turn_state(Some(prompt));
+            self.pending_skill_prompt = Some(prompt.into());
+            return Ok(vec![self.request(
+                "skills/list",
+                json!({"cwds": [self.cwd], "forceReload": force_reload}),
+            )?]);
         }
-        self.phase = Phase::Starting;
-        if !self.title_attempted && !self.native_named {
-            self.title_context = Some(super::titles::Context::new(prompt));
-        }
-        self.early_completions.clear();
-        self.streamed.clear();
-        self.tools.clear();
-        let config = self.config.as_ref().context("Agent 启动配置缺失")?;
-        let mut params = json!({"threadId":self.thread,"input":[{"type":"text","text":prompt}],"model":config.traex_model.as_ref().map(|m| &m.model).or(config.model.as_ref()),"effort":config.effort,"modelProvider":self.model_provider});
-        if self.codex {
-            params
-                .as_object_mut()
-                .expect("object")
-                .remove("modelProvider");
-        }
-        if let Some(selection) = &config.traex_model {
-            params["modelBackendVariant"] = json!(selection.backend_variant);
-        }
+        self.reset_turn_state(Some(prompt));
+        let params = self.turn_params(json!([{"type":"text","text":prompt}]))?;
         Ok(vec![self.request("turn/start", params)?])
     }
     fn admit_turn(&mut self, turn: &Value) -> Result<Vec<Action>> {
@@ -374,7 +581,10 @@ impl AppServer {
         match method {
             "initialize" => {
                 if self.discovering {
-                    return Ok(vec![Action::Commands(vec![])]);
+                    return Ok(vec![
+                        write(json!({"method":"initialized"}))?,
+                        self.request("skills/list", json!({"cwds": [self.cwd]}))?,
+                    ]);
                 }
                 if self.phase != Phase::Initializing {
                     bail!("Agent 初始化状态不一致");
@@ -557,9 +767,64 @@ impl AppServer {
                 }
                 Ok(actions)
             }
-            "turn/start" => {
+            "skills/list" => {
+                let (paths, commands) = self.parse_skills_list(result)?;
+                if self.discovering {
+                    return Ok(vec![Action::Commands(commands)]);
+                }
+                self.skills = Some(paths);
+                let Some(prompt) = self.pending_skill_prompt.take() else {
+                    return Ok(vec![]);
+                };
+                if std::mem::take(&mut self.interrupt_requested) {
+                    self.phase = Phase::Ready;
+                    self.title_context = None;
+                    return Ok(vec![
+                        Action::Interrupted,
+                        Action::Finished {
+                            failed: true,
+                            message: None,
+                        },
+                    ]);
+                }
+                let Some((name, body)) = parse_slash(&prompt) else {
+                    let params = self.turn_params(json!([{"type":"text","text":prompt}]))?;
+                    return Ok(vec![self.request("turn/start", params)?]);
+                };
+                let Some(path) = self
+                    .skills
+                    .as_ref()
+                    .and_then(|skills| skills.get(name))
+                    .cloned()
+                else {
+                    self.phase = Phase::Ready;
+                    self.title_context = None;
+                    return Ok(vec![Action::Finished {
+                        failed: true,
+                        message: Some(format!(
+                            "当前 {} 不支持命令 /{name}；输入 / 查看可用命令与技能",
+                            self.name()
+                        )),
+                    }]);
+                };
+                let params = self.turn_params(json!([
+                    {"type": "skill", "name": name, "path": path},
+                    {"type": "text", "text": skill_prompt_text(name, body)}
+                ]))?;
+                Ok(vec![self.request("turn/start", params)?])
+            }
+            "turn/start" | "review/start" => {
                 if self.phase == Phase::Starting {
                     self.admit_turn(&result["turn"])
+                } else {
+                    Ok(vec![])
+                }
+            }
+            "thread/compact/start" => {
+                if self.phase == Phase::Starting {
+                    Ok(vec![Action::NativeSession(
+                        self.thread.clone().context("Agent 会话 ID 缺失")?,
+                    )])
                 } else {
                     Ok(vec![])
                 }
@@ -639,11 +904,15 @@ impl AppServer {
         }
     }
     fn notification(&mut self, message: &Value) -> Result<Vec<Action>> {
+        let method = message["method"].as_str().unwrap_or_default();
+        if method == "skills/changed" {
+            self.skills = None;
+            return Ok(vec![]);
+        }
         let params = &message["params"];
         if params["threadId"].as_str() != self.thread.as_deref() {
             return Ok(vec![]);
         }
-        let method = message["method"].as_str().unwrap_or_default();
         if method == "thread/name/generated" {
             if !self.generating_title || params["turnId"] != "latte-generate-title" {
                 return Ok(vec![]);
@@ -749,7 +1018,18 @@ impl AppServer {
             "item/started" | "item/completed" => {
                 self.item(&params["item"], method == "item/completed")
             }
+            "thread/compacted" => {
+                if self.tools.insert("latte-compaction-notice".into()) {
+                    Ok(vec![Action::Event(EventKind::Notice {
+                        text: "已压缩会话上下文。".into(),
+                    })])
+                } else {
+                    Ok(vec![])
+                }
+            }
             "turn/completed" => {
+                self.compacting = false;
+                self.skill_notices.clear();
                 let status = field(&params["turn"], "status")?;
                 let failed = match status {
                     "completed" => false,
@@ -872,10 +1152,58 @@ impl AppServer {
             }
             return Ok(vec![]);
         }
-        if kind == "reasoning" {
+        if kind == "userMessage" {
+            let mut notices = Vec::new();
+            for entry in item["content"].as_array().into_iter().flatten() {
+                if entry["type"] == "skill"
+                    && let Some(name) = entry["name"].as_str().filter(|s| {
+                        !s.is_empty()
+                            && s.len() <= 256
+                            && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+                    })
+                    && self.skill_notices.len() < 64
+                    && self.skill_notices.insert(name.to_owned())
+                {
+                    notices.push(Action::Event(EventKind::Notice {
+                        text: format!("已加载 Skill：{name}"),
+                    }));
+                }
+            }
+            return Ok(notices);
+        }
+        if kind == "contextCompaction" {
+            return Ok(
+                if completed && self.tools.insert("latte-compaction-notice".into()) {
+                    vec![Action::Event(EventKind::Notice {
+                        text: "已压缩会话上下文。".into(),
+                    })]
+                } else {
+                    vec![]
+                },
+            );
+        }
+        if kind == "enteredReviewMode" || kind == "reasoning" {
             return Ok(vec![Action::Event(EventKind::Progress {
                 phase: ExecutionPhase::Thinking,
             })]);
+        }
+        if kind == "exitedReviewMode" {
+            return Ok(
+                if completed
+                    && self.streamed.is_empty()
+                    && let Some(review) = item["review"].as_str().filter(|s| !s.trim().is_empty())
+                {
+                    if let Some(context) = &mut self.title_context {
+                        context.reply(review);
+                    }
+                    self.streamed.insert(id);
+                    vec![Action::Event(EventKind::Text {
+                        text: review.into(),
+                    })]
+                } else {
+                    vec![]
+                },
+            );
         }
         if kind == "agentMessage" {
             return Ok(if completed && !self.streamed.contains(&id) {
@@ -1064,6 +1392,9 @@ impl AgentAdapter for AppServer {
     fn knows_subagent(&self, _: &str) -> bool {
         false
     }
+    fn skill_path(&self, name: &str) -> Option<String> {
+        self.skills.as_ref()?.get(name).cloned()
+    }
     fn set_session_title(&mut self, title: Option<String>, resuming: bool, title_requested: bool) {
         self.native_named = title.is_some();
         self.title_attempted = title_requested;
@@ -1071,7 +1402,6 @@ impl AgentAdapter for AppServer {
     }
     fn set_side_parent(&mut self, native_id: String) -> Result<()> {
         self.side_parent = Some(native_id);
-        self.title_attempted = true;
         Ok(())
     }
     fn prediction_snapshot(&self, _config: &LaunchConfig) -> Option<crate::predictions::Snapshot> {
@@ -1151,8 +1481,12 @@ impl AgentAdapter for AppServer {
             }
             Input::Start { prompt } => match self.phase {
                 Phase::Fresh => {
-                    if prompt.trim_start().starts_with('/') {
-                        bail!("Agent 尚不支持原生命令");
+                    if let Some((name, body)) = parse_slash(prompt)
+                        && self.side_parent.is_none()
+                        && name == "compact"
+                        && !body.is_empty()
+                    {
+                        bail!("{} 命令 /compact 不接受额外参数或引用", self.name());
                     }
                     self.pending_prompt = Some(prompt.into());
                     self.initialize()
@@ -2599,7 +2933,26 @@ mod tests {
         );
         assert!(agent.advance(Input::Message("not json")).is_err());
         let mut agent = opened();
-        assert!(agent.advance(Input::Start { prompt: "/unknown" }).is_err());
+        assert!(
+            agent
+                .advance(Input::Start {
+                    prompt: "/compact extra"
+                })
+                .is_err()
+        );
+        let probe = encoded(&agent.advance(Input::Start { prompt: "/unknown" }).unwrap());
+        assert_eq!(probe.len(), 1);
+        assert_eq!(probe[0]["method"], "skills/list");
+        let rejected = message(
+            &mut agent,
+            json!({"id":probe[0]["id"],"result":{"data":[{"cwd":"/tmp","skills":[],"errors":[]}]}}),
+        );
+        assert!(matches!(
+            &rejected[..],
+            [Action::Finished { failed: true, message: Some(text) }]
+                if text.contains("不支持命令 /unknown")
+        ));
+        assert!(agent.can_start_turn());
         let mut agent = AppServer::default();
         agent.command("traex", "/tmp", None, &config()).unwrap();
         agent.advance(Input::Open).unwrap();
@@ -2610,6 +2963,236 @@ mod tests {
                 ))
                 .is_err()
         );
+    }
+    #[test]
+    fn discover_commands_and_skill_execution_cover_codex_and_traex() {
+        for (codex, binary) in [(true, "codex"), (false, "traex")] {
+            let mut discover = AppServer {
+                codex,
+                ..Default::default()
+            };
+            discover.command(binary, "/tmp", None, &config()).unwrap();
+            let init = encoded(&discover.advance(Input::DiscoverCommands).unwrap());
+            assert_eq!(init[0]["method"], "initialize");
+            let list = encoded(&message(&mut discover, json!({"id":"latte-1","result":{}})));
+            assert_eq!(list[0]["method"], "initialized");
+            assert_eq!(list[1]["method"], "skills/list");
+            assert_eq!(list[1]["params"]["cwds"], json!(["/tmp"]));
+            let commands = message(
+                &mut discover,
+                json!({"id":list[1]["id"],"result":{"data":[{"cwd":"/tmp","skills":[
+                    {"name":"fix-ci","description":"Full body","shortDescription":"诊断流水线","interface":{"displayName":"修复 CI"},"path":"/skills/fix-ci/SKILL.md","enabled":true},
+                    {"name":"disabled","description":"Hidden","path":"/skills/disabled/SKILL.md","enabled":false}
+                ]}]}}),
+            );
+            let [Action::Commands(catalog)] = &commands[..] else {
+                panic!("expected commands action");
+            };
+            assert_eq!(catalog.len(), 3);
+            assert_eq!(catalog[0].name, "compact");
+            assert_eq!(catalog[0].kind, Some(AgentCommandKind::Command));
+            assert_eq!(catalog[1].name, "review");
+            assert_eq!(catalog[1].kind, Some(AgentCommandKind::Command));
+            assert_eq!(catalog[2].name, "fix-ci");
+            assert_eq!(catalog[2].display_name.as_deref(), Some("修复 CI"));
+            assert_eq!(catalog[2].description, "诊断流水线");
+            assert_eq!(catalog[2].kind, Some(AgentCommandKind::Skill));
+
+            let mut agent = opened();
+            agent.codex = codex;
+            // /compact runs native thread/compact/start and emits compaction notice once.
+            let compact = encoded(&agent.advance(Input::Start { prompt: "/compact" }).unwrap());
+            assert_eq!(compact[0]["method"], "thread/compact/start");
+            assert_eq!(compact[0]["params"]["threadId"], "t");
+            message(&mut agent, json!({"id":compact[0]["id"],"result":{}}));
+            message(
+                &mut agent,
+                json!({"method":"turn/started","params":{"threadId":"t","turn":{"id":"c1"}}}),
+            );
+            let compacted = message(
+                &mut agent,
+                json!({"method":"item/completed","params":{"threadId":"t","turnId":"c1","item":{"id":"ci","type":"contextCompaction"}}}),
+            );
+            assert!(compacted.iter().any(|a| matches!(
+                a,
+                Action::Event(EventKind::Notice { text }) if text == "已压缩会话上下文。"
+            )));
+            assert!(
+                message(
+                    &mut agent,
+                    json!({"method":"thread/compacted","params":{"threadId":"t","turnId":"c1"}})
+                )
+                .is_empty()
+            );
+            message(
+                &mut agent,
+                json!({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"c1","status":"completed"}}}),
+            );
+
+            // /review supports uncommittedChanges and custom instructions.
+            let review = encoded(&agent.advance(Input::Start { prompt: "/review" }).unwrap());
+            assert_eq!(review[0]["method"], "review/start");
+            assert_eq!(
+                review[0]["params"]["target"],
+                json!({"type":"uncommittedChanges"})
+            );
+            message(
+                &mut agent,
+                json!({"id":review[0]["id"],"result":{"turn":{"id":"r1"}}}),
+            );
+            let exited = message(
+                &mut agent,
+                json!({"method":"item/completed","params":{"threadId":"t","turnId":"r1","item":{"id":"rev","type":"exitedReviewMode","review":"LGTM"}}}),
+            );
+            assert!(
+                exited.iter().any(
+                    |a| matches!(a, Action::Event(EventKind::Text { text }) if text == "LGTM")
+                )
+            );
+            message(
+                &mut agent,
+                json!({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"r1","status":"completed"}}}),
+            );
+
+            let custom_review = encoded(
+                &agent
+                    .advance(Input::Start {
+                        prompt: "/review 检查 @src/lib.rs",
+                    })
+                    .unwrap(),
+            );
+            assert_eq!(custom_review[0]["method"], "review/start");
+            assert_eq!(
+                custom_review[0]["params"]["target"],
+                json!({"type":"custom","instructions":"检查 @src/lib.rs"})
+            );
+            message(
+                &mut agent,
+                json!({"id":custom_review[0]["id"],"result":{"turn":{"id":"r2"}}}),
+            );
+            message(
+                &mut agent,
+                json!({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"r2","status":"completed"}}}),
+            );
+
+            // /fix-ci lazily loads skills/list, attaches native skill input, and caches for steer/next turn.
+            let lookup = encoded(
+                &agent
+                    .advance(Input::Start {
+                        prompt: "/fix-ci 检查 @src/lib.rs",
+                    })
+                    .unwrap(),
+            );
+            assert_eq!(lookup[0]["method"], "skills/list");
+            let start_skill = encoded(&message(
+                &mut agent,
+                json!({"id":lookup[0]["id"],"result":{"data":[{"cwd":"/tmp","skills":[
+                    {"name":"fix-ci","description":"诊断流水线","path":"/skills/fix-ci/SKILL.md","enabled":true}
+                ]}]}}),
+            ));
+            assert_eq!(start_skill[0]["method"], "turn/start");
+            assert_eq!(
+                start_skill[0]["params"]["input"],
+                json!([
+                    {"type":"skill","name":"fix-ci","path":"/skills/fix-ci/SKILL.md"},
+                    {"type":"text","text":"$fix-ci 检查 @src/lib.rs"}
+                ])
+            );
+            message(
+                &mut agent,
+                json!({"id":start_skill[0]["id"],"result":{"turn":{"id":"s1"}}}),
+            );
+            let loaded = message(
+                &mut agent,
+                json!({"method":"item/completed","params":{"threadId":"t","turnId":"s1","item":{"id":"u1","type":"userMessage","content":start_skill[0]["params"]["input"]}}}),
+            );
+            assert!(loaded.iter().any(|a| matches!(
+                a,
+                Action::Event(EventKind::Notice { text }) if text == "已加载 Skill：fix-ci"
+            )));
+            // Steer with cached skill uses native skill item as well.
+            let steer_skill = encoded(
+                &agent
+                    .advance(Input::Queue {
+                        request_id: "q1",
+                        prompt: "/fix-ci 补充断言",
+                    })
+                    .unwrap(),
+            );
+            assert_eq!(steer_skill[0]["method"], "turn/steer");
+            assert_eq!(steer_skill[0]["params"]["input"][0]["type"], "skill");
+            message(
+                &mut agent,
+                json!({"id":steer_skill[0]["id"],"result":{"turnId":"s1"}}),
+            );
+            message(
+                &mut agent,
+                json!({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"s1","status":"completed"}}}),
+            );
+
+            // Leading filesystem paths are treated as plain text prompts, not slash commands.
+            let path_prompt = encoded(
+                &agent
+                    .advance(Input::Start {
+                        prompt: "/tmp/example.rs 请解释这个文件",
+                    })
+                    .unwrap(),
+            );
+            assert_eq!(path_prompt[0]["method"], "turn/start");
+            assert_eq!(path_prompt[0]["params"]["input"][0]["type"], "text");
+            message(
+                &mut agent,
+                json!({"id":path_prompt[0]["id"],"result":{"turn":{"id":"p1"}}}),
+            );
+            message(
+                &mut agent,
+                json!({"method":"turn/completed","params":{"threadId":"t","turn":{"id":"p1","status":"completed"}}}),
+            );
+
+            // skills/changed invalidates the skill cache so the next /skill re-queries skills/list.
+            message(&mut agent, json!({"method":"skills/changed","params":{}}));
+            let relookup = encoded(&agent.advance(Input::Start { prompt: "/fix-ci" }).unwrap());
+            assert_eq!(relookup[0]["method"], "skills/list");
+
+            // Side chats reject control commands (/compact, /review) while permitting skills.
+            let mut side = opened();
+            side.codex = codex;
+            side.side_parent = Some("parent".into());
+            for blocked in ["/compact", "/review", "/review main"] {
+                let actions = side.advance(Input::Start { prompt: blocked }).expect(
+                    "side chat control slash command settles cleanly without tearing down process",
+                );
+                assert!(matches!(
+                    actions.as_slice(),
+                    [Action::Finished { failed: true, message: Some(msg) }]
+                        if msg.contains("侧边聊天不支持原生控制命令")
+                ));
+            }
+            let lookup = encoded(
+                &side
+                    .advance(Input::Start {
+                        prompt: "/fix-ci 评审侧聊",
+                    })
+                    .unwrap(),
+            );
+            assert_eq!(lookup[0]["method"], "skills/list");
+            let id = lookup[0]["id"].clone();
+            let started = encoded(&message(
+                &mut side,
+                json!({"id": id, "result": {"data": [{"cwd": "/repo", "skills": [{"name": "fix-ci", "description": "Fix CI", "enabled": true, "path": "/skills/fix-ci/SKILL.md"}]}]}}),
+            ));
+            assert_eq!(started[0]["method"], "turn/start");
+            assert_eq!(
+                started[0]["params"]["input"][0],
+                json!({"type": "skill", "name": "fix-ci", "path": "/skills/fix-ci/SKILL.md"})
+            );
+            assert!(
+                started[0]["params"]["input"][1]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("评审侧聊")
+            );
+        }
     }
     #[test]
     fn codex_child_activity_keeps_idle_and_undo_fenced_until_identity_bound_completion() {

@@ -24,6 +24,7 @@ import {
   X,
 } from "lucide-react";
 import { chooseReferencePath, message, request } from "./api";
+import { useModelConfigVersion } from "./modelConfigVersion";
 import type { AgentSlashCommand, FileEntry } from "./protocol";
 import type { ModelPickerHandle } from "./ModelPicker";
 import {
@@ -32,7 +33,10 @@ import {
   appCommandAction,
   type AppCommandAction,
   hasCommandArguments,
+  isAlwaysNativeCommand,
   isNativeSubagentCommand,
+  leadingSlashCommand,
+  recognizedComposerCommands,
   supportsSideChatAgent,
   subagentPanelAliases,
   subagentPanelArgumentNotice,
@@ -60,6 +64,7 @@ import {
   type InlineSelection,
 } from "./InlineReferenceInput";
 import { ComposerRichInput } from "./ComposerRichInput";
+import { Badge } from "./ui";
 import {
   hasRichComposerMarkdown,
   smartPasteTransform,
@@ -114,6 +119,7 @@ interface Props {
   sideChat?: boolean;
   context?: ReactNode;
   hasContext?: boolean;
+  quotes?: string[];
   annotations?: Annotation[];
   referenceState?: { scope: string; entries: ComposerReference[] };
   onReferencesChange?: (value: {
@@ -148,6 +154,7 @@ type Option = {
   id: string;
   label: string;
   detail: string;
+  badge?: string;
   icon: "file" | "folder" | "back" | "command";
   uiAction?: AppCommandAction;
   choose: () => void;
@@ -249,7 +256,23 @@ export function Composer(props: Props) {
   );
   const inlineAttached = attached.filter((entry) => !entry.attachmentKind);
   const separateAttached = attached.filter((entry) => !!entry.attachmentKind);
-  const richSyntax = hasRichComposerMarkdown(value);
+  const [trigger, setTrigger] = useState<ComposerTrigger | null>(null);
+  const [commands, setCommands] = useState<AgentSlashCommand[]>([]);
+  const [commandsLoadedScope, setCommandsLoadedScope] = useState("");
+  const sideAgent = !sideChat && supportsSideChatAgent(agent);
+  const recognizedCommands = recognizedComposerCommands(
+    commands,
+    agent,
+    sideChat,
+    sideAgent,
+  );
+  const activeCommandTriggerStart =
+    trigger?.kind === "commands" ? trigger.start : null;
+  const richSyntax = hasRichComposerMarkdown(
+    value,
+    recognizedCommands,
+    activeCommandTriggerStart,
+  );
   const latchedRich = useRef(richSyntax);
   if (!imeActive) latchedRich.current = richSyntax;
   const richMode = !concealSubmitted && latchedRich.current;
@@ -334,11 +357,9 @@ export function Composer(props: Props) {
       pasteOperation.current++;
     };
   }, [scope, sessionId, hidden, disabled, sending, connected]);
-  const [trigger, setTrigger] = useState<ComposerTrigger | null>(null);
   const [browse, setBrowse] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState(0);
-  const [commands, setCommands] = useState<AgentSlashCommand[]>([]);
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -348,8 +369,10 @@ export function Composer(props: Props) {
   const [externalError, setExternalError] = useState("");
   const [externalBusy, setExternalBusy] = useState(false);
   const referenceOperation = useRef(0);
+  const configVersion = useModelConfigVersion(hostId, agent);
+  const catalogScope = `${scope}:${configVersion}`;
   const currentContext = useRef("");
-  const commandContext = `${scope}:${sessionId}:${disabled}:${sending}:${hidden}:${connected}`;
+  const commandContext = `${catalogScope}:${sessionId}:${disabled}:${sending}:${hidden}:${connected}`;
   currentContext.current = commandContext;
   const modelCommandGeneration = useRef(0);
   useLayoutEffect(
@@ -385,6 +408,7 @@ export function Composer(props: Props) {
     !props.predictionBlocked &&
     !props.skillCreator &&
     !(props.hasContext ?? !!props.context) &&
+    !props.quotes?.length &&
     !props.annotations?.length &&
     !attached.length &&
     !menu &&
@@ -433,6 +457,14 @@ export function Composer(props: Props) {
     browse !== null ? search : slash < 0 ? query : query.slice(slash + 1)
   ).toLowerCase();
   function close() {
+    if (
+      !inlineMode &&
+      input.current &&
+      trigger?.kind === "commands" &&
+      hasRichComposerMarkdown(value, recognizedCommands, null)
+    ) {
+      restoreCaret(input.current.selectionStart);
+    }
     setAddMenu(false);
     referenceOperation.current++;
     setExternal(false);
@@ -446,6 +478,7 @@ export function Composer(props: Props) {
   useEffect(() => {
     close();
     setCommands([]);
+    setCommandsLoadedScope("");
     setNotice("");
     // A different project never inherits references; moving a project directory
     // drops stale project-relative references while keeping absolute attachments.
@@ -461,7 +494,7 @@ export function Composer(props: Props) {
         ),
       });
     }
-  }, [scope]);
+  }, [catalogScope, scope]);
   useEffect(() => {
     if (!sending && !props.referenceState) {
       setReferences({ scope, entries: [] });
@@ -482,15 +515,16 @@ export function Composer(props: Props) {
   useEffect(() => {
     if (!menu || mode === "add") return;
     let disposed = false;
-    setEntries([]);
-    setCommands([]);
-    setError("");
-    if (sideChat && mode === "commands") {
-      setLoading(false);
-      return;
+    if (mode === "files") {
+      setEntries([]);
     }
+    setError("");
     setLoading(true);
     if (!connected || !projectId) {
+      if (mode === "commands") {
+        setCommands([]);
+        setCommandsLoadedScope("");
+      }
       setError("请先连接项目所在主机");
       setLoading(false);
       return;
@@ -505,14 +539,21 @@ export function Composer(props: Props) {
       )
         .then((response) => {
           if (disposed) return;
-          if (mode === "commands" && response.kind === "agent_commands")
+          if (mode === "commands" && response.kind === "agent_commands") {
             setCommands(response.commands);
-          else if (mode === "files" && response.kind === "files")
+            setCommandsLoadedScope(catalogScope);
+          } else if (mode === "files" && response.kind === "files")
             setEntries(response.entries);
           else throw new Error("响应格式不匹配，请更新项目所在主机的 Server");
         })
         .catch((cause) => {
-          if (!disposed) setError(message(cause));
+          if (!disposed) {
+            if (mode === "commands") {
+              setCommands([]);
+              setCommandsLoadedScope("");
+            }
+            setError(message(cause));
+          }
         })
         .finally(() => {
           if (!disposed) setLoading(false);
@@ -533,6 +574,7 @@ export function Composer(props: Props) {
     path,
     revision,
     sideChat,
+    catalogScope,
   ]);
   useEffect(() => {
     setSelected(0);
@@ -662,8 +704,9 @@ export function Composer(props: Props) {
     ...subagentPanelAliases,
     ...commands.filter(isNativeSubagentCommand).map((command) => command.name),
   ];
-  const sideAgent = !sideChat && supportsSideChatAgent(agent);
-  const nativeCommands = sideChat ? [] : commands;
+  const nativeCommands = sideChat
+    ? commands.filter((command) => command.kind === "skill")
+    : commands;
   const action = appCommandAction(value, nativeCommands, sideAgent);
   const localNavigation =
     sideChat && action !== "model" && action !== "effort" ? null : action;
@@ -678,7 +721,8 @@ export function Composer(props: Props) {
             (item) =>
               !sideChat ||
               item.ui_action === "model" ||
-              item.ui_action === "effort",
+              item.ui_action === "effort" ||
+              item.kind === "skill",
           )
           .filter((item) =>
             `${item.name} ${commandTitle(item, agent)} ${item.description} ${item.ui_action === "subagents" ? panelAliases.join(" ") : ""}`
@@ -702,6 +746,7 @@ export function Composer(props: Props) {
                 title !== item.name
                   ? [title, rawDetail].filter(Boolean).join(" · ")
                   : rawDetail,
+              badge: item.kind === "skill" ? "技能" : undefined,
               icon: "command" as const,
               uiAction: item.ui_action,
               choose: () => command(item.name),
@@ -995,43 +1040,118 @@ export function Composer(props: Props) {
       await openAppCommand(localNavigation);
       return;
     }
-    if (sideChat && value.trimStart().startsWith("/")) {
-      setNotice("侧边聊天暂不支持 Agent 原生命令，请输入普通消息。");
-      return;
-    }
-    if (value.trimStart().startsWith("/") && props.annotations?.length) {
-      setNotice("请先移除注释，再使用 Agent 原生命令。");
+    const nativeCommand = leadingSlashCommand(value);
+    const knownEntry = nativeCommand
+      ? commands.find((command) => command.name === nativeCommand)
+      : undefined;
+    if (sideChat && action) {
+      setNotice("侧边聊天不支持 Agent 原生命令，可调用技能或输入普通消息。");
       return;
     }
     if (
-      agent !== "opencode" &&
-      value.trimStart().startsWith("/") &&
-      attached.length
+      sideChat &&
+      nativeCommand &&
+      (knownEntry !== undefined
+        ? knownEntry.kind !== "skill"
+        : commandsLoadedScope === catalogScope ||
+          nativeCommand === "review" ||
+          (isAlwaysNativeCommand(nativeCommand) &&
+            (agent === "claude" || nativeCommand !== "init")))
     ) {
+      setNotice("侧边聊天不支持 Agent 原生命令，可调用技能或输入普通消息。");
+      return;
+    }
+    if (
+      sideChat &&
+      nativeCommand &&
+      !knownEntry &&
+      (!connected || !projectId)
+    ) {
+      setNotice("请先连接项目所在主机");
+      return;
+    }
+    const knownNonSkill =
+      !!nativeCommand &&
+      (knownEntry !== undefined
+        ? knownEntry.kind !== "skill"
+        : commandsLoadedScope === catalogScope &&
+          isAlwaysNativeCommand(nativeCommand));
+    if (knownNonSkill && props.quotes?.length) {
+      setNotice("请先移除引用的文本片段，再使用 Agent 原生命令。");
+      return;
+    }
+    if (knownNonSkill && props.annotations?.length) {
+      setNotice("请先移除注释，再使用 Agent 原生命令。");
+      return;
+    }
+    if (knownNonSkill && attached.length) {
       setNotice("Agent 命令使用原生参数，请先移除项目引用，避免改变命令含义。");
       return;
     }
-    if (!value.trim() && !attached.length && !props.hasContext) return;
+    if (
+      !value.trim() &&
+      !attached.length &&
+      !props.hasContext &&
+      !props.quotes?.length
+    )
+      return;
     const owner = scope;
     const commandContext = currentContext.current;
     submitting.current = true;
     close();
-    const nativeCommand = value.trim().match(/^\/([^\s]+)(?:\s|$)/)?.[1];
     try {
       let catalog = commands;
       if (
         nativeCommand &&
-        agent !== "opencode" &&
-        !catalog.some((command) => command.name === nativeCommand)
+        !knownEntry &&
+        commandsLoadedScope !== catalogScope &&
+        (sideChat ||
+          agent !== "opencode" ||
+          props.quotes?.length ||
+          props.annotations?.length ||
+          attached.length)
       ) {
-        const response = await request(hostId, {
-          method: "agent_commands",
-          agent,
-          project_id: projectId!,
-        });
-        if (response.kind !== "agent_commands")
-          throw new Error("无法读取原生命令列表");
-        catalog = response.commands;
+        try {
+          const response = await request(hostId, {
+            method: "agent_commands",
+            agent,
+            project_id: projectId!,
+          });
+          if (response.kind !== "agent_commands")
+            throw new Error("无法读取原生命令列表");
+          catalog = response.commands;
+          if (
+            currentScope.current === owner &&
+            currentContext.current === commandContext
+          ) {
+            setCommands(response.commands);
+            setCommandsLoadedScope(catalogScope);
+          }
+        } catch (cause) {
+          if (
+            currentScope.current !== owner ||
+            currentContext.current !== commandContext
+          )
+            return;
+          if (sideChat) throw cause;
+          if (props.quotes?.length) {
+            setNotice("请先移除引用的文本片段，再使用 Agent 原生命令。");
+            return;
+          }
+          if (props.annotations?.length) {
+            setNotice("请先移除注释，再使用 Agent 原生命令。");
+            return;
+          }
+          if (agent !== "opencode") {
+            if (attached.length) {
+              setNotice(
+                "Agent 命令使用原生参数，请先移除项目引用，避免改变命令含义。",
+              );
+              return;
+            }
+            throw cause;
+          }
+        }
         if (
           currentScope.current !== owner ||
           currentContext.current !== commandContext
@@ -1039,31 +1159,73 @@ export function Composer(props: Props) {
           return;
       }
       const uiAction = appCommandAction(value, catalog, sideAgent);
-      if (uiAction) {
+      if (
+        uiAction &&
+        (!sideChat || uiAction === "model" || uiAction === "effort")
+      ) {
         await openAppCommand(uiAction);
         return;
       }
-      if (
-        attached.length &&
-        catalog.some((command) => command.name === nativeCommand)
-      ) {
-        setNotice(
-          "Agent 命令使用原生参数，请先移除项目引用，避免改变命令含义。",
-        );
+      const matched = nativeCommand
+        ? catalog.find((command) => command.name === nativeCommand)
+        : undefined;
+      const isSkill = matched?.kind === "skill";
+      if (sideChat && nativeCommand && !isSkill) {
+        setNotice("侧边聊天不支持 Agent 原生命令，可调用技能或输入普通消息。");
         return;
       }
+      if (nativeCommand && !isSkill && (agent !== "opencode" || matched)) {
+        if (props.quotes?.length) {
+          setNotice("请先移除引用的文本片段，再使用 Agent 原生命令。");
+          return;
+        }
+        if (props.annotations?.length) {
+          setNotice("请先移除注释，再使用 Agent 原生命令。");
+          return;
+        }
+        if (attached.length) {
+          setNotice(
+            "Agent 命令使用原生参数，请先移除项目引用，避免改变命令含义。",
+          );
+          return;
+        }
+      }
+      const baseText = props.skillCreator ? skillCreatorPrompt(value) : value;
+      const formattedQuotes =
+        !sideChat && props.quotes?.length
+          ? props.quotes.map((quote) =>
+              quote
+                .split("\n")
+                .map((line) => `> ${line}`)
+                .join("\n"),
+            )
+          : [];
+      const quotedText = formattedQuotes.length
+        ? isSkill
+          ? [baseText.trim(), ...formattedQuotes].filter(Boolean).join("\n\n")
+          : [
+              ...formattedQuotes,
+              baseText.trim() ||
+                (props.annotations?.length || attached.length
+                  ? ""
+                  : "请结合以上侧边聊天内容继续。"),
+            ]
+              .filter(Boolean)
+              .join("\n\n")
+        : baseText;
       const prompt = referencePrompt(
-        annotationPrompt(
-          props.skillCreator ? skillCreatorPrompt(value) : value,
-          props.annotations ?? [],
-        ),
+        annotationPrompt(quotedText, props.annotations ?? []),
         attached,
       );
       if (
-        props.annotations?.length &&
+        (props.annotations?.length || (!sideChat && props.quotes?.length)) &&
         new TextEncoder().encode(prompt).length > 128 * 1024
       )
-        throw new Error("消息与注释总内容过长，请缩短后再发送。");
+        throw new Error(
+          props.quotes?.length
+            ? "消息、引用文本与注释总内容过长，请缩短后再发送。"
+            : "消息与注释总内容过长，请缩短后再发送。",
+        );
       if (await onSubmit(prompt)) {
         if (!props.referenceState && currentScope.current === owner)
           setReferences({ scope: owner, entries: [] });
@@ -1419,15 +1581,17 @@ export function Composer(props: Props) {
                     ? FileText
                     : option.icon === "back"
                       ? ArrowLeft
-                      : option.uiAction === "model"
-                        ? Cpu
-                        : option.uiAction === "effort"
-                          ? SlidersHorizontal
-                          : option.uiAction === "subagents"
-                            ? GitFork
-                            : option.uiAction === "side"
-                              ? MessageSquare
-                              : Terminal;
+                      : option.badge
+                        ? Box
+                        : option.uiAction === "model"
+                          ? Cpu
+                          : option.uiAction === "effort"
+                            ? SlidersHorizontal
+                            : option.uiAction === "subagents"
+                              ? GitFork
+                              : option.uiAction === "side"
+                                ? MessageSquare
+                                : Terminal;
               const folderEntry =
                 option.icon === "folder" && option.id.startsWith("entry:")
                   ? entries.find((item) => `entry:${item.path}` === option.id)
@@ -1439,7 +1603,9 @@ export function Composer(props: Props) {
                   title={
                     option.id.startsWith("entry:")
                       ? option.id.slice(6)
-                      : `${option.label} ${option.detail}`.trim()
+                      : option.icon === "command"
+                        ? [option.id, option.detail].filter(Boolean).join(" · ")
+                        : `${option.label} ${option.detail}`.trim()
                   }
                   role="option"
                   aria-selected={i === index}
@@ -1450,8 +1616,13 @@ export function Composer(props: Props) {
                 >
                   <Icon size={14.5} strokeWidth={1.7} aria-hidden="true" />
                   <span className="composer-menu-option-primary">
-                    {option.icon === "command" ? `/${option.id}` : option.label}
+                    {option.icon === "command" ? option.id : option.label}
                   </span>
+                  {option.badge && (
+                    <Badge className="composer-command-badge">
+                      {option.badge}
+                    </Badge>
+                  )}
                   {option.detail && <small>{option.detail}</small>}
                   {folderEntry && (
                     <span
@@ -1474,7 +1645,7 @@ export function Composer(props: Props) {
             {loading && (
               <p role="status">
                 {mode === "commands"
-                  ? "正在读取 Agent 原生命令…"
+                  ? "正在读取命令与技能…"
                   : "正在读取项目目录…"}
               </p>
             )}
@@ -1490,7 +1661,7 @@ export function Composer(props: Props) {
                 {mode === "files" && "，可输入目录路径继续查找"}
                 {mode === "commands" &&
                   !sideChat &&
-                  "，以当前 Agent 返回的命令为准"}
+                  "，以当前 Agent 返回的命令与技能为准"}
               </p>
             )}
           </div>
@@ -1626,12 +1797,17 @@ export function Composer(props: Props) {
               ref={inlineInput}
               value={value}
               references={inlineAttached}
+              recognizedCommands={recognizedCommands}
+              activeCommandTriggerStart={activeCommandTriggerStart}
               label={props.inputLabel ?? "任务输入"}
               placeholder={placeholder}
               disabled={disabled || sending || pasting}
               autocomplete={autocomplete}
               onEdit={(text, entries, caret) => {
-                if (caret && !hasRichComposerMarkdown(text))
+                if (
+                  caret &&
+                  !hasRichComposerMarkdown(text, recognizedCommands, null)
+                )
                   restoreCaret(caret.start, caret.afterPath);
                 if (text !== value) onChange(text);
                 const paths = new Map(
@@ -1669,8 +1845,18 @@ export function Composer(props: Props) {
               onCompositionEnd={(text, offset) => {
                 composing.current = false;
                 setImeActive(false);
-                if (!hasRichComposerMarkdown(text)) restoreCaret(offset);
-                setTrigger(composerTrigger(text, offset));
+                const nextTrigger = composerTrigger(text, offset);
+                const nextCmdStart =
+                  nextTrigger?.kind === "commands" ? nextTrigger.start : null;
+                if (
+                  !hasRichComposerMarkdown(
+                    text,
+                    recognizedCommands,
+                    nextCmdStart,
+                  )
+                )
+                  restoreCaret(Math.max(0, offset));
+                setTrigger(nextTrigger);
               }}
               renderImage={(entry) => (
                 <AttachmentImage
@@ -1696,7 +1882,21 @@ export function Composer(props: Props) {
               disabled={disabled || sending || pasting}
               autocomplete={autocomplete}
               onEdit={(text, entries, caret) => {
-                if (caret && (!entries.length || hasRichComposerMarkdown(text)))
+                const nextTrigger =
+                  caret && !composing.current
+                    ? composerTrigger(text, caret.start)
+                    : null;
+                const nextCmdStart =
+                  nextTrigger?.kind === "commands" ? nextTrigger.start : null;
+                if (
+                  caret &&
+                  (!entries.length ||
+                    hasRichComposerMarkdown(
+                      text,
+                      recognizedCommands,
+                      nextCmdStart,
+                    ))
+                )
                   restoreCaret(caret.start, caret.afterPath);
                 if (text !== value) onChange(text);
                 const paths = new Map(
@@ -1734,8 +1934,18 @@ export function Composer(props: Props) {
               onCompositionEnd={(text, offset) => {
                 composing.current = false;
                 setImeActive(false);
-                if (hasRichComposerMarkdown(text)) restoreCaret(offset);
-                setTrigger(composerTrigger(text, offset));
+                const nextTrigger = composerTrigger(text, offset);
+                const nextCmdStart =
+                  nextTrigger?.kind === "commands" ? nextTrigger.start : null;
+                if (
+                  hasRichComposerMarkdown(
+                    text,
+                    recognizedCommands,
+                    nextCmdStart,
+                  )
+                )
+                  restoreCaret(offset);
+                setTrigger(nextTrigger);
               }}
               renderImage={(entry) => (
                 <AttachmentImage
@@ -1786,18 +1996,26 @@ export function Composer(props: Props) {
               onChange={(event) => {
                 const nextValue = event.target.value;
                 const caretOffset = event.target.selectionStart;
-                if (!composing.current && hasRichComposerMarkdown(nextValue)) {
+                const nextTrigger = composing.current
+                  ? null
+                  : composerTrigger(nextValue, caretOffset);
+                const nextCmdStart =
+                  nextTrigger?.kind === "commands" ? nextTrigger.start : null;
+                if (
+                  !composing.current &&
+                  hasRichComposerMarkdown(
+                    nextValue,
+                    recognizedCommands,
+                    nextCmdStart,
+                  )
+                ) {
                   restoreCaret(caretOffset);
                 }
                 onChange(nextValue);
                 setNotice("");
                 setBrowse(null);
                 setAddMenu(false);
-                setTrigger(
-                  composing.current
-                    ? null
-                    : composerTrigger(nextValue, caretOffset),
-                );
+                setTrigger(nextTrigger);
               }}
               onClick={(event) => {
                 const el = event.currentTarget;
@@ -1892,7 +2110,10 @@ export function Composer(props: Props) {
           () => void submit(),
           !pasting &&
             !retryFiles.length &&
-            (!!value.trim() || !!attached.length || !!props.hasContext),
+            (!!value.trim() ||
+              !!attached.length ||
+              !!props.hasContext ||
+              !!props.quotes?.length),
           localNavigation,
         )}
       </div>

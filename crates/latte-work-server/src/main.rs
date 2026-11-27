@@ -1,6 +1,7 @@
 //! A single host daemon; `connect` is a disposable local/SSH byte bridge.
 mod admission;
 mod agent_environment;
+mod agent_workdir;
 mod agents;
 mod attachments;
 mod files;
@@ -823,8 +824,17 @@ async fn dispatch_admitted(
             terminal_id,
             cols,
             rows,
+            session_id,
+            repo_path,
         } => {
             let project = db(&s.database, |d| d.project(&project_id))?;
+            let preferred_cwd = agent_workdir::resolve_terminal_cwd(
+                s,
+                &project,
+                session_id.as_deref(),
+                repo_path.as_deref(),
+            )
+            .await;
             let terminals = s.terminals.clone();
             tokio::task::spawn_blocking(move || {
                 terminals
@@ -833,6 +843,7 @@ async fn dispatch_admitted(
                     .create(
                         project_id,
                         Path::new(&project.path),
+                        preferred_cwd.as_deref(),
                         terminal_id,
                         cols,
                         rows,
@@ -1905,11 +1916,42 @@ async fn dispatch_admitted(
                 })
                 .await?
         }
-        Request::SkillInfo { session_id, name } => {
+        Request::SkillInfo {
+            provider,
+            session_id,
+            name,
+        } => {
             let session = db(&s.database, |d| d.session(&session_id))?;
             let project = db(&s.database, |d| d.project(&session.project_id))?;
+            let environment = match provider {
+                Some(latte_work_protocol::TurnProvider::Configured { environment, .. }) => {
+                    latte_work_config::validate_agent_environment(&environment)?;
+                    environment
+                }
+                Some(
+                    latte_work_protocol::TurnProvider::Cli
+                    | latte_work_protocol::TurnProvider::Snapshot(_),
+                ) => latte_work_protocol::AgentEnvironment::default(),
+                None => runtime::session_environment(&s.runs, &session_id)
+                    .await
+                    .unwrap_or_default(),
+            };
+            let native_skill_path = if matches!(session.agent.as_str(), "codex" | "traex") {
+                runtime::session_skill_path(&s.runs, &session_id, &name)
+                    .await
+                    .map(std::path::PathBuf::from)
+            } else {
+                None
+            };
             Response::SkillInfo {
-                skill: agents::skill_info(&session.agent, project.path.into(), name).await?,
+                skill: agents::skill_info(
+                    &session.agent,
+                    project.path.into(),
+                    name,
+                    environment,
+                    native_skill_path,
+                )
+                .await?,
             }
         }
         Request::Sources { session_id } => {
@@ -2119,10 +2161,16 @@ async fn dispatch_admitted(
                         scope,
                         base,
                         head,
+                        repo_path,
                     } => {
                         let project = db(&s.database, |d| d.project(&project_id))?;
-                        git_review::image_chunk(
+                        let repo_root = git_review::resolve_repository(
                             Path::new(&project.path),
+                            repo_path.as_deref(),
+                        )
+                        .await?;
+                        git_review::image_chunk(
+                            &repo_root,
                             scope,
                             base.as_deref(),
                             head.as_deref(),
@@ -2154,7 +2202,11 @@ async fn dispatch_admitted(
                 files::resolve(Path::new(&p.path), &path)?
             };
             let target = tokio::fs::canonicalize(&requested).await?;
+            let canonical_project = tokio::fs::canonicalize(&p.path).await.ok();
             let mut allowed = target.starts_with(&p.path)
+                || canonical_project
+                    .as_ref()
+                    .is_some_and(|root| target.starts_with(root))
                 || db(&s.database, |d| d.reference_allowed(&project_id, &target))?;
             allowed |= s
                 .attachments
@@ -2234,20 +2286,36 @@ async fn dispatch_admitted(
             let (entries, truncated) = files::changes(Path::new(&p.path)).await?;
             Response::Changes { entries, truncated }
         }
-        Request::GitInfo { project_id } => {
+        Request::GitRepositories { project_id } => {
+            let p = db(&s.database, |d| d.project(&project_id))?;
+            let (repositories, truncated) =
+                git_review::discover_repositories(Path::new(&p.path)).await?;
+            Response::GitRepositories {
+                repositories,
+                truncated,
+            }
+        }
+        Request::GitInfo {
+            project_id,
+            repo_path,
+        } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
             Response::GitInfo {
-                info: git_review::info(Path::new(&p.path)).await?,
+                info: git_review::info_for_project(Path::new(&p.path), repo_path.as_deref())
+                    .await?,
             }
         }
         Request::GitCommits {
             project_id,
             head,
             offset,
+            repo_path,
         } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
+            let repo_root =
+                git_review::resolve_repository(Path::new(&p.path), repo_path.as_deref()).await?;
             let (head, commits, has_more) =
-                git_review::commits(Path::new(&p.path), head.as_deref(), offset).await?;
+                git_review::commits(&repo_root, head.as_deref(), offset).await?;
             Response::GitCommits {
                 head,
                 commits,
@@ -2258,10 +2326,13 @@ async fn dispatch_admitted(
             project_id,
             scope,
             base,
+            repo_path,
         } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
+            let repo_root =
+                git_review::resolve_repository(Path::new(&p.path), repo_path.as_deref()).await?;
             Response::GitReview {
-                review: git_review::review(Path::new(&p.path), scope, base.as_deref()).await?,
+                review: git_review::review(&repo_root, scope, base.as_deref()).await?,
             }
         }
         Request::GitReviewDiff {
@@ -2271,10 +2342,13 @@ async fn dispatch_admitted(
             head,
             path,
             full_context,
+            repo_path,
         } => {
             let p = db(&s.database, |d| d.project(&project_id))?;
+            let repo_root =
+                git_review::resolve_repository(Path::new(&p.path), repo_path.as_deref()).await?;
             let (text, truncated) = git_review::diff(
-                Path::new(&p.path),
+                &repo_root,
                 scope,
                 base.as_deref(),
                 head.as_deref(),

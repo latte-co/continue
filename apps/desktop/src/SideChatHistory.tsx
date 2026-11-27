@@ -10,7 +10,24 @@ export interface SideChatHistoryProps {
   hostId: string;
   parentId: string;
   currentId?: string;
-  onOpen: (id: string) => void;
+  onOpen: (id: string, title?: string) => void;
+}
+
+export function settledSideChatTitle(
+  session: Session,
+  hasCompletedTurn = false,
+): string | undefined {
+  const title = session.title?.trim();
+  if (!title || title === "侧边聊天") return undefined;
+  if (
+    session.custom_title ||
+    session.title_requested ||
+    session.status === "completed" ||
+    hasCompletedTurn
+  ) {
+    return title;
+  }
+  return undefined;
 }
 
 export function SideChatHistory({
@@ -130,7 +147,11 @@ function SideChatHistoryPages({
                 <MessageTimestamp at={session.created_at} label="创建时间" />
               </span>
             }
-            onClick={() => onOpen(session.id)}
+            onClick={() => {
+              const title = settledSideChatTitle(session);
+              if (title !== undefined) onOpen(session.id, title);
+              else onOpen(session.id);
+            }}
           >
             {session.title}
           </NavRow>
@@ -203,10 +224,11 @@ export function SideChatHistoryButton(props: SideChatHistoryProps) {
         <MenuTitle>历史</MenuTitle>
         <SideChatHistory
           {...props}
-          onOpen={(sideId) => {
+          onOpen={(sideId, title) => {
             setOpen(false);
             trigger.current?.focus();
-            props.onOpen(sideId);
+            if (title !== undefined) props.onOpen(sideId, title);
+            else props.onOpen(sideId);
           }}
         />
       </Popover>

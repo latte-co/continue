@@ -21,8 +21,16 @@ import {
   Wrench,
   ChevronRight,
 } from "lucide-react";
-import { request, ServerRequestError } from "./api";
+import { request } from "./api";
 import type { Event, GitReview, Project } from "./protocol";
+import {
+  isEmptyRepositoryReviewError,
+  isNotGitRepositoryError,
+  isRemovedGitRepositoryError,
+  normalizeGitRepoPath,
+  readGitRepositories,
+  useSelectedGitRepository,
+} from "./gitRepositories";
 import { TaskLinkRow } from "./TaskLinkRow";
 import { useBrowserHistory } from "./browserHistory";
 import { webLink } from "./browserLinks";
@@ -176,26 +184,90 @@ export function TaskInfo({
         ),
     )
     .at(-1)?.seq;
-  const readChanges = useCallback(async () => {
+  const [selectedRepo, setSelectedRepo] = useSelectedGitRepository(
+    hostId,
+    project,
+  );
+  const readChanges = useCallback(async (): Promise<{
+    review: GitReview | null;
+    repoLabel?: string;
+    repoCount?: number;
+  } | null> => {
+    const repoArg = normalizeGitRepoPath(selectedRepo);
     try {
       const response = await request(hostId, {
         method: "git_review",
         project_id: project!.id,
         scope: "branch",
         base: null,
+        ...(repoArg ? { repo_path: repoArg } : {}),
       });
       if (response.kind !== "git_review")
         throw new Error("无法读取变更，请检查 Server 版本");
-      return response.review;
+      return { review: response.review, repoLabel: repoArg };
     } catch (error) {
+      if (!isNotGitRepositoryError(error) && !repoArg) throw error;
+      let discovered: {
+        repositories: { path: string; name: string }[];
+        truncated: boolean;
+      };
+      try {
+        discovered = await readGitRepositories(hostId, project!.id);
+      } catch (scanError) {
+        throw isNotGitRepositoryError(error) ? scanError : error;
+      }
+      const { repositories, truncated } = discovered;
       if (
-        error instanceof ServerRequestError &&
-        error.code === "not_git_repository"
-      )
+        repoArg &&
+        (truncated ||
+          !isRemovedGitRepositoryError(error) ||
+          repositories.some((repo) => repo.path === repoArg))
+      ) {
+        throw error;
+      }
+      if (!repositories.length) {
+        if (repoArg && !truncated && isRemovedGitRepositoryError(error))
+          setSelectedRepo(undefined);
+        if (truncated) throw new Error("子目录过多，未能完成 Git 仓库扫描");
         return null;
-      throw error;
+      }
+      const chosen =
+        repositories.find((repo) => repo.path === selectedRepo) ??
+        repositories[0];
+      if (repoArg && chosen.path !== repoArg) {
+        setSelectedRepo(chosen.path);
+      }
+      const fallbackArg = normalizeGitRepoPath(chosen.path);
+      try {
+        const response = await request(hostId, {
+          method: "git_review",
+          project_id: project!.id,
+          scope: "branch",
+          base: null,
+          ...(fallbackArg ? { repo_path: fallbackArg } : {}),
+        });
+        if (response.kind !== "git_review")
+          throw new Error("无法读取变更，请检查 Server 版本");
+        return {
+          review: response.review,
+          repoLabel: chosen.path !== "." ? chosen.name : undefined,
+          repoCount: repositories.length,
+        };
+      } catch (childError) {
+        if (
+          isNotGitRepositoryError(childError) ||
+          isEmptyRepositoryReviewError(childError)
+        ) {
+          return {
+            review: null,
+            repoLabel: chosen.path !== "." ? chosen.name : undefined,
+            repoCount: repositories.length,
+          };
+        }
+        throw childError;
+      }
     }
-  }, [hostId, project?.id]);
+  }, [hostId, project?.id, selectedRepo]);
   const readSources = useCallback(async () => {
     if (!sessionId) return undefined;
     const response = await request(hostId, {
@@ -209,12 +281,20 @@ export function TaskInfo({
   const enabled = active && connected && !!project;
   // Branch diffs are read on opening, explicit refresh and settlement. Tool
   // activity during a turn never spawns a Git status/diff per streamed update.
-  const changes = usePollingSnapshot<GitReview | null | undefined>(
+  const changes = usePollingSnapshot<
+    | {
+        review: GitReview | null;
+        repoLabel?: string;
+        repoCount?: number;
+      }
+    | null
+    | undefined
+  >(
     scope,
     enabled,
     readChanges,
     undefined,
-    `${revision}:${running ? "running" : version}`,
+    `${revision}:${selectedRepo ?? ""}:${running ? "running" : version}`,
     0,
     0,
   );
@@ -228,7 +308,7 @@ export function TaskInfo({
     0,
   );
   const current = {
-    review: changes.data,
+    changes: changes.data,
     sources: sources.data?.entries,
     truncated: sources.data?.truncated,
     changesError: changes.error,
@@ -251,7 +331,10 @@ export function TaskInfo({
       action: { label: "重试", run: () => refresh((value) => value + 1) },
     },
   ]);
-  const review = current.review;
+  const changeState = current.changes;
+  const review =
+    changeState === undefined ? undefined : (changeState?.review ?? null);
+  const hasChildRepos = Boolean(changeState?.repoCount);
   const tools = current.sources?.filter(
     (source) => source.kind === "tool" || source.kind === "connector",
   );
@@ -282,7 +365,7 @@ export function TaskInfo({
       >
         <button
           className="task-info-row"
-          disabled={!project || review === null}
+          disabled={!project || (changeState === null && !hasChildRepos)}
           onClick={() => openWorkspaceResource(workspaceId, "diff")}
         >
           <span>分支变更</span>
@@ -291,13 +374,15 @@ export function TaskInfo({
               ? "状态待确认"
               : current.changesError
                 ? "暂不可用"
-                : review === null
+                : changeState === null
                   ? "此项目无 Git 分支信息"
-                  : !review
-                    ? project
-                      ? "读取中…"
-                      : "请先选择项目"
-                    : `${review.entries.length} 个文件`}
+                  : review === null && hasChildRepos
+                    ? `${changeState?.repoCount} 个 Git 仓库`
+                    : !review
+                      ? project
+                        ? "读取中…"
+                        : "请先选择项目"
+                      : `${review.entries.length} 个文件`}
           </span>
         </button>
         {review && (
@@ -306,7 +391,10 @@ export function TaskInfo({
               <b>+{review.added}</b>
               <em>-{review.removed}</em>
             </span>
-            <small>{review.truncated ? "部分记录" : "分支"}</small>
+            <small>
+              {changeState?.repoLabel ? `${changeState.repoLabel} · ` : ""}
+              {review.truncated ? "部分记录" : "分支"}
+            </small>
           </div>
         )}
       </Section>

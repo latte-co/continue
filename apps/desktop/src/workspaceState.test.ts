@@ -570,3 +570,66 @@ it("clamps split workspace width within StageIsland inset and resize handles so 
       clampedCollapsed,
   ).toBe(windowWidth - STAGE_ISLAND_INSET);
 });
+
+it("stamps transient Markdown preview requests for conversation file opens without persisting them to storage", async () => {
+  const {
+    openWorkspaceResource,
+    readWorkspace: read,
+    syncProjectInWorkspaces,
+  } = await import("./workspaceState");
+  const key = crypto.randomUUID();
+  openWorkspaceResource(key, "files", {
+    file: "docs/plan.md",
+    markdownPreview: true,
+  });
+  const firstTab = read(key).tabs[0];
+  expect(firstTab).toMatchObject({
+    id: "files",
+    kind: "files",
+    file: "docs/plan.md",
+  });
+  const firstRequest =
+    firstTab?.kind === "files" ? firstTab.markdownPreviewRequest : undefined;
+  expect(typeof firstRequest).toBe("number");
+  expect(
+    JSON.parse(
+      localStorage.getItem("latte-work.conversation-workspace.v1:" + key)!,
+    ).tabs[0].markdownPreviewRequest,
+  ).toBeUndefined();
+
+  openWorkspaceResource(key, "files", {
+    file: "docs/plan.md",
+    markdownPreview: true,
+  });
+  const secondTab = read(key).tabs[0];
+  const secondRequest =
+    secondTab?.kind === "files" ? secondTab.markdownPreviewRequest : undefined;
+  expect(secondRequest).toBeGreaterThan(firstRequest!);
+
+  openWorkspaceResource(key, "files", { file: "src/main.rs" });
+  expect(read(key).tabs[0]).toEqual({
+    id: "files",
+    kind: "files",
+    file: "src/main.rs",
+    reference: undefined,
+    sessionId: undefined,
+  });
+
+  openWorkspaceResource(key, "files", {
+    file: "README.markdown",
+    markdownPreview: true,
+  });
+  syncProjectInWorkspaces(
+    "local",
+    { id: "p1", name: "P1", path: "/moved" },
+    { pathChanged: true, ownedWorkspaceKeys: [key] },
+  );
+  expect(read(key).tabs[0]).toEqual({
+    id: "files",
+    kind: "files",
+    path: undefined,
+    file: undefined,
+    reference: undefined,
+    sessionId: undefined,
+  });
+});
