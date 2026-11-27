@@ -1616,7 +1616,7 @@ it("receives a late background generated title even after falling back to the pr
     title: "later generated title",
   };
   await waitFor(() => expect(readTabTitle()).toBe("later generated title"), {
-    timeout: 1500,
+    timeout: 3500,
   });
 }, 8500);
 
@@ -1705,15 +1705,23 @@ it("syncs background generated titles arriving more than 17 seconds after turn c
     });
     expect(readTabTitle()).toBe(question);
 
+    const pollsBeforeBackoff = request.mock.calls.filter(
+      ([, cmd]) => cmd.method === "poll",
+    ).length;
     await act(async () => {
       await vi.advanceTimersByTimeAsync(20000);
     });
+    const pollsDuringBackoff =
+      request.mock.calls.filter(([, cmd]) => cmd.method === "poll").length -
+      pollsBeforeBackoff;
+    // With exponential backoff capped at 5s, 20s of background waiting performs <= 6 polls (not ~30).
+    expect(pollsDuringBackoff).toBeLessThanOrEqual(7);
     state.session = {
       ...state.session,
       title: "later generated title",
     };
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(1500);
+      await vi.advanceTimersByTimeAsync(5000);
     });
     expect(readTabTitle()).toBe("later generated title");
   } finally {
@@ -1800,4 +1808,76 @@ it("keeps leading slash skill before quoted context and trailing file references
     sentText.startsWith("/review-code-changes 评审下\n\n> MR 编号与链接：!3"),
   ).toBe(true);
   expect(sentText).toMatch(/README\.md.*\]$/);
+});
+
+it("sizes cached transcripts incrementally on new poll pages without re-serializing full history", async () => {
+  const { props, state } = createSideChatReviewFixture();
+  const baseEvents: Event[] = Array.from({ length: 12 }, (_, index) => ({
+    seq: index + 1,
+    at: 1,
+    session_id: props.sideId,
+    event: { kind: "text" as const, text: `chunk-${index}` },
+  }));
+  const deltaEvent: Event = {
+    seq: 13,
+    at: 2,
+    session_id: props.sideId,
+    event: { kind: "text" as const, text: "delta-13" },
+  };
+  let deliveredDelta = false;
+  request.mockImplementation(async (_host: string, action: Request) => {
+    if (action.method !== "poll")
+      return { kind: "agent_permissions", modes: [] };
+    if (action.after === 0) {
+      return {
+        kind: "events",
+        session: { ...state.session, status: "running" },
+        events: baseEvents,
+        has_more: false,
+      };
+    }
+    if (!deliveredDelta) {
+      deliveredDelta = true;
+      return {
+        kind: "events",
+        session: { ...state.session, status: "completed" },
+        events: [deltaEvent],
+        has_more: false,
+      };
+    }
+    return {
+      kind: "events",
+      session: { ...state.session, status: "completed" },
+      events: [],
+      has_more: false,
+    };
+  });
+  const originalStringify = JSON.stringify;
+  let fullCombinedSerializations = 0;
+  const spy = vi.spyOn(JSON, "stringify").mockImplementation(function (
+    value,
+    ...rest
+  ) {
+    if (
+      Array.isArray(value) &&
+      value.length === baseEvents.length + 1 &&
+      (value[0] as Event | undefined)?.session_id === props.sideId
+    ) {
+      fullCombinedSerializations += 1;
+    }
+    return originalStringify(
+      value,
+      ...(rest as [
+        ((this: unknown, key: string, value: unknown) => unknown)?,
+        (string | number)?,
+      ]),
+    );
+  });
+  try {
+    render(<SideChat {...props} />);
+    await screen.findByText(/delta-13/);
+    expect(fullCombinedSerializations).toBe(0);
+  } finally {
+    spy.mockRestore();
+  }
 });

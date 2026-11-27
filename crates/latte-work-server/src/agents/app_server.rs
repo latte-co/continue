@@ -1392,6 +1392,9 @@ impl AgentAdapter for AppServer {
     fn knows_subagent(&self, _: &str) -> bool {
         false
     }
+    fn skill_path(&self, name: &str) -> Option<String> {
+        self.skills.as_ref()?.get(name).cloned()
+    }
     fn set_session_title(&mut self, title: Option<String>, resuming: bool, title_requested: bool) {
         self.native_named = title.is_some();
         self.title_attempted = title_requested;

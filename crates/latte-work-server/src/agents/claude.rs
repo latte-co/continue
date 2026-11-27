@@ -277,6 +277,7 @@ pub struct Claude {
     commands: HashSet<String>,
     builtin_commands: HashSet<String>,
     skill_commands: HashSet<String>,
+    discovery_non_builtin: HashSet<String>,
     skills: HashSet<String>,
     requested_skill_commands: HashSet<String>,
     pending_skill_command: Option<String>,
@@ -459,6 +460,33 @@ impl AgentAdapter for Claude {
     }
     fn knows_subagent(&self, native_id: &str) -> bool {
         self.agent_tasks.contains_key(native_id)
+    }
+    fn finish_command_discovery(
+        &mut self,
+        mut commands: Vec<latte_work_protocol::AgentSlashCommand>,
+    ) -> Vec<latte_work_protocol::AgentSlashCommand> {
+        if self.cwd.is_empty() {
+            for command in &mut commands {
+                if command.kind.is_none() && self.discovery_non_builtin.contains(&command.name) {
+                    command.kind = Some(latte_work_protocol::AgentCommandKind::Command);
+                }
+            }
+            return commands;
+        }
+        let mut classifier = super::claude_skills::SkillClassifier::new(
+            std::path::Path::new(&self.cwd),
+            &self.environment,
+        );
+        for command in &mut commands {
+            if command.kind.is_none() && command.ui_action.is_none() {
+                if classifier.is_skill(&command.name) {
+                    command.kind = Some(latte_work_protocol::AgentCommandKind::Skill);
+                } else if self.discovery_non_builtin.contains(&command.name) {
+                    command.kind = Some(latte_work_protocol::AgentCommandKind::Command);
+                }
+            }
+        }
+        commands
     }
     fn can_start_turn(&self) -> bool {
         matches!(self.phase, Phase::BetweenTurns)
@@ -878,17 +906,34 @@ impl Claude {
         self.live_totals = [0.0; 4];
         self.live_steps = 0.0;
     }
-    fn side_blocked_command(&self, prompt: &str) -> Option<String> {
+    fn is_side_skill(&mut self, name: &str) -> bool {
+        if self.builtin_commands.contains(name) {
+            return false;
+        }
+        if self.skill_commands.contains(name) {
+            return true;
+        }
+        if !self.cwd.is_empty()
+            && super::claude_skills::SkillClassifier::new(
+                std::path::Path::new(&self.cwd),
+                &self.environment,
+            )
+            .is_skill(name)
+        {
+            self.skill_commands.insert(name.into());
+            return true;
+        }
+        false
+    }
+    fn side_blocked_command(&mut self, prompt: &str) -> Option<String> {
         let name = prompt
             .trim_start()
             .strip_prefix('/')
             .and_then(|s| s.split_whitespace().next())?;
-        (self.side_parent.is_some()
-            && self.commands.contains(name)
-            && !self.skill_commands.contains(name))
-        .then(|| format!("侧边聊天不支持原生控制命令 /{name}，可调用技能或直接提问"))
+        (self.side_parent.is_some() && self.commands.contains(name) && !self.is_side_skill(name))
+            .then(|| format!("侧边聊天不支持原生控制命令 /{name}，可调用技能或直接提问"))
     }
-    fn check_command(&self, prompt: &str) -> Result<()> {
+    fn check_command(&mut self, prompt: &str) -> Result<()> {
         if let Some(name) = prompt
             .trim_start()
             .strip_prefix('/')
@@ -1156,11 +1201,9 @@ impl Claude {
                     bail!("Claude 未确认侧边聊天的只读权限，请检查 CLI 版本和权限设置");
                 }
                 if matches!(self.phase, Phase::Discovering) {
-                    let commands = parse_commands_in(
-                        &m["response"]["response"]["commands"],
-                        &self.cwd,
-                        &self.environment,
-                    )?;
+                    let (commands, non_builtin) =
+                        parse_commands_json(&m["response"]["response"]["commands"])?;
+                    self.discovery_non_builtin = non_builtin;
                     self.phase = Phase::Finished;
                     return Ok(vec![Action::Commands(commands)]);
                 }
@@ -1174,44 +1217,30 @@ impl Claude {
                     if prompt
                         .as_deref()
                         .is_some_and(|p| p.trim_start().starts_with('/'))
-                        || (self.side_parent.is_some()
-                            && m["response"]["response"]["commands"].is_array())
                     {
-                        let commands = parse_commands_in(
-                            &m["response"]["response"]["commands"],
-                            &self.cwd,
-                            &self.environment,
-                        )?;
-                        for command in commands {
-                            if command.kind == Some(latte_work_protocol::AgentCommandKind::Skill) {
-                                self.skill_commands.insert(command.name.clone());
-                            }
-                            self.commands.insert(command.name);
-                        }
+                        let (commands, _) =
+                            parse_commands_json(&m["response"]["response"]["commands"])?;
+                        self.commands.extend(commands.into_iter().map(|c| c.name));
                     }
-                    // Cache the catalog for subsequent turns; old CLIs without a
-                    // catalog can still accept ordinary prompts, never unknown commands.
+                    // Cache the catalog for subsequent turns in memory; never walk
+                    // the filesystem across all 2,000 entries on the Tokio worker.
                     if let Some(commands) = m["response"]["response"]["commands"].as_array() {
                         for command in commands {
-                            let is_builtin = command["builtin"].is_boolean()
+                            let is_builtin = command["builtin"] == true
                                 || command["name"].as_str().is_some_and(|n| {
                                     matches!(n, "agents" | "tasks" | "list-agents")
                                 });
-                            let is_skill = command["name"]
-                                .as_str()
-                                .is_some_and(|n| self.skill_commands.contains(n));
+                            let is_non_skill_cmd = command["builtin"] == false;
                             if let Some(name) = command["name"].as_str() {
                                 self.commands.insert(name.into());
-                                if is_builtin && !is_skill {
+                                if is_builtin {
                                     self.builtin_commands.insert(name.into());
                                 }
                             }
                             if let Some(aliases) = command["aliases"].as_array() {
                                 for alias in aliases.iter().filter_map(Value::as_str) {
                                     self.commands.insert(alias.into());
-                                    if is_skill {
-                                        self.skill_commands.insert(alias.into());
-                                    } else if is_builtin {
+                                    if is_builtin || is_non_skill_cmd {
                                         self.builtin_commands.insert(alias.into());
                                     }
                                 }
@@ -2167,14 +2196,20 @@ fn subagent_action(
 
 #[cfg(test)]
 fn parse_commands(value: &Value) -> Result<Vec<latte_work_protocol::AgentSlashCommand>> {
-    parse_commands_in(value, "", &Default::default())
+    let (commands, non_builtin) = parse_commands_json(value)?;
+    let mut claude = Claude {
+        discovery_non_builtin: non_builtin,
+        ..Default::default()
+    };
+    Ok(AgentAdapter::finish_command_discovery(
+        &mut claude,
+        commands,
+    ))
 }
 
-fn parse_commands_in(
+fn parse_commands_json(
     value: &Value,
-    cwd: &str,
-    environment: &latte_work_protocol::AgentEnvironment,
-) -> Result<Vec<latte_work_protocol::AgentSlashCommand>> {
+) -> Result<(Vec<latte_work_protocol::AgentSlashCommand>, HashSet<String>)> {
     let entries = value
         .as_array()
         .context("此 Claude CLI 未返回命令列表，请更新 CLI 后重试")?;
@@ -2182,6 +2217,7 @@ fn parse_commands_in(
         bail!("Agent 命令列表超出限制");
     }
     let mut names = HashSet::new();
+    let mut non_builtin = HashSet::new();
     let mut result = Vec::new();
     for entry in entries {
         let name = entry["name"].as_str().context("无效的 Agent 命令名称")?;
@@ -2202,16 +2238,10 @@ fn parse_commands_in(
             .then_some(latte_work_protocol::AgentCommandUiAction::Subagents);
         let kind = if ui_action.is_some() || entry["builtin"] == true {
             Some(latte_work_protocol::AgentCommandKind::Command)
-        } else if !cwd.is_empty()
-            && super::claude_skills::find_with_env(std::path::Path::new(cwd), name, environment)
-                .ok()
-                .flatten()
-                .is_some()
-        {
-            Some(latte_work_protocol::AgentCommandKind::Skill)
-        } else if entry["builtin"] == false {
-            Some(latte_work_protocol::AgentCommandKind::Command)
         } else {
+            if entry["builtin"] == false {
+                non_builtin.insert(name.to_owned());
+            }
             None
         };
         result.push(latte_work_protocol::AgentSlashCommand {
@@ -2232,7 +2262,7 @@ fn parse_commands_in(
             ui_action,
         });
     }
-    Ok(result)
+    Ok((result, non_builtin))
 }
 
 /// Shared Provider injection only; no platform context, session or ordinary-task launch.

@@ -416,6 +416,7 @@ pub async fn skill_info(
     project: std::path::PathBuf,
     name: String,
     environment: latte_work_protocol::AgentEnvironment,
+    native_skill_path: Option<std::path::PathBuf>,
 ) -> Result<Option<latte_work_protocol::SkillInfo>> {
     type SkillFinder = fn(
         &std::path::Path,
@@ -441,6 +442,15 @@ pub async fn skill_info(
         std::time::Duration::from_secs(3),
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            if let Some(skill_md) = native_skill_path
+                && crate::skills::component(&name)
+                && skill_md.is_absolute()
+                && skill_md.file_name().and_then(|s| s.to_str()) == Some("SKILL.md")
+                && let Some(dir) = skill_md.parent()
+                && let Ok(Some(found)) = claude_skills::inspect(dir, &name)
+            {
+                return Ok(Some(found));
+            }
             find(&project, &name, &environment)
         }),
     )

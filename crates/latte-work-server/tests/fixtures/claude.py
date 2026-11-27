@@ -127,7 +127,13 @@ for line in sys.stdin:
                 if description=='native-auto-title-unsupported':
                     emit({'type':'control_response','response':{'subtype':'error','request_id':request['request_id'],'error':'unsupported generate_session_title'}})
                     return
-                title='Friendly generated title' if description.startswith('native-auto-title') and description!='native-auto-title-empty' else None
+                title=(
+                    'Side generated title'
+                    if description == 'native-auto-title-side'
+                    else 'Friendly generated title'
+                    if description.startswith('native-auto-title') and description != 'native-auto-title-empty'
+                    else None
+                )
                 if description=='native-auto-title-credential':
                     title='Fix '+os.environ['ANTHROPIC_AUTH_TOKEN']
                 if title and request['request'].get('persist'):

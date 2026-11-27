@@ -1061,6 +1061,110 @@ it("keeps the repository switcher available when reopening a child repository re
   expect(screen.queryByRole("combobox", { name: "Git 仓库" })).toBeTruthy();
 });
 
+it("rescans repositories instead of showing empty changes when git_review fails with not_git_repository", async () => {
+  const removedRepoError = Object.assign(new Error("子仓库目录不存在"), {
+    code: "not_git_repository",
+  });
+  let childRemoved = false;
+  mocks.request.mockImplementation(async (_host: string, req: Request) => {
+    if (req.method === "git_info") {
+      if (req.repo_path === "child" && childRemoved) {
+        throw removedRepoError;
+      }
+      return {
+        kind: "git_info",
+        info: req.repo_path
+          ? { ...info, default_base: "refs/heads/main" }
+          : {
+              ...info,
+              repositories: childRemoved
+                ? [{ path: ".", name: "root", kind: "root" as const }]
+                : [
+                    { path: ".", name: "root", kind: "root" as const },
+                    {
+                      path: "child",
+                      name: "child",
+                      kind: "repository" as const,
+                    },
+                  ],
+            },
+      };
+    }
+    if (req.method === "git_repositories") {
+      return {
+        kind: "git_repositories",
+        repositories: [{ path: ".", name: "root", kind: "root" as const }],
+        truncated: false,
+      };
+    }
+    if (req.method === "git_review") {
+      if (req.repo_path === "child") {
+        childRemoved = true;
+        throw removedRepoError;
+      }
+      return {
+        kind: "git_review",
+        review: {
+          ...review,
+          entries: [
+            {
+              path: childRemoved ? "root-recovered.ts" : "initial-root.ts",
+              previous_path: null,
+              status: "M",
+              added: 1,
+              removed: 0,
+              binary: false,
+              untracked: false,
+            },
+          ],
+        },
+      };
+    }
+    if (req.method === "git_review_diff") {
+      return {
+        kind: "content",
+        text: `@@ -1 +1 @@\n-old\n+${req.path}\n`,
+        truncated: false,
+      };
+    }
+    throw new Error(`unexpected ${req.method}`);
+  });
+
+  render(<ChangesView {...props} />);
+  await screen.findByText("+initial-root.ts");
+  fireEvent.click(await screen.findByRole("combobox", { name: "Git 仓库" }));
+  fireEvent.click(screen.getByRole("option", { name: /child/ }));
+
+  // `git_info` succeeded for `child`, then `git_review` failed with `not_git_repository`;
+  // `ChangesView` must rescan and fall back to the root repository review (`+root-recovered.ts`),
+  // never stalling on a false "此范围内无变更" state.
+  await screen.findByText("+root-recovered.ts");
+  expect(screen.queryByText("此范围内无变更")).toBeNull();
+});
+
+it("distinguishes legacy unknown-variant errors from malformed git_repositories requests", async () => {
+  const { readGitRepositories } = await import("./gitRepositories");
+  mocks.request.mockRejectedValueOnce(
+    Object.assign(
+      new Error("unknown variant `git_repositories`, expected one of `hello`"),
+      { code: "invalid_request" },
+    ),
+  );
+  await expect(readGitRepositories("local", "p1")).resolves.toEqual({
+    repositories: [],
+    truncated: false,
+  });
+
+  mocks.request.mockRejectedValueOnce(
+    Object.assign(new Error("missing field `project_id`"), {
+      code: "invalid_request",
+    }),
+  );
+  await expect(readGitRepositories("local", "p1")).rejects.toThrow(
+    "missing field `project_id`",
+  );
+});
+
 it("resets to the newly selected repository default base after switching repositories in a sibling session", async () => {
   const { setSelectedGitRepository } = await import("./gitRepositories");
   setupMultiRepoResponses();

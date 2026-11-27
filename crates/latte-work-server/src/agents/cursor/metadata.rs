@@ -713,6 +713,7 @@ fn scan_local_catalog(
     environment: &AgentEnvironment,
 ) -> Vec<AgentSlashCommand> {
     const LIMIT: usize = 512;
+    const DIR_SCAN_HARD_LIMIT: usize = 8192;
     let mut seen = std::collections::HashSet::new();
     let mut catalog = Vec::new();
     for root in command_roots(project, environment) {
@@ -722,29 +723,31 @@ fn scan_local_catalog(
         let Ok(listing) = std::fs::read_dir(&canonical_root) else {
             continue;
         };
-        let mut files: Vec<_> = listing.take(LIMIT).filter_map(Result::ok).collect();
-        files.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in files {
+        let mut files: Vec<(String, PathBuf)> = listing
+            .take(DIR_SCAN_HARD_LIMIT)
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let file_name = entry.file_name().into_string().ok()?;
+                let stem = file_name.strip_suffix(".md")?;
+                valid_cursor_slash_id(stem).then(|| (stem.to_owned(), entry.path()))
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        for (stem, path) in files {
             if catalog.len() >= LIMIT {
                 return catalog;
             }
-            let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let Some(stem) = file_name.strip_suffix(".md") else {
-                continue;
-            };
-            if !valid_cursor_slash_id(stem) || seen.contains(stem) {
+            if seen.contains(&stem) {
                 continue;
             }
-            let Ok(resolved) = entry.path().canonicalize() else {
+            let Ok(resolved) = path.canonicalize() else {
                 continue;
             };
             if !resolved.starts_with(&canonical_root) {
                 continue;
             }
-            if let Ok(Some(cmd)) = parse_markdown_command(&resolved, stem) {
-                seen.insert(stem.to_owned());
+            if let Ok(Some(cmd)) = parse_markdown_command(&resolved, &stem) {
+                seen.insert(stem);
                 catalog.push(cmd);
             }
         }

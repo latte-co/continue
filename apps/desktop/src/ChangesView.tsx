@@ -527,8 +527,14 @@ export function ChangesView({
         }
       })
       .catch((cause) => {
-        if (!disposed && !isNotGitRepositoryError(cause))
-          setError(message(cause));
+        if (disposed) return;
+        if (isNotGitRepositoryError(cause)) {
+          setSnapshot(undefined);
+          setInfoState(undefined);
+          refresh((v) => v + 1);
+          return;
+        }
+        setError(message(cause));
       })
       .finally(() => {
         if (!disposed) setLoading(false);

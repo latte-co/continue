@@ -1936,9 +1936,22 @@ async fn dispatch_admitted(
                     .await
                     .unwrap_or_default(),
             };
+            let native_skill_path = if matches!(session.agent.as_str(), "codex" | "traex") {
+                runtime::session_skill_path(&s.runs, &session_id, &name)
+                    .await
+                    .map(std::path::PathBuf::from)
+            } else {
+                None
+            };
             Response::SkillInfo {
-                skill: agents::skill_info(&session.agent, project.path.into(), name, environment)
-                    .await?,
+                skill: agents::skill_info(
+                    &session.agent,
+                    project.path.into(),
+                    name,
+                    environment,
+                    native_skill_path,
+                )
+                .await?,
             }
         }
         Request::Sources { session_id } => {

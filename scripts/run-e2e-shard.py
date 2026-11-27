@@ -20,7 +20,7 @@ def discover_tests(package: str, target: str) -> list[str]:
             "--format=terse",
         ],
         check=True,
-        capture_output=True,
+        stdout=subprocess.PIPE,
         text=True,
     )
     tests = sorted(

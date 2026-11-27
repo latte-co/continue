@@ -122,7 +122,11 @@ export async function readGitRepositories(
       typeof error === "object" &&
       error !== null &&
       "code" in error &&
-      (error as { code?: unknown }).code === "invalid_request"
+      (error as { code?: unknown }).code === "invalid_request" &&
+      "message" in error &&
+      typeof (error as { message?: unknown }).message === "string" &&
+      (error as { message: string }).message.includes("git_repositories") &&
+      /unknown variant/i.test((error as { message: string }).message)
     ) {
       return { repositories: [], truncated: false };
     }

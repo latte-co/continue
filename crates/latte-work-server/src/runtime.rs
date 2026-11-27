@@ -183,6 +183,10 @@ pub enum Control {
     AgentCwd {
         reply: oneshot::Sender<Option<String>>,
     },
+    SkillPath {
+        name: String,
+        reply: oneshot::Sender<Option<String>>,
+    },
     Queue {
         action: QueueAction,
         reply: oneshot::Sender<Result<Response, String>>,
@@ -536,6 +540,21 @@ pub async fn session_agent_cwd(runs: &Runs, session_id: &str) -> Option<String> 
     let control = runs.lock().ok()?.get(session_id)?.control.clone();
     let (reply, receive) = oneshot::channel();
     control.try_send(Control::AgentCwd { reply }).ok()?;
+    tokio::time::timeout(Duration::from_secs(2), receive)
+        .await
+        .ok()?
+        .ok()?
+}
+
+pub async fn session_skill_path(runs: &Runs, session_id: &str, name: &str) -> Option<String> {
+    let control = runs.lock().ok()?.get(session_id)?.control.clone();
+    let (reply, receive) = oneshot::channel();
+    control
+        .try_send(Control::SkillPath {
+            name: name.into(),
+            reply,
+        })
+        .ok()?;
     tokio::time::timeout(Duration::from_secs(2), receive)
         .await
         .ok()?
@@ -2607,6 +2626,10 @@ async fn actor(
                     let _ = reply.send(process.as_ref().map(|p| p.agent_cwd.clone()));
                     Ok(())
                 }
+                Some(Control::SkillPath { name, reply }) => {
+                    let _ = reply.send(process.as_ref().and_then(|p| p.adapter.skill_path(&name)));
+                    Ok(())
+                }
                 Some(Control::RenameTitle {title,reply}) => {
                     safe_to_close.store(false, Ordering::SeqCst);
                     if let Some(p)=process.as_mut().filter(|p|p.state.ready) {
@@ -3332,7 +3355,17 @@ pub async fn commands(
     .await;
     let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
     let _ = group.child.wait().await;
-    result.context("读取 Agent 命令超时，请重试")?
+    let commands = result.context("读取 Agent 命令超时，请重试")??;
+    let fallback = commands.clone();
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || adapter.finish_command_discovery(commands)),
+    )
+    .await
+    {
+        Ok(Ok(classified)) => Ok(classified),
+        _ => Ok(fallback),
+    }
 }
 
 #[cfg(test)]

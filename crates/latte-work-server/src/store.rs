@@ -205,6 +205,7 @@ impl Store {
         }
         migration.execute_batch("CREATE INDEX IF NOT EXISTS side_chats_parent ON side_chats(parent_id);
         CREATE INDEX IF NOT EXISTS events_recent_activity_v2 ON events(session_id,seq DESC) WHERE json_extract(data,'$.kind') IN ('user','queued_message_sent','text','tool','tool_result','approval','approval_resolved','subagent');
+        CREATE INDEX IF NOT EXISTS events_workdir_tools ON events(session_id,seq DESC) WHERE json_extract(data,'$.kind') IN ('tool','tool_result');
         DROP INDEX IF EXISTS events_recent_activity;")?;
         let columns = migration
             .prepare("PRAGMA table_info(requests)")?
@@ -681,17 +682,16 @@ impl Store {
             .map(|row| Ok(serde_json::from_str(&row?)?))
             .collect()
     }
-    pub(crate) fn recent_workdir_tool_events(
+    pub(crate) fn workdir_tool_event_page(
         &self,
         session_id: &str,
-        project_root: &std::path::Path,
-        canonical_project: &std::path::Path,
-        base_cwd: &std::path::Path,
-        limit: usize,
-    ) -> Result<Vec<crate::agent_workdir::DirectorySignal>> {
-        const SCAN_ROW_LIMIT: i64 = 16_384;
-        let mut query = self.db.prepare(
+        before_seq: Option<i64>,
+        page_limit: usize,
+    ) -> Result<Vec<crate::agent_workdir::RawWorkdirEventRow>> {
+        let clamped = i64::try_from(page_limit.min(512)).unwrap_or(256);
+        let mut query = self.db.prepare_cached(
             "SELECT
+                 seq,
                  json_extract(data,'$.kind'),
                  json_extract(data,'$.id'),
                  json_extract(data,'$.is_error'),
@@ -700,56 +700,21 @@ impl Store {
                  END
              FROM events
              WHERE session_id=?1
+               AND (?2 IS NULL OR seq < ?2)
                AND json_extract(data,'$.kind') IN ('tool','tool_result')
              ORDER BY seq DESC
-             LIMIT ?2",
+             LIMIT ?3",
         )?;
-        let mut rows = query.query(params![session_id, SCAN_ROW_LIMIT])?;
-        let mut outcomes = std::collections::HashMap::<String, bool>::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut collected = Vec::new();
-        'rows: while let Some(row) = rows.next()? {
-            let kind: Option<String> = row.get(0)?;
-            let id: Option<String> = row.get(1)?;
-            match kind.as_deref() {
-                Some("tool_result") => {
-                    if let Some(id) = id {
-                        let is_error = row.get::<_, Option<bool>>(2)?.unwrap_or(false);
-                        outcomes.entry(id).or_insert(is_error);
-                    }
-                }
-                Some("tool") => {
-                    let Some(raw) = row.get::<_, Option<String>>(3)? else {
-                        continue;
-                    };
-                    let Ok(EventKind::Tool { id, name, input }) =
-                        serde_json::from_str::<EventKind>(&raw)
-                    else {
-                        continue;
-                    };
-                    let outcome = outcomes.get(&id).copied();
-                    for signal in crate::agent_workdir::extract_tool_signals(
-                        &name,
-                        &input,
-                        outcome,
-                        project_root,
-                        canonical_project,
-                        base_cwd,
-                    ) {
-                        let is_reset =
-                            signal == crate::agent_workdir::DirectorySignal::ResetToProjectRoot;
-                        if seen.insert(signal.clone()) {
-                            collected.push(signal);
-                            if is_reset || collected.len() >= limit {
-                                break 'rows;
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(collected)
+        let rows = query.query_map(params![session_id, before_seq, clamped], |row| {
+            Ok(crate::agent_workdir::RawWorkdirEventRow {
+                seq: row.get(0)?,
+                kind: row.get(1)?,
+                id: row.get(2)?,
+                is_error: row.get::<_, Option<bool>>(3)?.unwrap_or(false),
+                raw_tool: row.get(4)?,
+            })
+        })?;
+        rows.map(|r| Ok(r?)).collect()
     }
     pub fn recent_sessions(
         &self,

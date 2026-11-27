@@ -79,7 +79,11 @@ class SideChatTranscriptCache {
     this.entries.set(key, entry);
     return entry;
   }
-  set(key: string, value: Omit<CachedSideChat, "size">) {
+  set(
+    key: string,
+    value: Omit<CachedSideChat, "size">,
+    appendedEvents?: Event[],
+  ) {
     const previous = this.entries.get(key);
     const nextServerId = value.serverId || previous?.serverId || undefined;
     if (
@@ -94,7 +98,9 @@ class SideChatTranscriptCache {
     const size =
       previous?.events === value.events
         ? previous.size
-        : estimateEventsByteSize(value.events);
+        : previous && appendedEvents?.length
+          ? previous.size + estimateEventsByteSize(appendedEvents)
+          : estimateEventsByteSize(value.events);
     this.totalSize -= previous?.size ?? 0;
     this.entries.delete(key);
     if (size > this.maxSize) return;
@@ -550,6 +556,7 @@ function SideChatPane({
     if (!shouldPoll || busy || isDraft) return;
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
+    let idleBackgroundPolls = 0;
     async function read() {
       try {
         await sideOperations(drafts).get(key);
@@ -610,16 +617,36 @@ function SideChatPane({
         setSession(page.session);
         setReady(nextReady);
         if (nextReady) publishLiveStatus(page.session.status);
-        sideCache(drafts).set(key, {
-          hostId,
-          serverId: knownServerId,
-          session: page.session,
-          events: nextEvents,
-          after: after.current,
-          ready: nextReady,
-        });
+        sideCache(drafts).set(
+          key,
+          {
+            hostId,
+            serverId: knownServerId,
+            session: page.session,
+            events: nextEvents,
+            after: after.current,
+            ready: nextReady,
+          },
+          page.events.length ? page.events : undefined,
+        );
         setReadError("");
-        timer = setTimeout(read, page.has_more ? 0 : LIVE_POLL_MS);
+        const sessionActive =
+          page.session.status === "running" ||
+          page.session.status === "waiting";
+        let delay = LIVE_POLL_MS;
+        if (page.has_more) {
+          idleBackgroundPolls = 0;
+          delay = 0;
+        } else if (!active && !sessionActive && !page.events.length) {
+          idleBackgroundPolls += 1;
+          delay = Math.min(
+            LIVE_POLL_MS * 2 ** Math.min(idleBackgroundPolls - 1, 3),
+            5000,
+          );
+        } else {
+          idleBackgroundPolls = 0;
+        }
+        timer = setTimeout(read, delay);
       } catch (cause) {
         if (!disposed) {
           if (missingSession(cause)) {

@@ -183,7 +183,14 @@ for line in sys.stdin:
                 while not pathlib.Path('title-release').exists() and time.monotonic() < deadline:
                     time.sleep(.02)
             notify('thread/name/generated', {'turnId': 'unrelated-request', 'name': 'wrong'})
-            notify('thread/name/generated', {'turnId': 'latte-generate-title', 'name': '' if prompt == 'native-auto-title-empty' else '修复附件拖入失败'})
+            generated_name = (
+                ''
+                if prompt == 'native-auto-title-empty'
+                else 'Side generated title'
+                if prompt == 'native-auto-title-side'
+                else '修复附件拖入失败'
+            )
+            notify('thread/name/generated', {'turnId': 'latte-generate-title', 'name': generated_name})
             pathlib.Path('title-response').write_text('sent')
         threading.Thread(target=finish_title, daemon=True).start()
     elif method == 'thread/name/set':

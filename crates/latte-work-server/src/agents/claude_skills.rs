@@ -138,7 +138,7 @@ pub(crate) fn scan_roots(roots: &[PathBuf]) -> Vec<(String, SkillInfo)> {
         let Ok(listing) = std::fs::read_dir(root) else {
             continue;
         };
-        let mut entries: Vec<_> = listing.take(LIMIT).filter_map(Result::ok).collect();
+        let mut entries: Vec<_> = listing.take(8192).filter_map(Result::ok).collect();
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
             if found.len() >= LIMIT {
@@ -160,6 +160,130 @@ pub(crate) fn scan_roots(roots: &[PathBuf]) -> Vec<(String, SkillInfo)> {
     }
     found
 }
+
+pub(crate) struct SkillClassifier {
+    project: PathBuf,
+    roots: Vec<PathBuf>,
+    plugin_index_path: Option<PathBuf>,
+    plugin_index: Option<Option<serde_json::Value>>,
+    checked: usize,
+}
+
+impl SkillClassifier {
+    const CLASSIFY_LIMIT: usize = 512;
+
+    pub(crate) fn new(project: &Path, environment: &latte_work_protocol::AgentEnvironment) -> Self {
+        let config =
+            crate::agent_environment::configured_variable("CLAUDE_CONFIG_DIR", environment)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    crate::agent_environment::configured_variable("HOME", environment)
+                        .filter(|v| !v.is_empty())
+                        .map(|home| PathBuf::from(home).join(".claude"))
+                });
+        let mut roots = Vec::new();
+        let plugin_index_path = config.as_ref().map(|cfg| {
+            roots.push(cfg.join("skills"));
+            cfg.join("plugins/installed_plugins.json")
+        });
+        for parent in project.ancestors().take(32) {
+            roots.push(parent.join(".claude/skills"));
+            if parent.join(".git").exists() {
+                break;
+            }
+        }
+        Self {
+            project: project.to_path_buf(),
+            roots,
+            plugin_index_path,
+            plugin_index: None,
+            checked: 0,
+        }
+    }
+
+    pub(crate) fn is_skill(&mut self, name: &str) -> bool {
+        if self.plugin_index_path.is_none() || self.checked >= Self::CLASSIFY_LIMIT {
+            return false;
+        }
+        let parts: Vec<_> = name.split(':').collect();
+        if parts.len() > 2 || !parts.iter().all(|part| crate::skills::component(part)) {
+            return false;
+        }
+        self.checked += 1;
+        if parts.len() == 2 {
+            let index = self.plugin_index.get_or_insert_with(|| {
+                let path = self.plugin_index_path.as_ref()?;
+                if !path.exists() {
+                    return None;
+                }
+                let raw = read(path, 256 * 1024).ok()?;
+                serde_json::from_str(&raw).ok()
+            });
+            let Some(index) = index.as_ref() else {
+                return false;
+            };
+            return find_plugin_in_index(&self.project, index, parts[0], parts[1], name)
+                .ok()
+                .flatten()
+                .is_some();
+        }
+        for root in &self.roots {
+            if let Ok(Some(_)) = inspect(&root.join(name), name) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn find_plugin_in_index(
+    project: &Path,
+    index: &serde_json::Value,
+    plugin: &str,
+    skill: &str,
+    full_name: &str,
+) -> Result<Option<SkillInfo>> {
+    let mut matches = Vec::new();
+    if let Some(plugins) = index.get("plugins").and_then(|p| p.as_object()) {
+        for (key, installs) in plugins.iter().take(256) {
+            if key.split('@').next() != Some(plugin) {
+                continue;
+            }
+            for install in installs.as_array().into_iter().flatten().take(16) {
+                if let Some(scope) = install.get("projectPath").and_then(|p| p.as_str())
+                    && !project.starts_with(scope)
+                {
+                    continue;
+                }
+                if let Some(path) = install.get("installPath").and_then(|p| p.as_str()) {
+                    let root = Path::new(path);
+                    if !root.is_absolute() {
+                        continue;
+                    }
+                    let info = inspect(&root.join("skills").join(skill), full_name)?;
+                    let info = if info.is_some() {
+                        info
+                    } else {
+                        inspect(root, full_name)?
+                    };
+                    if let Some(info) = info
+                        && !matches
+                            .iter()
+                            .any(|existing: &SkillInfo| existing.directory == info.directory)
+                    {
+                        matches.push(info);
+                    }
+                }
+            }
+        }
+    }
+    if matches.len() > 1 {
+        bail!("此 Skill 有多个安装位置，无法确认当前目录");
+    }
+    Ok(matches.pop())
+}
+
 pub(crate) fn find_in(project: &Path, config: &Path, name: &str) -> Result<Option<SkillInfo>> {
     let parts: Vec<_> = name.split(':').collect();
     if parts.len() > 2 || !parts.iter().all(|part| crate::skills::component(part)) {
@@ -172,44 +296,7 @@ pub(crate) fn find_in(project: &Path, config: &Path, name: &str) -> Result<Optio
             return Ok(None);
         }
         let index: serde_json::Value = serde_json::from_str(&read(&index, 256 * 1024)?)?;
-        let mut matches = Vec::new();
-        if let Some(plugins) = index.get("plugins").and_then(|p| p.as_object()) {
-            for (key, installs) in plugins.iter().take(256) {
-                if key.split('@').next() != Some(parts[0]) {
-                    continue;
-                }
-                for install in installs.as_array().into_iter().flatten().take(16) {
-                    if let Some(scope) = install.get("projectPath").and_then(|p| p.as_str())
-                        && !project.starts_with(scope)
-                    {
-                        continue;
-                    }
-                    if let Some(path) = install.get("installPath").and_then(|p| p.as_str()) {
-                        let root = Path::new(path);
-                        if !root.is_absolute() {
-                            continue;
-                        }
-                        let info = inspect(&root.join("skills").join(parts[1]), name)?;
-                        let info = if info.is_some() {
-                            info
-                        } else {
-                            inspect(root, name)?
-                        };
-                        if let Some(info) = info
-                            && !matches
-                                .iter()
-                                .any(|existing: &SkillInfo| existing.directory == info.directory)
-                        {
-                            matches.push(info);
-                        }
-                    }
-                }
-            }
-        }
-        if matches.len() > 1 {
-            bail!("此 Skill 有多个安装位置，无法确认当前目录");
-        }
-        return Ok(matches.pop());
+        return find_plugin_in_index(project, &index, parts[0], parts[1], name);
     }
     // Personal precedes project. Symlinked skill folders are supported by canonicalizing them.
     if let Some(info) = inspect(&config.join("skills").join(name), name)? {
@@ -336,5 +423,41 @@ mod tests {
             "Plugin review"
         );
         assert!(find_in(root, root, "other:review").unwrap().is_none());
+    }
+
+    #[test]
+    fn sorts_before_truncating_large_roots_and_caches_plugin_index_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills_root = temp.path().join("skills");
+        for idx in 0..540 {
+            skill(
+                &skills_root.join(format!("zzz-skill-{idx:03}")),
+                "---\nname: Late\n---",
+            );
+        }
+        skill(&skills_root.join("aaa-first"), "---\nname: First\n---");
+        let scanned = scan_roots(&[skills_root]);
+        assert_eq!(scanned.len(), 512);
+        assert_eq!(scanned[0].0, "aaa-first");
+
+        let install = temp.path().join("installed");
+        skill(&install.join("skills/review"), "---\nname: Review\n---");
+        std::fs::create_dir_all(temp.path().join("plugins")).unwrap();
+        let index_path = temp.path().join("plugins/installed_plugins.json");
+        std::fs::write(
+            &index_path,
+            serde_json::json!({"plugins":{"example@market":[{"installPath":install}]}}).to_string(),
+        )
+        .unwrap();
+        let env = latte_work_protocol::AgentEnvironment(std::collections::BTreeMap::from([(
+            "CLAUDE_CONFIG_DIR".into(),
+            temp.path().to_string_lossy().into_owned(),
+        )]));
+        let mut classifier = SkillClassifier::new(temp.path(), &env);
+        assert!(classifier.is_skill("example:review"));
+        // Removing the file after the first lookup proves the parsed index is cached in memory.
+        std::fs::remove_file(&index_path).unwrap();
+        assert!(classifier.is_skill("example:review"));
+        assert!(!classifier.is_skill("other:review"));
     }
 }

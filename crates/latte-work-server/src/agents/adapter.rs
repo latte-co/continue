@@ -168,6 +168,17 @@ pub trait AgentAdapter: Send {
     }
     /// Only children observed by this process share its credential redaction context.
     fn knows_subagent(&self, native_id: &str) -> bool;
+    /// Native `SKILL.md` path reported by an open session's own skill catalog, if known.
+    fn skill_path(&self, _name: &str) -> Option<String> {
+        None
+    }
+    /// Optional blocking classification of discovered slash commands off the Tokio worker.
+    fn finish_command_discovery(
+        &mut self,
+        commands: Vec<latte_work_protocol::AgentSlashCommand>,
+    ) -> Vec<latte_work_protocol::AgentSlashCommand> {
+        commands
+    }
     /// Persisted manual name, including resumed sessions. Creation arguments
     /// must not implicitly rename an existing native session. `title_requested`
     /// records the durable once-per-session generation marker.

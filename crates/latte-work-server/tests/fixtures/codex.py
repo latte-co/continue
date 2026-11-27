@@ -285,7 +285,13 @@ for line in sys.stdin:
                 pathlib.Path('title-response').write_text('sent')
                 complete('failed')
             else:
-                title = '' if 'native-auto-title-empty' in description else '修复附件拖入失败'
+                title = (
+                    ''
+                    if 'native-auto-title-empty' in description
+                    else 'Side generated title'
+                    if 'native-auto-title-side' in description
+                    else '修复附件拖入失败'
+                )
                 # Unrelated output must not become a title.
                 notify('item/completed', {'threadId': 'other', 'item': {'id': 'bad', 'type': 'agentMessage', 'text': '{"title":"wrong"}'}})
                 text(json.dumps({'title': title}, ensure_ascii=False))

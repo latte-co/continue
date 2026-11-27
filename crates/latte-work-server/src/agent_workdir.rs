@@ -16,14 +16,27 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 const RECENT_TOOL_EVENT_LIMIT: usize = 64;
+const WORKDIR_SCAN_PAGE_SIZE: usize = 256;
+const WORKDIR_SCAN_MAX_PAGES: usize = 16;
 const PATCH_PATH_LIMIT: usize = 8;
+
+pub(crate) struct RawWorkdirEventRow {
+    pub seq: i64,
+    pub kind: Option<String>,
+    pub id: Option<String>,
+    pub is_error: bool,
+    pub raw_tool: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum DirectorySignal {
     /// Explicit exit back to the project's primary root (e.g. `ExitWorktree`).
     ResetToProjectRoot,
     /// Explicit working directory from a command tool, `cd` prefix, or `EnterWorktree`.
-    ExplicitDirectory(PathBuf),
+    ExplicitDirectory {
+        path: PathBuf,
+        allow_project_root: bool,
+    },
     /// Mutated file path whose enclosing Git worktree / repository root should be used.
     MutatedFile(PathBuf),
 }
@@ -87,16 +100,15 @@ async fn resolve_for_session(
         None => canonical_project.to_path_buf(),
     };
 
-    let signals = db(&service.database, |d| {
-        d.recent_workdir_tool_events(
-            &session.id,
-            project_root,
-            canonical_project,
-            &base_cwd,
-            RECENT_TOOL_EVENT_LIMIT,
-        )
-    })
-    .unwrap_or_default();
+    let signals = collect_recent_workdir_signals(
+        &service.database,
+        &session.id,
+        project_root,
+        canonical_project,
+        &base_cwd,
+        RECENT_TOOL_EVENT_LIMIT,
+    )
+    .await;
 
     if let Some(resolved) = resolve_from_signals(canonical_project, &signals).await {
         return Some(resolved);
@@ -141,6 +153,76 @@ async fn resolve_for_session(
     None
 }
 
+async fn collect_recent_workdir_signals(
+    database: &runtime::Database,
+    session_id: &str,
+    project_root: &Path,
+    canonical_project: &Path,
+    base_cwd: &Path,
+    limit: usize,
+) -> Vec<DirectorySignal> {
+    let mut before_seq: Option<i64> = None;
+    let mut outcomes = std::collections::HashMap::<String, bool>::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut collected = Vec::new();
+    'pages: for page_idx in 0..WORKDIR_SCAN_MAX_PAGES {
+        if page_idx > 0 {
+            tokio::task::yield_now().await;
+        }
+        let Ok(rows) = db(database, |d| {
+            d.workdir_tool_event_page(session_id, before_seq, WORKDIR_SCAN_PAGE_SIZE)
+        }) else {
+            break;
+        };
+        if rows.is_empty() {
+            break;
+        }
+        before_seq = rows.last().map(|r| r.seq);
+        let exhausted = rows.len() < WORKDIR_SCAN_PAGE_SIZE;
+        for row in rows {
+            match row.kind.as_deref() {
+                Some("tool_result") => {
+                    if let Some(id) = row.id {
+                        outcomes.entry(id).or_insert(row.is_error);
+                    }
+                }
+                Some("tool") => {
+                    let Some(raw) = row.raw_tool else {
+                        continue;
+                    };
+                    let Ok(latte_work_protocol::EventKind::Tool { id, name, input }) =
+                        serde_json::from_str::<latte_work_protocol::EventKind>(&raw)
+                    else {
+                        continue;
+                    };
+                    let outcome = outcomes.get(&id).copied();
+                    for signal in extract_tool_signals(
+                        &name,
+                        &input,
+                        outcome,
+                        project_root,
+                        canonical_project,
+                        base_cwd,
+                    ) {
+                        let is_reset = signal == DirectorySignal::ResetToProjectRoot;
+                        if seen.insert(signal.clone()) {
+                            collected.push(signal);
+                            if is_reset || collected.len() >= limit {
+                                break 'pages;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if exhausted {
+            break;
+        }
+    }
+    collected
+}
+
 async fn resolve_from_signals(
     canonical_project: &Path,
     signals: &[DirectorySignal],
@@ -150,8 +232,12 @@ async fn resolve_from_signals(
             DirectorySignal::ResetToProjectRoot => {
                 return Some(canonical_project.to_path_buf());
             }
-            DirectorySignal::ExplicitDirectory(candidate) => {
+            DirectorySignal::ExplicitDirectory {
+                path: candidate,
+                allow_project_root,
+            } => {
                 if let Some(valid) = validate_explicit_directory(canonical_project, candidate).await
+                    && (*allow_project_root || valid != canonical_project)
                 {
                     return Some(valid);
                 }
@@ -262,7 +348,10 @@ pub(crate) fn extract_tool_signals(
             if let Some(raw) = map.get(key).and_then(Value::as_str)
                 && let Some(resolved) = resolve_against(base_cwd, raw)
             {
-                out.push(DirectorySignal::ExplicitDirectory(resolved));
+                out.push(DirectorySignal::ExplicitDirectory {
+                    path: resolved,
+                    allow_project_root: true,
+                });
             }
         }
         if let Some(name) = map.get("name").and_then(Value::as_str)
@@ -271,9 +360,10 @@ pub(crate) fn extract_tool_signals(
             && name != "."
             && name != ".."
         {
-            out.push(DirectorySignal::ExplicitDirectory(
-                base_cwd.join(".claude/worktrees").join(name),
-            ));
+            out.push(DirectorySignal::ExplicitDirectory {
+                path: base_cwd.join(".claude/worktrees").join(name),
+                allow_project_root: true,
+            });
         }
         return out;
     }
@@ -300,18 +390,25 @@ pub(crate) fn extract_tool_signals(
             && let Some(cd_arg) = parse_leading_cd_target(&cmd_text)
             && let Some(cd_path) = resolve_against(cmd_base, &cd_arg)
         {
-            signals.push(DirectorySignal::ExplicitDirectory(cd_path));
+            signals.push(DirectorySignal::ExplicitDirectory {
+                path: cd_path,
+                allow_project_root: true,
+            });
         }
 
         // Only treat the tool's explicit `cwd` field as a specific working-directory
         // choice when it differs from the default project root; commands without
         // `workdir` default `cwd` to `project.path` even while operating on a worktree.
+        // Symlink equivalence to `canonical_project` is checked asynchronously in
+        // `resolve_from_signals` (`allow_project_root: false`) without blocking I/O here.
         if let Some(dir) = explicit_cwd
             && dir != project_root
             && dir != canonical_project
-            && dir.canonicalize().ok().as_deref() != Some(canonical_project)
         {
-            signals.push(DirectorySignal::ExplicitDirectory(dir));
+            signals.push(DirectorySignal::ExplicitDirectory {
+                path: dir,
+                allow_project_root: false,
+            });
         }
         return signals;
     }
